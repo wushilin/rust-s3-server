@@ -1,0 +1,32 @@
+refresh_rate: 60 seconds
+
+appenders:
+  stdout:
+    kind: console
+  default:
+    kind: rolling_file
+    path: "/var/log/rusts3.log"
+    append: true
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S%.3f %Z)} {({l}):5.5} {f}:{L} - {m}{n}"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10 mb
+      roller:
+        kind: fixed_window
+        pattern: "/var/log/rusts3.{}.log.gz"
+        count: 20
+        base: 1
+root:
+  level: info
+  appenders:
+    - stdout
+
+loggers:
+  rusts3:
+    level: info
+    appenders:
+      - default
+    additive: false
