@@ -62,5 +62,5 @@ $ aws --endpoint-url http://192.168.44.172:18000 s3 ls s3://new-bucket/some-path
 Deleting object:
 ```bash
 $ aws --endpoint-url http://192.168.44.172:18000 s3 rm s3://new-bucket/some-path/zulu.img
-delete: s3://new-bucket/some-path/zulu.img
+delete: s3://new-bucket/some-path/zulu.dmg
 ```
