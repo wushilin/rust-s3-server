@@ -534,7 +534,7 @@ impl LocalObjectStore {
         if !self.sqlite_repair_recently_checked(&cache_key) {
             let index = self.index(bucket).await?;
             if index.get(key).await?.is_none() {
-                let _ = index
+                index
                     .put(&ObjectIndexEntry {
                         object_key: key.to_string(),
                         physical_id: cached.meta.physical_id.clone(),
@@ -542,7 +542,15 @@ impl LocalObjectStore {
                         etag: cached.meta.etag.clone(),
                         last_modified_ms: cached.meta.last_modified_ms,
                     })
-                    .await;
+                    .await?;
+                log::info!(
+                    "sqlite repair fixed missing index row bucket={} key={} physical_id={} size={} etag={}",
+                    bucket,
+                    key,
+                    cached.meta.physical_id,
+                    cached.meta.size,
+                    cached.meta.etag,
+                );
             }
             self.mark_sqlite_repaired(cache_key.clone());
         }
@@ -572,6 +580,7 @@ impl LocalObjectStore {
     pub fn start_rebuild_background(&self, bucket: &str) -> bool {
         let mut guard = self.rebuilding.lock().unwrap();
         if guard.contains(bucket) {
+            log::info!("rebuild_sqlite trigger ignored bucket={bucket} reason=already_running");
             return false;
         }
         guard.insert(bucket.to_string());
@@ -580,11 +589,13 @@ impl LocalObjectStore {
         let store = self.clone();
         let bucket = bucket.to_string();
         tokio::spawn(async move {
+            log::info!("rebuild_sqlite background task started bucket={bucket}");
             match store.rebuild_sqlite(&bucket).await {
                 Ok(count) => log::info!("rebuild_sqlite complete bucket={bucket} repaired={count}"),
                 Err(err) => log::error!("rebuild_sqlite failed bucket={bucket} error={err}"),
             }
             store.rebuilding.lock().unwrap().remove(&bucket);
+            log::info!("rebuild_sqlite background task stopped bucket={bucket}");
         });
         true
     }
@@ -598,9 +609,18 @@ impl LocalObjectStore {
         let objects_dir = bucket_dir.join("objects");
         let index = self.index(bucket).await?;
         let mut entries = Vec::new();
-        Box::pin(rebuild_walk(&objects_dir, &mut entries, &self.shutdown)).await?;
+        log::info!("rebuild_sqlite scan started bucket={bucket}");
+        Box::pin(rebuild_walk(
+            bucket,
+            &objects_dir,
+            &mut entries,
+            &self.shutdown,
+        ))
+        .await?;
         let count = entries.len();
+        log::info!("rebuild_sqlite applying index bucket={bucket} objects={count}");
         index.replace_all(&entries).await?;
+        log::info!("rebuild_sqlite applied index bucket={bucket} objects={count}");
         Ok(count)
     }
 
@@ -1085,14 +1105,20 @@ async fn has_active_staging(bucket_dir: &Path) -> Result<bool> {
 }
 
 async fn rebuild_walk(
+    bucket: &str,
     dir: &Path,
     entries_out: &mut Vec<ObjectIndexEntry>,
     shutdown: &CancellationToken,
 ) -> Result<()> {
     if shutdown.is_cancelled() {
+        log::info!(
+            "rebuild_sqlite cancelled before scanning dir={}",
+            dir.display()
+        );
         return Err(StorageError::Io("rebuild cancelled".to_string()));
     }
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        log::info!("rebuild_sqlite scan skipped missing dir={}", dir.display());
         return Ok(());
     };
     let mut subdirs = Vec::new();
@@ -1125,19 +1151,39 @@ async fn rebuild_walk(
                     etag: meta.etag,
                     last_modified_ms: meta.last_modified_ms,
                 });
+                if let Some(entry) = entries_out.last() {
+                    log::info!(
+                        "rebuild_sqlite discovered object bucket={} key={} physical_id={} size={} etag={}",
+                        bucket,
+                        entry.object_key,
+                        entry.physical_id,
+                        entry.size,
+                        entry.etag,
+                    );
+                }
                 if entries_out.len() % 100 == 0 {
-                    log::info!("rebuild_sqlite: {} objects found so far", entries_out.len());
+                    log::info!(
+                        "rebuild_sqlite progress bucket={} objects_found={}",
+                        bucket,
+                        entries_out.len()
+                    );
                     tokio::task::yield_now().await;
                     if shutdown.is_cancelled() {
-                        log::info!("rebuild_sqlite: cancelled at {} objects", entries_out.len());
+                        log::info!(
+                            "rebuild_sqlite cancelled bucket={} objects_found={}",
+                            bucket,
+                            entries_out.len()
+                        );
                         return Err(StorageError::Io("rebuild cancelled".to_string()));
                     }
                 }
             }
+        } else {
+            log::warn!("rebuild_sqlite failed to read meta dir={}", dir.display());
         }
     } else {
         for subdir in subdirs {
-            Box::pin(rebuild_walk(&subdir, entries_out, shutdown)).await?;
+            Box::pin(rebuild_walk(bucket, &subdir, entries_out, shutdown)).await?;
         }
     }
     Ok(())

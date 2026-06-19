@@ -82,12 +82,24 @@ pub async fn sweep_bucket(
         {
             index.delete(&entry.object_key).await?;
             stats.sqlite_orphans_removed += 1;
+            log::info!(
+                "sweeper removed sqlite orphan bucket={} key={} physical_id={}",
+                bucket,
+                entry.object_key,
+                entry.physical_id,
+            );
             yield_now().await;
         }
     }
 
     if has_more_sqlite {
         // Batch limit hit — caller should resume from last_sqlite_key next tick.
+        log::info!(
+            "sweeper sqlite scan yielded bucket={} visited={} next_after={}",
+            bucket,
+            config.max_objects,
+            stats.last_sqlite_key.as_deref().unwrap_or("-"),
+        );
         return Ok(stats);
     }
 
@@ -117,8 +129,19 @@ async fn sweep_physical_orphans(
         if path_age_ms(&dir, config.now_ms)? < config.orphan_grace_period_ms {
             continue;
         }
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        stats.physical_orphans_removed += 1;
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {
+                stats.physical_orphans_removed += 1;
+                log::info!("sweeper removed physical orphan dir={}", dir.display());
+            }
+            Err(err) => {
+                log::warn!(
+                    "sweeper failed to remove physical orphan dir={} error={}",
+                    dir.display(),
+                    err,
+                );
+            }
+        }
         yield_now().await;
     }
     Ok(())
@@ -152,8 +175,25 @@ async fn sweep_staging(
             if staging_age >= config.staging_expiry_ms
                 && all_files_old_enough(&path, config.now_ms, config.staging_expiry_ms)
             {
-                let _ = tokio::fs::remove_dir_all(&path).await;
-                stats.staging_dirs_removed += 1;
+                match tokio::fs::remove_dir_all(&path).await {
+                    Ok(()) => {
+                        stats.staging_dirs_removed += 1;
+                        log::info!(
+                            "sweeper removed staging dir kind={} path={} age_ms={}",
+                            kind,
+                            path.display(),
+                            staging_age,
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "sweeper failed to remove staging dir kind={} path={} error={}",
+                            kind,
+                            path.display(),
+                            err,
+                        );
+                    }
+                }
                 yield_now().await;
             }
         }

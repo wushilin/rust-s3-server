@@ -218,15 +218,18 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     // Cancel all background tasks on SIGINT / Ctrl-C.
     let shutdown_sig = shutdown.clone();
     tokio::spawn(async move {
+        log::info!("shutdown signal watcher task started");
         tokio::signal::ctrl_c().await.ok();
         log::info!("SIGINT received — shutting down");
         shutdown_sig.cancel();
+        log::info!("shutdown signal watcher task completed");
     });
 
     if config.app_config.logging.enable_bandwidth_report {
         let metrics_shutdown = shutdown.clone();
         let metrics_for_task = metrics.clone();
         tokio::spawn(async move {
+            log::info!("traffic metrics task started interval_secs=10");
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
             let mut previous = TrafficSnapshot::default();
             interval.tick().await; // discard immediate first tick
@@ -262,6 +265,8 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                 }
             }
         });
+    } else {
+        log::info!("traffic metrics task disabled by config");
     }
 
     // Sweeper task: runs on a configurable interval, exits cooperatively on shutdown.
@@ -271,6 +276,13 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let sweeper_shutdown = shutdown.clone();
     let sweeper_cfg = config.app_config.sweeper.clone();
     tokio::spawn(async move {
+        log::info!(
+            "sweeper task started interval_secs={} max_objects_per_pass={} orphan_grace_period_secs={} staging_expiry_secs={}",
+            sweeper_cfg.interval_secs,
+            sweeper_cfg.max_objects_per_pass,
+            sweeper_cfg.orphan_grace_period_secs,
+            sweeper_cfg.staging_expiry_secs,
+        );
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(sweeper_cfg.interval_secs));
         interval.tick().await; // discard the immediate first tick
@@ -283,7 +295,13 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Ok(buckets) = sweeper_store.list_buckets().await {
+                    log::info!("sweeper tick triggered");
+                    match sweeper_store.list_buckets().await {
+                        Ok(buckets) => {
+                        log::info!("sweeper pass started buckets={}", buckets.len());
+                        if buckets.is_empty() {
+                            log::info!("sweeper pass complete buckets=0");
+                        }
                         // Drop cursors for buckets that no longer exist.
                         let names: std::collections::HashSet<&str> =
                             buckets.iter().map(|(b, _)| b.as_str()).collect();
@@ -294,6 +312,11 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                             let after = cursors
                                 .get(bucket.as_str())
                                 .and_then(|v| v.as_deref());
+                            log::info!(
+                                "sweeper bucket started bucket={} after={}",
+                                bucket,
+                                after.unwrap_or("-"),
+                            );
                             let cfg = SweepConfig {
                                 max_objects: sweeper_cfg.max_objects_per_pass,
                                 orphan_grace_period_ms: sweeper_cfg.orphan_grace_period_secs as i64 * 1000,
@@ -314,13 +337,40 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                                         );
                                     }
                                     if stats.pass_complete {
+                                        log::info!(
+                                            "sweeper bucket complete bucket={} sqlite_orphans={} physical_orphans={} staging={} pass_complete=true",
+                                            bucket,
+                                            stats.sqlite_orphans_removed,
+                                            stats.physical_orphans_removed,
+                                            stats.staging_dirs_removed,
+                                        );
                                         cursors.remove(bucket.as_str());
                                     } else if let Some(key) = stats.last_sqlite_key {
+                                        log::info!(
+                                            "sweeper bucket yielded bucket={} sqlite_orphans={} physical_orphans={} staging={} next_after={}",
+                                            bucket,
+                                            stats.sqlite_orphans_removed,
+                                            stats.physical_orphans_removed,
+                                            stats.staging_dirs_removed,
+                                            key,
+                                        );
                                         cursors.insert(bucket.clone(), Some(key));
                                     }
                                 }
                                 Err(err) => log::warn!("sweeper {bucket}: {err}"),
                             }
+                        }
+                        log::info!(
+                            "sweeper pass rescheduled interval_secs={}",
+                            sweeper_cfg.interval_secs,
+                        );
+                        }
+                        Err(err) => {
+                            log::warn!("sweeper pass failed to list buckets error={err}");
+                            log::info!(
+                                "sweeper pass rescheduled interval_secs={}",
+                                sweeper_cfg.interval_secs,
+                            );
                         }
                     }
                 }
