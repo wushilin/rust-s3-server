@@ -248,7 +248,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                             human_bytes(delta.bytes_out / 10),
                         );
                         log::info!(
-                            "requests total={} get={} put={} head={} delete={} post={} other={} total_qps={} get_qps={} put_qps={} head_qps={} delete_qps={} post_qps={} other_qps={}",
+                            "traffic requests total={} get={} put={} head={} delete={} post={} other={} total_qps={}",
                             snapshot.request_total(),
                             snapshot.get_requests,
                             snapshot.put_requests,
@@ -257,12 +257,6 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                             snapshot.post_requests,
                             snapshot.other_requests,
                             qps(delta.request_total()),
-                            qps(delta.get_requests),
-                            qps(delta.put_requests),
-                            qps(delta.head_requests),
-                            qps(delta.delete_requests),
-                            qps(delta.post_requests),
-                            qps(delta.other_requests),
                         );
                     }
                 }
