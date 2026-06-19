@@ -634,12 +634,13 @@ fn parse_complete_parts_xml(xml: &str) -> Result<Vec<CompletePartRequest>, &'sta
             .and_then(|v| v.get(1))
             .and_then(|v| v.as_str().parse::<u16>().ok())
             .ok_or("Invalid PartNumber")?;
-        let etag = etag_re
-            .captures(block)
-            .and_then(|v| v.get(1))
-            .ok_or("Invalid ETag")?
-            .as_str()
-            .to_string();
+        let etag = normalize_complete_etag(
+            etag_re
+                .captures(block)
+                .and_then(|v| v.get(1))
+                .ok_or("Invalid ETag")?
+                .as_str(),
+        );
         parts.push(CompletePartRequest { number, etag });
     }
     if parts.is_empty() {
@@ -651,7 +652,7 @@ fn parse_complete_parts_xml(xml: &str) -> Result<Vec<CompletePartRequest>, &'sta
             .collect::<Vec<_>>();
         let etags = flat_etag_re
             .captures_iter(xml)
-            .filter_map(|capture| capture.get(1).map(|v| v.as_str().to_string()))
+            .filter_map(|capture| capture.get(1).map(|v| normalize_complete_etag(v.as_str())))
             .collect::<Vec<_>>();
         if numbers.len() == etags.len() && !numbers.is_empty() {
             parts = numbers
@@ -666,6 +667,18 @@ fn parse_complete_parts_xml(xml: &str) -> Result<Vec<CompletePartRequest>, &'sta
     } else {
         Ok(parts)
     }
+}
+
+fn normalize_complete_etag(value: &str) -> String {
+    value
+        .trim()
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .trim_matches('"')
+        .to_string()
 }
 
 fn is_aws_chunked(headers: &HeaderMap) -> bool {
@@ -1729,5 +1742,15 @@ mod tests {
         assert_eq!(parts[0].number, 1);
         assert_eq!(parts[0].etag, "abc");
         assert_eq!(parts[1].number, 2);
+    }
+
+    #[test]
+    fn complete_parts_xml_accepts_xml_escaped_etags() {
+        let parts = parse_complete_parts_xml(
+            r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;900150983cd24fb0d6963f7d28e17f72&quot;</ETag></Part></CompleteMultipartUpload>"#,
+        )
+        .unwrap();
+        assert_eq!(parts[0].number, 1);
+        assert_eq!(parts[0].etag, "900150983cd24fb0d6963f7d28e17f72");
     }
 }
