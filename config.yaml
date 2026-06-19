@@ -1,0 +1,60 @@
+# rusts3 configuration file
+# Pass with: rusts3 -c config.yaml
+# All fields are optional; values shown below are the compiled-in defaults.
+
+# ─── Server ───────────────────────────────────────────────────────────────────
+server:
+  # IP address to listen on.  0.0.0.0 = all interfaces.
+  bind_address: "192.168.44.172"
+
+  # TCP port.
+  bind_port: 18000
+
+  # Root directory where bucket data is stored.
+  # Each bucket gets a sub-directory: <base_dir>/buckets/<bucket-name>/
+  base_dir: "./test-data"
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging:
+  # Log level: trace | debug | info | warn | error
+  level: "info"
+
+  # Path to a rolling log file.  When omitted, logs go to stdout only.
+  # file: "/var/log/rusts3/rusts3.log"
+
+  # Rotate when the file reaches this size (MiB).
+  rotation_size_mb: 100
+
+  # Number of archived log files to keep alongside the active log.
+  keep_files: 5
+
+  # Compress archived files with gzip (.gz extension added automatically).
+  compress: false
+
+# ─── Sweeper ──────────────────────────────────────────────────────────────────
+sweeper:
+  # How often the background sweeper runs (seconds).
+  interval_secs: 300
+
+  # Maximum objects inspected per bucket per pass.  The sweeper resumes from the
+  # last position on the next tick so large buckets are swept incrementally.
+  max_objects_per_pass: 100
+
+  # Minimum age of a stale SQLite row (with missing meta.json) before removal (seconds).
+  orphan_grace_period_secs: 300
+
+  # Minimum idle age of an abandoned staging directory before removal (seconds).
+  staging_expiry_secs: 86400
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+auth:
+  # Set to true to require SigV4 signatures on every request.
+  # When false the server accepts all requests without credentials.
+  enabled: false
+
+  # List of valid access-key / secret-key pairs.
+  credentials:
+    - access_key: "minioadmin"
+      secret_key: "minioadmin"
+    - access_key: "AKIAIOSFODNN7EXAMPLE"
+      secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
