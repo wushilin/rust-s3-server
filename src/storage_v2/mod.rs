@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod aws_chunked;
+pub mod cache;
 pub mod config;
 pub mod encoding;
 pub mod errors;

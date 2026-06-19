@@ -34,6 +34,8 @@ use super::xml::{
     list_objects_v1_xml, list_objects_v2_xml, BucketListEntry, S3ErrorXml,
 };
 
+const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct S3HttpConfig {
     pub address: SocketAddr,
@@ -641,7 +643,15 @@ async fn get_or_head_object(
     let body = if method == Method::HEAD {
         Body::empty()
     } else {
-        match stream_object_range(&object.meta, &object.object_dir, range_start, range_len).await {
+        match stream_object_range(
+            &object.meta,
+            &object.part_offsets,
+            &object.object_dir,
+            range_start,
+            range_len,
+        )
+        .await
+        {
             Ok(body) => body,
             Err(err) => return storage_error_response(err, &format!("/{bucket}/{key}")),
         }
@@ -658,6 +668,7 @@ async fn get_or_head_object(
 /// contiguous byte stream.
 async fn stream_object_range(
     meta: &super::metadata::ObjectMeta,
+    part_offsets: &[u64],
     object_dir: &FsPath,
     range_start: u64,
     range_len: u64,
@@ -682,7 +693,10 @@ async fn stream_object_range(
                         )));
                     }
                 }
-                return Ok(Body::from_stream(ReaderStream::new(file.take(range_len))));
+                return Ok(Body::from_stream(ReaderStream::with_capacity(
+                    file.take(range_len),
+                    STREAM_CHUNK_SIZE,
+                )));
             }
             Err(err) => {
                 return Err(StorageError::CorruptObject(format!(
@@ -696,24 +710,47 @@ async fn stream_object_range(
     // Multi-part: calculate which segments fall inside [range_start, range_end).
     let range_end = range_start + range_len;
     let mut segments: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
-    let mut cumulative = 0u64;
-    for part in &meta.parts {
-        let part_end = cumulative + part.size;
-        if cumulative >= range_end {
+    for (index, part) in meta.parts.iter().enumerate() {
+        let part_start = part_offsets.get(index).copied().unwrap_or(0);
+        let part_end = part_start + part.size;
+        if part_start >= range_end {
             break;
         }
         if part_end > range_start {
-            let read_from = range_start.max(cumulative);
+            let read_from = range_start.max(part_start);
             let read_to = range_end.min(part_end);
-            let skip = read_from - cumulative;
+            let skip = read_from - part_start;
             let take = read_to - read_from;
             segments.push((object_dir.join(&part.file), skip, take));
         }
-        cumulative = part_end;
+    }
+
+    if segments.len() == 1 {
+        let (path, skip, take) = segments.pop().unwrap();
+        match tokio::fs::File::open(&path).await {
+            Ok(mut file) => {
+                if skip > 0 && file.seek(SeekFrom::Start(skip)).await.is_err() {
+                    return Err(StorageError::CorruptObject(format!(
+                        "failed to seek {}",
+                        path.display()
+                    )));
+                }
+                return Ok(Body::from_stream(ReaderStream::with_capacity(
+                    file.take(take),
+                    STREAM_CHUNK_SIZE,
+                )));
+            }
+            Err(err) => {
+                return Err(StorageError::CorruptObject(format!(
+                    "failed to open {}: {err}",
+                    path.display()
+                )))
+            }
+        }
     }
 
     // Pipe all segments through a duplex channel so axum sees one Body stream.
-    let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+    let (mut writer, reader) = tokio::io::duplex(STREAM_CHUNK_SIZE);
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         for (path, skip, take) in segments {
@@ -732,7 +769,10 @@ async fn stream_object_range(
         }
     });
 
-    Ok(Body::from_stream(ReaderStream::new(reader)))
+    Ok(Body::from_stream(ReaderStream::with_capacity(
+        reader,
+        STREAM_CHUNK_SIZE,
+    )))
 }
 
 fn parse_complete_parts_xml(xml: &str) -> Result<Vec<CompletePartRequest>, &'static str> {

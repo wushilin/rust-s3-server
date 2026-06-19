@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -17,6 +18,7 @@ use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
 
 use super::aws_chunked::decode_aws_chunked;
+use super::cache::BoundedLruCache;
 use super::encoding::{physical_id_for_key, validate_bucket_name, validate_object_key};
 use super::errors::{Result, StorageError};
 use super::index::{ListPage, ObjectIndexEntry, SqliteObjectIndex};
@@ -29,6 +31,11 @@ use super::metadata::{
 use super::staging::{new_staging_id, validate_staging_id};
 use super::time::now_ms;
 
+const META_CACHE_CAPACITY: usize = 1_000_000;
+const SQLITE_REPAIR_CACHE_CAPACITY: usize = 2_000_000;
+const SQLITE_REPAIR_CACHE_TTL_MS: i64 = 2 * 60 * 60 * 1000;
+const CACHE_SHARDS: usize = 64;
+
 /// Filesystem-backed S3-compatible object store.
 ///
 /// Cheap to clone — all inner state is wrapped in `Arc`.
@@ -36,6 +43,8 @@ use super::time::now_ms;
 pub struct LocalObjectStore {
     layout: StorageLayout,
     locks: ObjectLockTable,
+    meta_cache: Arc<BoundedLruCache<ObjectCacheKey, CachedObjectMeta>>,
+    sqlite_repair_cache: Arc<BoundedLruCache<ObjectCacheKey, i64>>,
     /// Tracks which buckets are currently undergoing a SQLite rebuild.
     rebuilding: Arc<Mutex<HashSet<String>>>,
     /// Cooperative shutdown signal — cancel this to stop all background tasks.
@@ -58,6 +67,8 @@ pub struct PutResult {
 #[derive(Debug, Clone)]
 pub struct ReadObject {
     pub meta: ObjectMeta,
+    /// Starting byte offset for each part in `meta.parts`.
+    pub part_offsets: Vec<u64>,
     /// Directory that contains the part files (`part.1`, `part.2`, …).
     pub object_dir: std::path::PathBuf,
 }
@@ -69,11 +80,39 @@ pub struct CompletePartRequest {
     pub etag: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObjectCacheKey {
+    bucket: String,
+    key: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedObjectMeta {
+    meta: ObjectMeta,
+    part_offsets: Vec<u64>,
+    meta_modified: SystemTime,
+    meta_len: u64,
+}
+
+impl ObjectCacheKey {
+    fn new(bucket: &str, key: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        }
+    }
+}
+
 impl LocalObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             layout: StorageLayout::new(root),
             locks: ObjectLockTable::default(),
+            meta_cache: Arc::new(BoundedLruCache::new(META_CACHE_CAPACITY, CACHE_SHARDS)),
+            sqlite_repair_cache: Arc::new(BoundedLruCache::new(
+                SQLITE_REPAIR_CACHE_CAPACITY,
+                CACHE_SHARDS,
+            )),
             rebuilding: Arc::new(Mutex::new(HashSet::new())),
             shutdown: CancellationToken::new(),
         }
@@ -83,6 +122,11 @@ impl LocalObjectStore {
         Self {
             layout,
             locks: ObjectLockTable::default(),
+            meta_cache: Arc::new(BoundedLruCache::new(META_CACHE_CAPACITY, CACHE_SHARDS)),
+            sqlite_repair_cache: Arc::new(BoundedLruCache::new(
+                SQLITE_REPAIR_CACHE_CAPACITY,
+                CACHE_SHARDS,
+            )),
             rebuilding: Arc::new(Mutex::new(HashSet::new())),
             shutdown: CancellationToken::new(),
         }
@@ -95,6 +139,26 @@ impl LocalObjectStore {
 
     pub fn layout(&self) -> &StorageLayout {
         &self.layout
+    }
+
+    fn invalidate_object_caches(&self, cache_key: &ObjectCacheKey) {
+        self.meta_cache.remove(cache_key);
+        self.sqlite_repair_cache.remove(cache_key);
+    }
+
+    fn mark_sqlite_repaired(&self, cache_key: ObjectCacheKey) {
+        self.sqlite_repair_cache.insert(cache_key, now_ms());
+    }
+
+    fn sqlite_repair_recently_checked(&self, cache_key: &ObjectCacheKey) -> bool {
+        let Some(checked_at_ms) = self.sqlite_repair_cache.get(cache_key) else {
+            return false;
+        };
+        if now_ms().saturating_sub(checked_at_ms) <= SQLITE_REPAIR_CACHE_TTL_MS {
+            return true;
+        }
+        self.sqlite_repair_cache.remove(cache_key);
+        false
     }
 
     pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
@@ -341,6 +405,8 @@ impl LocalObjectStore {
         let _guard = self.locks.lock(bucket, key).await;
         let object_path = self.layout.object_path(bucket, key)?;
         let index = self.index(bucket).await?;
+        let cache_key = ObjectCacheKey::new(bucket, key);
+        self.invalidate_object_caches(&cache_key);
 
         let _ = tokio::fs::remove_file(&object_path.meta_path).await;
         index.delete(key).await?;
@@ -395,35 +461,63 @@ impl LocalObjectStore {
     pub async fn read_object(&self, bucket: &str, key: &str) -> Result<ReadObject> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let object_path = self.layout.object_path(bucket, key)?;
-        if !object_path.meta_path.exists() {
-            // Proactively clean up any orphaned SQLite entry and physical directory.
-            if let Ok(index) = self.index(bucket).await {
-                let _ = index.delete(key).await;
+        let cache_key = ObjectCacheKey::new(bucket, key);
+        let meta_file = match tokio::fs::metadata(&object_path.meta_path).await {
+            Ok(meta_file) if meta_file.is_file() => meta_file,
+            _ => {
+                self.invalidate_object_caches(&cache_key);
+                // Proactively clean up any orphaned SQLite entry and physical directory.
+                if let Ok(index) = self.index(bucket).await {
+                    let _ = index.delete(key).await;
+                }
+                let _ = tokio::fs::remove_dir_all(&object_path.object_dir).await;
+                return Err(StorageError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
             }
-            let _ = tokio::fs::remove_dir_all(&object_path.object_dir).await;
-            return Err(StorageError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
-        let meta: ObjectMeta = read_json(&object_path.meta_path).await?;
-        validate_object_parts(&object_path.object_dir, &meta).await?;
+        };
+        let meta_modified = meta_file.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let meta_len = meta_file.len();
+        let cached = self
+            .meta_cache
+            .get(&cache_key)
+            .filter(|entry| entry.meta_modified == meta_modified && entry.meta_len == meta_len);
+        let cached = match cached {
+            Some(cached) => cached,
+            None => {
+                let meta: ObjectMeta = read_json(&object_path.meta_path).await?;
+                validate_object_parts(&object_path.object_dir, &meta).await?;
+                let cached = CachedObjectMeta {
+                    part_offsets: part_offsets(&meta),
+                    meta,
+                    meta_modified,
+                    meta_len,
+                };
+                self.meta_cache.insert(cache_key.clone(), cached.clone());
+                cached
+            }
+        };
 
         // Repair SQLite if a row is missing (e.g. after a crash during commit).
-        let index = self.index(bucket).await?;
-        if index.get(key).await?.is_none() {
-            let _ = index
-                .put(&ObjectIndexEntry {
-                    object_key: key.to_string(),
-                    physical_id: meta.physical_id.clone(),
-                    size: meta.size,
-                    etag: meta.etag.clone(),
-                    last_modified_ms: meta.last_modified_ms,
-                })
-                .await;
+        if !self.sqlite_repair_recently_checked(&cache_key) {
+            let index = self.index(bucket).await?;
+            if index.get(key).await?.is_none() {
+                let _ = index
+                    .put(&ObjectIndexEntry {
+                        object_key: key.to_string(),
+                        physical_id: cached.meta.physical_id.clone(),
+                        size: cached.meta.size,
+                        etag: cached.meta.etag.clone(),
+                        last_modified_ms: cached.meta.last_modified_ms,
+                    })
+                    .await;
+            }
+            self.mark_sqlite_repaired(cache_key.clone());
         }
         Ok(ReadObject {
-            meta,
+            meta: cached.meta,
+            part_offsets: cached.part_offsets,
             object_dir: object_path.object_dir,
         })
     }
@@ -432,6 +526,8 @@ impl LocalObjectStore {
         self.ensure_bucket_and_key(bucket, key).await?;
         let _guard = self.locks.lock(bucket, key).await;
         let object_path = self.layout.object_path(bucket, key)?;
+        let cache_key = ObjectCacheKey::new(bucket, key);
+        self.invalidate_object_caches(&cache_key);
         // Remove meta.json first — this makes the object invisible atomically.
         let _ = tokio::fs::remove_file(&object_path.meta_path).await;
         self.index(bucket).await?.delete(key).await?;
@@ -656,6 +752,8 @@ impl LocalObjectStore {
         let _guard = self.locks.lock(bucket, key).await;
         let object_path = self.layout.object_path(bucket, key)?;
         let index = self.index(bucket).await?;
+        let cache_key = ObjectCacheKey::new(bucket, key);
+        self.invalidate_object_caches(&cache_key);
         let _ = tokio::fs::remove_file(&object_path.meta_path).await;
         index.delete(key).await?;
         tokio::fs::create_dir_all(&object_path.object_dir).await?;
@@ -932,6 +1030,16 @@ async fn validate_object_parts(object_dir: &Path, meta: &ObjectMeta) -> Result<(
     Ok(())
 }
 
+fn part_offsets(meta: &ObjectMeta) -> Vec<u64> {
+    let mut offsets = Vec::with_capacity(meta.parts.len());
+    let mut offset = 0u64;
+    for part in &meta.parts {
+        offsets.push(offset);
+        offset = offset.saturating_add(part.size);
+    }
+    offsets
+}
+
 async fn has_active_staging(bucket_dir: &Path) -> Result<bool> {
     for kind in ["put", "multipart"] {
         let path = bucket_dir.join("staging").join(kind);
@@ -1082,6 +1190,21 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn sqlite_repair_cooldown_has_absolute_ttl() {
+        let store = LocalObjectStore::new("/tmp/rusts3-test-unused");
+        let key = ObjectCacheKey::new("bucket", "object");
+
+        store.mark_sqlite_repaired(key.clone());
+        assert!(store.sqlite_repair_recently_checked(&key));
+
+        store
+            .sqlite_repair_cache
+            .insert(key.clone(), now_ms() - SQLITE_REPAIR_CACHE_TTL_MS - 1);
+        assert!(!store.sqlite_repair_recently_checked(&key));
+        assert!(store.sqlite_repair_cache.get(&key).is_none());
     }
 
     #[tokio::test]
