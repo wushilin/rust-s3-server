@@ -43,6 +43,11 @@ server:
   # Each bucket becomes a sub-directory: <base_dir>/buckets/<bucket-name>/
   base_dir: "./rusts3-data"
 
+# ─── Storage ──────────────────────────────────────────────────────────────────
+storage:
+  # Maximum SQLite connections kept open per bucket index pool.
+  sqlite_max_connections: 50
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging:
   # Minimum log level: trace | debug | info | warn | error

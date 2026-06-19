@@ -149,7 +149,10 @@ async fn traffic_metrics_middleware(
 /// directories every 5 minutes.  Responds to SIGINT (Ctrl-C) by cancelling
 /// all background tasks and draining in-flight HTTP requests before returning.
 pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let store = LocalObjectStore::new(config.root);
+    let store = LocalObjectStore::new_with_sqlite_max_connections(
+        config.root,
+        config.app_config.storage.sqlite_max_connections,
+    );
     let shutdown = store.shutdown_token();
     let metrics = Arc::new(TrafficMetrics::default());
 

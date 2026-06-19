@@ -17,6 +17,14 @@ pub struct ServerConfig {
     pub base_dir: String,
 }
 
+/// Storage engine settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Maximum SQLite connections kept open per bucket index pool.
+    #[serde(default = "default_sqlite_max_connections")]
+    pub sqlite_max_connections: u32,
+}
+
 /// Log rotation and output settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
@@ -90,6 +98,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -117,6 +127,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            storage: StorageConfig::default(),
             logging: LoggingConfig::default(),
             auth: AuthConfig::default(),
             sweeper: SweeperConfig::default(),
@@ -130,6 +141,14 @@ impl Default for ServerConfig {
             bind_address: default_bind_address(),
             bind_port: default_bind_port(),
             base_dir: default_base_dir(),
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            sqlite_max_connections: default_sqlite_max_connections(),
         }
     }
 }
@@ -155,6 +174,9 @@ fn default_bind_port() -> u16 {
 }
 fn default_base_dir() -> String {
     "./rusts3-data-v2".to_string()
+}
+fn default_sqlite_max_connections() -> u32 {
+    50
 }
 fn default_log_level() -> String {
     "info".to_string()
@@ -198,5 +220,14 @@ mod tests {
         let config: AppConfig =
             serde_yaml::from_str("logging:\n  enable_bandwidth_report: false\n").unwrap();
         assert!(!config.logging.enable_bandwidth_report);
+    }
+
+    #[test]
+    fn sqlite_pool_size_defaults_and_can_be_overridden() {
+        assert_eq!(AppConfig::default().storage.sqlite_max_connections, 50);
+
+        let config: AppConfig =
+            serde_yaml::from_str("storage:\n  sqlite_max_connections: 12\n").unwrap();
+        assert_eq!(config.storage.sqlite_max_connections, 12);
     }
 }

@@ -28,11 +28,18 @@ pub struct SqliteObjectIndex {
 
 impl SqliteObjectIndex {
     pub async fn open(bucket_dir: &Path) -> Result<Self> {
+        Self::open_with_max_connections(bucket_dir, 50).await
+    }
+
+    pub async fn open_with_max_connections(
+        bucket_dir: &Path,
+        max_connections: u32,
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(bucket_dir).await?;
         let db_path = bucket_dir.join("index.sqlite");
         let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
         let pool = SqlitePoolOptions::new()
-            .max_connections(4)
+            .max_connections(max_connections.max(1))
             .connect(&url)
             .await?;
         let index = Self { pool };

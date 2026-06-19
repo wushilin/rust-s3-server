@@ -4,7 +4,7 @@
 //! disk; an SQLite index per bucket is used for fast listings.  The store is
 //! `Clone + Send + Sync` and can be shared freely across async tasks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -42,7 +42,9 @@ const CACHE_SHARDS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
     layout: StorageLayout,
+    sqlite_max_connections: u32,
     locks: ObjectLockTable,
+    index_cache: Arc<Mutex<HashMap<String, SqliteObjectIndex>>>,
     meta_cache: Arc<BoundedLruCache<ObjectCacheKey, CachedObjectMeta>>,
     sqlite_repair_cache: Arc<BoundedLruCache<ObjectCacheKey, i64>>,
     /// Tracks which buckets are currently undergoing a SQLite rebuild.
@@ -105,9 +107,18 @@ impl ObjectCacheKey {
 
 impl LocalObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::new_with_sqlite_max_connections(root, 50)
+    }
+
+    pub fn new_with_sqlite_max_connections(
+        root: impl Into<PathBuf>,
+        sqlite_max_connections: u32,
+    ) -> Self {
         Self {
             layout: StorageLayout::new(root),
+            sqlite_max_connections: sqlite_max_connections.max(1),
             locks: ObjectLockTable::default(),
+            index_cache: Arc::new(Mutex::new(HashMap::new())),
             meta_cache: Arc::new(BoundedLruCache::new(META_CACHE_CAPACITY, CACHE_SHARDS)),
             sqlite_repair_cache: Arc::new(BoundedLruCache::new(
                 SQLITE_REPAIR_CACHE_CAPACITY,
@@ -119,9 +130,18 @@ impl LocalObjectStore {
     }
 
     pub fn with_layout(layout: StorageLayout) -> Self {
+        Self::with_layout_and_sqlite_max_connections(layout, 50)
+    }
+
+    pub fn with_layout_and_sqlite_max_connections(
+        layout: StorageLayout,
+        sqlite_max_connections: u32,
+    ) -> Self {
         Self {
             layout,
+            sqlite_max_connections: sqlite_max_connections.max(1),
             locks: ObjectLockTable::default(),
+            index_cache: Arc::new(Mutex::new(HashMap::new())),
             meta_cache: Arc::new(BoundedLruCache::new(META_CACHE_CAPACITY, CACHE_SHARDS)),
             sqlite_repair_cache: Arc::new(BoundedLruCache::new(
                 SQLITE_REPAIR_CACHE_CAPACITY,
@@ -222,6 +242,7 @@ impl LocalObjectStore {
             ));
         }
         tokio::fs::remove_dir_all(bucket_dir).await?;
+        self.index_cache.lock().unwrap().remove(bucket);
         Ok(())
     }
 
@@ -230,7 +251,17 @@ impl LocalObjectStore {
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        SqliteObjectIndex::open(&bucket_dir).await
+        if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
+            return Ok(index);
+        }
+        let index =
+            SqliteObjectIndex::open_with_max_connections(&bucket_dir, self.sqlite_max_connections)
+                .await?;
+        self.index_cache
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), index.clone());
+        Ok(index)
     }
 
     pub async fn put_object(
@@ -1190,6 +1221,17 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn index_pool_is_reused_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new_with_sqlite_max_connections(tmp.path(), 7);
+        store.create_bucket("bucket").await.unwrap();
+
+        let _ = store.index("bucket").await.unwrap();
+        let _ = store.index("bucket").await.unwrap();
+        assert_eq!(store.index_cache.lock().unwrap().len(), 1);
     }
 
     #[test]
