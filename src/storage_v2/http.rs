@@ -19,6 +19,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
+use futures::TryStreamExt;
 use regex::Regex;
 
 use super::auth::auth_middleware;
@@ -120,25 +121,20 @@ async fn traffic_metrics_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if let Some(bytes_in) = request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        metrics.add_in(bytes_in);
-    }
+    let (parts, body) = request.into_parts();
+    let counted_metrics = metrics.clone();
+    let counted_body = body.into_data_stream().inspect_ok(move |bytes| {
+        counted_metrics.add_in(bytes.len() as u64);
+    });
+    let request = Request::from_parts(parts, Body::from_stream(counted_body));
 
     let response = next.run(request).await;
-    let bytes_out = response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if let Some(bytes_out) = bytes_out {
-        metrics.add_out(bytes_out);
-    }
-    response
+    let (parts, body) = response.into_parts();
+    let counted_metrics = metrics.clone();
+    let counted_body = body.into_data_stream().inspect_ok(move |bytes| {
+        counted_metrics.add_out(bytes.len() as u64);
+    });
+    Response::from_parts(parts, Body::from_stream(counted_body))
 }
 
 // ─── Server entry point ───────────────────────────────────────────────────────
@@ -993,7 +989,7 @@ mod integration_tests {
 
     use crate::storage_v2::store::LocalObjectStore;
 
-    use super::router;
+    use super::{router, router_with_metrics, TrafficMetrics};
 
     fn make_app(tmp: &tempfile::TempDir) -> axum::Router {
         router(
@@ -1010,6 +1006,20 @@ mod integration_tests {
                 std::sync::Arc::new(super::super::config::AppConfig::default()),
             ),
             store,
+        )
+    }
+
+    fn make_app_with_metrics(
+        tmp: &tempfile::TempDir,
+    ) -> (axum::Router, std::sync::Arc<TrafficMetrics>) {
+        let metrics = std::sync::Arc::new(TrafficMetrics::default());
+        (
+            router_with_metrics(
+                LocalObjectStore::new(tmp.path()),
+                std::sync::Arc::new(super::super::config::AppConfig::default()),
+                metrics.clone(),
+            ),
+            metrics,
         )
     }
 
@@ -1190,6 +1200,77 @@ mod integration_tests {
             "bytes 2-5/10"
         );
         assert_eq!(body_text(res).await, "2345");
+    }
+
+    #[tokio::test]
+    async fn traffic_metrics_count_streamed_body_bytes_not_content_length_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, metrics) = make_app_with_metrics(&tmp);
+
+        let (before_bucket_in, _) = metrics.snapshot();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/metric-bucket")
+                    .header("content-length", "999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (after_bucket_in, _) = metrics.snapshot();
+        assert_eq!(after_bucket_in, before_bucket_in);
+
+        let (before_put_in, _) = metrics.snapshot();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/metric-bucket/object")
+                    .body(Body::from("hello world"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let (after_put_in, _) = metrics.snapshot();
+        assert_eq!(after_put_in - before_put_in, 11);
+
+        let (_, before_head_out) = metrics.snapshot();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/metric-bucket/object")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let (_, after_head_out) = metrics.snapshot();
+        assert_eq!(after_head_out, before_head_out);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metric-bucket/object")
+                    .header("range", "bytes=1-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_text(res).await, "ello");
+        let (_, after_get_out) = metrics.snapshot();
+        assert_eq!(after_get_out - after_head_out, 4);
     }
 
     #[tokio::test]
