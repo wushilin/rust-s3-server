@@ -48,6 +48,9 @@ logging:
   # Minimum log level: trace | debug | info | warn | error
   level: "info"
 
+  # Emit aggregate bandwidth totals and rates every 10 seconds.
+  enable_bandwidth_report: true
+
   # Path to a rolling log file.  Omit to log to stdout only.
   # file: "/var/log/rusts3/rusts3.log"
 

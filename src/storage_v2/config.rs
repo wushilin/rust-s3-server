@@ -25,6 +25,9 @@ pub struct LoggingConfig {
     /// Minimum log level: "trace", "debug", "info", "warn", "error".
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Emit aggregate bandwidth totals and rates every 10 seconds.
+    #[serde(default = "default_enable_bandwidth_report")]
+    pub enable_bandwidth_report: bool,
     /// Rotate when the log file reaches this size (MiB).
     #[serde(default = "default_rotation_size_mb")]
     pub rotation_size_mb: u64,
@@ -136,6 +139,7 @@ impl Default for LoggingConfig {
         Self {
             file: None,
             level: default_log_level(),
+            enable_bandwidth_report: default_enable_bandwidth_report(),
             rotation_size_mb: default_rotation_size_mb(),
             keep_files: default_keep_files(),
             compress: false,
@@ -155,6 +159,9 @@ fn default_base_dir() -> String {
 fn default_log_level() -> String {
     "info".to_string()
 }
+fn default_enable_bandwidth_report() -> bool {
+    true
+}
 fn default_rotation_size_mb() -> u64 {
     100
 }
@@ -172,4 +179,24 @@ fn default_orphan_grace_period_secs() -> u64 {
 }
 fn default_staging_expiry_secs() -> u64 {
     86400
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bandwidth_report_defaults_to_enabled() {
+        assert!(AppConfig::default().logging.enable_bandwidth_report);
+
+        let config: AppConfig = serde_yaml::from_str("logging: {}\n").unwrap();
+        assert!(config.logging.enable_bandwidth_report);
+    }
+
+    #[test]
+    fn bandwidth_report_can_be_disabled() {
+        let config: AppConfig =
+            serde_yaml::from_str("logging:\n  enable_bandwidth_report: false\n").unwrap();
+        assert!(!config.logging.enable_bandwidth_report);
+    }
 }

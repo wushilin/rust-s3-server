@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::Path as FsPath;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -38,8 +41,39 @@ pub struct S3HttpConfig {
     pub app_config: Arc<AppConfig>,
 }
 
+#[derive(Debug, Default)]
+struct TrafficMetrics {
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
+impl TrafficMetrics {
+    fn add_in(&self, bytes: u64) {
+        self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_out(&self, bytes: u64) {
+        self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.bytes_in.load(Ordering::Relaxed),
+            self.bytes_out.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Builds the Axum router.  Exported so integration tests can call it directly.
 pub fn router(store: LocalObjectStore, app_config: Arc<AppConfig>) -> Router {
+    router_with_metrics(store, app_config, Arc::new(TrafficMetrics::default()))
+}
+
+fn router_with_metrics(
+    store: LocalObjectStore,
+    app_config: Arc<AppConfig>,
+    metrics: Arc<TrafficMetrics>,
+) -> Router {
     Router::new()
         .route("/", get(list_buckets))
         .route("/:bucket", any(bucket_route))
@@ -47,6 +81,10 @@ pub fn router(store: LocalObjectStore, app_config: Arc<AppConfig>) -> Router {
         .layer(middleware::from_fn_with_state(
             app_config.clone(),
             auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            metrics,
+            traffic_metrics_middleware,
         ))
         .layer(middleware::from_fn(log_middleware))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
@@ -75,6 +113,32 @@ async fn log_middleware(request: Request<Body>, next: Next) -> Response {
     response
 }
 
+async fn traffic_metrics_middleware(
+    State(metrics): State<Arc<TrafficMetrics>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some(bytes_in) = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        metrics.add_in(bytes_in);
+    }
+
+    let response = next.run(request).await;
+    let bytes_out = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(bytes_out) = bytes_out {
+        metrics.add_out(bytes_out);
+    }
+    response
+}
+
 // ─── Server entry point ───────────────────────────────────────────────────────
 
 /// Starts the S3 server and blocks until shutdown.
@@ -85,6 +149,7 @@ async fn log_middleware(request: Request<Body>, next: Next) -> Response {
 pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error>> {
     let store = LocalObjectStore::new(config.root);
     let shutdown = store.shutdown_token();
+    let metrics = Arc::new(TrafficMetrics::default());
 
     // Cancel all background tasks on SIGINT / Ctrl-C.
     let shutdown_sig = shutdown.clone();
@@ -93,6 +158,39 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         log::info!("SIGINT received — shutting down");
         shutdown_sig.cancel();
     });
+
+    if config.app_config.logging.enable_bandwidth_report {
+        let metrics_shutdown = shutdown.clone();
+        let metrics_for_task = metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            let mut previous_in = 0u64;
+            let mut previous_out = 0u64;
+            interval.tick().await; // discard immediate first tick
+            loop {
+                tokio::select! {
+                    _ = metrics_shutdown.cancelled() => {
+                        log::info!("traffic metrics task stopping");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let (bytes_in, bytes_out) = metrics_for_task.snapshot();
+                        let delta_in = bytes_in.saturating_sub(previous_in);
+                        let delta_out = bytes_out.saturating_sub(previous_out);
+                        previous_in = bytes_in;
+                        previous_out = bytes_out;
+                        log::info!(
+                            "traffic bytes_in={} bytes_out={} bytes_in_rate={}/s bytes_out_rate={}/s",
+                            human_bytes(bytes_in),
+                            human_bytes(bytes_out),
+                            human_bytes(delta_in / 10),
+                            human_bytes(delta_out / 10),
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // Sweeper task: runs on a configurable interval, exits cooperatively on shutdown.
     // Per-bucket cursors ensure we resume from where we left off across ticks so
@@ -158,13 +256,28 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         }
     });
 
-    let app = router(store, config.app_config);
+    let app = router_with_metrics(store, config.app_config, metrics);
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
     log::info!("rusts3-v2 shutdown complete");
     Ok(())
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 
 async fn list_buckets(State(store): State<LocalObjectStore>) -> Response {
@@ -791,10 +904,15 @@ fn s3_error(
 }
 
 fn xml_response(status: StatusCode, body: String) -> Response {
+    let content_length = body.len();
     let mut response = (status, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/xml"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string()).unwrap(),
     );
     response.headers_mut().insert(
         "x-amz-request-id",
@@ -805,6 +923,9 @@ fn xml_response(status: StatusCode, body: String) -> Response {
 
 fn empty_response(status: StatusCode) -> Response {
     let mut response = status.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     response.headers_mut().insert(
         "x-amz-request-id",
         HeaderValue::from_static("rust-s3-server"),
@@ -1752,5 +1873,12 @@ mod tests {
         .unwrap();
         assert_eq!(parts[0].number, 1);
         assert_eq!(parts[0].etag, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn human_bytes_formats_units() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1536), "1.50 KiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.00 MiB");
     }
 }
