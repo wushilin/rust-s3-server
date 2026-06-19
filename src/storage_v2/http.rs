@@ -48,9 +48,65 @@ pub struct S3HttpConfig {
 struct TrafficMetrics {
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    get_requests: AtomicU64,
+    put_requests: AtomicU64,
+    head_requests: AtomicU64,
+    delete_requests: AtomicU64,
+    post_requests: AtomicU64,
+    other_requests: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TrafficSnapshot {
+    bytes_in: u64,
+    bytes_out: u64,
+    get_requests: u64,
+    put_requests: u64,
+    head_requests: u64,
+    delete_requests: u64,
+    post_requests: u64,
+    other_requests: u64,
+}
+
+impl TrafficSnapshot {
+    fn request_total(self) -> u64 {
+        self.get_requests
+            + self.put_requests
+            + self.head_requests
+            + self.delete_requests
+            + self.post_requests
+            + self.other_requests
+    }
+
+    fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            bytes_in: self.bytes_in.saturating_sub(previous.bytes_in),
+            bytes_out: self.bytes_out.saturating_sub(previous.bytes_out),
+            get_requests: self.get_requests.saturating_sub(previous.get_requests),
+            put_requests: self.put_requests.saturating_sub(previous.put_requests),
+            head_requests: self.head_requests.saturating_sub(previous.head_requests),
+            delete_requests: self
+                .delete_requests
+                .saturating_sub(previous.delete_requests),
+            post_requests: self.post_requests.saturating_sub(previous.post_requests),
+            other_requests: self.other_requests.saturating_sub(previous.other_requests),
+        }
+    }
 }
 
 impl TrafficMetrics {
+    fn add_request(&self, method: &Method) {
+        let counter = match *method {
+            Method::GET => &self.get_requests,
+            Method::PUT => &self.put_requests,
+            Method::HEAD => &self.head_requests,
+            Method::DELETE => &self.delete_requests,
+            Method::POST => &self.post_requests,
+            _ => &self.other_requests,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn add_in(&self, bytes: u64) {
         self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -59,11 +115,17 @@ impl TrafficMetrics {
         self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> (u64, u64) {
-        (
-            self.bytes_in.load(Ordering::Relaxed),
-            self.bytes_out.load(Ordering::Relaxed),
-        )
+    fn snapshot(&self) -> TrafficSnapshot {
+        TrafficSnapshot {
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+            get_requests: self.get_requests.load(Ordering::Relaxed),
+            put_requests: self.put_requests.load(Ordering::Relaxed),
+            head_requests: self.head_requests.load(Ordering::Relaxed),
+            delete_requests: self.delete_requests.load(Ordering::Relaxed),
+            post_requests: self.post_requests.load(Ordering::Relaxed),
+            other_requests: self.other_requests.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -122,6 +184,7 @@ async fn traffic_metrics_middleware(
     next: Next,
 ) -> Response {
     let (parts, body) = request.into_parts();
+    metrics.add_request(&parts.method);
     let counted_metrics = metrics.clone();
     let counted_body = body.into_data_stream().inspect_ok(move |bytes| {
         counted_metrics.add_in(bytes.len() as u64);
@@ -165,8 +228,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         let metrics_for_task = metrics.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-            let mut previous_in = 0u64;
-            let mut previous_out = 0u64;
+            let mut previous = TrafficSnapshot::default();
             interval.tick().await; // discard immediate first tick
             loop {
                 tokio::select! {
@@ -175,17 +237,32 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                         break;
                     }
                     _ = interval.tick() => {
-                        let (bytes_in, bytes_out) = metrics_for_task.snapshot();
-                        let delta_in = bytes_in.saturating_sub(previous_in);
-                        let delta_out = bytes_out.saturating_sub(previous_out);
-                        previous_in = bytes_in;
-                        previous_out = bytes_out;
+                        let snapshot = metrics_for_task.snapshot();
+                        let delta = snapshot.saturating_sub(previous);
+                        previous = snapshot;
                         log::info!(
                             "traffic bytes_in={} bytes_out={} bytes_in_rate={}/s bytes_out_rate={}/s",
-                            human_bytes(bytes_in),
-                            human_bytes(bytes_out),
-                            human_bytes(delta_in / 10),
-                            human_bytes(delta_out / 10),
+                            human_bytes(snapshot.bytes_in),
+                            human_bytes(snapshot.bytes_out),
+                            human_bytes(delta.bytes_in / 10),
+                            human_bytes(delta.bytes_out / 10),
+                        );
+                        log::info!(
+                            "requests total={} get={} put={} head={} delete={} post={} other={} total_qps={} get_qps={} put_qps={} head_qps={} delete_qps={} post_qps={} other_qps={}",
+                            snapshot.request_total(),
+                            snapshot.get_requests,
+                            snapshot.put_requests,
+                            snapshot.head_requests,
+                            snapshot.delete_requests,
+                            snapshot.post_requests,
+                            snapshot.other_requests,
+                            qps(delta.request_total()),
+                            qps(delta.get_requests),
+                            qps(delta.put_requests),
+                            qps(delta.head_requests),
+                            qps(delta.delete_requests),
+                            qps(delta.post_requests),
+                            qps(delta.other_requests),
                         );
                     }
                 }
@@ -279,6 +356,10 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.2} {}", UNITS[unit])
     }
+}
+
+fn qps(requests_in_window: u64) -> String {
+    format!("{:.2}", requests_in_window as f64 / 10.0)
 }
 
 async fn list_buckets(State(store): State<LocalObjectStore>) -> Response {
@@ -1207,7 +1288,7 @@ mod integration_tests {
         let tmp = tempfile::tempdir().unwrap();
         let (app, metrics) = make_app_with_metrics(&tmp);
 
-        let (before_bucket_in, _) = metrics.snapshot();
+        let before_bucket = metrics.snapshot();
         app.clone()
             .oneshot(
                 Request::builder()
@@ -1219,10 +1300,11 @@ mod integration_tests {
             )
             .await
             .unwrap();
-        let (after_bucket_in, _) = metrics.snapshot();
-        assert_eq!(after_bucket_in, before_bucket_in);
+        let after_bucket = metrics.snapshot();
+        assert_eq!(after_bucket.bytes_in, before_bucket.bytes_in);
+        assert_eq!(after_bucket.put_requests - before_bucket.put_requests, 1);
 
-        let (before_put_in, _) = metrics.snapshot();
+        let before_put = metrics.snapshot();
         let res = app
             .clone()
             .oneshot(
@@ -1236,10 +1318,11 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let _ = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        let (after_put_in, _) = metrics.snapshot();
-        assert_eq!(after_put_in - before_put_in, 11);
+        let after_put = metrics.snapshot();
+        assert_eq!(after_put.bytes_in - before_put.bytes_in, 11);
+        assert_eq!(after_put.put_requests - before_put.put_requests, 1);
 
-        let (_, before_head_out) = metrics.snapshot();
+        let before_head = metrics.snapshot();
         let res = app
             .clone()
             .oneshot(
@@ -1253,9 +1336,11 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let _ = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        let (_, after_head_out) = metrics.snapshot();
-        assert_eq!(after_head_out, before_head_out);
+        let after_head = metrics.snapshot();
+        assert_eq!(after_head.bytes_out, before_head.bytes_out);
+        assert_eq!(after_head.head_requests - before_head.head_requests, 1);
 
+        let before_get = metrics.snapshot();
         let res = app
             .oneshot(
                 Request::builder()
@@ -1269,8 +1354,10 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(body_text(res).await, "ello");
-        let (_, after_get_out) = metrics.snapshot();
-        assert_eq!(after_get_out - after_head_out, 4);
+        let after_get = metrics.snapshot();
+        assert_eq!(after_get.bytes_out - before_get.bytes_out, 4);
+        assert_eq!(after_get.get_requests - before_get.get_requests, 1);
+        assert_eq!(after_get.request_total(), 4);
     }
 
     #[tokio::test]
@@ -2004,5 +2091,11 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.50 KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.00 MiB");
+    }
+
+    #[test]
+    fn qps_formats_window_rate() {
+        assert_eq!(qps(0), "0.00");
+        assert_eq!(qps(25), "2.50");
     }
 }
