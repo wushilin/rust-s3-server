@@ -142,6 +142,7 @@ fn router_with_metrics(
     Router::new()
         .route("/", get(list_buckets))
         .route("/:bucket", any(bucket_route))
+        .route("/:bucket/", any(bucket_route))
         .route("/:bucket/*key", any(object_route))
         .layer(middleware::from_fn_with_state(
             app_config.clone(),
@@ -1518,6 +1519,48 @@ mod integration_tests {
         assert!(body.contains("<Prefix>a/</Prefix>"));
         assert!(body.contains("<Prefix>b/</Prefix>"));
         assert!(body.contains("<Key>c</Key>"));
+    }
+
+    #[tokio::test]
+    async fn list_objects_accepts_bucket_path_with_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/doris")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/doris/run.sh")
+                    .body(Body::from("echo ok"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/doris/?list-type=2&delimiter=%2F&max-keys=1000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(body.contains("<Name>doris</Name>"));
+        assert!(body.contains("<Key>run.sh</Key>"));
     }
 
     #[tokio::test]
