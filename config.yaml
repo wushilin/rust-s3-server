@@ -53,8 +53,8 @@ sweeper:
   # How often the background sweeper runs (seconds).
   interval_secs: 300
 
-  # Maximum objects inspected per bucket per pass.  The sweeper resumes from the
-  # last position on the next tick so large buckets are swept incrementally.
+  # Yield after this many SQLite index entries are checked.
+  # The sweeper still completes the full bucket scan before rescheduling.
   max_objects_per_pass: 100
 
   # Minimum age of a stale SQLite row (with missing meta.json) before removal (seconds).

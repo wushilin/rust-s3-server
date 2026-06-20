@@ -78,7 +78,7 @@ pub struct SweeperConfig {
     /// How often the sweeper runs (seconds).
     #[serde(default = "default_sweep_interval_secs")]
     pub interval_secs: u64,
-    /// Maximum objects inspected per bucket per pass.
+    /// Yield after this many SQLite index entries are checked.
     #[serde(default = "default_max_objects_per_pass")]
     pub max_objects_per_pass: usize,
     /// Minimum age of a stale SQLite row before it is removed (seconds).

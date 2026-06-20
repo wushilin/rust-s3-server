@@ -5,10 +5,8 @@
 //! older than the expiry window.  The second condition prevents racing against
 //! an in-progress multipart upload whose upload-id happens to look old.
 //!
-//! The SQLite orphan walk is incremental: each call to [`sweep_bucket`] processes
-//! at most `max_objects` entries starting after the provided `after` cursor.
-//! When the returned [`SweepStats::pass_complete`] is false the caller should
-//! resume from [`SweepStats::last_sqlite_key`] on the next tick.
+//! The SQLite orphan walk scans the full bucket in one sweeper pass and yields
+//! cooperatively every `max_objects` entries checked.
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -36,14 +34,7 @@ pub struct SweepStats {
     pub physical_orphans_removed: usize,
     pub staging_dirs_removed: usize,
     pub fanout_dirs_removed: usize,
-    /// `true` when the entire bucket was processed in this call (SQLite walk
-    /// completed + physical orphan walk + staging sweep).  When `false`, the
-    /// SQLite walk hit the batch limit and the caller should resume from
-    /// [`last_sqlite_key`] on the next tick.
-    pub pass_complete: bool,
-    /// The last SQLite key visited in this call.  Used as the resume cursor
-    /// when `pass_complete` is false.  `None` if no entries were visited.
-    pub last_sqlite_key: Option<String>,
+    pub sqlite_entries_checked: usize,
 }
 
 impl Default for SweepConfig {
@@ -59,60 +50,60 @@ impl Default for SweepConfig {
 
 /// Sweeps one bucket.
 ///
-/// `after` is the resume cursor from the previous call (`None` = start from
-/// the beginning).  Returns [`SweepStats`] containing a new cursor when the
-/// batch limit was hit, or `pass_complete = true` when the full sweep finished.
 pub async fn sweep_bucket(
     store: &LocalObjectStore,
     bucket: &str,
     config: &SweepConfig,
-    after: Option<&str>,
 ) -> Result<SweepStats> {
     let mut stats = SweepStats::default();
     let index = store.index(bucket).await?;
+    let yield_every = config.max_objects.max(1);
+    let page_size = yield_every as i64;
+    let mut after: Option<String> = None;
 
-    // Fetch one extra entry so we can detect whether there are more after the batch.
-    let entries = index
-        .all_entries_after(after, (config.max_objects + 1) as i64)
-        .await?;
-    let has_more_sqlite = entries.len() > config.max_objects;
-
-    for entry in entries.iter().take(config.max_objects) {
-        stats.last_sqlite_key = Some(entry.object_key.clone());
-        let object_path = store.layout().object_path(bucket, &entry.object_key)?;
-        if !object_path.meta_path.exists()
-            && config.now_ms.saturating_sub(entry.last_modified_ms) >= config.orphan_grace_period_ms
-        {
-            index.delete(&entry.object_key).await?;
-            stats.sqlite_orphans_removed += 1;
-            log::info!(
-                "sweeper removed sqlite orphan bucket={} key={} physical_id={}",
-                bucket,
-                entry.object_key,
-                entry.physical_id,
-            );
-            yield_now().await;
+    loop {
+        let entries = index.all_entries_after(after.as_deref(), page_size).await?;
+        if entries.is_empty() {
+            break;
+        }
+        for entry in entries {
+            after = Some(entry.object_key.clone());
+            stats.sqlite_entries_checked += 1;
+            let object_path = store.layout().object_path(bucket, &entry.object_key)?;
+            if !object_path.meta_path.exists()
+                && config.now_ms.saturating_sub(entry.last_modified_ms)
+                    >= config.orphan_grace_period_ms
+            {
+                index.delete(&entry.object_key).await?;
+                stats.sqlite_orphans_removed += 1;
+                log::info!(
+                    "sweeper removed sqlite orphan bucket={} key={} physical_id={}",
+                    bucket,
+                    entry.object_key,
+                    entry.physical_id,
+                );
+            }
+            if stats.sqlite_entries_checked % yield_every == 0 {
+                log::info!(
+                    "sweeper sqlite scan yielded bucket={} checked={} last_key={}",
+                    bucket,
+                    stats.sqlite_entries_checked,
+                    after.as_deref().unwrap_or("-"),
+                );
+                yield_now().await;
+            }
+        }
+        if after.is_none() {
+            break;
         }
     }
+    log::info!(
+        "sweeper sqlite scan complete bucket={} checked={} sqlite_orphans={}",
+        bucket,
+        stats.sqlite_entries_checked,
+        stats.sqlite_orphans_removed,
+    );
 
-    if has_more_sqlite {
-        // Batch limit hit — caller should resume from last_sqlite_key next tick.
-        log::info!(
-            "sweeper sqlite scan yielded bucket={} visited={} next_after={}",
-            bucket,
-            config.max_objects,
-            stats.last_sqlite_key.as_deref().unwrap_or("-"),
-        );
-        return Ok(stats);
-    }
-
-    // SQLite walk complete; run the physical orphan walk and staging sweep to
-    // completion.  These secondary sweeps don't have their own cursor: physical
-    // orphans are rare (only appear after a crash), and the staging walk is fast.
-    // We do NOT apply the max_objects batch limit here — doing so would cause the
-    // sweeper to stall indefinitely on a large healthy bucket (same SQLite cursor
-    // re-enters, SQLite portion completes instantly, physical portion hits limit
-    // every tick without making progress).
     let bucket_dir = store.layout().bucket_dir(bucket)?;
     sweep_physical_orphans(
         store,
@@ -131,7 +122,6 @@ pub async fn sweep_bucket(
     )
     .await?;
     sweep_staging(&bucket_dir.join("staging"), config, &mut stats).await?;
-    stats.pass_complete = true;
     Ok(stats)
 }
 
@@ -453,7 +443,6 @@ mod tests {
                 staging_expiry_ms: 1_000,
                 now_ms: 10_000,
             },
-            None,
         )
         .await
         .unwrap();
@@ -488,7 +477,6 @@ mod tests {
                 staging_expiry_ms: 1_000,
                 now_ms: 10_000,
             },
-            None,
         )
         .await
         .unwrap();
@@ -531,7 +519,6 @@ mod tests {
                 staging_expiry_ms: 1000,
                 now_ms: 10_000,
             },
-            None,
         )
         .await
         .unwrap();
@@ -582,7 +569,6 @@ mod tests {
                 staging_expiry_ms: 1000,
                 now_ms: now_ms(),
             },
-            None,
         )
         .await
         .unwrap();
@@ -601,11 +587,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_advances_across_ticks() {
+    async fn sqlite_scan_completes_full_bucket_with_small_yield_batch() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
-        // Put 5 objects; sweep with max_objects=2 so it takes multiple ticks.
+        // Put 5 objects; sweep with max_objects=2 so the scan yields internally
+        // but still completes the full bucket in one call.
         for i in 1..=5u32 {
             store
                 .put_object("bucket", &format!("key-{i:02}"), b"x", None, false)
@@ -620,23 +607,7 @@ mod tests {
             now_ms: now_ms(),
         };
 
-        // Tick 1: after=None → processes key-01, key-02; has_more=true
-        let s1 = sweep_bucket(&store, "bucket", &cfg, None).await.unwrap();
-        assert!(!s1.pass_complete);
-        assert_eq!(s1.last_sqlite_key.as_deref(), Some("key-02"));
-
-        // Tick 2: after=key-02 → processes key-03, key-04; has_more=true
-        let s2 = sweep_bucket(&store, "bucket", &cfg, s1.last_sqlite_key.as_deref())
-            .await
-            .unwrap();
-        assert!(!s2.pass_complete);
-        assert_eq!(s2.last_sqlite_key.as_deref(), Some("key-04"));
-
-        // Tick 3: after=key-04 → processes key-05; has_more=false → pass_complete
-        let s3 = sweep_bucket(&store, "bucket", &cfg, s2.last_sqlite_key.as_deref())
-            .await
-            .unwrap();
-        assert!(s3.pass_complete);
-        assert_eq!(s3.last_sqlite_key.as_deref(), Some("key-05"));
+        let stats = sweep_bucket(&store, "bucket", &cfg).await.unwrap();
+        assert_eq!(stats.sqlite_entries_checked, 5);
     }
 }

@@ -268,14 +268,13 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     }
 
     // Sweeper task: runs on a configurable interval, exits cooperatively on shutdown.
-    // Per-bucket cursors ensure we resume from where we left off across ticks so
-    // large buckets are swept incrementally rather than only at the front of the list.
+    // Each bucket pass scans all SQLite rows and yields every configured batch.
     let sweeper_store = store.clone();
     let sweeper_shutdown = shutdown.clone();
     let sweeper_cfg = config.app_config.sweeper.clone();
     tokio::spawn(async move {
         log::info!(
-            "sweeper task started interval_secs={} max_objects_per_pass={} orphan_grace_period_secs={} staging_expiry_secs={}",
+            "sweeper task started interval_secs={} yield_every_objects={} orphan_grace_period_secs={} staging_expiry_secs={}",
             sweeper_cfg.interval_secs,
             sweeper_cfg.max_objects_per_pass,
             sweeper_cfg.orphan_grace_period_secs,
@@ -283,9 +282,8 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         );
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(sweeper_cfg.interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // discard the immediate first tick
-        let mut cursors: std::collections::HashMap<String, Option<String>> =
-            std::collections::HashMap::new();
         loop {
             tokio::select! {
                 _ = sweeper_shutdown.cancelled() => {
@@ -300,28 +298,17 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                         if buckets.is_empty() {
                             log::info!("sweeper pass complete buckets=0");
                         }
-                        // Drop cursors for buckets that no longer exist.
-                        let names: std::collections::HashSet<&str> =
-                            buckets.iter().map(|(b, _)| b.as_str()).collect();
-                        cursors.retain(|k, _| names.contains(k.as_str()));
 
                         for (bucket, _) in &buckets {
                             if sweeper_shutdown.is_cancelled() { break; }
-                            let after = cursors
-                                .get(bucket.as_str())
-                                .and_then(|v| v.as_deref());
-                            log::info!(
-                                "sweeper bucket started bucket={} after={}",
-                                bucket,
-                                after.unwrap_or("-"),
-                            );
+                            log::info!("sweeper bucket started bucket={}", bucket);
                             let cfg = SweepConfig {
                                 max_objects: sweeper_cfg.max_objects_per_pass,
                                 orphan_grace_period_ms: sweeper_cfg.orphan_grace_period_secs as i64 * 1000,
                                 staging_expiry_ms: sweeper_cfg.staging_expiry_secs as i64 * 1000,
                                 now_ms: super::time::now_ms(),
                             };
-                            match sweep_bucket(&sweeper_store, bucket, &cfg, after).await {
+                            match sweep_bucket(&sweeper_store, bucket, &cfg).await {
                                 Ok(stats) => {
                                     let removed = stats.sqlite_orphans_removed
                                         + stats.physical_orphans_removed
@@ -336,28 +323,15 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                                             stats.fanout_dirs_removed,
                                         );
                                     }
-                                    if stats.pass_complete {
-                                        log::info!(
-                                            "sweeper bucket complete bucket={} sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={} pass_complete=true",
-                                            bucket,
-                                            stats.sqlite_orphans_removed,
-                                            stats.physical_orphans_removed,
-                                            stats.staging_dirs_removed,
-                                            stats.fanout_dirs_removed,
-                                        );
-                                        cursors.remove(bucket.as_str());
-                                    } else if let Some(key) = stats.last_sqlite_key {
-                                        log::info!(
-                                            "sweeper bucket yielded bucket={} sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={} next_after={}",
-                                            bucket,
-                                            stats.sqlite_orphans_removed,
-                                            stats.physical_orphans_removed,
-                                            stats.staging_dirs_removed,
-                                            stats.fanout_dirs_removed,
-                                            key,
-                                        );
-                                        cursors.insert(bucket.clone(), Some(key));
-                                    }
+                                    log::info!(
+                                        "sweeper bucket complete bucket={} sqlite_checked={} sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={}",
+                                        bucket,
+                                        stats.sqlite_entries_checked,
+                                        stats.sqlite_orphans_removed,
+                                        stats.physical_orphans_removed,
+                                        stats.staging_dirs_removed,
+                                        stats.fanout_dirs_removed,
+                                    );
                                 }
                                 Err(err) => log::warn!("sweeper {bucket}: {err}"),
                             }
