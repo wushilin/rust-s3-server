@@ -7,7 +7,6 @@ use super::errors::Result;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectIndexEntry {
     pub object_key: String,
-    pub physical_id: String,
     pub size: u64,
     pub etag: String,
     pub last_modified_ms: i64,
@@ -52,7 +51,6 @@ impl SqliteObjectIndex {
             r#"
             CREATE TABLE IF NOT EXISTS objects (
                 object_key TEXT PRIMARY KEY,
-                physical_id TEXT NOT NULL UNIQUE,
                 size INTEGER NOT NULL,
                 etag TEXT NOT NULL,
                 last_modified_ms INTEGER NOT NULL
@@ -70,17 +68,15 @@ impl SqliteObjectIndex {
     pub async fn put(&self, entry: &ObjectIndexEntry) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO objects(object_key, physical_id, size, etag, last_modified_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO objects(object_key, size, etag, last_modified_ms)
+            VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(object_key) DO UPDATE SET
-                physical_id = excluded.physical_id,
                 size = excluded.size,
                 etag = excluded.etag,
                 last_modified_ms = excluded.last_modified_ms
             "#,
         )
         .bind(&entry.object_key)
-        .bind(&entry.physical_id)
         .bind(entry.size as i64)
         .bind(&entry.etag)
         .bind(entry.last_modified_ms)
@@ -91,7 +87,7 @@ impl SqliteObjectIndex {
 
     pub async fn get(&self, key: &str) -> Result<Option<ObjectIndexEntry>> {
         let row = sqlx::query(
-            "SELECT object_key, physical_id, size, etag, last_modified_ms FROM objects WHERE object_key = ?1",
+            "SELECT object_key, size, etag, last_modified_ms FROM objects WHERE object_key = ?1",
         )
         .bind(key)
         .fetch_optional(&self.pool)
@@ -127,12 +123,11 @@ impl SqliteObjectIndex {
         for entry in entries {
             sqlx::query(
                 r#"
-                INSERT INTO objects(object_key, physical_id, size, etag, last_modified_ms)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                INSERT INTO objects(object_key, size, etag, last_modified_ms)
+                VALUES (?1, ?2, ?3, ?4)
                 "#,
             )
             .bind(&entry.object_key)
-            .bind(&entry.physical_id)
             .bind(entry.size as i64)
             .bind(&entry.etag)
             .bind(entry.last_modified_ms)
@@ -152,7 +147,7 @@ impl SqliteObjectIndex {
     ) -> Result<Vec<ObjectIndexEntry>> {
         let lower = after.unwrap_or("");
         let rows = sqlx::query(
-            "SELECT object_key, physical_id, size, etag, last_modified_ms FROM objects WHERE object_key > ?1 ORDER BY object_key LIMIT ?2",
+            "SELECT object_key, size, etag, last_modified_ms FROM objects WHERE object_key > ?1 ORDER BY object_key LIMIT ?2",
         )
         .bind(lower)
         .bind(limit)
@@ -192,7 +187,7 @@ impl SqliteObjectIndex {
         let lower = after.unwrap_or("");
         let rows = sqlx::query(
             r#"
-            SELECT object_key, physical_id, size, etag, last_modified_ms
+            SELECT object_key, size, etag, last_modified_ms
             FROM objects
             WHERE object_key >= ?1 AND object_key > ?2
             ORDER BY object_key
@@ -263,7 +258,6 @@ impl SqliteObjectIndex {
 fn row_to_entry(row: sqlx::sqlite::SqliteRow) -> ObjectIndexEntry {
     ObjectIndexEntry {
         object_key: row.get("object_key"),
-        physical_id: row.get("physical_id"),
         size: row.get::<i64, _>("size") as u64,
         etag: row.get("etag"),
         last_modified_ms: row.get("last_modified_ms"),
@@ -282,7 +276,6 @@ mod tests {
             index
                 .put(&ObjectIndexEntry {
                     object_key: key.to_string(),
-                    physical_id: key.replace('/', "_"),
                     size: 1,
                     etag: "e".to_string(),
                     last_modified_ms: 1,
@@ -309,7 +302,6 @@ mod tests {
             index
                 .put(&ObjectIndexEntry {
                     object_key: key.to_string(),
-                    physical_id: key.to_string(),
                     size: 1,
                     etag: "e".to_string(),
                     last_modified_ms: 1,
@@ -329,7 +321,6 @@ mod tests {
         index
             .put(&ObjectIndexEntry {
                 object_key: "a".to_string(),
-                physical_id: "a".to_string(),
                 size: 1,
                 etag: "e".to_string(),
                 last_modified_ms: 1,
@@ -350,7 +341,6 @@ mod tests {
             index
                 .put(&ObjectIndexEntry {
                     object_key: key.to_string(),
-                    physical_id: key.replace('/', "_"),
                     size: 1,
                     etag: "e".to_string(),
                     last_modified_ms: 1,

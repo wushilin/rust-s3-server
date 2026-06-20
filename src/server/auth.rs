@@ -153,17 +153,21 @@ fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(),
     // been rewritten by a reverse proxy, but both client and server agree on
     // the configured public hostname).
     let signed_headers: Vec<String> = signed_headers_str.split(';').map(str::to_string).collect();
-    let host_override: Option<HeaderMap> = config.auth.public_hostname.as_deref().and_then(|hostname| {
-        if signed_headers.iter().any(|h| h.eq_ignore_ascii_case("host")) {
-            let mut m = request.headers().clone();
-            if let Ok(v) = HeaderValue::from_str(hostname) {
-                m.insert(header::HOST, v);
+    let host_override: Option<HeaderMap> =
+        config.auth.public_hostname.as_deref().and_then(|hostname| {
+            if signed_headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("host"))
+            {
+                let mut m = request.headers().clone();
+                if let Ok(v) = HeaderValue::from_str(hostname) {
+                    m.insert(header::HOST, v);
+                }
+                Some(m)
+            } else {
+                None
             }
-            Some(m)
-        } else {
-            None
-        }
-    });
+        });
     let headers_for_canon = host_override.as_ref().unwrap_or_else(|| request.headers());
     let (canonical_hdrs, signed_hdrs_str) = canonical_headers(headers_for_canon, &signed_headers);
 
@@ -438,7 +442,7 @@ pub(crate) fn presign_query(
     access_key: &str,
     secret_key: &str,
     region: &str,
-    datetime: &str,   // "YYYYMMDDTHHMMSSZ"
+    datetime: &str, // "YYYYMMDDTHHMMSSZ"
     expires_secs: u64,
     extra_query: &[(&str, &str)],
 ) -> String {
@@ -482,17 +486,14 @@ pub(crate) fn presign_query(
     let uri: String = path
         .split('/')
         .map(|seg| {
-            urlencoding::encode(
-                &urlencoding::decode(seg).unwrap_or_else(|_| seg.into()),
-            )
-            .into_owned()
+            urlencoding::encode(&urlencoding::decode(seg).unwrap_or_else(|_| seg.into()))
+                .into_owned()
         })
         .collect::<Vec<_>>()
         .join("/");
 
-    let canonical = format!(
-        "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\nhost\nUNSIGNED-PAYLOAD"
-    );
+    let canonical =
+        format!("{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\nhost\nUNSIGNED-PAYLOAD");
 
     let string_to_sign = build_string_to_sign(datetime, &credential_scope, &canonical);
     let signing_key = derive_signing_key(secret_key, date, region, "s3");

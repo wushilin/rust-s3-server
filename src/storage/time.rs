@@ -22,10 +22,7 @@ pub fn http_date_ms(epoch_ms: i64) -> String {
 
 pub fn parse_http_date_ms(s: &str) -> Option<i64> {
     let st = httpdate::parse_http_date(s).ok()?;
-    let ms = st
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as i64;
+    let ms = st.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
     Some(ms)
 }
 

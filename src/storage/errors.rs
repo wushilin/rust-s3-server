@@ -4,7 +4,6 @@ use std::fmt;
 pub enum StorageError {
     InvalidBucketName(String),
     InvalidObjectKey(String),
-    PhysicalIdTooLong { encoded_len: usize, limit: usize },
     InvalidStagingId(String),
     InvalidRange,
     UnsatisfiableRange { total_size: u64 },
@@ -25,12 +24,6 @@ impl fmt::Display for StorageError {
         match self {
             StorageError::InvalidBucketName(v) => write!(f, "invalid bucket name: {v}"),
             StorageError::InvalidObjectKey(v) => write!(f, "invalid object key: {v}"),
-            StorageError::PhysicalIdTooLong { encoded_len, limit } => {
-                write!(
-                    f,
-                    "physical id length {encoded_len} exceeds component limit {limit}"
-                )
-            }
             StorageError::InvalidStagingId(v) => write!(f, "invalid staging id: {v}"),
             StorageError::InvalidRange => write!(f, "invalid range"),
             StorageError::UnsatisfiableRange { total_size } => {

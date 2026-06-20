@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use rust_s3_server::storage_v2::{
+use rust_s3_server::server::{
     config::AppConfig,
-    http::{serve, S3HttpConfig},
+    serve, S3HttpConfig,
     logging::init_logging,
 };
 

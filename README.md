@@ -13,7 +13,7 @@ Built for **local development and CI/CD** — not a production replacement for A
 | Low overhead | Streaming reads/writes — objects are never fully buffered in memory |
 | Durable | Each bucket has a SQLite index; `meta.json` acts as an atomic visibility gate |
 | Self-healing | On GET/DELETE of an orphaned key the stale index row and directory are cleaned up automatically; the index can be rebuilt in the background via HTTP |
-| Observable | Structured per-request logging (method, URI, status, size, latency) and periodic bandwidth reports via log4rs |
+| Observable | Structured per-request logging (method, URI, status, size, latency) and periodic bandwidth reports; rolling log file with configurable rotation and optional gzip compression |
 | Configurable | Single `config.yaml` controls network, storage, logging, auth, and the background sweeper; `--init` generates a fully-documented template |
 | No hot-spot directories | Objects are spread across a 4-level SHA-1 fanout tree — no single directory ever accumulates more than a handful of entries, regardless of how many objects the bucket contains |
 
@@ -256,43 +256,87 @@ value for the `host` signed header, regardless of what the proxy forwards.
 
 ---
 
+## Source layout
+
+```
+src/
+  storage/          # storage engine (no HTTP knowledge)
+    store.rs        # public API: put/get/delete/list/copy/multipart
+    resolver.rs     # find or allocate an object directory by (bucket, key)
+    index.rs        # SQLite index for sorted key listing
+    encoding.rs     # object dir naming (V1 prefix + fanout)
+    layout.rs       # maps (bucket, key) → fanout leaf directory path
+    metadata.rs     # ObjectMeta / PutMeta / UploadMeta / BucketMeta structs
+    staging.rs      # staging directory helpers
+    sweeper.rs      # background orphan cleanup
+    cache.rs        # LRU metadata cache
+    locks.rs        # per-key async mutex
+    aws_chunked.rs  # aws-chunked streaming decoder
+    config.rs       # StorageConfig
+    errors.rs       # StorageError type
+    time.rs         # timestamp helpers
+
+  server/           # HTTP layer (depends on storage, not vice versa)
+    mod.rs          # Axum routing, handlers, middleware, integration tests
+    auth.rs         # SigV4 / presigned-URL verification
+    config.rs       # AppConfig (re-exports StorageConfig)
+    logging.rs      # rolling log setup
+    range.rs        # HTTP Range header parsing
+    xml.rs          # S3 XML serialisation / deserialisation
+
+  bin/
+    rusts3.rs       # CLI entry point
+```
+
+---
+
 ## On-disk layout
 
 ```
 <base_dir>/
   buckets/
     <bucket>/
-      bucket.json          # bucket metadata (creation time)
-      index.sqlite         # SQLite object index
+      bucket.json            # bucket metadata (creation time, storage_version)
+      index.sqlite           # SQLite object index
       objects/
-        <2>/<2>/<2>/<2>/   # 4-level SHA-1 fanout of the physical ID
-          <physical-id>/
-            meta.json      # object metadata + part list (visibility gate)
-            part.1         # object data (single-part)
-            part.1, part.2 # multipart data (one file per part)
+        <2>/<2>/<2>/<2>/     # 4-level SHA-1 fanout (8 hex chars of SHA1(bucket+key))
+          V1<6hex>/          # object directory  e.g. V1AB3F7C/
+          V1<6hex>_<4hex>/   # collision suffix (rare)  e.g. V1AB3F7C_91FE/
+            meta.json        # object metadata + part list (visibility gate)
+            part.1           # object data (single-part)
+            part.1, part.2   # multipart data (one file per part)
       staging/
-        put/<id>/          # in-progress single PUT (cleaned by sweeper)
-        multipart/<id>/    # in-progress multipart (cleaned by sweeper)
+        put/<id>/            # in-progress single PUT (cleaned by sweeper)
+        multipart/<id>/      # in-progress multipart (cleaned by sweeper)
 ```
 
-`meta.json` is written **last** on PUT and removed **first** on DELETE.  This
-gives atomic object visibility without locking.  A missing `meta.json` always
-means the object does not exist, regardless of what the SQLite index says.
+`meta.json` is written **last** on PUT and removed **first** on DELETE, giving
+atomic object visibility without locking. A missing `meta.json` always means the
+object does not exist, regardless of what the SQLite index says.
+
+### Object Directory Names
+
+Object directory names are always 8 chars (`V1` + 6 uppercase hex digits), e.g.
+`V1AB3F7C`. The optional `_<4hex>` suffix (e.g. `V1AB3F7C_91FE`) handles the
+rare case where two different keys hash to the same 6-char prefix within the
+same fanout leaf. Lookup scans entries starting with the key-derived prefix and
+confirms the match via `meta.json`.
+
+SQLite stores only logical listing fields (`object_key`, size, ETag, and last
+modified time). It does not store physical directory names. Physical location is
+resolved from the key's deterministic fanout leaf and the `meta.json` files
+inside that leaf.
+
+`bucket.json` carries `storage_version: "v1"` for this initial on-disk format.
 
 ### Uniform object distribution — no directory hot-spots
 
-Each object's physical ID is derived from its content hash. The first 8 hex
-characters are used to create a 4-level directory fanout:
-
-```
-objects/ab/cd/ef/01/<physical-id>/
-```
-
-This means every directory in the tree holds at most a small, bounded number of
-entries — the fanout is the same whether the bucket contains 10 objects or
-10 million. You will never hit filesystem limits caused by a single directory
-growing unboundedly large (a common problem when objects are stored flat or
-keyed directly by their S3 key name).
+The 4-level fanout is derived from `SHA1(bucket + key)`, not from the key name
+itself. Objects are spread uniformly across `256^4 = 4 billion` possible leaf
+directories regardless of naming patterns — sequential keys, common prefixes,
+and deeply nested paths all distribute evenly. No single directory ever
+accumulates more than a handful of entries, so filesystem limits caused by
+oversized flat directories are not a concern.
 
 ---
 

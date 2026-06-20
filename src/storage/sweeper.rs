@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use tokio::task::yield_now;
 
 use super::errors::Result;
+use super::resolver::resolve_object_dir;
 use super::staging::epoch_ms_from_staging_id;
 use super::store::LocalObjectStore;
 use super::time::now_ms;
@@ -69,18 +70,18 @@ pub async fn sweep_bucket(
         for entry in entries {
             after = Some(entry.object_key.clone());
             stats.sqlite_entries_checked += 1;
-            let object_path = store.layout().object_path(bucket, &entry.object_key)?;
-            if !object_path.meta_path.exists()
+            if resolve_object_dir(store.layout(), bucket, &entry.object_key)
+                .await?
+                .is_none()
                 && config.now_ms.saturating_sub(entry.last_modified_ms)
                     >= config.orphan_grace_period_ms
             {
                 index.delete(&entry.object_key).await?;
                 stats.sqlite_orphans_removed += 1;
                 log::info!(
-                    "sweeper removed sqlite orphan bucket={} key={} physical_id={}",
+                    "sweeper removed sqlite orphan bucket={} key={}",
                     bucket,
                     entry.object_key,
-                    entry.physical_id,
                 );
             }
             if stats.sqlite_entries_checked % yield_every == 0 {
@@ -413,7 +414,6 @@ fn path_age_ms(path: &Path, now: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_v2::index::ObjectIndexEntry;
 
     #[tokio::test]
     async fn staging_with_recent_files_is_not_swept() {
@@ -494,15 +494,15 @@ mod tests {
             .put_object("bucket", "key", b"hello", None, None, false)
             .await
             .unwrap();
-        let object_path = store.layout().object_path("bucket", "key").unwrap();
-        tokio::fs::remove_file(&object_path.meta_path)
+        let read = store.read_object("bucket", "key").await.unwrap();
+        let object_dir = read.object_dir.clone();
+        tokio::fs::remove_file(object_dir.join("meta.json"))
             .await
             .unwrap();
         let index = store.index("bucket").await.unwrap();
         index
-            .put(&ObjectIndexEntry {
+            .put(&crate::storage::index::ObjectIndexEntry {
                 object_key: "key".to_string(),
-                physical_id: object_path.physical_id,
                 size: 5,
                 etag: "etag".to_string(),
                 last_modified_ms: 0,
@@ -535,11 +535,11 @@ mod tests {
             .put_object("bucket", "folder/test.txt", b"hello", None, None, false)
             .await
             .unwrap();
-        let object_path = store
-            .layout()
-            .object_path("bucket", "folder/test.txt")
+        let read = store
+            .read_object("bucket", "folder/test.txt")
+            .await
             .unwrap();
-        let fanout_dirs = object_path
+        let fanout_dirs = read
             .object_dir
             .ancestors()
             .skip(1)

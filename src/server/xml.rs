@@ -1,6 +1,6 @@
-use super::index::ListPage;
-use super::metadata::{quote_etag, PartMeta, UploadMeta};
-use super::time::iso_utc_ms;
+use crate::storage::index::ListPage;
+use crate::storage::metadata::{quote_etag, PartMeta, UploadMeta};
+use crate::storage::time::iso_utc_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketListEntry {
@@ -217,7 +217,10 @@ pub fn delete_objects_xml(results: &[DeleteObjectResult], quiet: bool) -> String
         match &r.error {
             None => {
                 if !quiet {
-                    body.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", escape_xml(&r.key)));
+                    body.push_str(&format!(
+                        "<Deleted><Key>{}</Key></Deleted>",
+                        escape_xml(&r.key)
+                    ));
                 }
             }
             Some((code, message)) => {
@@ -247,7 +250,7 @@ fn escape_xml(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_v2::index::ObjectIndexEntry;
+    use crate::storage::index::ObjectIndexEntry;
 
     #[test]
     fn list_v2_includes_s3_required_fields() {
@@ -261,7 +264,6 @@ mod tests {
             &ListPage {
                 entries: vec![ObjectIndexEntry {
                     object_key: "a/file".to_string(),
-                    physical_id: "pid".to_string(),
                     size: 3,
                     etag: "abc".to_string(),
                     last_modified_ms: 0,

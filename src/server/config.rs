@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::storage::config::StorageConfig;
+
 /// Network and storage settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -15,22 +17,6 @@ pub struct ServerConfig {
     pub bind_port: u16,
     #[serde(default = "default_base_dir")]
     pub base_dir: String,
-}
-
-/// Storage engine settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageConfig {
-    /// Maximum SQLite connections kept open per bucket index pool.
-    #[serde(default = "default_sqlite_max_connections")]
-    pub sqlite_max_connections: u32,
-    /// Maximum number of object metadata entries held in the LRU cache.
-    /// Each entry is roughly 400–700 bytes; 200 000 ≈ 80–140 MB.
-    #[serde(default = "default_meta_cache_capacity")]
-    pub meta_cache_capacity: usize,
-    /// Maximum number of entries in the SQLite-repair suppression cache.
-    /// Each entry is roughly 100 bytes; 200 000 ≈ 20 MB.
-    #[serde(default = "default_sqlite_repair_cache_capacity")]
-    pub sqlite_repair_cache_capacity: usize,
 }
 
 /// Log rotation and output settings.
@@ -165,16 +151,6 @@ impl Default for ServerConfig {
     }
 }
 
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            sqlite_max_connections: default_sqlite_max_connections(),
-            meta_cache_capacity: default_meta_cache_capacity(),
-            sqlite_repair_cache_capacity: default_sqlite_repair_cache_capacity(),
-        }
-    }
-}
-
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -195,16 +171,7 @@ fn default_bind_port() -> u16 {
     8002
 }
 fn default_base_dir() -> String {
-    "./rusts3-data-v2".to_string()
-}
-fn default_sqlite_max_connections() -> u32 {
-    50
-}
-fn default_meta_cache_capacity() -> usize {
-    200_000
-}
-fn default_sqlite_repair_cache_capacity() -> usize {
-    200_000
+    "./rusts3-data".to_string()
 }
 fn default_log_level() -> String {
     "info".to_string()

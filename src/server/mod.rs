@@ -3,6 +3,12 @@
 //! Entry point: [`serve`] starts the HTTP server.  [`router`] builds the
 //! Axum [`Router`] for use in integration tests.
 
+pub mod auth;
+pub mod config;
+pub mod logging;
+pub mod range;
+pub mod xml;
+
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
@@ -22,15 +28,15 @@ use axum::Router;
 use futures::TryStreamExt;
 use regex::Regex;
 
-use super::auth::auth_middleware;
-use super::config::AppConfig;
-use super::errors::StorageError;
-use super::metadata::quote_etag;
-use super::range::{parse_range_header, RangeSelection};
-use super::store::{CompletePartRequest, LocalObjectStore};
-use super::sweeper::{sweep_bucket, SweepConfig};
-use super::time::{http_date_ms, parse_http_date_ms};
-use super::xml::{
+use self::auth::auth_middleware;
+use self::config::AppConfig;
+use crate::storage::errors::StorageError;
+use crate::storage::metadata::quote_etag;
+use self::range::{parse_range_header, RangeSelection};
+use crate::storage::store::{CompletePartRequest, LocalObjectStore};
+use crate::storage::sweeper::{sweep_bucket, SweepConfig};
+use crate::storage::time::{http_date_ms, parse_http_date_ms};
+use self::xml::{
     complete_multipart_xml, copy_object_xml, delete_objects_xml, error_xml, initiate_multipart_xml,
     list_buckets_xml, list_multipart_uploads_xml, list_objects_v1_xml, list_objects_v2_xml,
     list_parts_xml, BucketListEntry, DeleteObjectResult, S3ErrorXml,
@@ -360,7 +366,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                                 max_objects: sweeper_cfg.max_objects_per_pass,
                                 orphan_grace_period_ms: sweeper_cfg.orphan_grace_period_secs as i64 * 1000,
                                 staging_expiry_ms: sweeper_cfg.staging_expiry_secs as i64 * 1000,
-                                now_ms: super::time::now_ms(),
+                                now_ms: crate::storage::time::now_ms(),
                             };
                             match sweep_bucket(&sweeper_store, bucket, &cfg).await {
                                 Ok(stats) => {
@@ -962,7 +968,7 @@ async fn get_or_head_object(
 /// piped through an in-process duplex channel so the caller gets a single
 /// contiguous byte stream.
 async fn stream_object_range(
-    meta: &super::metadata::ObjectMeta,
+    meta: &crate::storage::metadata::ObjectMeta,
     part_offsets: &[u64],
     object_dir: &FsPath,
     range_start: u64,
@@ -1064,7 +1070,7 @@ async fn stream_object_range(
 }
 
 fn multipart_range_segments(
-    meta: &super::metadata::ObjectMeta,
+    meta: &crate::storage::metadata::ObjectMeta,
     part_offsets: &[u64],
     range_start: u64,
     range_len: u64,
@@ -1317,8 +1323,7 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
         StorageError::InvalidBucketName(_)
         | StorageError::InvalidObjectKey(_)
         | StorageError::InvalidStagingId(_)
-        | StorageError::InvalidMultipartUpload(_)
-        | StorageError::PhysicalIdTooLong { .. } => s3_error(
+        | StorageError::InvalidMultipartUpload(_) => s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
             err.to_string(),
@@ -1405,14 +1410,14 @@ mod integration_tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use crate::storage_v2::store::LocalObjectStore;
+    use crate::storage::store::LocalObjectStore;
 
     use super::{router, router_with_metrics, TrafficMetrics};
 
     fn make_app(tmp: &tempfile::TempDir) -> axum::Router {
         router(
             LocalObjectStore::new(tmp.path()),
-            std::sync::Arc::new(super::super::config::AppConfig::default()),
+            std::sync::Arc::new(super::config::AppConfig::default()),
         )
     }
 
@@ -1421,7 +1426,7 @@ mod integration_tests {
         (
             router(
                 store.clone(),
-                std::sync::Arc::new(super::super::config::AppConfig::default()),
+                std::sync::Arc::new(super::config::AppConfig::default()),
             ),
             store,
         )
@@ -1434,7 +1439,7 @@ mod integration_tests {
         (
             router_with_metrics(
                 LocalObjectStore::new(tmp.path()),
-                std::sync::Arc::new(super::super::config::AppConfig::default()),
+                std::sync::Arc::new(super::config::AppConfig::default()),
                 metrics.clone(),
             ),
             metrics,
@@ -2423,11 +2428,11 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let object_path = store
-            .layout()
-            .object_path("corrupt-bucket", "file.txt")
+        let read = store
+            .read_object("corrupt-bucket", "file.txt")
+            .await
             .unwrap();
-        tokio::fs::remove_file(object_path.object_dir.join("part.1"))
+        tokio::fs::remove_file(read.object_dir.join("part.1"))
             .await
             .unwrap();
 
@@ -2583,7 +2588,8 @@ mod integration_tests {
                 .unwrap();
         }
 
-        let delete_xml = r#"<Delete><Object><Key>a</Key></Object><Object><Key>c</Key></Object></Delete>"#;
+        let delete_xml =
+            r#"<Delete><Object><Key>a</Key></Object><Object><Key>c</Key></Object></Delete>"#;
         let res = app
             .clone()
             .oneshot(
@@ -2657,8 +2663,7 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let delete_xml =
-            r#"<Delete><Quiet>true</Quiet><Object><Key>foo</Key></Object></Delete>"#;
+        let delete_xml = r#"<Delete><Quiet>true</Quiet><Object><Key>foo</Key></Object></Delete>"#;
         let res = app
             .oneshot(
                 Request::builder()
@@ -2671,7 +2676,10 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_text(res).await;
-        assert!(!body.contains("<Deleted>"), "quiet mode must omit <Deleted>");
+        assert!(
+            !body.contains("<Deleted>"),
+            "quiet mode must omit <Deleted>"
+        );
         assert!(!body.contains("<Error>"), "no errors expected");
     }
 
@@ -2733,7 +2741,10 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_text(res).await;
-        assert!(body.contains("<CopyObjectResult"), "must return copy result XML");
+        assert!(
+            body.contains("<CopyObjectResult"),
+            "must return copy result XML"
+        );
         assert!(body.contains("<ETag>"), "must include ETag");
 
         // Read the copy
@@ -3008,7 +3019,9 @@ mod integration_tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri(format!("/lp-bucket/big.bin?uploadId={upload_id}&partNumber=1"))
+                    .uri(format!(
+                        "/lp-bucket/big.bin?uploadId={upload_id}&partNumber=1"
+                    ))
                     .body(Body::from("part-one"))
                     .unwrap(),
             )
@@ -3021,7 +3034,9 @@ mod integration_tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri(format!("/lp-bucket/big.bin?uploadId={upload_id}&partNumber=2"))
+                    .uri(format!(
+                        "/lp-bucket/big.bin?uploadId={upload_id}&partNumber=2"
+                    ))
                     .body(Body::from("part-two"))
                     .unwrap(),
             )
@@ -3189,12 +3204,15 @@ mod integration_tests {
     const TEST_HOST: &str = "localhost";
 
     fn make_auth_app(tmp: &tempfile::TempDir) -> axum::Router {
-        let mut config = super::super::config::AppConfig::default();
+        let mut config = super::config::AppConfig::default();
         config.auth.enabled = true;
-        config.auth.credentials.push(super::super::config::Credential {
-            access_key: TEST_ACCESS_KEY.to_string(),
-            secret_key: TEST_SECRET_KEY.to_string(),
-        });
+        config
+            .auth
+            .credentials
+            .push(super::config::Credential {
+                access_key: TEST_ACCESS_KEY.to_string(),
+                secret_key: TEST_SECRET_KEY.to_string(),
+            });
         // Configure the public hostname so presigned URL verification is
         // proxy-safe: the server substitutes this value for the `host` signed
         // header rather than reading the incoming HTTP Host header.
@@ -3218,7 +3236,7 @@ mod integration_tests {
         body: Body,
     ) -> axum::response::Response {
         let datetime = now_datetime();
-        let auth = crate::storage_v2::auth::compute_auth_header(
+        let auth = crate::server::auth::compute_auth_header(
             method,
             path,
             query,
@@ -3256,13 +3274,19 @@ mod integration_tests {
         // Set up: create bucket + upload object using regular SigV4 auth.
         let res = signed_request(app.clone(), "PUT", "/ps-bucket", "", Body::empty()).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let res =
-            signed_request(app.clone(), "PUT", "/ps-bucket/secret.txt", "", Body::from("topsecret")).await;
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/ps-bucket/secret.txt",
+            "",
+            Body::from("topsecret"),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
 
         // Generate valid presigned GET URL.
         let datetime = now_datetime();
-        let qs = crate::storage_v2::auth::presign_query(
+        let qs = crate::server::auth::presign_query(
             "GET",
             "/ps-bucket/secret.txt",
             TEST_HOST,
@@ -3299,7 +3323,7 @@ mod integration_tests {
 
         // Presigned PUT.
         let datetime = now_datetime();
-        let qs = crate::storage_v2::auth::presign_query(
+        let qs = crate::server::auth::presign_query(
             "PUT",
             "/ps-put-bucket/upload.txt",
             TEST_HOST,
@@ -3324,8 +3348,14 @@ mod integration_tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         // Verify with regular auth.
-        let res =
-            signed_request(app.clone(), "GET", "/ps-put-bucket/upload.txt", "", Body::empty()).await;
+        let res = signed_request(
+            app.clone(),
+            "GET",
+            "/ps-put-bucket/upload.txt",
+            "",
+            Body::empty(),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_text(res).await, "via-presign");
     }
@@ -3348,7 +3378,7 @@ mod integration_tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         // Signed at epoch 0 with 1-second expiry — expired long ago.
-        let qs = crate::storage_v2::auth::presign_query(
+        let qs = crate::server::auth::presign_query(
             "GET",
             "/ps-exp-bucket/f.txt",
             TEST_HOST,
@@ -3392,7 +3422,7 @@ mod integration_tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         let datetime = now_datetime();
-        let mut qs = crate::storage_v2::auth::presign_query(
+        let mut qs = crate::server::auth::presign_query(
             "GET",
             "/ps-tamp-bucket/f.txt",
             TEST_HOST,
@@ -3406,7 +3436,11 @@ mod integration_tests {
 
         // Flip the last hex digit of X-Amz-Signature (which is always appended last).
         let last = qs.len() - 1;
-        let flipped = if qs.as_bytes()[last] == b'a' { b'b' } else { b'a' };
+        let flipped = if qs.as_bytes()[last] == b'a' {
+            b'b'
+        } else {
+            b'a'
+        };
         unsafe { qs.as_bytes_mut()[last] = flipped };
 
         let res = app
@@ -3431,12 +3465,18 @@ mod integration_tests {
 
         let res = signed_request(app.clone(), "PUT", "/ps-wk-bucket", "", Body::empty()).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let res =
-            signed_request(app.clone(), "PUT", "/ps-wk-bucket/f.txt", "", Body::from("x")).await;
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/ps-wk-bucket/f.txt",
+            "",
+            Body::from("x"),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
 
         let datetime = now_datetime();
-        let qs = crate::storage_v2::auth::presign_query(
+        let qs = crate::server::auth::presign_query(
             "GET",
             "/ps-wk-bucket/f.txt",
             TEST_HOST,
@@ -3498,8 +3538,14 @@ mod integration_tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
 
-        let res =
-            signed_request(app.clone(), "GET", "/sigv4-bucket/obj.txt", "", Body::empty()).await;
+        let res = signed_request(
+            app.clone(),
+            "GET",
+            "/sigv4-bucket/obj.txt",
+            "",
+            Body::empty(),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_text(res).await, "hello");
     }
@@ -3523,7 +3569,7 @@ mod integration_tests {
 
         // Client signs with TEST_HOST ("localhost") — which is the server's public_hostname.
         let datetime = now_datetime();
-        let qs = crate::storage_v2::auth::presign_query(
+        let qs = crate::server::auth::presign_query(
             "GET",
             "/ps-proxy-bucket/f.txt",
             TEST_HOST,
@@ -3548,7 +3594,11 @@ mod integration_tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "proxy-rewritten Host must not break presigned URL");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "proxy-rewritten Host must not break presigned URL"
+        );
         assert_eq!(body_text(res).await, "data");
     }
 
@@ -3558,7 +3608,7 @@ mod integration_tests {
         let app = make_auth_app(&tmp);
 
         let datetime = now_datetime();
-        let auth = crate::storage_v2::auth::compute_auth_header(
+        let auth = crate::server::auth::compute_auth_header(
             "GET",
             "/any-bucket/any-key",
             "",
@@ -3588,7 +3638,7 @@ mod integration_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::super::metadata::{ObjectMeta, ObjectStorageKind, PartMeta};
+    use crate::storage::metadata::{ObjectMeta, ObjectStorageKind, PartMeta};
     use super::*;
 
     #[test]
@@ -3682,7 +3732,6 @@ mod tests {
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),
-            physical_id: "physical".to_string(),
             storage: ObjectStorageKind::Multipart,
             size: 15,
             etag: "etag".to_string(),
@@ -3751,7 +3800,6 @@ mod tests {
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),
-            physical_id: "physical".to_string(),
             storage: ObjectStorageKind::Multipart,
             size: 0,
             etag: "etag".to_string(),
@@ -3770,7 +3818,6 @@ mod tests {
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),
-            physical_id: "physical".to_string(),
             storage: ObjectStorageKind::Multipart,
             size: 5,
             etag: "etag".to_string(),

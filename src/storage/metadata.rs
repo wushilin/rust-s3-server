@@ -20,7 +20,6 @@ pub struct ObjectMeta {
     pub format_version: u32,
     pub bucket: String,
     pub object_key: String,
-    pub physical_id: String,
     pub storage: ObjectStorageKind,
     pub size: u64,
     pub etag: String,
@@ -35,7 +34,6 @@ pub struct ObjectMeta {
 pub struct PutMeta {
     pub bucket: String,
     pub object_key: String,
-    pub physical_id: String,
     pub write_id: String,
     pub initiated_at_ms: i64,
     pub size: u64,
@@ -51,7 +49,6 @@ pub struct UploadMeta {
     pub object_key: String,
     pub upload_id: String,
     pub initiated_at_ms: i64,
-    pub physical_id: String,
     pub content_type: String,
     #[serde(default)]
     pub content_encoding: Option<String>,
@@ -60,6 +57,9 @@ pub struct UploadMeta {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketMeta {
     pub created_at_ms: i64,
+    /// On-disk storage layout version. Current unreleased format is "v1".
+    #[serde(default)]
+    pub storage_version: String,
 }
 
 pub fn content_type_or_default(value: Option<&str>) -> String {
@@ -112,7 +112,6 @@ mod tests {
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),
-            physical_id: "abc".to_string(),
             storage: ObjectStorageKind::Single,
             size: 3,
             etag: "etag".to_string(),
@@ -136,7 +135,6 @@ mod tests {
             "format_version":1,
             "bucket":"bucket",
             "object_key":"key",
-            "physical_id":"abc",
             "storage":"single",
             "size":3,
             "etag":"etag",
@@ -146,5 +144,6 @@ mod tests {
         }"#;
         let meta: ObjectMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.content_encoding, None);
+        assert_eq!(meta.object_key, "key");
     }
 }
