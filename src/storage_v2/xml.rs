@@ -1,5 +1,5 @@
 use super::index::ListPage;
-use super::metadata::quote_etag;
+use super::metadata::{quote_etag, PartMeta, UploadMeta};
 use super::time::iso_utc_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +161,77 @@ pub fn complete_multipart_xml(location: &str, bucket: &str, key: &str, etag: &st
         escape_xml(bucket),
         escape_xml(key),
         escape_xml(&quote_etag(etag)),
+    )
+}
+
+pub fn copy_object_xml(etag: &str, last_modified_ms: i64) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ETag>{}</ETag><LastModified>{}</LastModified></CopyObjectResult>"#,
+        escape_xml(&quote_etag(etag)),
+        iso_utc_ms(last_modified_ms),
+    )
+}
+
+pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[PartMeta]) -> String {
+    let mut body = String::new();
+    for part in parts {
+        body.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag><Size>{}</Size></Part>",
+            part.number,
+            escape_xml(&quote_etag(&part.etag)),
+            part.size,
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><IsTruncated>false</IsTruncated>{body}</ListPartsResult>"#,
+        escape_xml(bucket),
+        escape_xml(key),
+        escape_xml(upload_id),
+    )
+}
+
+pub fn list_multipart_uploads_xml(bucket: &str, uploads: &[UploadMeta]) -> String {
+    let mut body = String::new();
+    for upload in uploads {
+        body.push_str(&format!(
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
+            escape_xml(&upload.object_key),
+            escape_xml(&upload.upload_id),
+            iso_utc_ms(upload.initiated_at_ms),
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><MaxUploads>1000</MaxUploads><IsTruncated>false</IsTruncated>{body}</ListMultipartUploadsResult>"#,
+        escape_xml(bucket),
+    )
+}
+
+pub struct DeleteObjectResult {
+    pub key: String,
+    pub error: Option<(String, String)>, // (code, message)
+}
+
+pub fn delete_objects_xml(results: &[DeleteObjectResult], quiet: bool) -> String {
+    let mut body = String::new();
+    for r in results {
+        match &r.error {
+            None => {
+                if !quiet {
+                    body.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", escape_xml(&r.key)));
+                }
+            }
+            Some((code, message)) => {
+                body.push_str(&format!(
+                    "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
+                    escape_xml(&r.key),
+                    escape_xml(code),
+                    escape_xml(message),
+                ));
+            }
+        }
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{body}</DeleteResult>"#
     )
 }
 

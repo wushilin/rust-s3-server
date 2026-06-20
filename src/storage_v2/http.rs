@@ -29,10 +29,11 @@ use super::metadata::quote_etag;
 use super::range::{parse_range_header, RangeSelection};
 use super::store::{CompletePartRequest, LocalObjectStore};
 use super::sweeper::{sweep_bucket, SweepConfig};
-use super::time::http_date_ms;
+use super::time::{http_date_ms, parse_http_date_ms};
 use super::xml::{
-    complete_multipart_xml, error_xml, initiate_multipart_xml, list_buckets_xml,
-    list_objects_v1_xml, list_objects_v2_xml, BucketListEntry, S3ErrorXml,
+    complete_multipart_xml, copy_object_xml, delete_objects_xml, error_xml, initiate_multipart_xml,
+    list_buckets_xml, list_multipart_uploads_xml, list_objects_v1_xml, list_objects_v2_xml,
+    list_parts_xml, BucketListEntry, DeleteObjectResult, S3ErrorXml,
 };
 
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
@@ -461,6 +462,7 @@ async fn bucket_route(
     Path(bucket): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     method: Method,
+    body: Body,
 ) -> Response {
     match method {
         Method::HEAD => {
@@ -506,6 +508,17 @@ async fn bucket_route(
                     r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>"#.to_string(),
                 );
             }
+            if query.contains_key("uploads") {
+                match store.list_multipart_uploads(&bucket).await {
+                    Ok(uploads) => {
+                        return xml_response(
+                            StatusCode::OK,
+                            list_multipart_uploads_xml(&bucket, &uploads),
+                        )
+                    }
+                    Err(err) => return storage_error_response(err, &format!("/{bucket}")),
+                }
+            }
             if known_unimplemented_bucket_query(&query) {
                 return s3_error(
                     StatusCode::NOT_IMPLEMENTED,
@@ -517,7 +530,38 @@ async fn bucket_route(
             list_objects_response(store, bucket, query).await
         }
         Method::POST => {
-            if query.contains_key("rebuildIndex") {
+            if query.contains_key("delete") {
+                let raw = match to_bytes(body, 1024 * 1024).await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidRequest",
+                            err.to_string(),
+                            &format!("/{bucket}"),
+                        )
+                    }
+                };
+                let xml = String::from_utf8_lossy(&raw);
+                let (keys, quiet) = parse_delete_objects_xml(&xml);
+                if keys.is_empty() {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedXML",
+                        "No Object keys found in Delete request",
+                        &format!("/{bucket}"),
+                    );
+                }
+                let mut results = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let err = store.delete_object(&bucket, &key).await.err();
+                    results.push(DeleteObjectResult {
+                        key,
+                        error: err.map(|e| ("InternalError".to_string(), e.to_string())),
+                    });
+                }
+                xml_response(StatusCode::OK, delete_objects_xml(&results, quiet))
+            } else if query.contains_key("rebuildIndex") {
                 if store.start_rebuild_background(&bucket) {
                     log::info!("rebuild_sqlite started bucket={bucket}");
                     empty_response(StatusCode::ACCEPTED)
@@ -588,6 +632,32 @@ async fn object_route(
                     Ok(result) => empty_response_with_etag(StatusCode::OK, &result.etag),
                     Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
                 }
+            } else if let Some(copy_source) = headers
+                .get("x-amz-copy-source")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+            {
+                let (src_bucket, src_key) = match parse_copy_source(&copy_source) {
+                    Some(v) => v,
+                    None => {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidArgument",
+                            "Invalid x-amz-copy-source",
+                            &format!("/{bucket}/{key}"),
+                        )
+                    }
+                };
+                match store
+                    .copy_object(&src_bucket, &src_key, &bucket, &key)
+                    .await
+                {
+                    Ok(result) => xml_response(
+                        StatusCode::OK,
+                        copy_object_xml(&result.etag, result.last_modified_ms),
+                    ),
+                    Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
+                }
             } else {
                 let aws_chunked = is_aws_chunked(&headers);
                 let content_type = headers
@@ -610,6 +680,16 @@ async fn object_route(
                     Ok(result) => empty_response_with_etag(StatusCode::OK, &result.etag),
                     Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
                 }
+            }
+        }
+        Method::GET if query.contains_key("uploadId") => {
+            let upload_id = query["uploadId"].clone();
+            match store.list_parts(&bucket, &key, &upload_id).await {
+                Ok(parts) => xml_response(
+                    StatusCode::OK,
+                    list_parts_xml(&bucket, &key, &upload_id, &parts),
+                ),
+                Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
             }
         }
         Method::GET | Method::HEAD => get_or_head_object(store, bucket, key, headers, method).await,
@@ -776,6 +856,36 @@ async fn get_or_head_object(
         Ok(object) => object,
         Err(err) => return storage_error_response(err, &format!("/{bucket}/{key}")),
     };
+
+    // Conditional request checks (If-None-Match / If-Modified-Since).
+    let etag_quoted = quote_etag(&object.meta.etag);
+    if let Some(inm) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        let client_etag = inm.trim().trim_matches('"');
+        let server_etag = object.meta.etag.trim_matches('"');
+        if client_etag == "*" || client_etag == server_etag {
+            let mut resp = empty_response(StatusCode::NOT_MODIFIED);
+            resp.headers_mut()
+                .insert(header::ETAG, HeaderValue::from_str(&etag_quoted).unwrap());
+            return resp;
+        }
+    }
+    if let Some(ims) = headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(since_ms) = parse_http_date_ms(ims) {
+            if object.meta.last_modified_ms <= since_ms {
+                let mut resp = empty_response(StatusCode::NOT_MODIFIED);
+                resp.headers_mut()
+                    .insert(header::ETAG, HeaderValue::from_str(&etag_quoted).unwrap());
+                return resp;
+            }
+        }
+    }
+
     let total_size = object.meta.size;
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let selection = parse_range_header(range_header, total_size);
@@ -805,7 +915,7 @@ async fn get_or_head_object(
     };
 
     // Extract header values before consuming object fields.
-    let etag = quote_etag(&object.meta.etag);
+    let etag = etag_quoted;
     let content_type = object.meta.content_type.clone();
     let content_encoding = object.meta.content_encoding.clone();
     let last_modified = http_date_ms(object.meta.last_modified_ms);
@@ -1053,6 +1163,66 @@ fn parse_complete_parts_xml(xml: &str) -> Result<Vec<CompletePartRequest>, &'sta
     }
 }
 
+fn parse_delete_objects_xml(xml: &str) -> (Vec<String>, bool) {
+    let object_re = Regex::new(r#"(?s)<Object>\s*(.*?)\s*</Object>"#).unwrap();
+    let key_re = Regex::new(r#"(?s)<Key>\s*(.*?)\s*</Key>"#).unwrap();
+    let quiet_re = Regex::new(r#"(?si)<Quiet>\s*(true|false)\s*</Quiet>"#).unwrap();
+    let quiet = quiet_re
+        .captures(xml)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let keys = object_re
+        .captures_iter(xml)
+        .filter_map(|c| {
+            let block = c.get(1)?.as_str();
+            let key = key_re.captures(block)?.get(1)?.as_str();
+            Some(unescape_xml(key))
+        })
+        .collect();
+    (keys, quiet)
+}
+
+fn unescape_xml(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn parse_copy_source(raw: &str) -> Option<(String, String)> {
+    let path = percent_decode(raw.trim_start_matches('/'));
+    let slash = path.find('/')?;
+    let bucket = path[..slash].to_string();
+    let key = path[slash + 1..].to_string();
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket, key))
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn normalize_complete_etag(value: &str) -> String {
     value
         .trim()
@@ -1112,7 +1282,6 @@ fn expected_payload_sha256(headers: &HeaderMap, aws_chunked: bool) -> Option<Str
 
 fn known_unimplemented_bucket_query(query: &HashMap<String, String>) -> bool {
     [
-        "uploads",
         "versioning",
         "cors",
         "website",
@@ -2379,6 +2548,635 @@ mod integration_tests {
         );
         let returned = to_bytes(res.into_body(), usize::MAX).await.unwrap();
         assert_eq!(returned.as_ref(), gzip_helloworld.as_slice());
+    }
+
+    // ---------------------------------------------------------------------------
+    // POST /{bucket}?delete — Delete Multiple Objects
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_multiple_objects_removes_listed_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/del-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        for key in ["/del-bucket/a", "/del-bucket/b", "/del-bucket/c"] {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(key)
+                        .body(Body::from("x"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let delete_xml = r#"<Delete><Object><Key>a</Key></Object><Object><Key>c</Key></Object></Delete>"#;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/del-bucket?delete")
+                    .body(Body::from(delete_xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(body.contains("<DeleteResult"));
+        assert!(body.contains("<Deleted>"));
+        let deleted_keys = extract_all_xml_tags(&body, "Key");
+        assert!(deleted_keys.contains(&"a".to_string()));
+        assert!(deleted_keys.contains(&"c".to_string()));
+
+        // 'a' and 'c' gone, 'b' remains
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/del-bucket/a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/del-bucket/b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_multiple_objects_quiet_mode_returns_no_deleted_elements() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/del-quiet-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/del-quiet-bucket/foo")
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let delete_xml =
+            r#"<Delete><Quiet>true</Quiet><Object><Key>foo</Key></Object></Delete>"#;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/del-quiet-bucket?delete")
+                    .body(Body::from(delete_xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(!body.contains("<Deleted>"), "quiet mode must omit <Deleted>");
+        assert!(!body.contains("<Error>"), "no errors expected");
+    }
+
+    // ---------------------------------------------------------------------------
+    // PUT /{bucket}/{key} with x-amz-copy-source — Object Copy
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn copy_object_creates_independent_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/src-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/dst-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Upload source
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/src-bucket/original.txt")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("copy me"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Copy
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/dst-bucket/copy.txt")
+                    .header("x-amz-copy-source", "/src-bucket/original.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(body.contains("<CopyObjectResult"), "must return copy result XML");
+        assert!(body.contains("<ETag>"), "must include ETag");
+
+        // Read the copy
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/dst-bucket/copy.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "copy me");
+    }
+
+    #[tokio::test]
+    async fn copy_object_missing_source_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/cp-src")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/cp-dst")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/cp-dst/out.txt")
+                    .header("x-amz-copy-source", "/cp-src/nonexistent.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>NoSuchKey</Code>"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Conditional GET / HEAD — If-None-Match, If-Modified-Since
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_if_none_match_returns_304_on_etag_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/cond-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let put_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/cond-bucket/file.txt")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = put_res
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Matching ETag → 304
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/cond-bucket/file.txt")
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let body_bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(body_bytes.is_empty(), "304 must have no body");
+
+        // Different ETag → 200 with body
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/cond-bucket/file.txt")
+                    .header("if-none-match", "\"different-etag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn head_if_none_match_returns_304_on_etag_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/cond-head-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let put_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/cond-head-bucket/obj")
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = put_res
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/cond-head-bucket/obj")
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn get_if_modified_since_returns_304_when_not_modified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/ims-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/ims-bucket/file.txt")
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A far-future date means "not modified since then" → 304
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ims-bucket/file.txt")
+                    .header("if-modified-since", "Fri, 01 Jan 2100 00:00:00 GMT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+
+        // A date in the past means the file was modified after that → 200
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ims-bucket/file.txt")
+                    .header("if-modified-since", "Thu, 01 Jan 1970 00:00:00 GMT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ---------------------------------------------------------------------------
+    // GET /{bucket}/{key}?uploadId=... — List Parts
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_parts_returns_uploaded_part_numbers_and_etags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/lp-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let init_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lp-bucket/big.bin?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let xml = body_text(init_res).await;
+        let upload_id = extract_xml_tag(&xml, "UploadId").unwrap().to_string();
+
+        // Upload 2 parts
+        let p1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/lp-bucket/big.bin?uploadId={upload_id}&partNumber=1"))
+                    .body(Body::from("part-one"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p1.status(), StatusCode::OK);
+
+        let p2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/lp-bucket/big.bin?uploadId={upload_id}&partNumber=2"))
+                    .body(Body::from("part-two"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p2.status(), StatusCode::OK);
+
+        // List parts
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/lp-bucket/big.bin?uploadId={upload_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(body.contains("<ListPartsResult"));
+        assert!(body.contains("<UploadId>"));
+        let part_numbers = extract_all_xml_tags(&body, "PartNumber");
+        assert!(part_numbers.contains(&"1".to_string()));
+        assert!(part_numbers.contains(&"2".to_string()));
+        assert!(body.contains("<ETag>"));
+        assert!(body.contains("<Size>"));
+    }
+
+    #[tokio::test]
+    async fn list_parts_invalid_upload_id_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/lp2-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lp2-bucket/key?uploadId=0_0000000000000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>NoSuchUpload</Code>"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // GET /{bucket}?uploads — List Multipart Uploads
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_multipart_uploads_shows_initiated_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/lmu-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Initiate two uploads
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lmu-bucket/file-a?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let xml1 = body_text(r1).await;
+        let uid1 = extract_xml_tag(&xml1, "UploadId").unwrap().to_string();
+
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lmu-bucket/file-b?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let xml2 = body_text(r2).await;
+        let uid2 = extract_xml_tag(&xml2, "UploadId").unwrap().to_string();
+
+        // List uploads
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lmu-bucket?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(body.contains("<ListMultipartUploadsResult"));
+        assert!(body.contains(&uid1));
+        assert!(body.contains(&uid2));
+        let keys = extract_all_xml_tags(&body, "Key");
+        assert!(keys.contains(&"file-a".to_string()));
+        assert!(keys.contains(&"file-b".to_string()));
+
+        // After abort, upload disappears from the list
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/lmu-bucket/file-a?uploadId={uid1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lmu-bucket?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(res).await;
+        assert!(!body.contains(&uid1), "aborted upload must not appear");
+        assert!(body.contains(&uid2), "active upload must still appear");
     }
 }
 

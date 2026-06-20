@@ -962,6 +962,77 @@ impl LocalObjectStore {
         })
     }
 
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<PutResult> {
+        let src = self.read_object(src_bucket, src_key).await?;
+        let mut bytes: Vec<u8> = Vec::with_capacity(src.meta.size as usize);
+        for part in &src.meta.parts {
+            let data = tokio::fs::read(src.object_dir.join(&part.file)).await?;
+            bytes.extend_from_slice(&data);
+        }
+        self.put_object(
+            dst_bucket,
+            dst_key,
+            &bytes,
+            Some(&src.meta.content_type),
+            src.meta.content_encoding.as_deref(),
+            false,
+        )
+        .await
+    }
+
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<PartMeta>> {
+        self.validate_upload(bucket, key, upload_id).await?;
+        let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
+        let mut parts = Vec::new();
+        let mut entries = tokio::fs::read_dir(&staging_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let fname = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if fname.starts_with("part.") && fname.ends_with(".meta.json") {
+                if let Ok(part) = read_json::<PartMeta>(&path).await {
+                    parts.push(part);
+                }
+            }
+        }
+        parts.sort_by_key(|p| p.number);
+        Ok(parts)
+    }
+
+    pub async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<UploadMeta>> {
+        validate_bucket_name(bucket)?;
+        if !self.bucket_exists(bucket).await {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let staging_dir = self.layout.bucket_dir(bucket)?.join("staging").join("multipart");
+        let Ok(mut entries) = tokio::fs::read_dir(&staging_dir).await else {
+            return Ok(Vec::new());
+        };
+        let mut uploads = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let upload_json = entry.path().join("upload.json");
+            if let Ok(upload) = read_json::<UploadMeta>(&upload_json).await {
+                uploads.push(upload);
+            }
+        }
+        uploads.sort_by_key(|u| u.initiated_at_ms);
+        Ok(uploads)
+    }
+
     pub async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
         self.validate_upload(bucket, key, upload_id).await?;
         let _guard = self.locks.lock(bucket, key).await;
