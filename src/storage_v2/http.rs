@@ -283,7 +283,6 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(sweeper_cfg.interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await; // discard the immediate first tick
         loop {
             tokio::select! {
                 _ = sweeper_shutdown.cancelled() => {
