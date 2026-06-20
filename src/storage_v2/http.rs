@@ -37,6 +37,13 @@ use super::xml::{
 
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartReadSegment {
+    index: usize,
+    skip: u64,
+    take: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct S3HttpConfig {
     pub address: SocketAddr,
@@ -828,23 +835,16 @@ async fn stream_object_range(
         }
     }
 
-    // Multi-part: calculate which segments fall inside [range_start, range_end).
-    let range_end = range_start + range_len;
-    let mut segments: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
-    for (index, part) in meta.parts.iter().enumerate() {
-        let part_start = part_offsets.get(index).copied().unwrap_or(0);
-        let part_end = part_start + part.size;
-        if part_start >= range_end {
-            break;
-        }
-        if part_end > range_start {
-            let read_from = range_start.max(part_start);
-            let read_to = range_end.min(part_end);
-            let skip = read_from - part_start;
-            let take = read_to - read_from;
-            segments.push((object_dir.join(&part.file), skip, take));
-        }
-    }
+    let mut segments = multipart_range_segments(meta, part_offsets, range_start, range_len)?
+        .into_iter()
+        .map(|segment| {
+            (
+                object_dir.join(&meta.parts[segment.index].file),
+                segment.skip,
+                segment.take,
+            )
+        })
+        .collect::<Vec<_>>();
 
     if segments.len() == 1 {
         let (path, skip, take) = segments.pop().unwrap();
@@ -894,6 +894,59 @@ async fn stream_object_range(
         reader,
         STREAM_CHUNK_SIZE,
     )))
+}
+
+fn multipart_range_segments(
+    meta: &super::metadata::ObjectMeta,
+    part_offsets: &[u64],
+    range_start: u64,
+    range_len: u64,
+) -> Result<Vec<PartReadSegment>, StorageError> {
+    if range_len == 0 {
+        return Ok(Vec::new());
+    }
+    if meta.parts.is_empty() || meta.parts.len() != part_offsets.len() {
+        return Err(StorageError::CorruptObject(
+            "object part offset index is invalid".to_string(),
+        ));
+    }
+
+    let range_end = range_start.saturating_add(range_len);
+    let start_index = part_offsets
+        .partition_point(|offset| *offset <= range_start)
+        .saturating_sub(1);
+    let end_index_exclusive = part_offsets
+        .partition_point(|offset| *offset < range_end)
+        .min(meta.parts.len());
+
+    let mut segments = Vec::with_capacity(end_index_exclusive.saturating_sub(start_index));
+    for index in start_index..end_index_exclusive {
+        let part = &meta.parts[index];
+        let part_start = part_offsets[index];
+        let part_end = part_start.saturating_add(part.size);
+        if part_start >= range_end {
+            break;
+        }
+        if part_end > range_start {
+            let read_from = range_start.max(part_start);
+            let read_to = range_end.min(part_end);
+            let take = read_to.saturating_sub(read_from);
+            if take > 0 {
+                segments.push(PartReadSegment {
+                    index,
+                    skip: read_from - part_start,
+                    take,
+                });
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Err(StorageError::CorruptObject(
+            "object range maps to no parts".to_string(),
+        ));
+    }
+    Ok(segments)
 }
 
 fn parse_complete_parts_xml(xml: &str) -> Result<Vec<CompletePartRequest>, &'static str> {
@@ -2134,6 +2187,7 @@ mod integration_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::super::metadata::{ObjectMeta, ObjectStorageKind, PartMeta};
     use super::*;
 
     #[test]
@@ -2180,5 +2234,121 @@ mod tests {
     fn qps_formats_window_rate() {
         assert_eq!(qps(0), "0.00");
         assert_eq!(qps(25), "2.50");
+    }
+
+    #[test]
+    fn multipart_range_segments_binary_searches_to_touched_parts() {
+        let meta = ObjectMeta {
+            format_version: 1,
+            bucket: "bucket".to_string(),
+            object_key: "key".to_string(),
+            physical_id: "physical".to_string(),
+            storage: ObjectStorageKind::Multipart,
+            size: 15,
+            etag: "etag".to_string(),
+            last_modified_ms: 1,
+            content_type: "application/octet-stream".to_string(),
+            parts: vec![
+                PartMeta {
+                    number: 1,
+                    file: "part.1".to_string(),
+                    size: 5,
+                    etag: "etag1".to_string(),
+                },
+                PartMeta {
+                    number: 2,
+                    file: "part.2".to_string(),
+                    size: 5,
+                    etag: "etag2".to_string(),
+                },
+                PartMeta {
+                    number: 3,
+                    file: "part.3".to_string(),
+                    size: 5,
+                    etag: "etag3".to_string(),
+                },
+            ],
+        };
+        let offsets = [0, 5, 10];
+
+        assert_eq!(
+            multipart_range_segments(&meta, &offsets, 2, 6).unwrap(),
+            vec![
+                PartReadSegment {
+                    index: 0,
+                    skip: 2,
+                    take: 3,
+                },
+                PartReadSegment {
+                    index: 1,
+                    skip: 0,
+                    take: 3,
+                },
+            ]
+        );
+        assert_eq!(
+            multipart_range_segments(&meta, &offsets, 5, 5).unwrap(),
+            vec![PartReadSegment {
+                index: 1,
+                skip: 0,
+                take: 5,
+            }]
+        );
+        assert_eq!(
+            multipart_range_segments(&meta, &offsets, 12, 3).unwrap(),
+            vec![PartReadSegment {
+                index: 2,
+                skip: 2,
+                take: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn multipart_range_segments_handles_invalid_boundaries_without_panic() {
+        let empty_meta = ObjectMeta {
+            format_version: 1,
+            bucket: "bucket".to_string(),
+            object_key: "key".to_string(),
+            physical_id: "physical".to_string(),
+            storage: ObjectStorageKind::Multipart,
+            size: 0,
+            etag: "etag".to_string(),
+            last_modified_ms: 1,
+            content_type: "application/octet-stream".to_string(),
+            parts: vec![],
+        };
+        assert!(multipart_range_segments(&empty_meta, &[], 0, 1).is_err());
+        assert_eq!(
+            multipart_range_segments(&empty_meta, &[], 0, 0).unwrap(),
+            Vec::<PartReadSegment>::new()
+        );
+
+        let meta = ObjectMeta {
+            format_version: 1,
+            bucket: "bucket".to_string(),
+            object_key: "key".to_string(),
+            physical_id: "physical".to_string(),
+            storage: ObjectStorageKind::Multipart,
+            size: 5,
+            etag: "etag".to_string(),
+            last_modified_ms: 1,
+            content_type: "application/octet-stream".to_string(),
+            parts: vec![PartMeta {
+                number: 1,
+                file: "part.1".to_string(),
+                size: 5,
+                etag: "etag1".to_string(),
+            }],
+        };
+
+        assert!(multipart_range_segments(&meta, &[], 0, 1).is_err());
+        assert!(multipart_range_segments(&meta, &[0], 99, 1).is_err());
+        assert_eq!(
+            multipart_range_segments(&meta, &[0], u64::MAX - 1, 1)
+                .unwrap_err()
+                .to_string(),
+            StorageError::CorruptObject("object range maps to no parts".to_string()).to_string()
+        );
     }
 }
