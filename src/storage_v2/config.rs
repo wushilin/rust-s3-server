@@ -70,6 +70,18 @@ pub struct AuthConfig {
     pub enabled: bool,
     #[serde(default)]
     pub credentials: Vec<Credential>,
+    /// The hostname (and optional port) that S3 clients are configured to use,
+    /// e.g. `"mys3.company.com"` or `"localhost:8002"`.
+    ///
+    /// When set, presigned URL verification substitutes this value for the
+    /// `host` signed header instead of reading it from the incoming HTTP request.
+    /// This makes signature verification proxy-safe: a reverse proxy may rewrite
+    /// the `Host` header, but both the client and server still agree on the
+    /// configured public hostname.
+    ///
+    /// When absent the incoming `Host` header is used (direct-access mode).
+    #[serde(default)]
+    pub public_hostname: Option<String>,
 }
 
 /// Background sweeper settings.

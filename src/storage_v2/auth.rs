@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -148,8 +148,24 @@ fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(),
     let canonical_query = presigned_canonical_query(raw_query);
 
     // ── Canonical headers: only the signed headers ─────────────────────────
+    // If a public_hostname is configured, substitute it for the `host` signed
+    // header so verification is proxy-safe (the incoming Host header may have
+    // been rewritten by a reverse proxy, but both client and server agree on
+    // the configured public hostname).
     let signed_headers: Vec<String> = signed_headers_str.split(';').map(str::to_string).collect();
-    let (canonical_hdrs, signed_hdrs_str) = canonical_headers(request.headers(), &signed_headers);
+    let host_override: Option<HeaderMap> = config.auth.public_hostname.as_deref().and_then(|hostname| {
+        if signed_headers.iter().any(|h| h.eq_ignore_ascii_case("host")) {
+            let mut m = request.headers().clone();
+            if let Ok(v) = HeaderValue::from_str(hostname) {
+                m.insert(header::HOST, v);
+            }
+            Some(m)
+        } else {
+            None
+        }
+    });
+    let headers_for_canon = host_override.as_ref().unwrap_or_else(|| request.headers());
+    let (canonical_hdrs, signed_hdrs_str) = canonical_headers(headers_for_canon, &signed_headers);
 
     // ── Build canonical request ────────────────────────────────────────────
     let method = request.method().as_str();
@@ -408,6 +424,117 @@ mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
+}
+
+/// Generates the query string for a SigV4 presigned URL (test helper).
+///
+/// Returns the full query string including `X-Amz-Signature`, ready to be
+/// appended to a URL as `?<returned-string>`.
+#[cfg(test)]
+pub(crate) fn presign_query(
+    method: &str,
+    path: &str,
+    host: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    datetime: &str,   // "YYYYMMDDTHHMMSSZ"
+    expires_secs: u64,
+    extra_query: &[(&str, &str)],
+) -> String {
+    let date = &datetime[..8];
+    let credential_scope = format!("{date}/{region}/s3/aws4_request");
+    let credential = format!("{access_key}/{credential_scope}");
+
+    // Collect all params that will be signed (everything except X-Amz-Signature).
+    let mut params: Vec<(&str, String)> = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", credential),
+        ("X-Amz-Date", datetime.to_string()),
+        ("X-Amz-Expires", expires_secs.to_string()),
+        ("X-Amz-SignedHeaders", "host".to_string()),
+    ];
+    for (k, v) in extra_query {
+        params.push((k, v.to_string()));
+    }
+
+    // Encode and sort — must match what presigned_canonical_query() produces.
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| {
+            (
+                urlencoding::encode(k).into_owned(),
+                urlencoding::encode(v).into_owned(),
+            )
+        })
+        .collect();
+    encoded.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let canonical_query = encoded
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    // Canonical headers: only `host` is signed for presigned URLs.
+    let canonical_hdrs = format!("host:{host}\n");
+
+    // Canonical URI — mirrors canonical_uri().
+    let uri: String = path
+        .split('/')
+        .map(|seg| {
+            urlencoding::encode(
+                &urlencoding::decode(seg).unwrap_or_else(|_| seg.into()),
+            )
+            .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let canonical = format!(
+        "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\nhost\nUNSIGNED-PAYLOAD"
+    );
+
+    let string_to_sign = build_string_to_sign(datetime, &credential_scope, &canonical);
+    let signing_key = derive_signing_key(secret_key, date, region, "s3");
+    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes());
+
+    format!("{canonical_query}&X-Amz-Signature={signature}")
+}
+
+/// Generates an `Authorization` header value for a regular SigV4 request (test helper).
+///
+/// Signs `host` and `x-amz-date` with `UNSIGNED-PAYLOAD` as the payload hash.
+/// The caller must send both `host: <host>` and `x-amz-date: <datetime>` headers.
+#[cfg(test)]
+pub(crate) fn compute_auth_header(
+    method: &str,
+    path: &str,
+    query: &str,
+    host: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    datetime: &str,
+) -> String {
+    let date = &datetime[..8];
+    let credential_scope = format!("{date}/{region}/s3/aws4_request");
+
+    let canonical_query = canonical_query_string(query);
+    let uri = canonical_uri(path);
+
+    // Sign host + x-amz-date, use UNSIGNED-PAYLOAD as the body hash.
+    let canonical_hdrs = format!("host:{host}\nx-amz-date:{datetime}\n");
+    let canonical = format!(
+        "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\nhost;x-amz-date\nUNSIGNED-PAYLOAD"
+    );
+
+    let string_to_sign = build_string_to_sign(datetime, &credential_scope, &canonical);
+    let signing_key = derive_signing_key(secret_key, date, region, "s3");
+    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes());
+
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders=host;x-amz-date, Signature={signature}"
+    )
 }
 
 #[cfg(test)]

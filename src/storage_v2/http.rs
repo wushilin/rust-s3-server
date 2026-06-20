@@ -3178,6 +3178,412 @@ mod integration_tests {
         assert!(!body.contains(&uid1), "aborted upload must not appear");
         assert!(body.contains(&uid2), "active upload must still appear");
     }
+
+    // ---------------------------------------------------------------------------
+    // SigV4 presigned URL tests
+    // ---------------------------------------------------------------------------
+
+    const TEST_ACCESS_KEY: &str = "TESTKEY";
+    const TEST_SECRET_KEY: &str = "TESTSECRET";
+    const TEST_REGION: &str = "us-east-1";
+    const TEST_HOST: &str = "localhost";
+
+    fn make_auth_app(tmp: &tempfile::TempDir) -> axum::Router {
+        let mut config = super::super::config::AppConfig::default();
+        config.auth.enabled = true;
+        config.auth.credentials.push(super::super::config::Credential {
+            access_key: TEST_ACCESS_KEY.to_string(),
+            secret_key: TEST_SECRET_KEY.to_string(),
+        });
+        // Configure the public hostname so presigned URL verification is
+        // proxy-safe: the server substitutes this value for the `host` signed
+        // header rather than reading the incoming HTTP Host header.
+        config.auth.public_hostname = Some(TEST_HOST.to_string());
+        router(
+            LocalObjectStore::new(tmp.path()),
+            std::sync::Arc::new(config),
+        )
+    }
+
+    fn now_datetime() -> String {
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+    }
+
+    /// Sends a regular SigV4-signed request through the app.
+    async fn signed_request(
+        app: axum::Router,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: Body,
+    ) -> axum::response::Response {
+        let datetime = now_datetime();
+        let auth = crate::storage_v2::auth::compute_auth_header(
+            method,
+            path,
+            query,
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+        );
+        let uri = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", TEST_HOST)
+                .header("x-amz-date", &datetime)
+                .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                .header("authorization", auth)
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn presigned_get_valid_signature_returns_200_with_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        // Set up: create bucket + upload object using regular SigV4 auth.
+        let res = signed_request(app.clone(), "PUT", "/ps-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res =
+            signed_request(app.clone(), "PUT", "/ps-bucket/secret.txt", "", Body::from("topsecret")).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Generate valid presigned GET URL.
+        let datetime = now_datetime();
+        let qs = crate::storage_v2::auth::presign_query(
+            "GET",
+            "/ps-bucket/secret.txt",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[],
+        );
+
+        // No `host` header — the server uses its configured public_hostname.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/ps-bucket/secret.txt?{qs}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "topsecret");
+    }
+
+    #[tokio::test]
+    async fn presigned_put_valid_signature_uploads_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(app.clone(), "PUT", "/ps-put-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Presigned PUT.
+        let datetime = now_datetime();
+        let qs = crate::storage_v2::auth::presign_query(
+            "PUT",
+            "/ps-put-bucket/upload.txt",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[],
+        );
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/ps-put-bucket/upload.txt?{qs}"))
+                    .body(Body::from("via-presign"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Verify with regular auth.
+        let res =
+            signed_request(app.clone(), "GET", "/ps-put-bucket/upload.txt", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "via-presign");
+    }
+
+    #[tokio::test]
+    async fn presigned_url_expired_returns_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(app.clone(), "PUT", "/ps-exp-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/ps-exp-bucket/f.txt",
+            "",
+            Body::from("x"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Signed at epoch 0 with 1-second expiry — expired long ago.
+        let qs = crate::storage_v2::auth::presign_query(
+            "GET",
+            "/ps-exp-bucket/f.txt",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            "19700101T000000Z",
+            1,
+            &[],
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/ps-exp-bucket/f.txt?{qs}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"));
+    }
+
+    #[tokio::test]
+    async fn presigned_url_tampered_signature_returns_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(app.clone(), "PUT", "/ps-tamp-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/ps-tamp-bucket/f.txt",
+            "",
+            Body::from("x"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let datetime = now_datetime();
+        let mut qs = crate::storage_v2::auth::presign_query(
+            "GET",
+            "/ps-tamp-bucket/f.txt",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[],
+        );
+
+        // Flip the last hex digit of X-Amz-Signature (which is always appended last).
+        let last = qs.len() - 1;
+        let flipped = if qs.as_bytes()[last] == b'a' { b'b' } else { b'a' };
+        unsafe { qs.as_bytes_mut()[last] = flipped };
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/ps-tamp-bucket/f.txt?{qs}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"));
+    }
+
+    #[tokio::test]
+    async fn presigned_url_wrong_access_key_returns_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(app.clone(), "PUT", "/ps-wk-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res =
+            signed_request(app.clone(), "PUT", "/ps-wk-bucket/f.txt", "", Body::from("x")).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let datetime = now_datetime();
+        let qs = crate::storage_v2::auth::presign_query(
+            "GET",
+            "/ps-wk-bucket/f.txt",
+            TEST_HOST,
+            "UNKNOWNKEY", // not registered in the server
+            "anysecret",
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[],
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/ps-wk-bucket/f.txt?{qs}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_request_when_auth_enabled_returns_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/any-bucket/any-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"));
+    }
+
+    #[tokio::test]
+    async fn regular_sigv4_auth_header_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(app.clone(), "PUT", "/sigv4-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/sigv4-bucket/obj.txt",
+            "",
+            Body::from("hello"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res =
+            signed_request(app.clone(), "GET", "/sigv4-bucket/obj.txt", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "hello");
+    }
+
+    #[tokio::test]
+    async fn presigned_url_works_even_when_proxy_rewrites_host_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(app.clone(), "PUT", "/ps-proxy-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/ps-proxy-bucket/f.txt",
+            "",
+            Body::from("data"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Client signs with TEST_HOST ("localhost") — which is the server's public_hostname.
+        let datetime = now_datetime();
+        let qs = crate::storage_v2::auth::presign_query(
+            "GET",
+            "/ps-proxy-bucket/f.txt",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[],
+        );
+
+        // Request arrives with a *different* Host header (simulating proxy rewrite).
+        // Server uses its configured public_hostname for verification, so it still passes.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/ps-proxy-bucket/f.txt?{qs}"))
+                    .header("host", "internal-loadbalancer.corp:9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "proxy-rewritten Host must not break presigned URL");
+        assert_eq!(body_text(res).await, "data");
+    }
+
+    #[tokio::test]
+    async fn wrong_secret_key_in_auth_header_returns_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let datetime = now_datetime();
+        let auth = crate::storage_v2::auth::compute_auth_header(
+            "GET",
+            "/any-bucket/any-key",
+            "",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            "WRONGSECRET",
+            TEST_REGION,
+            &datetime,
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/any-bucket/any-key")
+                    .header("host", TEST_HOST)
+                    .header("x-amz-date", &datetime)
+                    .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[cfg(test)]

@@ -69,6 +69,17 @@ auth:
   # When false the server accepts all requests without credentials.
   enabled: false
 
+  # The hostname (and optional port) that S3 clients are configured to use.
+  # Example: "mys3.company.com" or "localhost:8002"
+  #
+  # When set, presigned URL verification uses this value for the `host` signed
+  # header instead of the incoming HTTP Host header.  This makes presigned URLs
+  # work correctly behind a reverse proxy that rewrites the Host header.
+  # Clients must configure their endpoint to match this value exactly.
+  #
+  # When omitted (default), the incoming Host header is used directly.
+  # public_hostname: "localhost:18000"
+
   # List of valid access-key / secret-key pairs.
   credentials:
     - access_key: "minioadmin"
