@@ -459,9 +459,19 @@ async fn bucket_route(
         },
         Method::GET => {
             if query.contains_key("location") {
+                if !store.bucket_exists(&bucket).await {
+                    return storage_error_response(
+                        StorageError::BucketNotFound(bucket.clone()),
+                        &format!("/{bucket}"),
+                    );
+                }
+                // Return an empty LocationConstraint (meaning "default region / us-east-1").
+                // Returning a real AWS region name (e.g. "ap-southeast-1") causes some S3
+                // clients (mc) to redirect subsequent requests to that AWS regional endpoint,
+                // where the bucket obviously doesn't exist.
                 return xml_response(
                     StatusCode::OK,
-                    r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">ap-southeast-1</LocationConstraint>"#.to_string(),
+                    r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>"#.to_string(),
                 );
             }
             if known_unimplemented_bucket_query(&query) {
