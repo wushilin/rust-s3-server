@@ -15,6 +15,7 @@ Built for **local development and CI/CD** — not a production replacement for A
 | Self-healing | On GET/DELETE of an orphaned key the stale index row and directory are cleaned up automatically; the index can be rebuilt in the background via HTTP |
 | Observable | Structured per-request logging (method, URI, status, size, latency) and periodic bandwidth reports via log4rs |
 | Configurable | Single `config.yaml` controls network, storage, logging, auth, and the background sweeper; `--init` generates a fully-documented template |
+| No hot-spot directories | Objects are spread across a 4-level SHA-1 fanout tree — no single directory ever accumulates more than a handful of entries, regardless of how many objects the bucket contains |
 
 ## Explicit non-goals
 
@@ -63,40 +64,67 @@ target/release/rusts3 -c config.yaml
 
 ## Configuration reference (`config.yaml`)
 
+Run `rusts3 --init` to generate a fully-documented `config.yaml` in the current directory.
+All fields are optional — built-in defaults are used for anything omitted.
+
+### `server` — network and storage root
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `bind_address` | `"0.0.0.0"` | IP address to listen on. `"0.0.0.0"` binds all interfaces; use `"127.0.0.1"` to restrict to localhost. |
+| `bind_port` | `8002` | TCP port the HTTP server listens on. |
+| `base_dir` | `"./rusts3-data"` | Root directory where all bucket data is stored on disk. Created automatically if it does not exist. |
+
+### `storage` — storage engine tuning
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `sqlite_max_connections` | `50` | Maximum SQLite connections kept open per bucket index pool. Increase if you see pool-exhaustion errors under high concurrency. |
+| `meta_cache_capacity` | `200000` | Maximum object metadata entries in the in-process LRU cache. Each entry is roughly 400–700 bytes; 200 000 entries ≈ 80–140 MB. `HEAD` and `GET` requests are served from cache on warm hits without touching SQLite. |
+| `sqlite_repair_cache_capacity` | `200000` | Maximum entries in the SQLite-repair suppression cache. Prevents the server from repeatedly attempting to repair the same broken index row within a short window. Each entry is roughly 100 bytes; 200 000 ≈ 20 MB. |
+
+### `logging` — log output and rotation
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `level` | `"info"` | Minimum log level. Accepted values: `trace`, `debug`, `info`, `warn`, `error`. |
+| `enable_bandwidth_report` | `true` | When `true`, logs aggregate read/write bandwidth totals and rates every 10 seconds. Useful for monitoring throughput without a metrics backend. |
+| `file` | *(absent)* | Path to a rolling log file (e.g. `"/var/log/rusts3/rusts3.log"`). When omitted, all output goes to stdout only. When set, logs go to **both** stdout and the file. |
+| `rotation_size_mb` | `100` | Rotate the log file when it reaches this size in MiB. Only applies when `file` is set. |
+| `keep_files` | `5` | Number of archived (rotated) log files to keep alongside the active file. Older archives are deleted automatically. |
+| `compress` | `false` | When `true`, archived log files are compressed with gzip (`.gz` extension appended). |
+
+### `sweeper` — background cleanup
+
+The sweeper is a background task that removes orphaned staging directories and stale SQLite index rows left behind by interrupted uploads or server crashes.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `interval_secs` | `300` | How often (in seconds) the sweeper wakes up to scan each bucket. |
+| `max_objects_per_pass` | `100` | The sweeper yields to other tasks after checking this many SQLite index entries per bucket. It still finishes the full scan before rescheduling. |
+| `orphan_grace_period_secs` | `300` | Minimum age (seconds) a stale SQLite row must have before the sweeper removes it. Protects against racing with concurrent writes. |
+| `staging_expiry_secs` | `86400` | Minimum idle age (seconds) an abandoned staging directory must have before the sweeper deletes it. Covers interrupted single-PUT and multipart uploads. Default is 24 hours. |
+
+### `auth` — SigV4 authentication
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | When `false`, the server accepts all requests without credentials (open access). Set to `true` to require AWS SigV4 signatures on every request. |
+| `credentials` | `[]` | List of `{access_key, secret_key}` pairs. Only used when `enabled: true`. Clients must present one of these pairs to authenticate. |
+| `public_hostname` | *(absent)* | The hostname (and optional port) that S3 clients are configured to use, e.g. `"mys3.company.com"` or `"localhost:8002"`. When set, presigned URL verification substitutes this value for the `host` signed header instead of reading it from the incoming HTTP request. This makes signature verification proxy-safe — a reverse proxy may rewrite the `Host` header, but the client and server still agree on the configured public hostname. When omitted, the incoming `Host` header is used directly. |
+
+**Example with auth enabled:**
+
 ```yaml
-server:
-  bind_address: "0.0.0.0"   # all interfaces
-  bind_port: 8002
-  base_dir: "./rusts3-data"
-
-storage:
-  sqlite_max_connections: 50
-  meta_cache_capacity: 200000          # LRU entries (~80–140 MB at full capacity)
-  sqlite_repair_cache_capacity: 200000 # repair-suppression entries (~20 MB)
-
-logging:
-  level: "info"              # trace | debug | info | warn | error
-  enable_bandwidth_report: true
-  # file: "/var/log/rusts3/rusts3.log"   # omit for stdout only
-  rotation_size_mb: 100
-  keep_files: 5
-  compress: false            # gzip archives
-
-sweeper:
-  interval_secs: 300
-  max_objects_per_pass: 100
-  orphan_grace_period_secs: 300
-  staging_expiry_secs: 86400
-
 auth:
-  enabled: false
-  # public_hostname: "localhost:8002"   # see "Presigned URLs behind a proxy" below
-  # credentials:
-  #   - access_key: "minioadmin"
-  #     secret_key: "minioadmin"
+  enabled: true
+  public_hostname: "mys3.company.com"
+  credentials:
+    - access_key: "minioadmin"
+      secret_key: "minioadmin"
+    - access_key: "AKIAIOSFODNN7EXAMPLE"
+      secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
-
-Run `rusts3 --init` to write this template (with inline comments) to `config.yaml`.
 
 ---
 
@@ -250,6 +278,21 @@ value for the `host` signed header, regardless of what the proxy forwards.
 `meta.json` is written **last** on PUT and removed **first** on DELETE.  This
 gives atomic object visibility without locking.  A missing `meta.json` always
 means the object does not exist, regardless of what the SQLite index says.
+
+### Uniform object distribution — no directory hot-spots
+
+Each object's physical ID is derived from its content hash. The first 8 hex
+characters are used to create a 4-level directory fanout:
+
+```
+objects/ab/cd/ef/01/<physical-id>/
+```
+
+This means every directory in the tree holds at most a small, bounded number of
+entries — the fanout is the same whether the bucket contains 10 objects or
+10 million. You will never hit filesystem limits caused by a single directory
+growing unboundedly large (a common problem when objects are stored flat or
+keyed directly by their S3 key name).
 
 ---
 
