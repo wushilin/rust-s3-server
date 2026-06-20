@@ -28,8 +28,8 @@ use super::index::{ListPage, ObjectIndexEntry, SqliteObjectIndex};
 use super::layout::StorageLayout;
 use super::locks::ObjectLockTable;
 use super::metadata::{
-    content_type_or_default, unquote_etag, BucketMeta, ObjectMeta, ObjectStorageKind, PartMeta,
-    PutMeta, UploadMeta,
+    content_encoding_or_none, content_type_or_default, unquote_etag, BucketMeta, ObjectMeta,
+    ObjectStorageKind, PartMeta, PutMeta, UploadMeta,
 };
 use super::staging::{new_staging_id, validate_staging_id};
 use super::time::now_ms;
@@ -339,6 +339,7 @@ impl LocalObjectStore {
         key: &str,
         bytes: &[u8],
         content_type: Option<&str>,
+        content_encoding: Option<&str>,
         aws_chunked: bool,
     ) -> Result<PutResult> {
         let payload = if aws_chunked {
@@ -346,7 +347,9 @@ impl LocalObjectStore {
         } else {
             bytes.to_vec()
         };
-        let staging_id = self.stage_put(bucket, key, &payload, content_type).await?;
+        let staging_id = self
+            .stage_put(bucket, key, &payload, content_type, content_encoding)
+            .await?;
         self.commit_staged_put(bucket, key, &staging_id).await
     }
 
@@ -356,6 +359,7 @@ impl LocalObjectStore {
         key: &str,
         stream: S,
         content_type: Option<&str>,
+        content_encoding: Option<&str>,
         aws_chunked: bool,
         expected_sha256: Option<&str>,
     ) -> Result<PutResult>
@@ -364,11 +368,18 @@ impl LocalObjectStore {
         E: std::fmt::Display,
     {
         let staging_id = if aws_chunked {
-            self.stage_put_aws_chunked_stream(bucket, key, stream, content_type)
+            self.stage_put_aws_chunked_stream(bucket, key, stream, content_type, content_encoding)
                 .await?
         } else {
-            self.stage_put_stream(bucket, key, stream, content_type, expected_sha256)
-                .await?
+            self.stage_put_stream(
+                bucket,
+                key,
+                stream,
+                content_type,
+                content_encoding,
+                expected_sha256,
+            )
+            .await?
         };
         self.commit_staged_put(bucket, key, &staging_id).await
     }
@@ -379,6 +390,7 @@ impl LocalObjectStore {
         key: &str,
         bytes: &[u8],
         content_type: Option<&str>,
+        content_encoding: Option<&str>,
     ) -> Result<String> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let staging_id = new_staging_id(now_ms());
@@ -395,6 +407,7 @@ impl LocalObjectStore {
             size: bytes.len() as u64,
             etag,
             content_type: content_type_or_default(content_type),
+            content_encoding: content_encoding_or_none(content_encoding),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         Ok(staging_id)
@@ -406,6 +419,7 @@ impl LocalObjectStore {
         key: &str,
         stream: S,
         content_type: Option<&str>,
+        content_encoding: Option<&str>,
         expected_sha256: Option<&str>,
     ) -> Result<String>
     where
@@ -442,6 +456,7 @@ impl LocalObjectStore {
             size: written.size,
             etag: written.md5,
             content_type: content_type_or_default(content_type),
+            content_encoding: content_encoding_or_none(content_encoding),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         Ok(staging_id)
@@ -453,6 +468,7 @@ impl LocalObjectStore {
         key: &str,
         stream: S,
         content_type: Option<&str>,
+        content_encoding: Option<&str>,
     ) -> Result<String>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -479,6 +495,7 @@ impl LocalObjectStore {
             size: written.size,
             etag: written.md5,
             content_type: content_type_or_default(content_type),
+            content_encoding: content_encoding_or_none(content_encoding),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         Ok(staging_id)
@@ -536,6 +553,7 @@ impl LocalObjectStore {
             etag: put_meta.etag.clone(),
             last_modified_ms,
             content_type: put_meta.content_type,
+            content_encoding: put_meta.content_encoding,
             parts: vec![PartMeta {
                 number: 1,
                 file: "part.1".to_string(),
@@ -742,6 +760,7 @@ impl LocalObjectStore {
         bucket: &str,
         key: &str,
         content_type: Option<&str>,
+        content_encoding: Option<&str>,
     ) -> Result<String> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let upload_id = new_staging_id(now_ms());
@@ -754,6 +773,7 @@ impl LocalObjectStore {
             initiated_at_ms: now_ms(),
             physical_id: physical_id_for_key(key, 255)?,
             content_type: content_type_or_default(content_type),
+            content_encoding: content_encoding_or_none(content_encoding),
         };
         write_json_atomic(&staging_dir.join("upload.json"), &upload).await?;
         Ok(upload_id)
@@ -930,6 +950,7 @@ impl LocalObjectStore {
             etag: etag.clone(),
             last_modified_ms,
             content_type: upload.content_type,
+            content_encoding: upload.content_encoding,
             parts,
         };
         write_json_atomic(&object_path.meta_path, &object_meta).await?;
@@ -1327,6 +1348,7 @@ mod tests {
                 "doris/1722372774777722231",
                 b"hello",
                 Some("text/plain"),
+                None,
                 false,
             )
             .await
@@ -1393,7 +1415,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         store
-            .put_object("bucket", "key", b"hello", None, false)
+            .put_object("bucket", "key", b"hello", None, None, false)
             .await
             .unwrap();
         let object_path = store.layout().object_path("bucket", "key").unwrap();
@@ -1412,7 +1434,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         store
-            .put_object("bucket", "key", b"hello", None, false)
+            .put_object("bucket", "key", b"hello", None, None, false)
             .await
             .unwrap();
         let object_path = store.layout().object_path("bucket", "key").unwrap();
@@ -1436,7 +1458,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         store
-            .put_object("bucket", "key", b"hello", None, false)
+            .put_object("bucket", "key", b"hello", None, None, false)
             .await
             .unwrap();
         let object_path = store.layout().object_path("bucket", "key").unwrap();
@@ -1466,7 +1488,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         let upload_id = store
-            .initiate_multipart("bucket", "large.bin", None)
+            .initiate_multipart("bucket", "large.bin", None, None)
             .await
             .unwrap();
         store
@@ -1504,11 +1526,11 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         store
-            .put_object("bucket", "a/1", b"foo", None, false)
+            .put_object("bucket", "a/1", b"foo", None, None, false)
             .await
             .unwrap();
         store
-            .put_object("bucket", "a/2", b"bar", None, false)
+            .put_object("bucket", "a/2", b"bar", None, None, false)
             .await
             .unwrap();
         store
@@ -1553,7 +1575,7 @@ mod tests {
             let store = LocalObjectStore::new(tmp.path());
             store.create_bucket("bucket").await.unwrap();
             store
-                .put_object("bucket", "a/1", b"foo", None, false)
+                .put_object("bucket", "a/1", b"foo", None, None, false)
                 .await
                 .unwrap();
         }
@@ -1596,7 +1618,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         store
-            .put_object("bucket", "a/1", b"foo", None, false)
+            .put_object("bucket", "a/1", b"foo", None, None, false)
             .await
             .unwrap();
         let index = store.index("bucket").await.unwrap();
@@ -1613,7 +1635,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         let upload_id = store
-            .initiate_multipart("bucket", "large.bin", None)
+            .initiate_multipart("bucket", "large.bin", None, None)
             .await
             .unwrap();
         let p1 = store

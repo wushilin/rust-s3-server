@@ -26,6 +26,8 @@ pub struct ObjectMeta {
     pub etag: String,
     pub last_modified_ms: i64,
     pub content_type: String,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
     pub parts: Vec<PartMeta>,
 }
 
@@ -39,6 +41,8 @@ pub struct PutMeta {
     pub size: u64,
     pub etag: String,
     pub content_type: String,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +53,8 @@ pub struct UploadMeta {
     pub initiated_at_ms: i64,
     pub physical_id: String,
     pub content_type: String,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +67,13 @@ pub fn content_type_or_default(value: Option<&str>) -> String {
         .filter(|v| !v.trim().is_empty())
         .unwrap_or("application/octet-stream")
         .to_string()
+}
+
+pub fn content_encoding_or_none(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 pub fn quote_etag(etag: &str) -> String {
@@ -105,6 +118,7 @@ mod tests {
             etag: "etag".to_string(),
             last_modified_ms: 1,
             content_type: "text/plain".to_string(),
+            content_encoding: None,
             parts: vec![PartMeta {
                 number: 1,
                 file: "part.1".to_string(),
@@ -114,5 +128,23 @@ mod tests {
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"storage\":\"single\""));
+    }
+
+    #[test]
+    fn object_meta_deserializes_without_content_encoding() {
+        let json = r#"{
+            "format_version":1,
+            "bucket":"bucket",
+            "object_key":"key",
+            "physical_id":"abc",
+            "storage":"single",
+            "size":3,
+            "etag":"etag",
+            "last_modified_ms":1,
+            "content_type":"text/plain",
+            "parts":[{"number":1,"file":"part.1","size":3,"etag":"etag"}]
+        }"#;
+        let meta: ObjectMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.content_encoding, None);
     }
 }

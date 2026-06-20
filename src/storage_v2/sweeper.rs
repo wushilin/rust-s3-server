@@ -491,7 +491,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         store
-            .put_object("bucket", "key", b"hello", None, false)
+            .put_object("bucket", "key", b"hello", None, None, false)
             .await
             .unwrap();
         let object_path = store.layout().object_path("bucket", "key").unwrap();
@@ -532,7 +532,7 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         store
-            .put_object("bucket", "folder/test.txt", b"hello", None, false)
+            .put_object("bucket", "folder/test.txt", b"hello", None, None, false)
             .await
             .unwrap();
         let object_path = store
@@ -595,7 +595,7 @@ mod tests {
         // but still completes the full bucket in one call.
         for i in 1..=5u32 {
             store
-                .put_object("bucket", &format!("key-{i:02}"), b"x", None, false)
+                .put_object("bucket", &format!("key-{i:02}"), b"x", None, None, false)
                 .await
                 .unwrap();
         }

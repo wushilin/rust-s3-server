@@ -555,6 +555,7 @@ async fn object_route(
                 let content_type = headers
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok());
+                let content_encoding = object_content_encoding(&headers);
                 let expected_sha256 = expected_payload_sha256(&headers, aws_chunked);
                 match store
                     .put_object_stream(
@@ -562,6 +563,7 @@ async fn object_route(
                         &key,
                         body.into_data_stream(),
                         content_type,
+                        content_encoding.as_deref(),
                         aws_chunked,
                         expected_sha256.as_deref(),
                     )
@@ -591,7 +593,11 @@ async fn object_route(
                 let content_type = headers
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok());
-                match store.initiate_multipart(&bucket, &key, content_type).await {
+                let content_encoding = object_content_encoding(&headers);
+                match store
+                    .initiate_multipart(&bucket, &key, content_type, content_encoding.as_deref())
+                    .await
+                {
                     Ok(upload_id) => xml_response(
                         StatusCode::OK,
                         initiate_multipart_xml(&bucket, &key, &upload_id),
@@ -763,6 +769,7 @@ async fn get_or_head_object(
     // Extract header values before consuming object fields.
     let etag = quote_etag(&object.meta.etag);
     let content_type = object.meta.content_type.clone();
+    let content_encoding = object.meta.content_encoding.clone();
     let last_modified = http_date_ms(object.meta.last_modified_ms);
 
     let mut builder = Response::builder()
@@ -773,6 +780,9 @@ async fn get_or_head_object(
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::LAST_MODIFIED, last_modified)
         .header("x-amz-request-id", "rust-s3-server");
+    if let Some(content_encoding) = content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, content_encoding);
+    }
     if let Some(cr) = content_range {
         builder = builder.header(header::CONTENT_RANGE, cr);
     }
@@ -1029,6 +1039,23 @@ fn is_aws_chunked(headers: &HeaderMap) -> bool {
             .unwrap_or(false)
 }
 
+fn object_content_encoding(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())?;
+    let encodings = value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .filter(|v| !v.eq_ignore_ascii_case("aws-chunked"))
+        .collect::<Vec<_>>();
+    if encodings.is_empty() {
+        None
+    } else {
+        Some(encodings.join(", "))
+    }
+}
+
 fn expected_payload_sha256(headers: &HeaderMap, aws_chunked: bool) -> Option<String> {
     if aws_chunked {
         return None;
@@ -1212,6 +1239,21 @@ mod integration_tests {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
+    fn aws_chunked_body(payload: &[u8]) -> Vec<u8> {
+        let mut body = format!("{:x};chunk-signature=abc\r\n", payload.len()).into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\r\n0;chunk-signature=def\r\n\r\n");
+        body
+    }
+
+    fn gzip_helloworld() -> Vec<u8> {
+        vec![
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0xcb, 0x48, 0xcd, 0xc9,
+            0xc9, 0x2f, 0xcf, 0x2f, 0xca, 0x49, 0x01, 0x00, 0xad, 0x20, 0xeb, 0xf9, 0x0a, 0x00,
+            0x00, 0x00,
+        ]
+    }
+
     fn extract_all_xml_tags(xml: &str, tag: &str) -> Vec<String> {
         let open = format!("<{tag}>");
         let close = format!("</{tag}>");
@@ -1315,6 +1357,60 @@ mod integration_tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body = body_text(res).await;
         assert!(body.contains("<Code>NoSuchKey</Code>"));
+    }
+
+    #[tokio::test]
+    async fn gzip_content_encoding_is_preserved_with_raw_stored_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        let gzip_helloworld = gzip_helloworld();
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/gzip-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/gzip-bucket/hello.txt")
+                    .header("content-type", "text/plain")
+                    .header("content-encoding", "gzip")
+                    .body(Body::from(gzip_helloworld.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/gzip-bucket/hello.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        let returned = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(returned.as_ref(), gzip_helloworld.as_slice());
+        assert_ne!(String::from_utf8_lossy(&returned), "helloworld");
     }
 
     #[tokio::test]
@@ -2190,7 +2286,61 @@ mod integration_tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        assert!(!res.headers().contains_key("content-encoding"));
         assert_eq!(body_text(res).await, "hello");
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_with_gzip_preserves_gzip_content_encoding_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        let gzip_helloworld = gzip_helloworld();
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/chunked-gzip-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/chunked-gzip-bucket/file.txt")
+                    .header("content-type", "text/plain")
+                    .header("content-encoding", "aws-chunked, gzip")
+                    .body(Body::from(aws_chunked_body(&gzip_helloworld)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chunked-gzip-bucket/file.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        let returned = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(returned.as_ref(), gzip_helloworld.as_slice());
     }
 }
 
@@ -2246,6 +2396,25 @@ mod tests {
     }
 
     #[test]
+    fn object_content_encoding_strips_aws_chunked_framing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(object_content_encoding(&headers).as_deref(), Some("gzip"));
+
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("aws-chunked"),
+        );
+        assert_eq!(object_content_encoding(&headers), None);
+
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("aws-chunked, gzip"),
+        );
+        assert_eq!(object_content_encoding(&headers).as_deref(), Some("gzip"));
+    }
+
+    #[test]
     fn multipart_range_segments_binary_searches_to_touched_parts() {
         let meta = ObjectMeta {
             format_version: 1,
@@ -2257,6 +2426,7 @@ mod tests {
             etag: "etag".to_string(),
             last_modified_ms: 1,
             content_type: "application/octet-stream".to_string(),
+            content_encoding: None,
             parts: vec![
                 PartMeta {
                     number: 1,
@@ -2325,6 +2495,7 @@ mod tests {
             etag: "etag".to_string(),
             last_modified_ms: 1,
             content_type: "application/octet-stream".to_string(),
+            content_encoding: None,
             parts: vec![],
         };
         assert!(multipart_range_segments(&empty_meta, &[], 0, 1).is_err());
@@ -2343,6 +2514,7 @@ mod tests {
             etag: "etag".to_string(),
             last_modified_ms: 1,
             content_type: "application/octet-stream".to_string(),
+            content_encoding: None,
             parts: vec![PartMeta {
                 number: 1,
                 file: "part.1".to_string(),
