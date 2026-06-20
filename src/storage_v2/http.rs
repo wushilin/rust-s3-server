@@ -325,31 +325,35 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                                 Ok(stats) => {
                                     let removed = stats.sqlite_orphans_removed
                                         + stats.physical_orphans_removed
-                                        + stats.staging_dirs_removed;
+                                        + stats.staging_dirs_removed
+                                        + stats.fanout_dirs_removed;
                                     if removed > 0 {
                                         log::info!(
-                                            "sweeper {bucket}: sqlite_orphans={} physical_orphans={} staging={}",
+                                            "sweeper {bucket}: sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={}",
                                             stats.sqlite_orphans_removed,
                                             stats.physical_orphans_removed,
                                             stats.staging_dirs_removed,
+                                            stats.fanout_dirs_removed,
                                         );
                                     }
                                     if stats.pass_complete {
                                         log::info!(
-                                            "sweeper bucket complete bucket={} sqlite_orphans={} physical_orphans={} staging={} pass_complete=true",
+                                            "sweeper bucket complete bucket={} sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={} pass_complete=true",
                                             bucket,
                                             stats.sqlite_orphans_removed,
                                             stats.physical_orphans_removed,
                                             stats.staging_dirs_removed,
+                                            stats.fanout_dirs_removed,
                                         );
                                         cursors.remove(bucket.as_str());
                                     } else if let Some(key) = stats.last_sqlite_key {
                                         log::info!(
-                                            "sweeper bucket yielded bucket={} sqlite_orphans={} physical_orphans={} staging={} next_after={}",
+                                            "sweeper bucket yielded bucket={} sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={} next_after={}",
                                             bucket,
                                             stats.sqlite_orphans_removed,
                                             stats.physical_orphans_removed,
                                             stats.staging_dirs_removed,
+                                            stats.fanout_dirs_removed,
                                             key,
                                         );
                                         cursors.insert(bucket.clone(), Some(key));

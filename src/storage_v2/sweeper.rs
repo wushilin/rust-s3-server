@@ -10,6 +10,8 @@
 //! When the returned [`SweepStats::pass_complete`] is false the caller should
 //! resume from [`SweepStats::last_sqlite_key`] on the next tick.
 
+use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -33,6 +35,7 @@ pub struct SweepStats {
     pub sqlite_orphans_removed: usize,
     pub physical_orphans_removed: usize,
     pub staging_dirs_removed: usize,
+    pub fanout_dirs_removed: usize,
     /// `true` when the entire bucket was processed in this call (SQLite walk
     /// completed + physical orphan walk + staging sweep).  When `false`, the
     /// SQLite walk hit the batch limit and the caller should resume from
@@ -111,28 +114,60 @@ pub async fn sweep_bucket(
     // re-enters, SQLite portion completes instantly, physical portion hits limit
     // every tick without making progress).
     let bucket_dir = store.layout().bucket_dir(bucket)?;
-    sweep_physical_orphans(&bucket_dir.join("objects"), config, &mut stats).await?;
+    sweep_physical_orphans(
+        store,
+        bucket,
+        &bucket_dir.join("objects"),
+        config,
+        &mut stats,
+    )
+    .await?;
+    sweep_empty_fanout_dirs(
+        store,
+        bucket,
+        &bucket_dir.join("objects"),
+        config,
+        &mut stats,
+    )
+    .await?;
     sweep_staging(&bucket_dir.join("staging"), config, &mut stats).await?;
     stats.pass_complete = true;
     Ok(stats)
 }
 
 async fn sweep_physical_orphans(
+    store: &LocalObjectStore,
+    bucket: &str,
     objects_dir: &Path,
     config: &SweepConfig,
     stats: &mut SweepStats,
 ) -> Result<()> {
     for dir in leaf_dirs(objects_dir) {
+        if relative_depth(objects_dir, &dir) < 5 {
+            continue;
+        }
         if dir.join("meta.json").exists() {
             continue;
         }
         if path_age_ms(&dir, config.now_ms)? < config.orphan_grace_period_ms {
             continue;
         }
+        let Some(top) = top_fanout_segment(objects_dir, &dir) else {
+            continue;
+        };
+        let _fanout_guard = store.fanout_shard_write_lock(bucket, &top).await;
+        if dir.join("meta.json").exists() || !dir.is_dir() {
+            continue;
+        }
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => {
                 stats.physical_orphans_removed += 1;
-                log::info!("sweeper removed physical orphan dir={}", dir.display());
+                log::info!(
+                    "sweeper removed physical orphan bucket={} fanout={} dir={}",
+                    bucket,
+                    top,
+                    dir.display()
+                );
             }
             Err(err) => {
                 log::warn!(
@@ -143,6 +178,102 @@ async fn sweep_physical_orphans(
             }
         }
         yield_now().await;
+    }
+    Ok(())
+}
+
+async fn sweep_empty_fanout_dirs(
+    store: &LocalObjectStore,
+    bucket: &str,
+    objects_dir: &Path,
+    config: &SweepConfig,
+    stats: &mut SweepStats,
+) -> Result<()> {
+    let Ok(top_entries) = std::fs::read_dir(objects_dir) else {
+        return Ok(());
+    };
+    for top_entry in top_entries.flatten() {
+        let top_dir = top_entry.path();
+        if !top_dir.is_dir() {
+            continue;
+        }
+        let Some(top) = top_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let _fanout_guard = store.fanout_shard_write_lock(bucket, &top).await;
+        let mut parents_made_empty = HashSet::new();
+        let mut removed_in_shard = 0usize;
+        loop {
+            let mut removed_in_pass = false;
+            let mut dirs = Vec::new();
+            collect_dirs_postorder(&top_dir, &mut dirs);
+            for dir in dirs {
+                let old_enough = path_age_ms(&dir, config.now_ms)? >= config.orphan_grace_period_ms;
+                if !old_enough && !parents_made_empty.contains(&dir) {
+                    continue;
+                }
+                if !is_empty_dir(&dir) {
+                    continue;
+                }
+                match tokio::fs::remove_dir(&dir).await {
+                    Ok(()) => {
+                        removed_in_pass = true;
+                        stats.fanout_dirs_removed += 1;
+                        if let Some(parent) = dir.parent() {
+                            if parent != objects_dir {
+                                parents_made_empty.insert(parent.to_path_buf());
+                            }
+                        }
+                        log::info!(
+                            "sweeper removed empty fanout dir bucket={} fanout={} dir={}",
+                            bucket,
+                            top,
+                            dir.display()
+                        );
+                        removed_in_shard += 1;
+                        if removed_in_shard % 100 == 0 {
+                            log::info!(
+                                "sweeper empty fanout cleanup yielded bucket={} fanout={} removed_in_shard={}",
+                                bucket,
+                                top,
+                                removed_in_shard,
+                            );
+                            yield_now().await;
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                        ) => {}
+                    Err(err) => {
+                        log::warn!(
+                            "sweeper failed to remove empty fanout dir bucket={} fanout={} dir={} error={}",
+                            bucket,
+                            top,
+                            dir.display(),
+                            err,
+                        );
+                    }
+                }
+            }
+            if !removed_in_pass {
+                break;
+            }
+        }
+        if removed_in_shard > 0 {
+            log::info!(
+                "sweeper empty fanout cleanup shard complete bucket={} fanout={} removed_in_shard={}",
+                bucket,
+                top,
+                removed_in_shard,
+            );
+            yield_now().await;
+        }
     }
     Ok(())
 }
@@ -222,6 +353,43 @@ fn collect_leaf_dirs(path: &Path, result: &mut Vec<PathBuf>) {
     }
     if !has_child_dir && path.is_dir() {
         result.push(path.to_path_buf());
+    }
+}
+
+fn collect_dirs_postorder(path: &Path, result: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            collect_dirs_postorder(&child, result);
+        }
+    }
+    if path.is_dir() {
+        result.push(path.to_path_buf());
+    }
+}
+
+fn top_fanout_segment(objects_dir: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(objects_dir)
+        .ok()?
+        .components()
+        .next()
+        .map(|v| v.as_os_str().to_string_lossy().to_string())
+}
+
+fn relative_depth(root: &Path, path: &Path) -> usize {
+    path.strip_prefix(root)
+        .map(|relative| relative.components().count())
+        .unwrap_or(0)
+}
+
+fn is_empty_dir(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => false,
     }
 }
 
@@ -369,6 +537,67 @@ mod tests {
         .unwrap();
         assert_eq!(stats.sqlite_orphans_removed, 1);
         assert!(index.get("key").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn removes_empty_fanout_dirs_after_object_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bucket").await.unwrap();
+        store
+            .put_object("bucket", "folder/test.txt", b"hello", None, false)
+            .await
+            .unwrap();
+        let object_path = store
+            .layout()
+            .object_path("bucket", "folder/test.txt")
+            .unwrap();
+        let fanout_dirs = object_path
+            .object_dir
+            .ancestors()
+            .skip(1)
+            .take(4)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+
+        store
+            .delete_object("bucket", "folder/test.txt")
+            .await
+            .unwrap();
+        assert_eq!(fanout_dirs.len(), 4);
+        for dir in &fanout_dirs {
+            assert!(
+                dir.exists(),
+                "expected fanout dir to exist: {}",
+                dir.display()
+            );
+        }
+
+        let stats = sweep_bucket(
+            &store,
+            "bucket",
+            &SweepConfig {
+                max_objects: 100,
+                orphan_grace_period_ms: 0,
+                staging_expiry_ms: 1000,
+                now_ms: now_ms(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            stats.fanout_dirs_removed >= 4,
+            "expected to remove the four empty fanout dirs, got {stats:?}"
+        );
+        for dir in &fanout_dirs {
+            assert!(
+                !dir.exists(),
+                "expected fanout dir to be removed: {}",
+                dir.display()
+            );
+        }
     }
 
     #[tokio::test]

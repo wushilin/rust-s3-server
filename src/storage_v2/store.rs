@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use md5::{Digest, Md5};
@@ -19,7 +20,9 @@ use tokio::io::AsyncWriteExt;
 
 use super::aws_chunked::decode_aws_chunked;
 use super::cache::BoundedLruCache;
-use super::encoding::{physical_id_for_key, validate_bucket_name, validate_object_key};
+use super::encoding::{
+    fanout_segments, physical_id_for_key, validate_bucket_name, validate_object_key,
+};
 use super::errors::{Result, StorageError};
 use super::index::{ListPage, ObjectIndexEntry, SqliteObjectIndex};
 use super::layout::StorageLayout;
@@ -45,6 +48,7 @@ pub struct LocalObjectStore {
     layout: StorageLayout,
     sqlite_max_connections: u32,
     locks: ObjectLockTable,
+    fanout_locks: Arc<Mutex<HashMap<FanoutLockKey, Arc<RwLock<()>>>>>,
     index_cache: Arc<Mutex<HashMap<String, SqliteObjectIndex>>>,
     meta_cache: Arc<BoundedLruCache<ObjectCacheKey, CachedObjectMeta>>,
     sqlite_repair_cache: Arc<BoundedLruCache<ObjectCacheKey, i64>>,
@@ -95,6 +99,21 @@ struct CachedObjectMeta {
     part_offsets: Vec<u64>,
     meta_modified: SystemTime,
     meta_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FanoutLockKey {
+    bucket: String,
+    top: String,
+}
+
+impl FanoutLockKey {
+    fn new(bucket: &str, top: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            top: top.to_string(),
+        }
+    }
 }
 
 impl ObjectCacheKey {
@@ -161,6 +180,7 @@ impl LocalObjectStore {
             layout,
             sqlite_max_connections: sqlite_max_connections.max(1),
             locks: ObjectLockTable::default(),
+            fanout_locks: Arc::new(Mutex::new(HashMap::new())),
             index_cache: Arc::new(Mutex::new(HashMap::new())),
             meta_cache: Arc::new(BoundedLruCache::new(meta_cache_capacity, CACHE_SHARDS)),
             sqlite_repair_cache: Arc::new(BoundedLruCache::new(
@@ -179,6 +199,31 @@ impl LocalObjectStore {
 
     pub fn layout(&self) -> &StorageLayout {
         &self.layout
+    }
+
+    fn fanout_lock(&self, bucket: &str, top: &str) -> Arc<RwLock<()>> {
+        let mut locks = self.fanout_locks.lock().unwrap();
+        locks
+            .entry(FanoutLockKey::new(bucket, top))
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    async fn object_fanout_read_lock(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<OwnedRwLockReadGuard<()>> {
+        let [top, _, _, _] = fanout_segments(bucket, key);
+        Ok(self.fanout_lock(bucket, &top).read_owned().await)
+    }
+
+    pub(crate) async fn fanout_shard_write_lock(
+        &self,
+        bucket: &str,
+        top: &str,
+    ) -> OwnedRwLockWriteGuard<()> {
+        self.fanout_lock(bucket, top).write_owned().await
     }
 
     fn invalidate_object_caches(&self, cache_key: &ObjectCacheKey) {
@@ -458,6 +503,7 @@ impl LocalObjectStore {
         ensure_file_exists(&staged_part).await?;
 
         let _guard = self.locks.lock(bucket, key).await;
+        let _fanout_guard = self.object_fanout_read_lock(bucket, key).await?;
         let object_path = self.layout.object_path(bucket, key)?;
         let index = self.index(bucket).await?;
         let cache_key = ObjectCacheKey::new(bucket, key);
@@ -825,6 +871,7 @@ impl LocalObjectStore {
         }
 
         let _guard = self.locks.lock(bucket, key).await;
+        let _fanout_guard = self.object_fanout_read_lock(bucket, key).await?;
         let object_path = self.layout.object_path(bucket, key)?;
         let index = self.index(bucket).await?;
         let cache_key = ObjectCacheKey::new(bucket, key);
