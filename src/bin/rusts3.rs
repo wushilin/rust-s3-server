@@ -48,6 +48,15 @@ storage:
   # Maximum SQLite connections kept open per bucket index pool.
   sqlite_max_connections: 50
 
+  # Maximum object metadata entries in the LRU cache.
+  # Each entry is roughly 400–700 bytes; 200 000 entries ≈ 80–140 MB.
+  # HEAD and GET requests are served from this cache on warm hits.
+  meta_cache_capacity: 200000
+
+  # Maximum entries in the SQLite-repair suppression cache (key → last-checked timestamp).
+  # Each entry is roughly 100 bytes; 200 000 entries ≈ 20 MB.
+  sqlite_repair_cache_capacity: 200000
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging:
   # Minimum log level: trace | debug | info | warn | error

@@ -46,10 +46,9 @@ where
     }
 
     pub fn get(&self, key: &K) -> Option<V> {
-        let access = self.next_access();
         let mut shard = self.shard(key).lock().unwrap();
         let entry = shard.entries.get_mut(key)?;
-        entry.last_access = access;
+        entry.last_access = self.clock.fetch_add(1, Ordering::Relaxed);
         Some(entry.value.clone())
     }
 

@@ -208,10 +208,7 @@ async fn traffic_metrics_middleware(
 /// directories every 5 minutes.  Responds to SIGINT (Ctrl-C) by cancelling
 /// all background tasks and draining in-flight HTTP requests before returning.
 pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let store = LocalObjectStore::new_with_sqlite_max_connections(
-        config.root,
-        config.app_config.storage.sqlite_max_connections,
-    );
+    let store = LocalObjectStore::from_storage_config(&config.root, &config.app_config.storage);
     let shutdown = store.shutdown_token();
     let metrics = Arc::new(TrafficMetrics::default());
 
@@ -434,6 +431,18 @@ async fn bucket_route(
     method: Method,
 ) -> Response {
     match method {
+        Method::HEAD => {
+            if store.bucket_exists(&bucket).await {
+                empty_response(StatusCode::OK)
+            } else {
+                s3_error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchBucket",
+                    "The specified bucket does not exist",
+                    &format!("/{bucket}"),
+                )
+            }
+        }
         Method::PUT => match store.create_bucket(&bucket).await {
             Ok(()) => empty_response(StatusCode::OK),
             Err(err) => storage_error_response(err, &format!("/{bucket}")),

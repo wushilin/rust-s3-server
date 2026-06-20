@@ -31,10 +31,11 @@ use super::metadata::{
 use super::staging::{new_staging_id, validate_staging_id};
 use super::time::now_ms;
 
-const META_CACHE_CAPACITY: usize = 1_000_000;
-const SQLITE_REPAIR_CACHE_CAPACITY: usize = 2_000_000;
 const SQLITE_REPAIR_CACHE_TTL_MS: i64 = 2 * 60 * 60 * 1000;
 const CACHE_SHARDS: usize = 64;
+const DEFAULT_META_CACHE_CAPACITY: usize = 200_000;
+const DEFAULT_SQLITE_REPAIR_CACHE_CAPACITY: usize = 200_000;
+const INDEX_CACHE_WARN_THRESHOLD: usize = 500;
 
 /// Filesystem-backed S3-compatible object store.
 ///
@@ -114,19 +115,24 @@ impl LocalObjectStore {
         root: impl Into<PathBuf>,
         sqlite_max_connections: u32,
     ) -> Self {
-        Self {
-            layout: StorageLayout::new(root),
-            sqlite_max_connections: sqlite_max_connections.max(1),
-            locks: ObjectLockTable::default(),
-            index_cache: Arc::new(Mutex::new(HashMap::new())),
-            meta_cache: Arc::new(BoundedLruCache::new(META_CACHE_CAPACITY, CACHE_SHARDS)),
-            sqlite_repair_cache: Arc::new(BoundedLruCache::new(
-                SQLITE_REPAIR_CACHE_CAPACITY,
-                CACHE_SHARDS,
-            )),
-            rebuilding: Arc::new(Mutex::new(HashSet::new())),
-            shutdown: CancellationToken::new(),
-        }
+        Self::inner(
+            StorageLayout::new(root),
+            sqlite_max_connections,
+            DEFAULT_META_CACHE_CAPACITY,
+            DEFAULT_SQLITE_REPAIR_CACHE_CAPACITY,
+        )
+    }
+
+    pub fn from_storage_config(
+        root: impl Into<PathBuf>,
+        config: &super::config::StorageConfig,
+    ) -> Self {
+        Self::inner(
+            StorageLayout::new(root),
+            config.sqlite_max_connections,
+            config.meta_cache_capacity,
+            config.sqlite_repair_cache_capacity,
+        )
     }
 
     pub fn with_layout(layout: StorageLayout) -> Self {
@@ -137,14 +143,28 @@ impl LocalObjectStore {
         layout: StorageLayout,
         sqlite_max_connections: u32,
     ) -> Self {
+        Self::inner(
+            layout,
+            sqlite_max_connections,
+            DEFAULT_META_CACHE_CAPACITY,
+            DEFAULT_SQLITE_REPAIR_CACHE_CAPACITY,
+        )
+    }
+
+    fn inner(
+        layout: StorageLayout,
+        sqlite_max_connections: u32,
+        meta_cache_capacity: usize,
+        sqlite_repair_cache_capacity: usize,
+    ) -> Self {
         Self {
             layout,
             sqlite_max_connections: sqlite_max_connections.max(1),
             locks: ObjectLockTable::default(),
             index_cache: Arc::new(Mutex::new(HashMap::new())),
-            meta_cache: Arc::new(BoundedLruCache::new(META_CACHE_CAPACITY, CACHE_SHARDS)),
+            meta_cache: Arc::new(BoundedLruCache::new(meta_cache_capacity, CACHE_SHARDS)),
             sqlite_repair_cache: Arc::new(BoundedLruCache::new(
-                SQLITE_REPAIR_CACHE_CAPACITY,
+                sqlite_repair_cache_capacity,
                 CACHE_SHARDS,
             )),
             rebuilding: Arc::new(Mutex::new(HashSet::new())),
@@ -257,10 +277,14 @@ impl LocalObjectStore {
         let index =
             SqliteObjectIndex::open_with_max_connections(&bucket_dir, self.sqlite_max_connections)
                 .await?;
-        self.index_cache
-            .lock()
-            .unwrap()
-            .insert(bucket.to_string(), index.clone());
+        let mut cache = self.index_cache.lock().unwrap();
+        cache.insert(bucket.to_string(), index.clone());
+        if cache.len() > INDEX_CACHE_WARN_THRESHOLD {
+            log::warn!(
+                "index_cache has {} entries — consider reducing bucket count or adding eviction",
+                cache.len()
+            );
+        }
         Ok(index)
     }
 
