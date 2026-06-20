@@ -169,21 +169,59 @@ fn router_with_metrics(
 async fn log_middleware(request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
+    let put_decoded_content_length = if method == Method::PUT {
+        header_value(request.headers(), "x-amz-decoded-content-length")
+    } else {
+        None
+    };
+    let put_request_bytes = Arc::new(AtomicU64::new(0));
+    let request = if method == Method::PUT {
+        let counted_bytes = put_request_bytes.clone();
+        let (parts, body) = request.into_parts();
+        let counted_body = body.into_data_stream().inspect_ok(move |bytes| {
+            counted_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        });
+        Request::from_parts(parts, Body::from_stream(counted_body))
+    } else {
+        request
+    };
     let start = std::time::Instant::now();
     let response = next.run(request).await;
     let elapsed_ms = start.elapsed().as_millis();
     let status = response.status();
-    let content_length = response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+    let content_length = log_content_length(
+        &method,
+        put_decoded_content_length.as_deref(),
+        put_request_bytes.load(Ordering::Relaxed),
+        response.headers(),
+    );
     if status.is_client_error() || status.is_server_error() {
         log::warn!("{method} {uri} {status} size={content_length} {elapsed_ms}ms");
     } else {
         log::info!("{method} {uri} {status} size={content_length} {elapsed_ms}ms");
     }
     response
+}
+
+fn log_content_length(
+    method: &Method,
+    put_decoded_content_length: Option<&str>,
+    put_request_bytes: u64,
+    response_headers: &HeaderMap,
+) -> String {
+    if method == Method::PUT {
+        return put_decoded_content_length
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| put_request_bytes.to_string());
+    }
+    header_value(response_headers, header::CONTENT_LENGTH.as_str()).unwrap_or_else(|| "-".into())
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned)
 }
 
 async fn traffic_metrics_middleware(
@@ -2393,6 +2431,26 @@ mod tests {
     fn qps_formats_window_rate() {
         assert_eq!(qps(0), "0.00");
         assert_eq!(qps(25), "2.50");
+    }
+
+    #[test]
+    fn log_content_length_uses_put_request_size() {
+        let headers = HeaderMap::new();
+        assert_eq!(log_content_length(&Method::PUT, None, 11, &headers), "11");
+        assert_eq!(
+            log_content_length(&Method::PUT, Some("7"), 33, &headers),
+            "7"
+        );
+    }
+
+    #[test]
+    fn log_content_length_uses_response_size_for_non_put() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("10805888"));
+        assert_eq!(
+            log_content_length(&Method::HEAD, None, 0, &headers),
+            "10805888"
+        );
     }
 
     #[test]
