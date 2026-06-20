@@ -670,6 +670,27 @@ impl LocalObjectStore {
         true
     }
 
+    pub async fn start_missing_index_rebuilds(&self) -> Result<usize> {
+        let buckets = self.list_buckets().await?;
+        let mut started = 0usize;
+        for (bucket, _) in buckets {
+            let index_path = self.layout.bucket_dir(&bucket)?.join("index.sqlite");
+            if index_path.exists() {
+                continue;
+            }
+            log::warn!(
+                "rebuild_sqlite auto trigger bucket={} reason=missing_index path={}",
+                bucket,
+                index_path.display()
+            );
+            if self.start_rebuild_background(&bucket) {
+                started += 1;
+            }
+        }
+        log::info!("rebuild_sqlite auto trigger scan complete started={started}");
+        Ok(started)
+    }
+
     pub async fn rebuild_sqlite(&self, bucket: &str) -> Result<usize> {
         validate_bucket_name(bucket)?;
         if !self.bucket_exists(bucket).await {
@@ -1523,6 +1544,50 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_sqlite_file_on_restart_triggers_background_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = LocalObjectStore::new(tmp.path());
+            store.create_bucket("bucket").await.unwrap();
+            store
+                .put_object("bucket", "a/1", b"foo", None, false)
+                .await
+                .unwrap();
+        }
+
+        let index_path = tmp
+            .path()
+            .join("buckets")
+            .join("bucket")
+            .join("index.sqlite");
+        tokio::fs::remove_file(&index_path).await.unwrap();
+        assert!(!index_path.exists());
+
+        let restarted = LocalObjectStore::new(tmp.path());
+        assert_eq!(restarted.start_missing_index_rebuilds().await.unwrap(), 1);
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        loop {
+            let restored = restarted
+                .index("bucket")
+                .await
+                .unwrap()
+                .get("a/1")
+                .await
+                .unwrap()
+                .is_some();
+            if restored {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "missing index was not rebuilt"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

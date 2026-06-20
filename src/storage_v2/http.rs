@@ -220,6 +220,15 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let shutdown = store.shutdown_token();
     let metrics = Arc::new(TrafficMetrics::default());
 
+    match store.start_missing_index_rebuilds().await {
+        Ok(started) => {
+            if started > 0 {
+                log::warn!("rebuild_sqlite startup auto rebuilds started count={started}");
+            }
+        }
+        Err(err) => log::warn!("rebuild_sqlite startup scan failed error={err}"),
+    }
+
     // Cancel all background tasks on SIGINT / Ctrl-C.
     let shutdown_sig = shutdown.clone();
     tokio::spawn(async move {
