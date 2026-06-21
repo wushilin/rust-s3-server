@@ -1081,22 +1081,29 @@ async fn stream_object_range(
         }
     }
 
-    // Pipe all segments through a duplex channel so axum sees one Body stream.
+    let mut open_segments = Vec::with_capacity(segments.len());
+    for (path, skip, take) in segments {
+        let mut file = tokio::fs::File::open(&path).await.map_err(|err| {
+            StorageError::CorruptObject(format!("failed to open {}: {err}", path.display()))
+        })?;
+        if skip > 0 {
+            file.seek(SeekFrom::Start(skip)).await.map_err(|_| {
+                StorageError::CorruptObject(format!("failed to seek {}", path.display()))
+            })?;
+        }
+        open_segments.push((file, take));
+    }
+
+    // Pipe all pre-opened segments through a duplex channel so axum sees one
+    // Body stream. Opening every touched part before returning the response
+    // keeps this read stable if the object directory is later moved to trash.
     let (mut writer, reader) = tokio::io::duplex(STREAM_CHUNK_SIZE);
     tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        for (path, skip, take) in segments {
-            match tokio::fs::File::open(&path).await {
-                Ok(mut file) => {
-                    if skip > 0 && file.seek(SeekFrom::Start(skip)).await.is_err() {
-                        return;
-                    }
-                    let mut limited = file.take(take);
-                    if tokio::io::copy(&mut limited, &mut writer).await.is_err() {
-                        return; // reader dropped (client disconnected)
-                    }
-                }
-                Err(_) => return,
+        use tokio::io::AsyncReadExt;
+        for (file, take) in open_segments {
+            let mut limited = file.take(take);
+            if tokio::io::copy(&mut limited, &mut writer).await.is_err() {
+                return; // reader dropped (client disconnected)
             }
         }
     });
@@ -1446,6 +1453,7 @@ fn empty_response_with_etag(status: StatusCode, etag: &str) -> Response {
 mod integration_tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     use crate::storage::store::LocalObjectStore;
@@ -2058,6 +2066,156 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_text(res).await, "hello world");
+    }
+
+    #[tokio::test]
+    async fn multipart_get_survives_delete_after_stream_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mpu-read-delete-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mpu-read-delete-bucket/big.bin?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = body_text(res).await;
+        let upload_id = extract_xml_tag(&xml, "UploadId").unwrap().to_string();
+
+        let parts = [
+            vec![b'a'; 384 * 1024],
+            vec![b'b'; 384 * 1024],
+            vec![b'c'; 384 * 1024],
+            vec![b'd'; 384 * 1024],
+        ];
+        let mut expected = Vec::new();
+        let mut etags = Vec::new();
+        for (idx, part) in parts.iter().enumerate() {
+            expected.extend_from_slice(part);
+            let part_number = idx + 1;
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/mpu-read-delete-bucket/big.bin?uploadId={upload_id}&partNumber={part_number}"
+                        ))
+                        .body(Body::from(part.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            etags.push(
+                res.headers()
+                    .get("etag")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+
+        let complete_parts = etags
+            .iter()
+            .enumerate()
+            .map(|(idx, etag)| {
+                format!(
+                    "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                    idx + 1,
+                    etag
+                )
+            })
+            .collect::<String>();
+        let complete_xml =
+            format!("<CompleteMultipartUpload>{complete_parts}</CompleteMultipartUpload>");
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/mpu-read-delete-bucket/big.bin?uploadId={upload_id}"
+                    ))
+                    .body(Body::from(complete_xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mpu-read-delete-bucket/big.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut stream = res.into_body().into_data_stream();
+
+        let mut downloaded = Vec::new();
+        let first = stream
+            .next()
+            .await
+            .expect("GET body should produce the first chunk")
+            .expect("first chunk should be readable");
+        downloaded.extend_from_slice(&first);
+
+        let delete_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/mpu-read-delete-bucket/big.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_res.status(), StatusCode::NO_CONTENT);
+
+        let head_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/mpu-read-delete-bucket/big.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_res.status(), StatusCode::NOT_FOUND);
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("open multipart GET should survive concurrent delete");
+            downloaded.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(downloaded, expected);
     }
 
     #[tokio::test]
