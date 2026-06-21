@@ -2,11 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use rust_s3_server::server::{
-    config::AppConfig,
-    serve, S3HttpConfig,
-    logging::init_logging,
-};
+use rust_s3_server::server::{config::AppConfig, logging::init_logging, serve, S3HttpConfig};
 
 /// S3-compatible local dev server.
 ///
@@ -77,20 +73,23 @@ logging:
   # Compress archived files with gzip (.gz extension added automatically).
   compress: false
 
-# ─── Sweeper ──────────────────────────────────────────────────────────────────
+# ─── Background maintenance ───────────────────────────────────────────────────
 sweeper:
-  # How often the background sweeper runs (seconds).
+  # How often background maintenance runs (seconds).
   interval_secs: 300
 
-  # Yield after this many SQLite index entries are checked.
-  # The sweeper still completes the full bucket scan before rescheduling.
-  max_objects_per_pass: 100
+  # Targeted visibility repair batch size.
+  # One maintenance pass drains all eligible rows in batches of this size.
+  visibility_repair_batch_size: 100
 
-  # Minimum age of a stale SQLite row (with missing meta.json) before removal (seconds).
-  orphan_grace_period_secs: 300
+  # Minimum age of a targeted visibility repair during normal runtime (seconds).
+  visibility_repair_grace_period_secs: 86400
 
   # Minimum idle age of an abandoned staging directory before removal (seconds).
   staging_expiry_secs: 86400
+
+  # Minimum idle age of a trash directory before removal (seconds).
+  trash_expiry_secs: 600
 
 # ─── Authentication ───────────────────────────────────────────────────────────
 auth:

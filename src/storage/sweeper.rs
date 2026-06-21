@@ -1,31 +1,30 @@
-//! Background sweeper: cleans up abandoned staging directories and orphaned objects.
+//! Background maintenance for bounded, non-live cleanup.
 //!
 //! A staging directory is safe to delete only when BOTH its folder-name epoch
 //! is older than the expiry window AND every file inside it has an mtime
 //! older than the expiry window.  The second condition prevents racing against
 //! an in-progress multipart upload whose upload-id happens to look old.
 //!
-//! The SQLite orphan walk scans the full bucket in one sweeper pass and yields
-//! cooperatively every `max_objects` entries checked.
+//! The maintenance pass does not scan the live object namespace or every SQLite
+//! object row. SQLite drift is repaired only through the targeted
+//! visibility_repair_queue.
 
-use std::collections::HashSet;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 use tokio::task::yield_now;
 
 use super::errors::Result;
-use super::resolver::resolve_object_dir;
 use super::staging::epoch_ms_from_staging_id;
 use super::store::LocalObjectStore;
 use super::time::now_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepConfig {
-    pub max_objects: usize,
-    pub orphan_grace_period_ms: i64,
+    pub visibility_repair_batch_size: usize,
+    pub visibility_repair_grace_period_ms: i64,
     pub staging_expiry_ms: i64,
+    pub trash_expiry_ms: i64,
     pub now_ms: i64,
 }
 
@@ -34,239 +33,50 @@ pub struct SweepStats {
     pub sqlite_orphans_removed: usize,
     pub physical_orphans_removed: usize,
     pub staging_dirs_removed: usize,
+    pub trash_dirs_removed: usize,
     pub fanout_dirs_removed: usize,
     pub sqlite_entries_checked: usize,
+    pub visibility_repairs_processed: usize,
 }
 
 impl Default for SweepConfig {
     fn default() -> Self {
         Self {
-            max_objects: 100,
-            orphan_grace_period_ms: 5 * 60 * 1000,
+            visibility_repair_batch_size: 100,
+            visibility_repair_grace_period_ms: 24 * 60 * 60 * 1000,
             staging_expiry_ms: 24 * 60 * 60 * 1000,
+            trash_expiry_ms: 10 * 60 * 1000,
             now_ms: now_ms(),
         }
     }
 }
 
-/// Sweeps one bucket.
-///
+/// Runs bounded maintenance for one bucket.
 pub async fn sweep_bucket(
     store: &LocalObjectStore,
     bucket: &str,
     config: &SweepConfig,
 ) -> Result<SweepStats> {
     let mut stats = SweepStats::default();
-    let index = store.index(bucket).await?;
-    let yield_every = config.max_objects.max(1);
-    let page_size = yield_every as i64;
-    let mut after: Option<String> = None;
-
+    let batch_size = config.visibility_repair_batch_size.max(1);
     loop {
-        let entries = index.all_entries_after(after.as_deref(), page_size).await?;
-        if entries.is_empty() {
+        let batch = store
+            .process_visibility_repairs(
+                bucket,
+                config.visibility_repair_grace_period_ms,
+                batch_size,
+            )
+            .await?;
+        stats.visibility_repairs_processed += batch.selected;
+        if batch.selected < batch_size || batch.failed > 0 {
             break;
-        }
-        for entry in entries {
-            after = Some(entry.object_key.clone());
-            stats.sqlite_entries_checked += 1;
-            if resolve_object_dir(store.layout(), bucket, &entry.object_key)
-                .await?
-                .is_none()
-                && config.now_ms.saturating_sub(entry.last_modified_ms)
-                    >= config.orphan_grace_period_ms
-            {
-                index.delete(&entry.object_key).await?;
-                stats.sqlite_orphans_removed += 1;
-                log::info!(
-                    "sweeper removed sqlite orphan bucket={} key={}",
-                    bucket,
-                    entry.object_key,
-                );
-            }
-            if stats.sqlite_entries_checked % yield_every == 0 {
-                log::info!(
-                    "sweeper sqlite scan yielded bucket={} checked={} last_key={}",
-                    bucket,
-                    stats.sqlite_entries_checked,
-                    after.as_deref().unwrap_or("-"),
-                );
-                yield_now().await;
-            }
-        }
-        if after.is_none() {
-            break;
-        }
-    }
-    log::info!(
-        "sweeper sqlite scan complete bucket={} checked={} sqlite_orphans={}",
-        bucket,
-        stats.sqlite_entries_checked,
-        stats.sqlite_orphans_removed,
-    );
-
-    let bucket_dir = store.layout().bucket_dir(bucket)?;
-    sweep_physical_orphans(
-        store,
-        bucket,
-        &bucket_dir.join("objects"),
-        config,
-        &mut stats,
-    )
-    .await?;
-    sweep_empty_fanout_dirs(
-        store,
-        bucket,
-        &bucket_dir.join("objects"),
-        config,
-        &mut stats,
-    )
-    .await?;
-    sweep_staging(&bucket_dir.join("staging"), config, &mut stats).await?;
-    Ok(stats)
-}
-
-async fn sweep_physical_orphans(
-    store: &LocalObjectStore,
-    bucket: &str,
-    objects_dir: &Path,
-    config: &SweepConfig,
-    stats: &mut SweepStats,
-) -> Result<()> {
-    for dir in leaf_dirs(objects_dir) {
-        if relative_depth(objects_dir, &dir) < 5 {
-            continue;
-        }
-        if dir.join("meta.json").exists() {
-            continue;
-        }
-        if path_age_ms(&dir, config.now_ms)? < config.orphan_grace_period_ms {
-            continue;
-        }
-        let Some(top) = top_fanout_segment(objects_dir, &dir) else {
-            continue;
-        };
-        let _fanout_guard = store.fanout_shard_write_lock(bucket, &top).await;
-        if dir.join("meta.json").exists() || !dir.is_dir() {
-            continue;
-        }
-        match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => {
-                stats.physical_orphans_removed += 1;
-                log::info!(
-                    "sweeper removed physical orphan bucket={} fanout={} dir={}",
-                    bucket,
-                    top,
-                    dir.display()
-                );
-            }
-            Err(err) => {
-                log::warn!(
-                    "sweeper failed to remove physical orphan dir={} error={}",
-                    dir.display(),
-                    err,
-                );
-            }
         }
         yield_now().await;
     }
-    Ok(())
-}
-
-async fn sweep_empty_fanout_dirs(
-    store: &LocalObjectStore,
-    bucket: &str,
-    objects_dir: &Path,
-    config: &SweepConfig,
-    stats: &mut SweepStats,
-) -> Result<()> {
-    let Ok(top_entries) = std::fs::read_dir(objects_dir) else {
-        return Ok(());
-    };
-    for top_entry in top_entries.flatten() {
-        let top_dir = top_entry.path();
-        if !top_dir.is_dir() {
-            continue;
-        }
-        let Some(top) = top_dir
-            .file_name()
-            .and_then(|v| v.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let _fanout_guard = store.fanout_shard_write_lock(bucket, &top).await;
-        let mut parents_made_empty = HashSet::new();
-        let mut removed_in_shard = 0usize;
-        loop {
-            let mut removed_in_pass = false;
-            let mut dirs = Vec::new();
-            collect_dirs_postorder(&top_dir, &mut dirs);
-            for dir in dirs {
-                let old_enough = path_age_ms(&dir, config.now_ms)? >= config.orphan_grace_period_ms;
-                if !old_enough && !parents_made_empty.contains(&dir) {
-                    continue;
-                }
-                if !is_empty_dir(&dir) {
-                    continue;
-                }
-                match tokio::fs::remove_dir(&dir).await {
-                    Ok(()) => {
-                        removed_in_pass = true;
-                        stats.fanout_dirs_removed += 1;
-                        if let Some(parent) = dir.parent() {
-                            if parent != objects_dir {
-                                parents_made_empty.insert(parent.to_path_buf());
-                            }
-                        }
-                        log::info!(
-                            "sweeper removed empty fanout dir bucket={} fanout={} dir={}",
-                            bucket,
-                            top,
-                            dir.display()
-                        );
-                        removed_in_shard += 1;
-                        if removed_in_shard % 100 == 0 {
-                            log::info!(
-                                "sweeper empty fanout cleanup yielded bucket={} fanout={} removed_in_shard={}",
-                                bucket,
-                                top,
-                                removed_in_shard,
-                            );
-                            yield_now().await;
-                        }
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
-                        ) => {}
-                    Err(err) => {
-                        log::warn!(
-                            "sweeper failed to remove empty fanout dir bucket={} fanout={} dir={} error={}",
-                            bucket,
-                            top,
-                            dir.display(),
-                            err,
-                        );
-                    }
-                }
-            }
-            if !removed_in_pass {
-                break;
-            }
-        }
-        if removed_in_shard > 0 {
-            log::info!(
-                "sweeper empty fanout cleanup shard complete bucket={} fanout={} removed_in_shard={}",
-                bucket,
-                top,
-                removed_in_shard,
-            );
-            yield_now().await;
-        }
-    }
-    Ok(())
+    let bucket_dir = store.layout().bucket_dir(bucket)?;
+    sweep_staging(&bucket_dir.join("staging"), config, &mut stats).await?;
+    sweep_trash(&bucket_dir.join("trash"), config, &mut stats).await?;
+    Ok(stats)
 }
 
 async fn sweep_staging(
@@ -323,65 +133,36 @@ async fn sweep_staging(
     Ok(())
 }
 
-fn leaf_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    collect_leaf_dirs(root, &mut result);
-    result
-}
-
-fn collect_leaf_dirs(path: &Path, result: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(path) {
+async fn sweep_trash(trash_dir: &Path, config: &SweepConfig, stats: &mut SweepStats) -> Result<()> {
+    let entries = match std::fs::read_dir(trash_dir) {
         Ok(entries) => entries,
-        Err(_) => return,
-    };
-    let mut has_child_dir = false;
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if child.is_dir() {
-            has_child_dir = true;
-            collect_leaf_dirs(&child, result);
-        }
-    }
-    if !has_child_dir && path.is_dir() {
-        result.push(path.to_path_buf());
-    }
-}
-
-fn collect_dirs_postorder(path: &Path, result: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
     for entry in entries.flatten() {
-        let child = entry.path();
-        if child.is_dir() {
-            collect_dirs_postorder(&child, result);
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
         }
+        let old_enough = path_age_ms(&path, config.now_ms)? >= config.trash_expiry_ms;
+        if !old_enough || !all_files_old_enough(&path, config.now_ms, config.trash_expiry_ms) {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {
+                stats.trash_dirs_removed += 1;
+                log::info!("sweeper removed trash dir path={}", path.display());
+            }
+            Err(err) => {
+                log::warn!(
+                    "sweeper failed to remove trash dir path={} error={}",
+                    path.display(),
+                    err,
+                );
+            }
+        }
+        yield_now().await;
     }
-    if path.is_dir() {
-        result.push(path.to_path_buf());
-    }
-}
-
-fn top_fanout_segment(objects_dir: &Path, path: &Path) -> Option<String> {
-    path.strip_prefix(objects_dir)
-        .ok()?
-        .components()
-        .next()
-        .map(|v| v.as_os_str().to_string_lossy().to_string())
-}
-
-fn relative_depth(root: &Path, path: &Path) -> usize {
-    path.strip_prefix(root)
-        .map(|relative| relative.components().count())
-        .unwrap_or(0)
-}
-
-fn is_empty_dir(path: &Path) -> bool {
-    match std::fs::read_dir(path) {
-        Ok(mut entries) => entries.next().is_none(),
-        Err(_) => false,
-    }
+    Ok(())
 }
 
 fn all_files_old_enough(dir: &Path, now_ms: i64, expiry_ms: i64) -> bool {
@@ -395,6 +176,8 @@ fn all_files_old_enough(dir: &Path, now_ms: i64, expiry_ms: i64) -> bool {
             if age < expiry_ms {
                 return false;
             }
+        } else if path.is_dir() && !all_files_old_enough(&path, now_ms, expiry_ms) {
+            return false;
         }
     }
     true
@@ -438,9 +221,10 @@ mod tests {
             &store,
             "bucket",
             &SweepConfig {
-                max_objects: 100,
-                orphan_grace_period_ms: 1,
+                visibility_repair_batch_size: 100,
+                visibility_repair_grace_period_ms: 1,
                 staging_expiry_ms: 1_000,
+                trash_expiry_ms: 1_000,
                 now_ms: 10_000,
             },
         )
@@ -472,9 +256,10 @@ mod tests {
             &store,
             "bucket",
             &SweepConfig {
-                max_objects: 100,
-                orphan_grace_period_ms: 1,
+                visibility_repair_batch_size: 100,
+                visibility_repair_grace_period_ms: 1,
                 staging_expiry_ms: 1_000,
+                trash_expiry_ms: 1_000,
                 now_ms: 10_000,
             },
         )
@@ -486,7 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removes_sqlite_orphan_after_grace_period() {
+    async fn repairs_queued_sqlite_orphan_after_grace_period() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
@@ -509,25 +294,27 @@ mod tests {
             })
             .await
             .unwrap();
+        index.enqueue_visibility_repair("key", 0).await.unwrap();
 
         let stats = sweep_bucket(
             &store,
             "bucket",
             &SweepConfig {
-                max_objects: 10,
-                orphan_grace_period_ms: 1,
+                visibility_repair_batch_size: 10,
+                visibility_repair_grace_period_ms: 1,
                 staging_expiry_ms: 1000,
+                trash_expiry_ms: 1000,
                 now_ms: 10_000,
             },
         )
         .await
         .unwrap();
-        assert_eq!(stats.sqlite_orphans_removed, 1);
+        assert_eq!(stats.visibility_repairs_processed, 1);
         assert!(index.get("key").await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn removes_empty_fanout_dirs_after_object_delete() {
+    async fn removes_trash_dirs_after_object_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
@@ -535,79 +322,53 @@ mod tests {
             .put_object("bucket", "folder/test.txt", b"hello", None, None, false)
             .await
             .unwrap();
-        let read = store
-            .read_object("bucket", "folder/test.txt")
-            .await
-            .unwrap();
-        let fanout_dirs = read
-            .object_dir
-            .ancestors()
-            .skip(1)
-            .take(4)
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
 
         store
             .delete_object("bucket", "folder/test.txt")
             .await
             .unwrap();
-        assert_eq!(fanout_dirs.len(), 4);
-        for dir in &fanout_dirs {
-            assert!(
-                dir.exists(),
-                "expected fanout dir to exist: {}",
-                dir.display()
-            );
-        }
+        let trash_dir = store.layout().trash_dir("bucket").unwrap();
+        assert!(trash_dir.exists());
 
         let stats = sweep_bucket(
             &store,
             "bucket",
             &SweepConfig {
-                max_objects: 100,
-                orphan_grace_period_ms: 0,
+                visibility_repair_batch_size: 100,
+                visibility_repair_grace_period_ms: 0,
                 staging_expiry_ms: 1000,
+                trash_expiry_ms: 0,
                 now_ms: now_ms(),
             },
         )
         .await
         .unwrap();
 
-        assert!(
-            stats.fanout_dirs_removed >= 4,
-            "expected to remove the four empty fanout dirs, got {stats:?}"
-        );
-        for dir in &fanout_dirs {
-            assert!(
-                !dir.exists(),
-                "expected fanout dir to be removed: {}",
-                dir.display()
-            );
-        }
+        assert_eq!(stats.trash_dirs_removed, 1);
     }
 
     #[tokio::test]
-    async fn sqlite_scan_completes_full_bucket_with_small_yield_batch() {
+    async fn visibility_repair_queue_drains_all_eligible_rows_in_batches() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
-        // Put 5 objects; sweep with max_objects=2 so the scan yields internally
-        // but still completes the full bucket in one call.
+        let index = store.index("bucket").await.unwrap();
         for i in 1..=5u32 {
-            store
-                .put_object("bucket", &format!("key-{i:02}"), b"x", None, None, false)
+            index
+                .enqueue_visibility_repair(&format!("key-{i:02}"), 0)
                 .await
                 .unwrap();
         }
 
         let cfg = SweepConfig {
-            max_objects: 2,
-            orphan_grace_period_ms: 1,
+            visibility_repair_batch_size: 2,
+            visibility_repair_grace_period_ms: 1,
             staging_expiry_ms: 1000,
+            trash_expiry_ms: 1000,
             now_ms: now_ms(),
         };
 
         let stats = sweep_bucket(&store, "bucket", &cfg).await.unwrap();
-        assert_eq!(stats.sqlite_entries_checked, 5);
+        assert_eq!(stats.visibility_repairs_processed, 5);
     }
 }

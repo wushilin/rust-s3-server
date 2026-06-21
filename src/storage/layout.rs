@@ -49,6 +49,14 @@ impl StorageLayout {
             .join("multipart")
             .join(upload_id))
     }
+
+    pub fn trash_dir(&self, bucket: &str) -> Result<PathBuf> {
+        Ok(self.bucket_dir(bucket)?.join("trash"))
+    }
+
+    pub fn object_trash_dir(&self, bucket: &str, trash_id: &str) -> Result<PathBuf> {
+        Ok(self.trash_dir(bucket)?.join(trash_id))
+    }
 }
 
 #[cfg(test)]

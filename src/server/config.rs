@@ -70,30 +70,42 @@ pub struct AuthConfig {
     pub public_hostname: Option<String>,
 }
 
-/// Background sweeper settings.
+/// Background maintenance settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweeperConfig {
-    /// How often the sweeper runs (seconds).
+    /// How often maintenance runs (seconds).
     #[serde(default = "default_sweep_interval_secs")]
     pub interval_secs: u64,
-    /// Yield after this many SQLite index entries are checked.
-    #[serde(default = "default_max_objects_per_pass")]
-    pub max_objects_per_pass: usize,
-    /// Minimum age of a stale SQLite row before it is removed (seconds).
-    #[serde(default = "default_orphan_grace_period_secs")]
-    pub orphan_grace_period_secs: u64,
+    /// Targeted visibility repair batch size. One maintenance pass drains all
+    /// eligible rows in batches of this size.
+    #[serde(
+        default = "default_visibility_repair_batch_size",
+        alias = "visibility_repair_max_per_pass",
+        alias = "max_objects_per_pass"
+    )]
+    pub visibility_repair_batch_size: usize,
+    /// Minimum age of a targeted visibility repair during normal runtime.
+    #[serde(
+        default = "default_visibility_repair_grace_period_secs",
+        alias = "orphan_grace_period_secs"
+    )]
+    pub visibility_repair_grace_period_secs: u64,
     /// Minimum idle age of a staging directory before it is removed (seconds).
     #[serde(default = "default_staging_expiry_secs")]
     pub staging_expiry_secs: u64,
+    /// Minimum idle age of a trash directory before it is removed (seconds).
+    #[serde(default = "default_trash_expiry_secs")]
+    pub trash_expiry_secs: u64,
 }
 
 impl Default for SweeperConfig {
     fn default() -> Self {
         Self {
             interval_secs: default_sweep_interval_secs(),
-            max_objects_per_pass: default_max_objects_per_pass(),
-            orphan_grace_period_secs: default_orphan_grace_period_secs(),
+            visibility_repair_batch_size: default_visibility_repair_batch_size(),
+            visibility_repair_grace_period_secs: default_visibility_repair_grace_period_secs(),
             staging_expiry_secs: default_staging_expiry_secs(),
+            trash_expiry_secs: default_trash_expiry_secs(),
         }
     }
 }
@@ -188,14 +200,17 @@ fn default_keep_files() -> u32 {
 fn default_sweep_interval_secs() -> u64 {
     300
 }
-fn default_max_objects_per_pass() -> usize {
+fn default_visibility_repair_batch_size() -> usize {
     100
 }
-fn default_orphan_grace_period_secs() -> u64 {
-    300
+fn default_visibility_repair_grace_period_secs() -> u64 {
+    24 * 60 * 60
 }
 fn default_staging_expiry_secs() -> u64 {
     86400
+}
+fn default_trash_expiry_secs() -> u64 {
+    600
 }
 
 #[cfg(test)]
@@ -224,5 +239,26 @@ mod tests {
         let config: AppConfig =
             serde_yaml::from_str("storage:\n  sqlite_max_connections: 12\n").unwrap();
         assert_eq!(config.storage.sqlite_max_connections, 12);
+    }
+
+    #[test]
+    fn visibility_repair_config_accepts_new_names_and_legacy_aliases() {
+        let config: AppConfig = serde_yaml::from_str(
+            "sweeper:\n  visibility_repair_batch_size: 7\n  visibility_repair_grace_period_secs: 9\n",
+        )
+        .unwrap();
+        assert_eq!(config.sweeper.visibility_repair_batch_size, 7);
+        assert_eq!(config.sweeper.visibility_repair_grace_period_secs, 9);
+
+        let renamed: AppConfig =
+            serde_yaml::from_str("sweeper:\n  visibility_repair_max_per_pass: 10\n").unwrap();
+        assert_eq!(renamed.sweeper.visibility_repair_batch_size, 10);
+
+        let legacy: AppConfig = serde_yaml::from_str(
+            "sweeper:\n  max_objects_per_pass: 11\n  orphan_grace_period_secs: 13\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.sweeper.visibility_repair_batch_size, 11);
+        assert_eq!(legacy.sweeper.visibility_repair_grace_period_secs, 13);
     }
 }

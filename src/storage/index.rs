@@ -3,6 +3,7 @@ use std::path::Path;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 
 use super::errors::Result;
+use super::time::now_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectIndexEntry {
@@ -53,33 +54,66 @@ impl SqliteObjectIndex {
                 object_key TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
                 etag TEXT NOT NULL,
-                last_modified_ms INTEGER NOT NULL
+                last_modified_ms INTEGER NOT NULL,
+                index_seen_at_ms INTEGER NOT NULL DEFAULT 0
             )
             "#,
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query("ALTER TABLE objects ADD COLUMN index_seen_at_ms INTEGER NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await
+            .ok();
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_key_order ON objects(object_key)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_objects_index_seen_at ON objects(index_seen_at_ms)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS visibility_repair_queue (
+                object_key TEXT PRIMARY KEY,
+                first_created_at_ms INTEGER NOT NULL,
+                last_created_at_ms INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_visibility_repair_due ON visibility_repair_queue(first_created_at_ms)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     pub async fn put(&self, entry: &ObjectIndexEntry) -> Result<()> {
+        self.put_seen_at(entry, now_ms()).await
+    }
+
+    pub async fn put_seen_at(&self, entry: &ObjectIndexEntry, seen_at_ms: i64) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO objects(object_key, size, etag, last_modified_ms)
-            VALUES (?1, ?2, ?3, ?4)
+            INSERT INTO objects(object_key, size, etag, last_modified_ms, index_seen_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(object_key) DO UPDATE SET
                 size = excluded.size,
                 etag = excluded.etag,
-                last_modified_ms = excluded.last_modified_ms
+                last_modified_ms = excluded.last_modified_ms,
+                index_seen_at_ms = excluded.index_seen_at_ms
             "#,
         )
         .bind(&entry.object_key)
         .bind(entry.size as i64)
         .bind(&entry.etag)
         .bind(entry.last_modified_ms)
+        .bind(seen_at_ms)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -123,18 +157,94 @@ impl SqliteObjectIndex {
         for entry in entries {
             sqlx::query(
                 r#"
-                INSERT INTO objects(object_key, size, etag, last_modified_ms)
-                VALUES (?1, ?2, ?3, ?4)
+                INSERT INTO objects(object_key, size, etag, last_modified_ms, index_seen_at_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
                 "#,
             )
             .bind(&entry.object_key)
             .bind(entry.size as i64)
             .bind(&entry.etag)
             .bind(entry.last_modified_ms)
+            .bind(now_ms())
             .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_entries_not_seen_since(&self, scan_started_at_ms: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM objects WHERE index_seen_at_ms < ?1")
+            .bind(scan_started_at_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn enqueue_visibility_repair(&self, key: &str, now_ms: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO visibility_repair_queue(object_key, first_created_at_ms, last_created_at_ms)
+            VALUES (?1, ?2, ?2)
+            ON CONFLICT(object_key) DO UPDATE SET
+                first_created_at_ms = MIN(first_created_at_ms, excluded.first_created_at_ms),
+                last_created_at_ms = MAX(last_created_at_ms, excluded.last_created_at_ms)
+            "#,
+        )
+        .bind(key)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_visibility_repair(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM visibility_repair_queue WHERE object_key = ?1")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn due_visibility_repairs(
+        &self,
+        now_ms: i64,
+        min_age_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let cutoff = now_ms.saturating_sub(min_age_ms);
+        let rows = sqlx::query(
+            r#"
+            SELECT object_key
+            FROM visibility_repair_queue
+            WHERE first_created_at_ms <= ?1
+            ORDER BY first_created_at_ms, object_key
+            LIMIT ?2
+            "#,
+        )
+        .bind(cutoff)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("object_key"))
+            .collect())
+    }
+
+    pub async fn mark_visibility_repair_attempt(&self, key: &str, now_ms: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE visibility_repair_queue
+            SET attempts = attempts + 1,
+                last_created_at_ms = ?2
+            WHERE object_key = ?1
+            "#,
+        )
+        .bind(key)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

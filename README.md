@@ -11,10 +11,10 @@ Built for **local development and CI/CD** — not a production replacement for A
 |------|-------|
 | S3 wire-compatible | Works with the AWS CLI, AWS SDKs, and any library that targets the S3 API |
 | Low overhead | Streaming reads/writes — objects are never fully buffered in memory |
-| Durable | Each bucket has a SQLite index; `meta.json` acts as an atomic visibility gate |
-| Self-healing | On GET/DELETE of an orphaned key the stale index row and directory are cleaned up automatically; the index can be rebuilt in the background via HTTP |
+| Durable | Complete object directories are published with atomic renames; each bucket has a derived SQLite listing index |
+| Self-healing | GET/DELETE and targeted visibility-repair rows reconcile stale SQLite entries; the index can still be rebuilt explicitly via HTTP |
 | Observable | Structured per-request logging (method, URI, status, size, latency) and periodic bandwidth reports; rolling log file with configurable rotation and optional gzip compression |
-| Configurable | Single `config.yaml` controls network, storage, logging, auth, and the background sweeper; `--init` generates a fully-documented template |
+| Configurable | Single `config.yaml` controls network, storage, logging, auth, and background maintenance; `--init` generates a fully-documented template |
 | No hot-spot directories | Objects are spread across a 4-level SHA-1 fanout tree — no single directory ever accumulates more than a handful of entries, regardless of how many objects the bucket contains |
 
 ## Explicit non-goals
@@ -94,16 +94,21 @@ All fields are optional — built-in defaults are used for anything omitted.
 | `keep_files` | `5` | Number of archived (rotated) log files to keep alongside the active file. Older archives are deleted automatically. |
 | `compress` | `false` | When `true`, archived log files are compressed with gzip (`.gz` extension appended). |
 
-### `sweeper` — background cleanup
+### `sweeper` — background maintenance
 
-The sweeper is a background task that removes orphaned staging directories and stale SQLite index rows left behind by interrupted uploads or server crashes.
+The sweeper performs bounded maintenance only. It cleans old staging/trash directories and processes targeted visibility-repair rows; it does not automatically crawl all live objects or all SQLite index rows.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `interval_secs` | `300` | How often (in seconds) the sweeper wakes up to scan each bucket. |
-| `max_objects_per_pass` | `100` | The sweeper yields to other tasks after checking this many SQLite index entries per bucket. It still finishes the full scan before rescheduling. |
-| `orphan_grace_period_secs` | `300` | Minimum age (seconds) a stale SQLite row must have before the sweeper removes it. Protects against racing with concurrent writes. |
+| `interval_secs` | `300` | How often (in seconds) background maintenance wakes up for each bucket. |
+| `visibility_repair_batch_size` | `100` | Targeted visibility repair batch size. One maintenance pass drains all eligible rows in batches of this size. |
+| `visibility_repair_grace_period_secs` | `86400` | Minimum age (seconds) of a targeted visibility-repair row during normal runtime. Startup repair bypasses this delay because pre-restart requests are no longer running. |
 | `staging_expiry_secs` | `86400` | Minimum idle age (seconds) an abandoned staging directory must have before the sweeper deletes it. Covers interrupted single-PUT and multipart uploads. Default is 24 hours. |
+| `trash_expiry_secs` | `600` | Minimum idle age (seconds) a trash directory must have before recursive deletion. Default is 10 minutes. |
+
+Older configs using `visibility_repair_max_per_pass`, `max_objects_per_pass`,
+and `orphan_grace_period_secs` are still accepted as aliases, but new configs
+should use the visibility-repair names above.
 
 ### `auth` — SigV4 authentication
 
@@ -268,7 +273,7 @@ src/
     layout.rs       # maps (bucket, key) → fanout leaf directory path
     metadata.rs     # ObjectMeta / PutMeta / UploadMeta / BucketMeta structs
     staging.rs      # staging directory helpers
-    sweeper.rs      # background orphan cleanup
+    sweeper.rs      # bounded background maintenance
     cache.rs        # LRU metadata cache
     locks.rs        # per-key async mutex
     aws_chunked.rs  # aws-chunked streaming decoder
@@ -302,17 +307,27 @@ src/
         <2>/<2>/<2>/<2>/     # 4-level SHA-1 fanout (8 hex chars of SHA1(bucket+key))
           V1<6hex>/          # object directory  e.g. V1AB3F7C/
           V1<6hex>_<4hex>/   # collision suffix (rare)  e.g. V1AB3F7C_91FE/
-            meta.json        # object metadata + part list (visibility gate)
+            meta.json        # object metadata + part list
             part.1           # object data (single-part)
             part.1, part.2   # multipart data (one file per part)
       staging/
-        put/<id>/            # in-progress single PUT (cleaned by sweeper)
-        multipart/<id>/      # in-progress multipart (cleaned by sweeper)
+        put/<id>/            # unpublished single PUT (cleaned by maintenance)
+        multipart/<id>/      # unpublished multipart upload (cleaned by maintenance)
+      trash/
+        <id>/                # complete objects removed from live visibility
 ```
 
-`meta.json` is written **last** on PUT and removed **first** on DELETE, giving
-atomic object visibility without locking. A missing `meta.json` always means the
-object does not exist, regardless of what the SQLite index says.
+PUT and multipart completion prepare a complete object directory in staging,
+including `meta.json`, then publish it into `objects/` with an atomic rename.
+DELETE moves the live object directory to `trash/` with an atomic rename and
+removes the SQLite row afterward. Overwrite PUT is documented as delete-then-put:
+if the process crashes between moving the old object to trash and publishing the
+new object, the key may be absent, but no partial live object directory is left
+behind.
+
+SQLite stores a derived listing index. The live `objects/` namespace is
+authoritative; reads/deletes and targeted visibility-repair rows reconcile SQLite
+when drift is detected.
 
 ### Object Directory Names
 
@@ -351,7 +366,11 @@ curl -X POST http://127.0.0.1:8002/my-bucket?rebuildIndex
 # 409 Conflict — already running
 ```
 
-Progress is logged at INFO level every 100 objects.
+The rebuild streams the live `objects/` tree and upserts each discovered object
+directly into SQLite with a rebuild timestamp. When the scan finishes, SQLite
+rows not seen since the rebuild started are removed. This keeps memory bounded
+and fixes both missing rows and stale rows. Progress is logged at INFO level
+every 100 objects.
 
 ---
 
@@ -359,5 +378,5 @@ Progress is logged at INFO level every 100 objects.
 
 `SIGINT` (Ctrl-C) triggers a graceful shutdown:
 1. The HTTP server stops accepting new connections and drains in-flight requests.
-2. The sweeper task and any running index rebuild are cooperatively cancelled.
+2. The background maintenance task and any running index rebuild are cooperatively cancelled.
 3. The process exits cleanly.

@@ -30,17 +30,17 @@ use regex::Regex;
 
 use self::auth::auth_middleware;
 use self::config::AppConfig;
-use crate::storage::errors::StorageError;
-use crate::storage::metadata::quote_etag;
 use self::range::{parse_range_header, RangeSelection};
-use crate::storage::store::{CompletePartRequest, LocalObjectStore};
-use crate::storage::sweeper::{sweep_bucket, SweepConfig};
-use crate::storage::time::{http_date_ms, parse_http_date_ms};
 use self::xml::{
     complete_multipart_xml, copy_object_xml, delete_objects_xml, error_xml, initiate_multipart_xml,
     list_buckets_xml, list_multipart_uploads_xml, list_objects_v1_xml, list_objects_v2_xml,
     list_parts_xml, BucketListEntry, DeleteObjectResult, S3ErrorXml,
 };
+use crate::storage::errors::StorageError;
+use crate::storage::metadata::quote_etag;
+use crate::storage::store::{CompletePartRequest, LocalObjectStore};
+use crate::storage::sweeper::{sweep_bucket, SweepConfig};
+use crate::storage::time::{http_date_ms, parse_http_date_ms};
 
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 
@@ -257,9 +257,10 @@ async fn traffic_metrics_middleware(
 
 /// Starts the S3 server and blocks until shutdown.
 ///
-/// Spawns a background sweeper task that cleans up abandoned staging
-/// directories every 5 minutes.  Responds to SIGINT (Ctrl-C) by cancelling
-/// all background tasks and draining in-flight HTTP requests before returning.
+/// Spawns a bounded background maintenance task for targeted visibility repair,
+/// staging cleanup, and trash cleanup. Responds to SIGINT (Ctrl-C) by
+/// cancelling all background tasks and draining in-flight HTTP requests before
+/// returning.
 pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error>> {
     let store = LocalObjectStore::from_storage_config(&config.root, &config.app_config.storage);
     let shutdown = store.shutdown_token();
@@ -335,76 +336,113 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let sweeper_cfg = config.app_config.sweeper.clone();
     tokio::spawn(async move {
         log::info!(
-            "sweeper task started interval_secs={} yield_every_objects={} orphan_grace_period_secs={} staging_expiry_secs={}",
+            "maintenance task started interval_secs={} visibility_repair_batch_size={} repair_grace_period_secs={} staging_expiry_secs={} trash_expiry_secs={}",
             sweeper_cfg.interval_secs,
-            sweeper_cfg.max_objects_per_pass,
-            sweeper_cfg.orphan_grace_period_secs,
+            sweeper_cfg.visibility_repair_batch_size,
+            sweeper_cfg.visibility_repair_grace_period_secs,
             sweeper_cfg.staging_expiry_secs,
+            sweeper_cfg.trash_expiry_secs,
         );
+        match sweeper_store.list_buckets().await {
+            Ok(buckets) => {
+                let repair_batch = sweeper_cfg.visibility_repair_batch_size.max(1);
+                for (bucket, _) in &buckets {
+                    if sweeper_shutdown.is_cancelled() {
+                        break;
+                    }
+                    let mut total_repaired = 0usize;
+                    loop {
+                        match sweeper_store
+                            .process_visibility_repairs(bucket, 0, repair_batch)
+                            .await
+                        {
+                            Ok(batch) => {
+                                total_repaired += batch.repaired;
+                                if batch.selected < repair_batch || batch.failed > 0 {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "startup visibility repair failed bucket={} error={err}",
+                                    bucket,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if total_repaired > 0 {
+                        log::info!(
+                            "startup visibility repair complete bucket={} repaired={}",
+                            bucket,
+                            total_repaired,
+                        );
+                    }
+                }
+            }
+            Err(err) => log::warn!("startup visibility repair failed to list buckets error={err}"),
+        }
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(sweeper_cfg.interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = sweeper_shutdown.cancelled() => {
-                    log::info!("sweeper task stopping");
+                    log::info!("maintenance task stopping");
                     break;
                 }
                 _ = interval.tick() => {
-                    log::info!("sweeper tick triggered");
+                    log::info!("maintenance tick triggered");
                     match sweeper_store.list_buckets().await {
                         Ok(buckets) => {
-                        log::info!("sweeper pass started buckets={}", buckets.len());
+                        log::info!("maintenance pass started buckets={}", buckets.len());
                         if buckets.is_empty() {
-                            log::info!("sweeper pass complete buckets=0");
+                            log::info!("maintenance pass complete buckets=0");
                         }
 
                         for (bucket, _) in &buckets {
                             if sweeper_shutdown.is_cancelled() { break; }
-                            log::info!("sweeper bucket started bucket={}", bucket);
+                            log::info!("maintenance bucket started bucket={}", bucket);
                             let cfg = SweepConfig {
-                                max_objects: sweeper_cfg.max_objects_per_pass,
-                                orphan_grace_period_ms: sweeper_cfg.orphan_grace_period_secs as i64 * 1000,
+                                visibility_repair_batch_size: sweeper_cfg.visibility_repair_batch_size,
+                                visibility_repair_grace_period_ms: sweeper_cfg.visibility_repair_grace_period_secs as i64 * 1000,
                                 staging_expiry_ms: sweeper_cfg.staging_expiry_secs as i64 * 1000,
+                                trash_expiry_ms: sweeper_cfg.trash_expiry_secs as i64 * 1000,
                                 now_ms: crate::storage::time::now_ms(),
                             };
                             match sweep_bucket(&sweeper_store, bucket, &cfg).await {
                                 Ok(stats) => {
-                                    let removed = stats.sqlite_orphans_removed
-                                        + stats.physical_orphans_removed
-                                        + stats.staging_dirs_removed
-                                        + stats.fanout_dirs_removed;
+                                    let removed = stats.staging_dirs_removed
+                                        + stats.trash_dirs_removed
+                                        + stats.visibility_repairs_processed;
                                     if removed > 0 {
                                         log::info!(
-                                            "sweeper {bucket}: sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={}",
-                                            stats.sqlite_orphans_removed,
-                                            stats.physical_orphans_removed,
+                                            "maintenance {bucket}: visibility_repairs={} staging={} trash={}",
+                                            stats.visibility_repairs_processed,
                                             stats.staging_dirs_removed,
-                                            stats.fanout_dirs_removed,
+                                            stats.trash_dirs_removed,
                                         );
                                     }
                                     log::info!(
-                                        "sweeper bucket complete bucket={} sqlite_checked={} sqlite_orphans={} physical_orphans={} staging={} fanout_dirs={}",
+                                        "maintenance bucket complete bucket={} visibility_repairs={} staging={} trash={}",
                                         bucket,
-                                        stats.sqlite_entries_checked,
-                                        stats.sqlite_orphans_removed,
-                                        stats.physical_orphans_removed,
+                                        stats.visibility_repairs_processed,
                                         stats.staging_dirs_removed,
-                                        stats.fanout_dirs_removed,
+                                        stats.trash_dirs_removed,
                                     );
                                 }
-                                Err(err) => log::warn!("sweeper {bucket}: {err}"),
+                                Err(err) => log::warn!("maintenance {bucket}: {err}"),
                             }
                         }
                         log::info!(
-                            "sweeper pass rescheduled interval_secs={}",
+                            "maintenance pass rescheduled interval_secs={}",
                             sweeper_cfg.interval_secs,
                         );
                         }
                         Err(err) => {
-                            log::warn!("sweeper pass failed to list buckets error={err}");
+                            log::warn!("maintenance pass failed to list buckets error={err}");
                             log::info!(
-                                "sweeper pass rescheduled interval_secs={}",
+                                "maintenance pass rescheduled interval_secs={}",
                                 sweeper_cfg.interval_secs,
                             );
                         }
@@ -3206,13 +3244,10 @@ mod integration_tests {
     fn make_auth_app(tmp: &tempfile::TempDir) -> axum::Router {
         let mut config = super::config::AppConfig::default();
         config.auth.enabled = true;
-        config
-            .auth
-            .credentials
-            .push(super::config::Credential {
-                access_key: TEST_ACCESS_KEY.to_string(),
-                secret_key: TEST_SECRET_KEY.to_string(),
-            });
+        config.auth.credentials.push(super::config::Credential {
+            access_key: TEST_ACCESS_KEY.to_string(),
+            secret_key: TEST_SECRET_KEY.to_string(),
+        });
         // Configure the public hostname so presigned URL verification is
         // proxy-safe: the server substitutes this value for the `host` signed
         // header rather than reading the incoming HTTP Host header.
@@ -3638,8 +3673,8 @@ mod integration_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::metadata::{ObjectMeta, ObjectStorageKind, PartMeta};
     use super::*;
+    use crate::storage::metadata::{ObjectMeta, ObjectStorageKind, PartMeta};
 
     #[test]
     fn complete_parts_xml_accepts_quoted_etags() {
