@@ -156,6 +156,9 @@ mod tests {
             last_modified_ms: 0,
             content_type: "application/octet-stream".to_string(),
             content_encoding: None,
+            content_language: None,
+            storage_class: "STANDARD".to_string(),
+            user_meta: std::collections::BTreeMap::new(),
             parts: vec![],
         };
         let bytes = serde_json::to_vec(&meta).unwrap();
