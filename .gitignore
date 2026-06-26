@@ -4,3 +4,4 @@ rusts3-data/
 rusts3-data-debug/
 *.swp
 test-data/
+deploy.sh
