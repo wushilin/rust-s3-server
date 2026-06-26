@@ -22,7 +22,13 @@ pub fn validate_bucket_name(bucket: &str) -> Result<()> {
     if !is_alnum(bytes[0]) || !is_alnum(bytes[bytes.len() - 1]) {
         return Err(StorageError::InvalidBucketName(bucket.to_string()));
     }
-    if !bytes.iter().all(|b| is_alnum(*b) || *b == b'-') {
+    if !bytes
+        .iter()
+        .all(|b| is_alnum(*b) || *b == b'-' || *b == b'.')
+    {
+        return Err(StorageError::InvalidBucketName(bucket.to_string()));
+    }
+    if bucket.contains("..") || bucket.contains(".-") || bucket.contains("-.") {
         return Err(StorageError::InvalidBucketName(bucket.to_string()));
     }
     Ok(())
@@ -116,11 +122,23 @@ mod tests {
     #[test]
     fn bucket_validation_rejects_unsafe_names() {
         for bucket in [
-            "AA", "Upper", "has.dot", "1.2.3.4", "-bad", "bad-", "bad/name",
+            "AA",
+            "Upper",
+            "1.2.3.4",
+            "-bad",
+            "bad-",
+            "bad/name",
+            "bad..name",
+            "bad.-name",
+            "bad-.name",
+            ".bad",
+            "bad.",
         ] {
             assert!(validate_bucket_name(bucket).is_err(), "{bucket}");
         }
         assert!(validate_bucket_name("abc-123").is_ok());
+        assert!(validate_bucket_name("abc.123").is_ok());
+        assert!(validate_bucket_name("minio-java-test.withperiod").is_ok());
     }
 
     #[test]

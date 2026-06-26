@@ -4,7 +4,7 @@
 //! disk; an SQLite index per bucket is used for fast listings.  The store is
 //! `Clone + Send + Sync` and can be shared freely across async tasks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -30,8 +30,9 @@ use super::index::{ListPage, ObjectIndexEntry, SqliteObjectIndex};
 use super::layout::StorageLayout;
 use super::locks::ObjectLockTable;
 use super::metadata::{
-    content_encoding_or_none, content_type_or_default, unquote_etag, BucketMeta, ObjectMeta,
-    ObjectStorageKind, PartMeta, PutMeta, UploadMeta,
+    content_encoding_or_none, content_language_or_none, content_type_or_default,
+    storage_class_or_default, unquote_etag, BucketMeta, ObjectMeta, ObjectStorageKind, PartMeta,
+    PutMeta, UploadMeta,
 };
 use super::resolver::{allocate_object_dir, resolve_object_dir};
 use super::staging::{new_staging_id, validate_staging_id};
@@ -42,6 +43,7 @@ const CACHE_SHARDS: usize = 64;
 const DEFAULT_META_CACHE_CAPACITY: usize = 200_000;
 const DEFAULT_SQLITE_REPAIR_CACHE_CAPACITY: usize = 200_000;
 const INDEX_CACHE_WARN_THRESHOLD: usize = 500;
+const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Filesystem-backed S3-compatible object store.
 ///
@@ -59,6 +61,13 @@ pub struct LocalObjectStore {
     rebuilding: Arc<Mutex<HashSet<String>>>,
     /// Cooperative shutdown signal — cancel this to stop all background tasks.
     shutdown: CancellationToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersionEntry {
+    pub meta: ObjectMeta,
+    pub version_id: String,
+    pub is_latest: bool,
 }
 
 /// Returned by a successful PUT or multipart complete.
@@ -370,16 +379,60 @@ impl LocalObjectStore {
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
+        self.put_object_stream_with_metadata(
+            bucket,
+            key,
+            stream,
+            content_type,
+            content_encoding,
+            None,
+            None,
+            &BTreeMap::new(),
+            aws_chunked,
+            expected_sha256,
+        )
+        .await
+    }
+
+    pub async fn put_object_stream_with_metadata<S, E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream: S,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
+        aws_chunked: bool,
+        expected_sha256: Option<&str>,
+    ) -> Result<PutResult>
+    where
+        S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
         let staging_id = if aws_chunked {
-            self.stage_put_aws_chunked_stream(bucket, key, stream, content_type, content_encoding)
-                .await?
-        } else {
-            self.stage_put_stream(
+            self.stage_put_aws_chunked_stream_with_metadata(
                 bucket,
                 key,
                 stream,
                 content_type,
                 content_encoding,
+                storage_class,
+                content_language,
+                user_meta,
+            )
+            .await?
+        } else {
+            self.stage_put_stream_with_metadata(
+                bucket,
+                key,
+                stream,
+                content_type,
+                content_encoding,
+                storage_class,
+                content_language,
+                user_meta,
                 expected_sha256,
             )
             .await?
@@ -394,6 +447,30 @@ impl LocalObjectStore {
         bytes: &[u8],
         content_type: Option<&str>,
         content_encoding: Option<&str>,
+    ) -> Result<String> {
+        self.stage_put_with_metadata(
+            bucket,
+            key,
+            bytes,
+            content_type,
+            content_encoding,
+            None,
+            None,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn stage_put_with_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        bytes: &[u8],
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
     ) -> Result<String> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let staging_id = new_staging_id(now_ms());
@@ -410,6 +487,9 @@ impl LocalObjectStore {
             etag,
             content_type: content_type_or_default(content_type),
             content_encoding: content_encoding_or_none(content_encoding),
+            content_language: content_language_or_none(content_language),
+            storage_class: storage_class_or_default(storage_class),
+            user_meta: user_meta.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         Ok(staging_id)
@@ -422,6 +502,36 @@ impl LocalObjectStore {
         stream: S,
         content_type: Option<&str>,
         content_encoding: Option<&str>,
+        expected_sha256: Option<&str>,
+    ) -> Result<String>
+    where
+        S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        self.stage_put_stream_with_metadata(
+            bucket,
+            key,
+            stream,
+            content_type,
+            content_encoding,
+            None,
+            None,
+            &BTreeMap::new(),
+            expected_sha256,
+        )
+        .await
+    }
+
+    pub async fn stage_put_stream_with_metadata<S, E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream: S,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
         expected_sha256: Option<&str>,
     ) -> Result<String>
     where
@@ -458,6 +568,9 @@ impl LocalObjectStore {
             etag: written.md5,
             content_type: content_type_or_default(content_type),
             content_encoding: content_encoding_or_none(content_encoding),
+            content_language: content_language_or_none(content_language),
+            storage_class: storage_class_or_default(storage_class),
+            user_meta: user_meta.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         Ok(staging_id)
@@ -470,6 +583,34 @@ impl LocalObjectStore {
         stream: S,
         content_type: Option<&str>,
         content_encoding: Option<&str>,
+    ) -> Result<String>
+    where
+        S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        self.stage_put_aws_chunked_stream_with_metadata(
+            bucket,
+            key,
+            stream,
+            content_type,
+            content_encoding,
+            None,
+            None,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn stage_put_aws_chunked_stream_with_metadata<S, E>(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream: S,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
     ) -> Result<String>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -496,6 +637,9 @@ impl LocalObjectStore {
             etag: written.md5,
             content_type: content_type_or_default(content_type),
             content_encoding: content_encoding_or_none(content_encoding),
+            content_language: content_language_or_none(content_language),
+            storage_class: storage_class_or_default(storage_class),
+            user_meta: user_meta.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         Ok(staging_id)
@@ -535,6 +679,9 @@ impl LocalObjectStore {
             last_modified_ms,
             content_type: put_meta.content_type.clone(),
             content_encoding: put_meta.content_encoding.clone(),
+            content_language: put_meta.content_language.clone(),
+            storage_class: put_meta.storage_class.clone(),
+            user_meta: put_meta.user_meta.clone(),
             parts: vec![PartMeta {
                 number: 1,
                 file: "part.1".to_string(),
@@ -891,12 +1038,60 @@ impl LocalObjectStore {
             .await
     }
 
+    pub async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<ObjectVersionEntry>> {
+        validate_bucket_name(bucket)?;
+        validate_object_key(prefix)
+            .or_else(|err| if prefix.is_empty() { Ok(()) } else { Err(err) })?;
+        if !self.bucket_exists(bucket).await {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+
+        let mut versions = Vec::new();
+        let objects_dir = self.layout.bucket_dir(bucket)?.join("objects");
+        collect_object_versions_from_dir(&objects_dir, prefix, true, &mut versions).await?;
+        let trash_dir = self.layout.trash_dir(bucket)?;
+        collect_object_versions_from_dir(&trash_dir, prefix, false, &mut versions).await?;
+        versions.sort_by(|a, b| {
+            a.meta
+                .object_key
+                .cmp(&b.meta.object_key)
+                .then_with(|| b.meta.last_modified_ms.cmp(&a.meta.last_modified_ms))
+        });
+        Ok(versions)
+    }
+
     pub async fn initiate_multipart(
         &self,
         bucket: &str,
         key: &str,
         content_type: Option<&str>,
         content_encoding: Option<&str>,
+    ) -> Result<String> {
+        self.initiate_multipart_with_metadata(
+            bucket,
+            key,
+            content_type,
+            content_encoding,
+            None,
+            None,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn initiate_multipart_with_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
     ) -> Result<String> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let upload_id = new_staging_id(now_ms());
@@ -909,6 +1104,9 @@ impl LocalObjectStore {
             initiated_at_ms: now_ms(),
             content_type: content_type_or_default(content_type),
             content_encoding: content_encoding_or_none(content_encoding),
+            content_language: content_language_or_none(content_language),
+            storage_class: storage_class_or_default(storage_class),
+            user_meta: user_meta.clone(),
         };
         write_json_atomic(&staging_dir.join("upload.json"), &upload).await?;
         Ok(upload_id)
@@ -1010,6 +1208,34 @@ impl LocalObjectStore {
         })
     }
 
+    pub async fn copy_multipart_part(
+        &self,
+        dst_bucket: &str,
+        dst_key: &str,
+        upload_id: &str,
+        part_number: u16,
+        src_bucket: &str,
+        src_key: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<PutResult> {
+        let src = self.read_object(src_bucket, src_key).await?;
+        let mut bytes: Vec<u8> = Vec::with_capacity(src.meta.size as usize);
+        for part in &src.meta.parts {
+            let data = tokio::fs::read(src.object_dir.join(&part.file)).await?;
+            bytes.extend_from_slice(&data);
+        }
+        if let Some((start, end)) = range {
+            if start > end || end >= bytes.len() as u64 {
+                return Err(StorageError::InvalidMultipartUpload(
+                    "invalid copy source range".to_string(),
+                ));
+            }
+            bytes = bytes[start as usize..=end as usize].to_vec();
+        }
+        self.put_multipart_part(dst_bucket, dst_key, upload_id, part_number, &bytes, false)
+            .await
+    }
+
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -1045,6 +1271,14 @@ impl LocalObjectStore {
             ensure_file_exists(&staging_dir.join(&part_meta.file)).await?;
             parts.push(part_meta);
         }
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            if part.size < MIN_MULTIPART_PART_SIZE {
+                return Err(StorageError::EntityTooSmall(format!(
+                    "part {} is smaller than 5 MiB",
+                    part.number
+                )));
+            }
+        }
 
         let size = parts.iter().map(|p| p.size).sum();
         let etag = multipart_etag(&parts)?;
@@ -1059,6 +1293,9 @@ impl LocalObjectStore {
             last_modified_ms,
             content_type: upload.content_type.clone(),
             content_encoding: upload.content_encoding.clone(),
+            content_language: upload.content_language.clone(),
+            storage_class: upload.storage_class.clone(),
+            user_meta: upload.user_meta.clone(),
             parts: parts.clone(),
         };
         let publish_dir = prepare_multipart_publish_dir(&staging_dir, &parts, &object_meta).await?;
@@ -1116,24 +1353,57 @@ impl LocalObjectStore {
         dst_bucket: &str,
         dst_key: &str,
     ) -> Result<PutResult> {
+        self.copy_object_with_metadata(
+            src_bucket, src_key, dst_bucket, dst_key, None, None, None, None,
+        )
+        .await
+    }
+
+    pub async fn copy_object_with_metadata(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        storage_class: Option<&str>,
+        replacement_user_meta: Option<&BTreeMap<String, String>>,
+        replacement_content_type: Option<&str>,
+        replacement_content_language: Option<&str>,
+    ) -> Result<PutResult> {
         let src = self.read_object(src_bucket, src_key).await?;
         let mut bytes: Vec<u8> = Vec::with_capacity(src.meta.size as usize);
         for part in &src.meta.parts {
             let data = tokio::fs::read(src.object_dir.join(&part.file)).await?;
             bytes.extend_from_slice(&data);
         }
-        let content_type = src.meta.content_type.clone();
+        let content_type = replacement_content_type
+            .map(str::to_string)
+            .unwrap_or_else(|| src.meta.content_type.clone());
         let content_encoding = src.meta.content_encoding.clone();
+        let content_language = replacement_content_language
+            .map(str::to_string)
+            .or_else(|| src.meta.content_language.clone());
+        let copied_storage_class = storage_class
+            .map(str::to_string)
+            .unwrap_or_else(|| src.meta.storage_class.clone());
+        let user_meta = replacement_user_meta
+            .cloned()
+            .unwrap_or_else(|| src.meta.user_meta.clone());
         drop(src);
-        self.put_object(
-            dst_bucket,
-            dst_key,
-            &bytes,
-            Some(&content_type),
-            content_encoding.as_deref(),
-            false,
-        )
-        .await
+        let staging_id = self
+            .stage_put_with_metadata(
+                dst_bucket,
+                dst_key,
+                &bytes,
+                Some(&content_type),
+                content_encoding.as_deref(),
+                Some(&copied_storage_class),
+                content_language.as_deref(),
+                &user_meta,
+            )
+            .await?;
+        self.commit_staged_put(dst_bucket, dst_key, &staging_id)
+            .await
     }
 
     pub async fn list_parts(
@@ -1213,7 +1483,8 @@ impl LocalObjectStore {
         upload_id: &str,
     ) -> Result<UploadMeta> {
         self.ensure_bucket_and_key(bucket, key).await?;
-        validate_staging_id(upload_id)?;
+        validate_staging_id(upload_id)
+            .map_err(|_| StorageError::NoSuchUpload(upload_id.to_string()))?;
         let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
         let upload: UploadMeta = read_json(&staging_dir.join("upload.json"))
             .await
@@ -1532,6 +1803,49 @@ async fn has_active_staging(bucket_dir: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+async fn collect_object_versions_from_dir(
+    root: &Path,
+    prefix: &str,
+    is_latest: bool,
+    out: &mut Vec<ObjectVersionEntry>,
+) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        let mut has_meta = false;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some("meta.json") {
+                has_meta = true;
+            } else if path.is_dir() {
+                stack.push(path);
+            }
+        }
+        if !has_meta {
+            continue;
+        }
+        let Ok(meta) = read_json::<ObjectMeta>(&dir.join("meta.json")).await else {
+            continue;
+        };
+        if !meta.object_key.starts_with(prefix) {
+            continue;
+        }
+        let version_id = dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("null")
+            .to_string();
+        out.push(ObjectVersionEntry {
+            meta,
+            version_id,
+            is_latest,
+        });
+    }
+    Ok(())
 }
 
 async fn rebuild_walk(
@@ -2028,8 +2342,9 @@ mod tests {
             .initiate_multipart("bucket", "large.bin", None, None)
             .await
             .unwrap();
+        let first_part = vec![b'a'; MIN_MULTIPART_PART_SIZE as usize];
         let p1 = store
-            .put_multipart_part("bucket", "large.bin", &upload_id, 1, b"abc", false)
+            .put_multipart_part("bucket", "large.bin", &upload_id, 1, &first_part, false)
             .await
             .unwrap();
         let p3 = store
@@ -2054,7 +2369,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(completed.size, 7);
+        assert_eq!(completed.size, MIN_MULTIPART_PART_SIZE + 4);
         let read = store.read_object("bucket", "large.bin").await.unwrap();
         // Read bytes directly from the part files on disk.
         let mut bytes = Vec::new();
@@ -2065,8 +2380,48 @@ mod tests {
                     .unwrap(),
             );
         }
-        assert_eq!(bytes, b"abcdefg");
+        assert_eq!(bytes.len(), first_part.len() + 4);
+        assert!(bytes.starts_with(&first_part));
+        assert!(bytes.ends_with(b"defg"));
         assert_eq!(read.meta.parts.len(), 2);
         assert_eq!(read.meta.parts[1].number, 3);
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_rejects_small_non_final_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bucket").await.unwrap();
+        let upload_id = store
+            .initiate_multipart("bucket", "large.bin", None, None)
+            .await
+            .unwrap();
+        let p1 = store
+            .put_multipart_part("bucket", "large.bin", &upload_id, 1, b"abc", false)
+            .await
+            .unwrap();
+        let p2 = store
+            .put_multipart_part("bucket", "large.bin", &upload_id, 2, b"def", false)
+            .await
+            .unwrap();
+        let err = store
+            .complete_multipart(
+                "bucket",
+                "large.bin",
+                &upload_id,
+                &[
+                    CompletePartRequest {
+                        number: 1,
+                        etag: p1.etag,
+                    },
+                    CompletePartRequest {
+                        number: 2,
+                        etag: p2.etag,
+                    },
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::EntityTooSmall(_)));
     }
 }

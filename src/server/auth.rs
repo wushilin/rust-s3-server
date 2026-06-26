@@ -11,14 +11,17 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use super::config::AppConfig;
 use super::xml::{error_xml, S3ErrorXml};
 
 type HmacSha256 = Hmac<Sha256>;
+type HmacSha1 = Hmac<Sha1>;
 
 // ─── Public middleware ────────────────────────────────────────────────────────
 
@@ -41,10 +44,32 @@ pub async fn auth_middleware(
 // ─── Core validator ───────────────────────────────────────────────────────────
 
 fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &'static str> {
+    if matches!(
+        request.uri().path(),
+        "/minio/health/live" | "/minio/health/ready"
+    ) || request.uri().path().starts_with("/minio/v2/metrics/")
+        || request.uri().path() == "/minio/prometheus/metrics"
+    {
+        return Ok(());
+    }
+    if request.method() == axum::http::Method::POST
+        && request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.starts_with("multipart/form-data"))
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
     let uri_str = request.uri().to_string();
 
     if uri_str.contains("X-Amz-Signature=") {
         return validate_presigned(config, request);
+    }
+    if uri_str.contains("AWSAccessKeyId=") && uri_str.contains("Signature=") {
+        return validate_signature_v2_query(config, request);
     }
 
     let auth = request
@@ -52,6 +77,10 @@ fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .ok_or("Missing Authorization header")?;
+
+    if let Some(v2) = auth.strip_prefix("AWS ") {
+        return validate_signature_v2(config, request, v2);
+    }
 
     if !auth.starts_with("AWS4-HMAC-SHA256 ") {
         return Err("Unsupported auth scheme");
@@ -87,6 +116,186 @@ fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &
         return Err("Signature does not match");
     }
     Ok(())
+}
+
+fn validate_signature_v2(
+    config: &AppConfig,
+    request: &Request<Body>,
+    value: &str,
+) -> Result<(), &'static str> {
+    let (access_key, signature) = value
+        .split_once(':')
+        .ok_or("Malformed Authorization header")?;
+    let secret = config.find_secret(access_key).ok_or("Unknown access key")?;
+    let string_to_sign = signature_v2_string_to_sign(request);
+    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(string_to_sign.as_bytes());
+    let expected = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+    if !constant_time_eq(&expected, signature) {
+        return Err("Signature does not match");
+    }
+    Ok(())
+}
+
+fn validate_signature_v2_query(
+    config: &AppConfig,
+    request: &Request<Body>,
+) -> Result<(), &'static str> {
+    let query = request.uri().query().ok_or("Missing query string")?;
+    let access_key = query_param(query, "AWSAccessKeyId").ok_or("Missing AWSAccessKeyId")?;
+    let signature = query_param(query, "Signature").ok_or("Missing Signature")?;
+    let expires = query_param(query, "Expires").ok_or("Missing Expires")?;
+    let expires_epoch = expires
+        .parse::<i64>()
+        .map_err(|_| "Invalid Expires value")?;
+    if Utc::now().timestamp() > expires_epoch {
+        return Err("Presigned URL expired");
+    }
+    let secret = config
+        .find_secret(&access_key)
+        .ok_or("Unknown access key")?;
+    let string_to_sign = signature_v2_query_string_to_sign(request, &expires);
+    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(string_to_sign.as_bytes());
+    let expected = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+    if !constant_time_eq(&expected, &signature) {
+        return Err("Signature does not match");
+    }
+    Ok(())
+}
+
+fn signature_v2_string_to_sign(request: &Request<Body>) -> String {
+    let headers = request.headers();
+    let content_md5 = header_str(headers, "content-md5").unwrap_or("");
+    let content_type = header_str(headers, "content-type").unwrap_or("");
+    let date = if headers.contains_key("x-amz-date") {
+        ""
+    } else {
+        header_str(headers, "date").unwrap_or("")
+    };
+    let amz_headers = canonicalized_amz_headers(headers);
+    let resource = canonicalized_resource(request);
+    format!(
+        "{}\n{}\n{}\n{}\n{}{}",
+        request.method().as_str(),
+        content_md5,
+        content_type,
+        date,
+        amz_headers,
+        resource
+    )
+}
+
+fn signature_v2_query_string_to_sign(request: &Request<Body>, expires: &str) -> String {
+    let headers = request.headers();
+    let content_md5 = header_str(headers, "content-md5").unwrap_or("");
+    let content_type = header_str(headers, "content-type").unwrap_or("");
+    let amz_headers = canonicalized_amz_headers(headers);
+    let resource = canonicalized_resource(request);
+    format!(
+        "{}\n{}\n{}\n{}\n{}{}",
+        request.method().as_str(),
+        content_md5,
+        content_type,
+        expires,
+        amz_headers,
+        resource
+    )
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn canonicalized_amz_headers(headers: &HeaderMap) -> String {
+    let mut pairs = Vec::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        if !name.starts_with("x-amz-") {
+            continue;
+        }
+        let value = value
+            .to_str()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        pairs.push((name, value));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect()
+}
+
+fn canonicalized_resource(request: &Request<Body>) -> String {
+    const SUBRESOURCES: &[&str] = &[
+        "acl",
+        "cors",
+        "delete",
+        "lifecycle",
+        "location",
+        "logging",
+        "notification",
+        "partNumber",
+        "policy",
+        "requestPayment",
+        "response-cache-control",
+        "response-content-disposition",
+        "response-content-encoding",
+        "response-content-language",
+        "response-content-type",
+        "response-expires",
+        "tagging",
+        "torrent",
+        "uploadId",
+        "uploads",
+        "versionId",
+        "versioning",
+        "versions",
+        "website",
+    ];
+    let mut resource = request.uri().path().to_string();
+    let Some(query) = request.uri().query() else {
+        return resource;
+    };
+    let mut params = query
+        .split('&')
+        .filter_map(|part| {
+            let mut it = part.splitn(2, '=');
+            let key_raw = it.next()?;
+            let key = percent_decode(key_raw);
+            if !SUBRESOURCES.contains(&key.as_str()) {
+                return None;
+            }
+            let value = it.next().map(percent_decode).unwrap_or_default();
+            Some((key, value, part.contains('=')))
+        })
+        .collect::<Vec<_>>();
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    if !params.is_empty() {
+        resource.push('?');
+        resource.push_str(
+            &params
+                .into_iter()
+                .map(|(k, v, had_eq)| if had_eq { format!("{k}={v}") } else { k })
+                .collect::<Vec<_>>()
+                .join("&"),
+        );
+    }
+    resource
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if percent_decode(key) == name {
+            Some(percent_decode(value))
+        } else {
+            None
+        }
+    })
 }
 
 // ─── Pre-signed URL full SigV4 validation ────────────────────────────────────
@@ -169,13 +378,22 @@ fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(),
             }
         });
     let headers_for_canon = host_override.as_ref().unwrap_or_else(|| request.headers());
+    for signed_header in &signed_headers {
+        if signed_header.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if !headers_for_canon.contains_key(signed_header.as_str()) {
+            return Err("Signed header is missing");
+        }
+    }
     let (canonical_hdrs, signed_hdrs_str) = canonical_headers(headers_for_canon, &signed_headers);
 
     // ── Build canonical request ────────────────────────────────────────────
     let method = request.method().as_str();
     let uri = canonical_uri(request.uri().path());
+    let payload_hash = presigned_payload_hash(request.headers(), &signed_headers);
     let canonical = format!(
-        "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\n{signed_hdrs_str}\nUNSIGNED-PAYLOAD"
+        "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\n{signed_hdrs_str}\n{payload_hash}"
     );
 
     let string_to_sign = build_string_to_sign(date_time_str, &credential_scope, &canonical);
@@ -186,6 +404,20 @@ fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(),
         return Err("Presigned signature does not match");
     }
     Ok(())
+}
+
+fn presigned_payload_hash(headers: &HeaderMap, signed_headers: &[String]) -> String {
+    if signed_headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("x-amz-content-sha256"))
+    {
+        return headers
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("UNSIGNED-PAYLOAD")
+            .to_string();
+    }
+    "UNSIGNED-PAYLOAD".to_string()
 }
 
 /// Builds the canonical query string for a presigned URL (excludes `X-Amz-Signature`).
@@ -233,6 +465,26 @@ fn decode(s: &str) -> String {
     urlencoding::decode(s)
         .unwrap_or_else(|_| s.into())
         .into_owned()
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 // ─── Canonical request construction ──────────────────────────────────────────
@@ -363,7 +615,8 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuth> {
     let mut signed_headers = None;
     let mut signature = None;
 
-    for part in body.split(", ") {
+    for part in body.split(',') {
+        let part = part.trim();
         if let Some(v) = part.strip_prefix("Credential=") {
             credential = Some(v.trim());
         } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
@@ -502,6 +755,89 @@ pub(crate) fn presign_query(
     format!("{canonical_query}&X-Amz-Signature={signature}")
 }
 
+#[cfg(test)]
+pub(crate) fn presign_query_with_signed_headers(
+    method: &str,
+    path: &str,
+    _host: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    datetime: &str,
+    expires_secs: u64,
+    signed_headers: &[(&str, &str)],
+) -> String {
+    let date = &datetime[..8];
+    let credential_scope = format!("{date}/{region}/s3/aws4_request");
+    let credential = format!("{access_key}/{credential_scope}");
+    let signed_names = signed_headers
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let signed_header_string = signed_names.join(";");
+    let mut params: Vec<(&str, String)> = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", credential),
+        ("X-Amz-Date", datetime.to_string()),
+        ("X-Amz-Expires", expires_secs.to_string()),
+        ("X-Amz-SignedHeaders", signed_header_string.clone()),
+    ];
+
+    let mut encoded: Vec<(String, String)> = params
+        .iter_mut()
+        .map(|(k, v)| {
+            (
+                urlencoding::encode(k).into_owned(),
+                urlencoding::encode(v).into_owned(),
+            )
+        })
+        .collect();
+    encoded.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let canonical_query = encoded
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let mut canonical_headers = signed_headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_ascii_lowercase(),
+                value.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        })
+        .collect::<Vec<_>>();
+    canonical_headers.sort_by(|a, b| a.0.cmp(&b.0));
+    let canonical_hdrs = canonical_headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect::<String>();
+    let payload_hash = canonical_headers
+        .iter()
+        .find(|(name, _)| name == "x-amz-content-sha256")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("UNSIGNED-PAYLOAD");
+
+    let uri: String = path
+        .split('/')
+        .map(|seg| {
+            urlencoding::encode(&urlencoding::decode(seg).unwrap_or_else(|_| seg.into()))
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let canonical = format!(
+        "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\n{signed_header_string}\n{payload_hash}"
+    );
+    let string_to_sign = build_string_to_sign(datetime, &credential_scope, &canonical);
+    let signing_key = derive_signing_key(secret_key, date, region, "s3");
+    let signature = hex_hmac(&signing_key, string_to_sign.as_bytes());
+
+    format!("{canonical_query}&X-Amz-Signature={signature}")
+}
+
 /// Generates an `Authorization` header value for a regular SigV4 request (test helper).
 ///
 /// Signs `host` and `x-amz-date` with `UNSIGNED-PAYLOAD` as the payload hash.
@@ -595,12 +931,97 @@ mod tests {
 
     #[test]
     fn parse_auth_header_extracts_fields() {
-        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123";
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-date,Signature=abc123";
         let parsed = parse_auth_header(header).unwrap();
         assert_eq!(parsed.access_key, "AKID");
         assert_eq!(parsed.region, "us-east-1");
         assert_eq!(parsed.signature, "abc123");
         assert_eq!(parsed.signed_headers, vec!["host", "x-amz-date"]);
+    }
+
+    #[test]
+    fn signature_v2_auth_header_is_accepted() {
+        let mut config = AppConfig::default();
+        config.auth.enabled = true;
+        config
+            .auth
+            .credentials
+            .push(super::super::config::Credential {
+                access_key: "AKID".to_string(),
+                secret_key: "secret".to_string(),
+            });
+        let unsigned = Request::builder()
+            .method("PUT")
+            .uri("/bucket")
+            .header("date", "Tue, 27 Mar 2007 19:36:42 +0000")
+            .body(Body::empty())
+            .unwrap();
+        let string_to_sign = signature_v2_string_to_sign(&unsigned);
+        let mut mac = HmacSha1::new_from_slice(b"secret").unwrap();
+        mac.update(string_to_sign.as_bytes());
+        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket")
+            .header("date", "Tue, 27 Mar 2007 19:36:42 +0000")
+            .header("authorization", format!("AWS AKID:{signature}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(validate_request(&config, &request), Ok(()));
+    }
+
+    #[test]
+    fn signature_v2_query_auth_is_accepted() {
+        let mut config = AppConfig::default();
+        config.auth.enabled = true;
+        config
+            .auth
+            .credentials
+            .push(super::super::config::Credential {
+                access_key: "AKID".to_string(),
+                secret_key: "secret".to_string(),
+            });
+        let expires = "4102444800";
+        let unsigned = Request::builder()
+            .method("GET")
+            .uri(format!("/bucket/key?AWSAccessKeyId=AKID&Expires={expires}"))
+            .body(Body::empty())
+            .unwrap();
+        let string_to_sign = signature_v2_query_string_to_sign(&unsigned, expires);
+        let mut mac = HmacSha1::new_from_slice(b"secret").unwrap();
+        mac.update(string_to_sign.as_bytes());
+        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/bucket/key?AWSAccessKeyId=AKID&Expires={expires}&Signature={}",
+                urlencoding::encode(&signature)
+            ))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(validate_request(&config, &request), Ok(()));
+    }
+
+    #[test]
+    fn minio_health_and_metrics_paths_bypass_auth() {
+        let mut config = AppConfig::default();
+        config.auth.enabled = true;
+        for path in [
+            "/minio/health/live",
+            "/minio/health/ready",
+            "/minio/v2/metrics/cluster",
+            "/minio/v2/metrics/node",
+            "/minio/v2/metrics/bucket",
+            "/minio/v2/metrics/resource",
+            "/minio/prometheus/metrics",
+        ] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(validate_request(&config, &request), Ok(()), "{path}");
+        }
     }
 
     #[test]

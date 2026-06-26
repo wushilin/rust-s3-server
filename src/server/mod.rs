@@ -9,7 +9,7 @@ pub mod logging;
 pub mod range;
 pub mod xml;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::Path as FsPath;
@@ -19,8 +19,8 @@ use std::sync::{
 };
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -33,16 +33,19 @@ use self::config::AppConfig;
 use self::range::{parse_range_header, RangeSelection};
 use self::xml::{
     complete_multipart_xml, copy_object_xml, delete_objects_xml, error_xml, initiate_multipart_xml,
-    list_buckets_xml, list_multipart_uploads_xml, list_objects_v1_xml, list_objects_v2_xml,
-    list_parts_xml, BucketListEntry, DeleteObjectResult, S3ErrorXml,
+    list_buckets_xml, list_multipart_uploads_xml, list_object_versions_xml, list_objects_v1_xml,
+    list_objects_v2_xml, list_parts_xml, upload_part_copy_xml, BucketListEntry, DeleteObjectResult,
+    S3ErrorXml,
 };
 use crate::storage::errors::StorageError;
+use crate::storage::metadata::is_valid_storage_class;
 use crate::storage::metadata::quote_etag;
 use crate::storage::store::{CompletePartRequest, LocalObjectStore};
 use crate::storage::sweeper::{sweep_bucket, SweepConfig};
 use crate::storage::time::{http_date_ms, parse_http_date_ms};
 
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+const MAX_USER_META_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PartReadSegment {
@@ -154,6 +157,13 @@ fn router_with_metrics(
     metrics: Arc<TrafficMetrics>,
 ) -> Router {
     Router::new()
+        .route("/minio/health/live", get(health_live))
+        .route("/minio/health/ready", get(health_live))
+        .route("/minio/v2/metrics/cluster", get(metrics_endpoint))
+        .route("/minio/v2/metrics/node", get(metrics_endpoint))
+        .route("/minio/v2/metrics/bucket", get(metrics_endpoint))
+        .route("/minio/v2/metrics/resource", get(metrics_endpoint))
+        .route("/minio/prometheus/metrics", get(metrics_endpoint))
         .route("/", get(list_buckets))
         .route("/:bucket", any(bucket_route))
         .route("/:bucket/", any(bucket_route))
@@ -169,6 +179,20 @@ fn router_with_metrics(
         .layer(middleware::from_fn(log_middleware))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
         .with_state(store)
+}
+
+async fn health_live() -> Response {
+    empty_response(StatusCode::OK)
+}
+
+async fn metrics_endpoint() -> Response {
+    let body = "# HELP rusts3_up RustS3 compatibility metrics endpoint\n# TYPE rusts3_up gauge\nrusts3_up 1\n";
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    response
 }
 
 // ─── Logging middleware ───────────────────────────────────────────────────────
@@ -504,10 +528,12 @@ async fn list_buckets(State(store): State<LocalObjectStore>) -> Response {
 async fn bucket_route(
     State(store): State<LocalObjectStore>,
     Path(bucket): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
     method: Method,
     body: Body,
 ) -> Response {
+    let query = parse_s3_query(raw_query.as_deref().unwrap_or(""));
     match method {
         Method::HEAD => {
             if store.bucket_exists(&bucket).await {
@@ -558,6 +584,19 @@ async fn bucket_route(
                         return xml_response(
                             StatusCode::OK,
                             list_multipart_uploads_xml(&bucket, &uploads),
+                        )
+                    }
+                    Err(err) => return storage_error_response(err, &format!("/{bucket}")),
+                }
+            }
+            if query.contains_key("versions") {
+                let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+                let encoding_type = query.get("encoding-type").map(String::as_str);
+                match store.list_object_versions(&bucket, prefix).await {
+                    Ok(versions) => {
+                        return xml_response(
+                            StatusCode::OK,
+                            list_object_versions_xml(&bucket, prefix, encoding_type, &versions),
                         )
                     }
                     Err(err) => return storage_error_response(err, &format!("/{bucket}")),
@@ -617,6 +656,8 @@ async fn bucket_route(
                         &format!("/{bucket}"),
                     )
                 }
+            } else if is_multipart_form(&headers) {
+                browser_post_object(store, bucket, headers, body).await
             } else {
                 s3_error(
                     StatusCode::NOT_IMPLEMENTED,
@@ -638,11 +679,12 @@ async fn bucket_route(
 async fn object_route(
     State(store): State<LocalObjectStore>,
     Path((bucket, key)): Path<(String, String)>,
-    Query(query): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     method: Method,
     body: Body,
 ) -> Response {
+    let query = parse_s3_query(raw_query.as_deref().unwrap_or(""));
     match method {
         Method::PUT => {
             if let (Some(upload_id), Some(part_number)) =
@@ -659,6 +701,52 @@ async fn object_route(
                         )
                     }
                 };
+                if let Some(copy_source) = headers
+                    .get("x-amz-copy-source")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+                {
+                    let (src_bucket, src_key) = match parse_copy_source(&copy_source) {
+                        Some(v) => v,
+                        None => {
+                            return s3_error(
+                                StatusCode::BAD_REQUEST,
+                                "InvalidArgument",
+                                "Invalid x-amz-copy-source",
+                                &format!("/{bucket}/{key}"),
+                            )
+                        }
+                    };
+                    let range = match parse_copy_source_range(&headers) {
+                        Ok(range) => range,
+                        Err(message) => {
+                            return s3_error(
+                                StatusCode::BAD_REQUEST,
+                                "InvalidArgument",
+                                message,
+                                &format!("/{bucket}/{key}"),
+                            )
+                        }
+                    };
+                    return match store
+                        .copy_multipart_part(
+                            &bucket,
+                            &key,
+                            upload_id,
+                            part_number,
+                            &src_bucket,
+                            &src_key,
+                            range,
+                        )
+                        .await
+                    {
+                        Ok(result) => xml_response(
+                            StatusCode::OK,
+                            upload_part_copy_xml(&result.etag, result.last_modified_ms),
+                        ),
+                        Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
+                    };
+                }
                 let aws_chunked = is_aws_chunked(&headers);
                 let expected_sha256 = expected_payload_sha256(&headers, aws_chunked);
                 match store
@@ -692,8 +780,76 @@ async fn object_route(
                         )
                     }
                 };
+                let storage_class = storage_class_header(&headers);
+                if let Some(resp) =
+                    reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}"))
+                {
+                    return resp;
+                }
+                let replace_metadata = headers
+                    .get("x-amz-metadata-directive")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.eq_ignore_ascii_case("REPLACE"))
+                    .unwrap_or(false);
+                let user_meta = if replace_metadata {
+                    match extract_user_meta(&headers) {
+                        Ok(meta) => Some(meta),
+                        Err(message) => {
+                            return s3_error(
+                                StatusCode::BAD_REQUEST,
+                                "InvalidArgument",
+                                message,
+                                &format!("/{bucket}/{key}"),
+                            )
+                        }
+                    }
+                } else {
+                    None
+                };
+                let replacement_content_type = if replace_metadata {
+                    headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                } else {
+                    None
+                };
+                let replacement_content_language = if replace_metadata {
+                    headers
+                        .get(header::CONTENT_LANGUAGE)
+                        .and_then(|v| v.to_str().ok())
+                } else {
+                    None
+                };
+                let src_object = match store.read_object(&src_bucket, &src_key).await {
+                    Ok(object) => object,
+                    Err(err) => {
+                        return storage_error_response(err, &format!("/{src_bucket}/{src_key}"))
+                    }
+                };
+                if !copy_source_preconditions_match(
+                    &headers,
+                    &src_object.meta.etag,
+                    src_object.meta.last_modified_ms,
+                ) {
+                    return s3_error(
+                        StatusCode::PRECONDITION_FAILED,
+                        "PreconditionFailed",
+                        "At least one of the preconditions you specified did not hold",
+                        &format!("/{src_bucket}/{src_key}"),
+                    );
+                }
+                drop(src_object);
                 match store
-                    .copy_object(&src_bucket, &src_key, &bucket, &key)
+                    .copy_object_with_metadata(
+                        &src_bucket,
+                        &src_key,
+                        &bucket,
+                        &key,
+                        storage_class,
+                        user_meta.as_ref(),
+                        replacement_content_type,
+                        replacement_content_language,
+                    )
                     .await
                 {
                     Ok(result) => xml_response(
@@ -708,14 +864,37 @@ async fn object_route(
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok());
                 let content_encoding = object_content_encoding(&headers);
+                let content_language = headers
+                    .get(header::CONTENT_LANGUAGE)
+                    .and_then(|v| v.to_str().ok());
+                let storage_class = storage_class_header(&headers);
+                if let Some(resp) =
+                    reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}"))
+                {
+                    return resp;
+                }
+                let user_meta = match extract_user_meta(&headers) {
+                    Ok(meta) => meta,
+                    Err(message) => {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidArgument",
+                            message,
+                            &format!("/{bucket}/{key}"),
+                        )
+                    }
+                };
                 let expected_sha256 = expected_payload_sha256(&headers, aws_chunked);
                 match store
-                    .put_object_stream(
+                    .put_object_stream_with_metadata(
                         &bucket,
                         &key,
                         body.into_data_stream(),
                         content_type,
                         content_encoding.as_deref(),
+                        storage_class,
+                        content_language,
+                        &user_meta,
                         aws_chunked,
                         expected_sha256.as_deref(),
                     )
@@ -736,11 +915,14 @@ async fn object_route(
                 Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
             }
         }
-        Method::GET | Method::HEAD => get_or_head_object(store, bucket, key, headers, method).await,
+        Method::GET | Method::HEAD => {
+            get_or_head_object(store, bucket, key, query, headers, method).await
+        }
         Method::DELETE => {
             if let Some(upload_id) = query.get("uploadId") {
                 match store.abort_multipart(&bucket, &key, upload_id).await {
                     Ok(()) => empty_response(StatusCode::NO_CONTENT),
+                    Err(StorageError::NoSuchUpload(_)) => empty_response(StatusCode::NO_CONTENT),
                     Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
                 }
             } else {
@@ -756,8 +938,36 @@ async fn object_route(
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok());
                 let content_encoding = object_content_encoding(&headers);
+                let content_language = headers
+                    .get(header::CONTENT_LANGUAGE)
+                    .and_then(|v| v.to_str().ok());
+                let storage_class = storage_class_header(&headers);
+                if let Some(resp) =
+                    reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}"))
+                {
+                    return resp;
+                }
+                let user_meta = match extract_user_meta(&headers) {
+                    Ok(meta) => meta,
+                    Err(message) => {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidArgument",
+                            message,
+                            &format!("/{bucket}/{key}"),
+                        )
+                    }
+                };
                 match store
-                    .initiate_multipart(&bucket, &key, content_type, content_encoding.as_deref())
+                    .initiate_multipart_with_metadata(
+                        &bucket,
+                        &key,
+                        content_type,
+                        content_encoding.as_deref(),
+                        storage_class,
+                        content_language,
+                        &user_meta,
+                    )
                     .await
                 {
                     Ok(upload_id) => xml_response(
@@ -830,12 +1040,25 @@ async fn list_objects_response(
     query: HashMap<String, String>,
 ) -> Response {
     let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
-    let delimiter = query.get("delimiter").map(String::as_str);
-    let max_keys = query
-        .get("max-keys")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1000)
-        .min(1000);
+    let delimiter = query
+        .get("delimiter")
+        .map(String::as_str)
+        .filter(|v| !v.is_empty());
+    let encoding_type = query.get("encoding-type").map(String::as_str);
+    let max_keys = match query.get("max-keys") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) => value.min(1000),
+            Err(_) => {
+                return s3_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Invalid max-keys",
+                    &format!("/{bucket}"),
+                )
+            }
+        },
+        None => 1000,
+    };
 
     // ListObjectsV2 is identified by list-type=2, or by the use of v2-only params.
     // ListObjectsV1 uses `marker`; without any of these the SDK is calling v1.
@@ -870,6 +1093,7 @@ async fn list_objects_response(
                     delimiter,
                     query.get("continuation-token").map(String::as_str),
                     query.get("start-after").map(String::as_str),
+                    encoding_type,
                     max_keys,
                     &page,
                 )
@@ -879,6 +1103,7 @@ async fn list_objects_response(
                     prefix,
                     delimiter,
                     query.get("marker").map(String::as_str),
+                    encoding_type,
                     max_keys,
                     &page,
                 )
@@ -889,10 +1114,249 @@ async fn list_objects_response(
     }
 }
 
+async fn browser_post_object(
+    store: LocalObjectStore,
+    bucket: String,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let boundary = match multipart_boundary(&headers) {
+        Some(v) => v,
+        None => {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "Missing multipart boundary",
+                &format!("/{bucket}"),
+            )
+        }
+    };
+    let raw = match to_bytes(body, 128 * 1024 * 1024).await {
+        Ok(v) => v,
+        Err(err) => {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                err.to_string(),
+                &format!("/{bucket}"),
+            )
+        }
+    };
+    let form = match parse_multipart_form(&raw, &boundary) {
+        Ok(v) => v,
+        Err(message) => {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "MalformedPOSTRequest",
+                message,
+                &format!("/{bucket}"),
+            )
+        }
+    };
+    let key = match form.fields.get("key").filter(|v| !v.is_empty()) {
+        Some(v) => v.clone(),
+        None => {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "Missing form key field",
+                &format!("/{bucket}"),
+            )
+        }
+    };
+    let file = match form.file {
+        Some(v) => v,
+        None => {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "Missing form file field",
+                &format!("/{bucket}"),
+            )
+        }
+    };
+    let mut user_meta = BTreeMap::new();
+    for (name, value) in &form.fields {
+        if let Some(key) = name.strip_prefix("x-amz-meta-") {
+            user_meta.insert(key.to_ascii_lowercase(), value.clone());
+        }
+    }
+    let storage_class = form.fields.get("x-amz-storage-class").map(String::as_str);
+    if let Some(resp) = reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}")) {
+        return resp;
+    }
+    let content_type = file
+        .content_type
+        .as_deref()
+        .or_else(|| form.fields.get("Content-Type").map(String::as_str))
+        .or_else(|| form.fields.get("content-type").map(String::as_str));
+    let content_language = form
+        .fields
+        .get("Content-Language")
+        .or_else(|| form.fields.get("content-language"))
+        .map(String::as_str);
+    let staging_id = match store
+        .stage_put_with_metadata(
+            &bucket,
+            &key,
+            &file.bytes,
+            content_type,
+            None,
+            storage_class,
+            content_language,
+            &user_meta,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => return storage_error_response(err, &format!("/{bucket}/{key}")),
+    };
+    match store.commit_staged_put(&bucket, &key, &staging_id).await {
+        Ok(result) => {
+            let location = format!("/{bucket}/{key}");
+            xml_response(
+                StatusCode::CREATED,
+                post_object_xml(&location, &bucket, &key, &result.etag),
+            )
+        }
+        Err(err) => storage_error_response(err, &format!("/{bucket}/{key}")),
+    }
+}
+
+#[derive(Debug)]
+struct MultipartForm {
+    fields: BTreeMap<String, String>,
+    file: Option<FormFile>,
+}
+
+#[derive(Debug)]
+struct FormFile {
+    content_type: Option<String>,
+    bytes: Vec<u8>,
+}
+
+fn is_multipart_form(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("multipart/form-data"))
+        .unwrap_or(false)
+}
+
+fn multipart_boundary(headers: &HeaderMap) -> Option<String> {
+    let content_type = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
+    content_type.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("boundary=")
+            .map(|v| v.trim_matches('"').to_string())
+    })
+}
+
+fn parse_multipart_form(raw: &[u8], boundary: &str) -> Result<MultipartForm, &'static str> {
+    let marker = format!("--{boundary}").into_bytes();
+    let mut fields = BTreeMap::new();
+    let mut file = None;
+    for mut part in split_bytes(raw, &marker).into_iter().skip(1) {
+        part = trim_prefix_bytes(part, b"\r\n");
+        if part.starts_with(b"--") {
+            break;
+        }
+        let Some(header_end) = find_bytes(part, b"\r\n\r\n") else {
+            continue;
+        };
+        let headers_raw = &part[..header_end];
+        let mut body_raw = &part[header_end + 4..];
+        body_raw = trim_suffix_bytes(body_raw, b"\r\n");
+        let mut name = None;
+        let mut filename = None;
+        let mut content_type = None;
+        let headers_text =
+            std::str::from_utf8(headers_raw).map_err(|_| "Multipart headers are not UTF-8")?;
+        for line in headers_text.split("\r\n") {
+            let Some((header_name, header_value)) = line.split_once(':') else {
+                continue;
+            };
+            if header_name.eq_ignore_ascii_case("content-disposition") {
+                for attr in header_value.split(';').map(str::trim) {
+                    if let Some(v) = attr.strip_prefix("name=") {
+                        name = Some(v.trim_matches('"').to_string());
+                    } else if let Some(v) = attr.strip_prefix("filename=") {
+                        filename = Some(v.trim_matches('"').to_string());
+                    }
+                }
+            } else if header_name.eq_ignore_ascii_case("content-type") {
+                content_type = Some(header_value.trim().to_string());
+            }
+        }
+        let Some(name) = name else {
+            continue;
+        };
+        if filename.is_some() || name == "file" {
+            file = Some(FormFile {
+                content_type,
+                bytes: body_raw.to_vec(),
+            });
+        } else {
+            fields.insert(
+                name,
+                String::from_utf8(body_raw.to_vec())
+                    .map_err(|_| "Multipart form field is not UTF-8")?,
+            );
+        }
+    }
+    Ok(MultipartForm { fields, file })
+}
+
+fn split_bytes<'a>(haystack: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while let Some(pos) = find_bytes(&haystack[start..], needle) {
+        parts.push(&haystack[start..start + pos]);
+        start += pos + needle.len();
+    }
+    parts.push(&haystack[start..]);
+    parts
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn trim_prefix_bytes<'a>(value: &'a [u8], prefix: &[u8]) -> &'a [u8] {
+    value.strip_prefix(prefix).unwrap_or(value)
+}
+
+fn trim_suffix_bytes<'a>(value: &'a [u8], suffix: &[u8]) -> &'a [u8] {
+    value.strip_suffix(suffix).unwrap_or(value)
+}
+
+fn post_object_xml(location: &str, bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><PostResponse><Location>{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></PostResponse>"#,
+        escape_xml_local(location),
+        escape_xml_local(bucket),
+        escape_xml_local(key),
+        escape_xml_local(&quote_etag(etag)),
+    )
+}
+
+fn escape_xml_local(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 async fn get_or_head_object(
     store: LocalObjectStore,
     bucket: String,
     key: String,
+    query: HashMap<String, String>,
     headers: HeaderMap,
     method: Method,
 ) -> Response {
@@ -960,8 +1424,14 @@ async fn get_or_head_object(
 
     // Extract header values before consuming object fields.
     let etag = etag_quoted;
-    let content_type = object.meta.content_type.clone();
+    let content_type = query
+        .get("response-content-type")
+        .cloned()
+        .unwrap_or_else(|| object.meta.content_type.clone());
     let content_encoding = object.meta.content_encoding.clone();
+    let content_language = object.meta.content_language.clone();
+    let storage_class = object.meta.storage_class.clone();
+    let user_meta = object.meta.user_meta.clone();
     let last_modified = http_date_ms(object.meta.last_modified_ms);
 
     let mut builder = Response::builder()
@@ -971,9 +1441,33 @@ async fn get_or_head_object(
         .header(header::CONTENT_LENGTH, range_len.to_string())
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::LAST_MODIFIED, last_modified)
+        .header("x-amz-storage-class", storage_class)
         .header("x-amz-request-id", "rust-s3-server");
     if let Some(content_encoding) = content_encoding {
         builder = builder.header(header::CONTENT_ENCODING, content_encoding);
+    }
+    if let Some(content_language) = content_language {
+        builder = builder.header(header::CONTENT_LANGUAGE, content_language);
+    }
+    if let Some(value) = query.get("response-content-language") {
+        builder = builder.header(header::CONTENT_LANGUAGE, value);
+    }
+    if let Some(value) = query.get("response-cache-control") {
+        builder = builder.header(header::CACHE_CONTROL, value);
+    }
+    if let Some(value) = query.get("response-content-disposition") {
+        builder = builder.header(header::CONTENT_DISPOSITION, value);
+    }
+    if let Some(value) = query.get("response-content-encoding") {
+        builder = builder.header(header::CONTENT_ENCODING, value);
+    }
+    if let Some(value) = query.get("response-expires") {
+        builder = builder.header(header::EXPIRES, value);
+    }
+    for (key, value) in user_meta {
+        if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{key}").as_bytes()) {
+            builder = builder.header(header_name, value);
+        }
     }
     if let Some(cr) = content_range {
         builder = builder.header(header::CONTENT_RANGE, cr);
@@ -1081,22 +1575,29 @@ async fn stream_object_range(
         }
     }
 
-    // Pipe all segments through a duplex channel so axum sees one Body stream.
+    let mut open_segments = Vec::with_capacity(segments.len());
+    for (path, skip, take) in segments {
+        let mut file = tokio::fs::File::open(&path).await.map_err(|err| {
+            StorageError::CorruptObject(format!("failed to open {}: {err}", path.display()))
+        })?;
+        if skip > 0 {
+            file.seek(SeekFrom::Start(skip)).await.map_err(|_| {
+                StorageError::CorruptObject(format!("failed to seek {}", path.display()))
+            })?;
+        }
+        open_segments.push((file, take));
+    }
+
+    // Pipe all pre-opened segments through a duplex channel so axum sees one
+    // Body stream. Opening every touched part before returning the response
+    // keeps this read stable if the object directory is later moved to trash.
     let (mut writer, reader) = tokio::io::duplex(STREAM_CHUNK_SIZE);
     tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        for (path, skip, take) in segments {
-            match tokio::fs::File::open(&path).await {
-                Ok(mut file) => {
-                    if skip > 0 && file.seek(SeekFrom::Start(skip)).await.is_err() {
-                        return;
-                    }
-                    let mut limited = file.take(take);
-                    if tokio::io::copy(&mut limited, &mut writer).await.is_err() {
-                        return; // reader dropped (client disconnected)
-                    }
-                }
-                Err(_) => return,
+        use tokio::io::AsyncReadExt;
+        for (file, take) in open_segments {
+            let mut limited = file.take(take);
+            if tokio::io::copy(&mut limited, &mut writer).await.is_err() {
+                return; // reader dropped (client disconnected)
             }
         }
     });
@@ -1247,6 +1748,87 @@ fn parse_copy_source(raw: &str) -> Option<(String, String)> {
     Some((bucket, key))
 }
 
+fn parse_copy_source_range(headers: &HeaderMap) -> Result<Option<(u64, u64)>, &'static str> {
+    let Some(value) = headers
+        .get("x-amz-copy-source-range")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let Some(range) = value.strip_prefix("bytes=") else {
+        return Err("Invalid x-amz-copy-source-range");
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return Err("Invalid x-amz-copy-source-range");
+    };
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| "Invalid x-amz-copy-source-range")?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| "Invalid x-amz-copy-source-range")?;
+    if start > end {
+        return Err("Invalid x-amz-copy-source-range");
+    }
+    Ok(Some((start, end)))
+}
+
+fn copy_source_preconditions_match(
+    headers: &HeaderMap,
+    source_etag: &str,
+    source_last_modified_ms: i64,
+) -> bool {
+    if let Some(value) = headers
+        .get("x-amz-copy-source-if-match")
+        .and_then(|v| v.to_str().ok())
+    {
+        if !etag_condition_contains(value, source_etag) {
+            return false;
+        }
+    }
+
+    if let Some(value) = headers
+        .get("x-amz-copy-source-if-none-match")
+        .and_then(|v| v.to_str().ok())
+    {
+        if etag_condition_contains(value, source_etag) {
+            return false;
+        }
+    }
+
+    if let Some(value) = headers
+        .get("x-amz-copy-source-if-unmodified-since")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(since_ms) = parse_http_date_ms(value) {
+            if source_last_modified_ms > since_ms {
+                return false;
+            }
+        }
+    }
+
+    if let Some(value) = headers
+        .get("x-amz-copy-source-if-modified-since")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(since_ms) = parse_http_date_ms(value) {
+            if source_last_modified_ms <= since_ms {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn etag_condition_contains(value: &str, etag: &str) -> bool {
+    let etag = etag.trim().trim_matches('"');
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim().trim_matches('"');
+        candidate == "*" || candidate == etag
+    })
+}
+
 fn percent_decode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -1265,6 +1847,18 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+fn parse_s3_query(raw: &str) -> HashMap<String, String> {
+    raw.split('&')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let mut it = part.splitn(2, '=');
+            let key = it.next()?;
+            let value = it.next().unwrap_or("");
+            Some((percent_decode(key), percent_decode(value)))
+        })
+        .collect()
 }
 
 fn normalize_complete_etag(value: &str) -> String {
@@ -1308,6 +1902,56 @@ fn object_content_encoding(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+fn storage_class_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-amz-storage-class")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// Returns an `InvalidStorageClass` error response when the client supplied a
+/// storage class that is not one of the known S3 values; otherwise `None`.
+fn reject_invalid_storage_class(value: Option<&str>, resource: &str) -> Option<Response> {
+    if is_valid_storage_class(value) {
+        None
+    } else {
+        Some(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidStorageClass",
+            "The storage class you specified is not valid",
+            resource,
+        ))
+    }
+}
+
+fn extract_user_meta(headers: &HeaderMap) -> Result<BTreeMap<String, String>, String> {
+    let mut meta = BTreeMap::new();
+    for (name, value) in headers {
+        let Some(key) = name.as_str().strip_prefix("x-amz-meta-") else {
+            continue;
+        };
+        if key.is_empty() {
+            return Err("User metadata key must not be empty".to_string());
+        }
+        let value = value
+            .to_str()
+            .map_err(|_| "User metadata values must be valid UTF-8".to_string())?;
+        meta.insert(key.to_ascii_lowercase(), value.to_string());
+    }
+
+    let total = meta
+        .iter()
+        .map(|(key, value)| key.as_bytes().len() + value.as_bytes().len())
+        .sum::<usize>();
+    if total > MAX_USER_META_BYTES {
+        return Err(format!(
+            "User metadata size exceeds {MAX_USER_META_BYTES} bytes"
+        ));
+    }
+    Ok(meta)
+}
+
 fn expected_payload_sha256(headers: &HeaderMap, aws_chunked: bool) -> Option<String> {
     if aws_chunked {
         return None;
@@ -1315,10 +1959,7 @@ fn expected_payload_sha256(headers: &HeaderMap, aws_chunked: bool) -> Option<Str
     let value = headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())?;
-    if value.eq_ignore_ascii_case("UNSIGNED-PAYLOAD")
-        || value.starts_with("STREAMING-")
-        || value.len() != 64
-    {
+    if value.eq_ignore_ascii_case("UNSIGNED-PAYLOAD") || value.starts_with("STREAMING-") {
         return None;
     }
     Some(value.to_ascii_lowercase())
@@ -1364,6 +2005,12 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
         | StorageError::InvalidMultipartUpload(_) => s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
+            err.to_string(),
+            resource,
+        ),
+        StorageError::EntityTooSmall(_) => s3_error(
+            StatusCode::BAD_REQUEST,
+            "EntityTooSmall",
             err.to_string(),
             resource,
         ),
@@ -1446,6 +2093,7 @@ fn empty_response_with_etag(status: StatusCode, etag: &str) -> Response {
 mod integration_tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     use crate::storage::store::LocalObjectStore;
@@ -1610,6 +2258,69 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn put_object_rejects_invalid_storage_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/sc-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A valid S3 storage class is accepted.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/sc-bucket/ok.txt")
+                    .header("x-amz-storage-class", "REDUCED_REDUNDANCY")
+                    .body(Body::from("hi"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // An unknown storage class is rejected with InvalidStorageClass.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/sc-bucket/bad.txt")
+                    .header("x-amz-storage-class", "REDUCED")
+                    .body(Body::from("hi"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>InvalidStorageClass</Code>"));
+
+        // The rejected object must not have been stored.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sc-bucket/bad.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn gzip_content_encoding_is_preserved_with_raw_stored_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let app = make_app(&tmp);
@@ -1642,6 +2353,7 @@ mod integration_tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -1669,6 +2381,7 @@ mod integration_tests {
         let app = make_app(&tmp);
 
         let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -1971,6 +2684,8 @@ mod integration_tests {
                 Request::builder()
                     .method("POST")
                     .uri("/mpu-bucket/large.bin?uploads")
+                    .header("x-amz-meta-randomstuff", "multipart-meta")
+                    .header("x-amz-storage-class", "STANDARD_IA")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1981,6 +2696,7 @@ mod integration_tests {
         let upload_id = extract_xml_tag(&xml, "UploadId").unwrap().to_string();
 
         // Upload parts
+        let part1 = vec![b'a'; 5 * 1024 * 1024];
         let res1 = app
             .clone()
             .oneshot(
@@ -1989,7 +2705,7 @@ mod integration_tests {
                     .uri(format!(
                         "/mpu-bucket/large.bin?uploadId={upload_id}&partNumber=1"
                     ))
-                    .body(Body::from("hello"))
+                    .body(Body::from(part1.clone()))
                     .unwrap(),
             )
             .await
@@ -2057,7 +2773,277 @@ mod integration_tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(body_text(res).await, "hello world");
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.len(), part1.len() + " world".len());
+        assert!(body.starts_with(&part1));
+        assert!(body.ends_with(b" world"));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/mpu-bucket/large.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-amz-meta-randomstuff")
+                .and_then(|v| v.to_str().ok()),
+            Some("multipart-meta")
+        );
+        assert_eq!(
+            res.headers()
+                .get("x-amz-storage-class")
+                .and_then(|v| v.to_str().ok()),
+            Some("STANDARD_IA")
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_part_copy_returns_copy_part_xml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        for bucket in ["/mpu-copy-src", "/mpu-copy-dst"] {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(bucket)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mpu-copy-src/source.txt")
+                    .body(Body::from("abcdefgh"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mpu-copy-dst/copied.txt?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = body_text(res).await;
+        let upload_id = extract_xml_tag(&xml, "UploadId").unwrap().to_string();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/mpu-copy-dst/copied.txt?uploadId={upload_id}&partNumber=1"
+                    ))
+                    .header("x-amz-copy-source", "/mpu-copy-src/source.txt")
+                    .header("x-amz-copy-source-range", "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = body_text(res).await;
+        assert!(xml.contains("<CopyPartResult"));
+        let etag = extract_xml_tag(&xml, "ETag").unwrap().to_string();
+
+        let complete_xml = format!(
+            r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"#
+        );
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/mpu-copy-dst/copied.txt?uploadId={upload_id}"))
+                    .body(Body::from(complete_xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mpu-copy-dst/copied.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "cdef");
+    }
+
+    #[tokio::test]
+    async fn multipart_get_survives_delete_after_stream_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mpu-read-delete-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mpu-read-delete-bucket/big.bin?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = body_text(res).await;
+        let upload_id = extract_xml_tag(&xml, "UploadId").unwrap().to_string();
+
+        let parts = [
+            vec![b'a'; 5 * 1024 * 1024],
+            vec![b'b'; 5 * 1024 * 1024],
+            vec![b'c'; 5 * 1024 * 1024],
+            vec![b'd'; 384 * 1024],
+        ];
+        let mut expected = Vec::new();
+        let mut etags = Vec::new();
+        for (idx, part) in parts.iter().enumerate() {
+            expected.extend_from_slice(part);
+            let part_number = idx + 1;
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/mpu-read-delete-bucket/big.bin?uploadId={upload_id}&partNumber={part_number}"
+                        ))
+                        .body(Body::from(part.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            etags.push(
+                res.headers()
+                    .get("etag")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+
+        let complete_parts = etags
+            .iter()
+            .enumerate()
+            .map(|(idx, etag)| {
+                format!(
+                    "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                    idx + 1,
+                    etag
+                )
+            })
+            .collect::<String>();
+        let complete_xml =
+            format!("<CompleteMultipartUpload>{complete_parts}</CompleteMultipartUpload>");
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/mpu-read-delete-bucket/big.bin?uploadId={upload_id}"
+                    ))
+                    .body(Body::from(complete_xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mpu-read-delete-bucket/big.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut stream = res.into_body().into_data_stream();
+
+        let mut downloaded = Vec::new();
+        let first = stream
+            .next()
+            .await
+            .expect("GET body should produce the first chunk")
+            .expect("first chunk should be readable");
+        downloaded.extend_from_slice(&first);
+
+        let delete_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/mpu-read-delete-bucket/big.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_res.status(), StatusCode::NO_CONTENT);
+
+        let head_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/mpu-read-delete-bucket/big.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_res.status(), StatusCode::NOT_FOUND);
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("open multipart GET should survive concurrent delete");
+            downloaded.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(downloaded, expected);
     }
 
     #[tokio::test]
@@ -2184,6 +3170,37 @@ mod integration_tests {
         // No duplicates
         let unique: std::collections::HashSet<_> = all_keys.iter().collect();
         assert_eq!(unique.len(), 35, "no duplicate keys");
+    }
+
+    #[tokio::test]
+    async fn list_objects_rejects_invalid_max_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/invalid-max-keys-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/invalid-max-keys-bucket?max-keys=-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>InvalidArgument</Code>"));
     }
 
     #[tokio::test]
@@ -2372,6 +3389,8 @@ mod integration_tests {
                     .method("PUT")
                     .uri("/head-bucket/file.txt")
                     .header("content-type", "text/plain")
+                    .header("x-amz-meta-randomstuff", "abc123")
+                    .header("x-amz-storage-class", "REDUCED_REDUNDANCY")
                     .body(Body::from("abc"))
                     .unwrap(),
             )
@@ -2401,8 +3420,164 @@ mod integration_tests {
             res.headers().get("content-type").unwrap().to_str().unwrap(),
             "text/plain"
         );
+        assert_eq!(
+            res.headers()
+                .get("x-amz-meta-randomstuff")
+                .and_then(|v| v.to_str().ok()),
+            Some("abc123")
+        );
+        assert_eq!(
+            res.headers()
+                .get("x-amz-storage-class")
+                .and_then(|v| v.to_str().ok()),
+            Some("REDUCED_REDUNDANCY")
+        );
         let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_object_returns_content_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/lang-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/lang-bucket/file.txt")
+                    .header("content-language", "en-US")
+                    .body(Body::from("abc"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/lang-bucket/file.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers()
+                .get("content-language")
+                .and_then(|v| v.to_str().ok()),
+            Some("en-US")
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_style_post_upload_creates_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/post-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let boundary = "post-boundary";
+        let body = concat!(
+            "--post-boundary\r\n",
+            "Content-Disposition: form-data; name=\"key\"\r\n\r\n",
+            "posted.txt\r\n",
+            "--post-boundary\r\n",
+            "Content-Disposition: form-data; name=\"x-amz-meta-origin\"\r\n\r\n",
+            "browser\r\n",
+            "--post-boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"posted.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "hello post\r\n",
+            "--post-boundary--\r\n"
+        );
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/post-bucket")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/post-bucket/posted.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-amz-meta-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("browser")
+        );
+        assert_eq!(body_text(res).await, "hello post");
+    }
+
+    #[tokio::test]
+    async fn put_object_rejects_user_metadata_over_s3_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/meta-limit-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let too_large = "x".repeat(super::MAX_USER_META_BYTES + 1);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/meta-limit-bucket/file.txt")
+                    .header("x-amz-meta-large", too_large)
+                    .body(Body::from("abc"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>InvalidArgument</Code>"));
     }
 
     #[tokio::test]
@@ -2441,6 +3616,96 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn put_rejects_invalid_payload_hash_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/invalid-hash-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/invalid-hash-bucket/file.txt")
+                    .header("x-amz-content-sha256", "invalid-sha256")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_includes_overwritten_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/versions-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/versions-bucket?versioning")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        for body in ["first", "second"] {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/versions-bucket/object.txt")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/versions-bucket?versions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(body.contains("<ListVersionsResult"));
+        assert_eq!(body.matches("<Version>").count(), 2);
+        assert_eq!(body.matches("<Key>object.txt</Key>").count(), 2);
+        assert!(body.contains("<IsLatest>true</IsLatest>"));
+        assert!(body.contains("<IsLatest>false</IsLatest>"));
+    }
+
+    #[tokio::test]
     async fn get_with_missing_physical_part_returns_error_not_success() {
         let tmp = tempfile::tempdir().unwrap();
         let (app, store) = make_app_with_store(&tmp);
@@ -2475,6 +3740,7 @@ mod integration_tests {
             .unwrap();
 
         let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2758,6 +4024,8 @@ mod integration_tests {
                     .method("PUT")
                     .uri("/src-bucket/original.txt")
                     .header("content-type", "text/plain")
+                    .header("x-amz-meta-source", "keep")
+                    .header("x-amz-storage-class", "ONEZONE_IA")
                     .body(Body::from("copy me"))
                     .unwrap(),
             )
@@ -2787,6 +4055,7 @@ mod integration_tests {
 
         // Read the copy
         let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2798,6 +4067,70 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_text(res).await, "copy me");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/dst-bucket/copy.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-amz-meta-source")
+                .and_then(|v| v.to_str().ok()),
+            Some("keep")
+        );
+        assert_eq!(
+            res.headers()
+                .get("x-amz-storage-class")
+                .and_then(|v| v.to_str().ok()),
+            Some("ONEZONE_IA")
+        );
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/dst-bucket/replaced.txt")
+                    .header("x-amz-copy-source", "/src-bucket/original.txt")
+                    .header("x-amz-metadata-directive", "REPLACE")
+                    .header("x-amz-meta-source", "replaced")
+                    .header("x-amz-storage-class", "GLACIER")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/dst-bucket/replaced.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers()
+                .get("x-amz-meta-source")
+                .and_then(|v| v.to_str().ok()),
+            Some("replaced")
+        );
+        assert_eq!(
+            res.headers()
+                .get("x-amz-storage-class")
+                .and_then(|v| v.to_str().ok()),
+            Some("GLACIER")
+        );
     }
 
     #[tokio::test]
@@ -2840,6 +4173,100 @@ mod integration_tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body = body_text(res).await;
         assert!(body.contains("<Code>NoSuchKey</Code>"));
+    }
+
+    #[tokio::test]
+    async fn copy_object_honors_source_etag_preconditions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/copy-cond")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/copy-cond/source.txt")
+                    .body(Body::from("copy condition source"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = put
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/copy-cond/ok-match.txt")
+                    .header("x-amz-copy-source", "/copy-cond/source.txt")
+                    .header("x-amz-copy-source-if-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/copy-cond/fail-match.txt")
+                    .header("x-amz-copy-source", "/copy-cond/source.txt")
+                    .header("x-amz-copy-source-if-match", "\"not-the-etag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/copy-cond/ok-none-match.txt")
+                    .header("x-amz-copy-source", "/copy-cond/source.txt")
+                    .header("x-amz-copy-source-if-none-match", "\"not-the-etag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/copy-cond/fail-none-match.txt")
+                    .header("x-amz-copy-source", "/copy-cond/source.txt")
+                    .header("x-amz-copy-source-if-none-match", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     // ---------------------------------------------------------------------------
@@ -3396,6 +4823,86 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn presigned_put_with_signed_payload_hash_reaches_hash_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(app.clone(), "PUT", "/ps-hash-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let expected_hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let datetime = now_datetime();
+        let qs = crate::server::auth::presign_query_with_signed_headers(
+            "PUT",
+            "/ps-hash-bucket/upload.txt",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[("host", TEST_HOST), ("x-amz-content-sha256", expected_hash)],
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/ps-hash-bucket/upload.txt?{qs}"))
+                    .header("x-amz-content-sha256", expected_hash)
+                    .body(Body::from("not-hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
+    }
+
+    #[tokio::test]
+    async fn presigned_put_rejects_missing_signed_payload_hash_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/ps-missing-signed-header",
+            "",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let expected_hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let datetime = now_datetime();
+        let qs = crate::server::auth::presign_query_with_signed_headers(
+            "PUT",
+            "/ps-missing-signed-header/upload.txt",
+            TEST_HOST,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[("host", TEST_HOST), ("x-amz-content-sha256", expected_hash)],
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/ps-missing-signed-header/upload.txt?{qs}"))
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"));
+    }
+
+    #[tokio::test]
     async fn presigned_url_expired_returns_403() {
         let tmp = tempfile::tempdir().unwrap();
         let app = make_auth_app(&tmp);
@@ -3762,6 +5269,13 @@ mod tests {
     }
 
     #[test]
+    fn s3_query_parser_preserves_literal_plus() {
+        let query = parse_s3_query("prefix=a+b%2Bc&delimiter=%2F");
+        assert_eq!(query.get("prefix").map(String::as_str), Some("a+b+c"));
+        assert_eq!(query.get("delimiter").map(String::as_str), Some("/"));
+    }
+
+    #[test]
     fn multipart_range_segments_binary_searches_to_touched_parts() {
         let meta = ObjectMeta {
             format_version: 1,
@@ -3773,6 +5287,9 @@ mod tests {
             last_modified_ms: 1,
             content_type: "application/octet-stream".to_string(),
             content_encoding: None,
+            content_language: None,
+            storage_class: "STANDARD".to_string(),
+            user_meta: std::collections::BTreeMap::new(),
             parts: vec![
                 PartMeta {
                     number: 1,
@@ -3841,6 +5358,9 @@ mod tests {
             last_modified_ms: 1,
             content_type: "application/octet-stream".to_string(),
             content_encoding: None,
+            content_language: None,
+            storage_class: "STANDARD".to_string(),
+            user_meta: std::collections::BTreeMap::new(),
             parts: vec![],
         };
         assert!(multipart_range_segments(&empty_meta, &[], 0, 1).is_err());
@@ -3859,6 +5379,9 @@ mod tests {
             last_modified_ms: 1,
             content_type: "application/octet-stream".to_string(),
             content_encoding: None,
+            content_language: None,
+            storage_class: "STANDARD".to_string(),
+            user_meta: std::collections::BTreeMap::new(),
             parts: vec![PartMeta {
                 number: 1,
                 file: "part.1".to_string(),
