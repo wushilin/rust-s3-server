@@ -38,6 +38,7 @@ use self::xml::{
     S3ErrorXml,
 };
 use crate::storage::errors::StorageError;
+use crate::storage::metadata::is_valid_storage_class;
 use crate::storage::metadata::quote_etag;
 use crate::storage::store::{CompletePartRequest, LocalObjectStore};
 use crate::storage::sweeper::{sweep_bucket, SweepConfig};
@@ -780,6 +781,11 @@ async fn object_route(
                     }
                 };
                 let storage_class = storage_class_header(&headers);
+                if let Some(resp) =
+                    reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}"))
+                {
+                    return resp;
+                }
                 let replace_metadata = headers
                     .get("x-amz-metadata-directive")
                     .and_then(|v| v.to_str().ok())
@@ -862,6 +868,11 @@ async fn object_route(
                     .get(header::CONTENT_LANGUAGE)
                     .and_then(|v| v.to_str().ok());
                 let storage_class = storage_class_header(&headers);
+                if let Some(resp) =
+                    reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}"))
+                {
+                    return resp;
+                }
                 let user_meta = match extract_user_meta(&headers) {
                     Ok(meta) => meta,
                     Err(message) => {
@@ -931,6 +942,11 @@ async fn object_route(
                     .get(header::CONTENT_LANGUAGE)
                     .and_then(|v| v.to_str().ok());
                 let storage_class = storage_class_header(&headers);
+                if let Some(resp) =
+                    reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}"))
+                {
+                    return resp;
+                }
                 let user_meta = match extract_user_meta(&headers) {
                     Ok(meta) => meta,
                     Err(message) => {
@@ -1166,6 +1182,9 @@ async fn browser_post_object(
         }
     }
     let storage_class = form.fields.get("x-amz-storage-class").map(String::as_str);
+    if let Some(resp) = reject_invalid_storage_class(storage_class, &format!("/{bucket}/{key}")) {
+        return resp;
+    }
     let content_type = file
         .content_type
         .as_deref()
@@ -1891,6 +1910,21 @@ fn storage_class_header(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
+/// Returns an `InvalidStorageClass` error response when the client supplied a
+/// storage class that is not one of the known S3 values; otherwise `None`.
+fn reject_invalid_storage_class(value: Option<&str>, resource: &str) -> Option<Response> {
+    if is_valid_storage_class(value) {
+        None
+    } else {
+        Some(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidStorageClass",
+            "The storage class you specified is not valid",
+            resource,
+        ))
+    }
+}
+
 fn extract_user_meta(headers: &HeaderMap) -> Result<BTreeMap<String, String>, String> {
     let mut meta = BTreeMap::new();
     for (name, value) in headers {
@@ -2221,6 +2255,69 @@ mod integration_tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body = body_text(res).await;
         assert!(body.contains("<Code>NoSuchKey</Code>"));
+    }
+
+    #[tokio::test]
+    async fn put_object_rejects_invalid_storage_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/sc-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A valid S3 storage class is accepted.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/sc-bucket/ok.txt")
+                    .header("x-amz-storage-class", "REDUCED_REDUNDANCY")
+                    .body(Body::from("hi"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // An unknown storage class is rejected with InvalidStorageClass.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/sc-bucket/bad.txt")
+                    .header("x-amz-storage-class", "REDUCED")
+                    .body(Body::from("hi"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>InvalidStorageClass</Code>"));
+
+        // The rejected object must not have been stored.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sc-bucket/bad.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -1,6 +1,11 @@
 use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
 
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
+use sqlx::{Row, SqlitePool};
 
 use super::errors::Result;
 use super::time::now_ms;
@@ -37,10 +42,19 @@ impl SqliteObjectIndex {
     ) -> Result<Self> {
         tokio::fs::create_dir_all(bucket_dir).await?;
         let db_path = bucket_dir.join("index.sqlite");
-        let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+        let url = format!("sqlite://{}", db_path.to_string_lossy());
+        // WAL lets concurrent readers proceed alongside a single writer without
+        // blocking each other; the built-in DELETE journal makes reads and
+        // writes mutually exclusive on the whole file. NORMAL synchronous is
+        // safe and standard under WAL and avoids an fsync per commit.
+        let connect_options = SqliteConnectOptions::from_str(&url)?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections.max(1))
-            .connect(&url)
+            .connect_with(connect_options)
             .await?;
         let index = Self { pool };
         index.migrate().await?;
@@ -135,6 +149,15 @@ impl SqliteObjectIndex {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Returns the active SQLite journal mode (e.g. "wal"). Useful for
+    /// diagnostics and verifying the connection is configured as expected.
+    pub async fn journal_mode(&self) -> Result<String> {
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(mode)
     }
 
     pub async fn is_empty(&self) -> Result<bool> {
@@ -377,6 +400,14 @@ fn row_to_entry(row: sqlx::sqlite::SqliteRow) -> ObjectIndexEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn opens_in_wal_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = SqliteObjectIndex::open(tmp.path()).await.unwrap();
+        let mode = index.journal_mode().await.unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
 
     #[tokio::test]
     async fn list_dedupes_delimiter_common_prefixes() {

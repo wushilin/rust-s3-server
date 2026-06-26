@@ -198,7 +198,10 @@ pub fn list_object_versions_xml(
         body.push_str(&format!(
             "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>{}</StorageClass><Owner><ID>rust-s3-server</ID><DisplayName>rust-s3-server</DisplayName></Owner></Version>",
             escape_xml(&encode_list_value(&version.meta.object_key, encode_keys)),
-            escape_xml(&version.version_id),
+            // This server is non-versioned; S3 reports the version id as the literal
+            // "null" for objects in unversioned buckets. The internal storage
+            // directory name on `version.version_id` is never exposed to clients.
+            "null",
             version.is_latest,
             iso_utc_ms(version.meta.last_modified_ms),
             escape_xml(&quote_etag(&version.meta.etag)),
@@ -338,6 +341,7 @@ fn encode_list_value(value: &str, encode: bool) -> String {
 mod tests {
     use super::*;
     use crate::storage::index::ObjectIndexEntry;
+    use crate::storage::metadata::ObjectMeta;
 
     #[test]
     fn list_v2_includes_s3_required_fields() {
@@ -399,6 +403,35 @@ mod tests {
         assert!(xml.contains("<NextContinuationToken>a%2Bb%20c</NextContinuationToken>"));
         assert!(xml.contains("<ContinuationToken>a%2Bb%20</ContinuationToken>"));
         assert!(xml.contains("<StartAfter>z%20z</StartAfter>"));
+    }
+
+    #[test]
+    fn list_object_versions_reports_null_version_id() {
+        let meta = ObjectMeta {
+            format_version: 1,
+            bucket: "bucket".to_string(),
+            object_key: "my-prefix/datafile".to_string(),
+            storage: crate::storage::metadata::ObjectStorageKind::Single,
+            size: 5,
+            etag: "abc".to_string(),
+            last_modified_ms: 0,
+            content_type: "text/plain".to_string(),
+            content_encoding: None,
+            content_language: None,
+            storage_class: "STANDARD".to_string(),
+            user_meta: std::collections::BTreeMap::new(),
+            parts: vec![],
+        };
+        let versions = vec![ObjectVersionEntry {
+            meta,
+            // Internal on-disk storage directory name; must never leak to clients.
+            version_id: "V1ED6836".to_string(),
+            is_latest: true,
+        }];
+        let xml = list_object_versions_xml("bucket", "my-prefix", None, &versions);
+        assert!(xml.contains("<VersionId>null</VersionId>"));
+        assert!(!xml.contains("V1ED6836"));
+        assert!(xml.contains("<IsLatest>true</IsLatest>"));
     }
 
     #[test]

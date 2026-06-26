@@ -117,6 +117,31 @@ pub fn default_storage_class() -> String {
     DEFAULT_STORAGE_CLASS.to_string()
 }
 
+/// S3 storage classes accepted on the `x-amz-storage-class` request header.
+const VALID_STORAGE_CLASSES: &[&str] = &[
+    "STANDARD",
+    "REDUCED_REDUNDANCY",
+    "STANDARD_IA",
+    "ONEZONE_IA",
+    "INTELLIGENT_TIERING",
+    "GLACIER",
+    "DEEP_ARCHIVE",
+    "GLACIER_IR",
+    "SNOW",
+    "EXPRESS_ONEZONE",
+    "OUTPOSTS",
+];
+
+/// Validates a client-supplied storage class. An absent or blank value is
+/// treated as valid (the server defaults it to STANDARD); a present value must
+/// match one of the known S3 storage classes exactly.
+pub fn is_valid_storage_class(value: Option<&str>) -> bool {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => true,
+        Some(class) => VALID_STORAGE_CLASSES.contains(&class),
+    }
+}
+
 pub fn quote_etag(etag: &str) -> String {
     let trimmed = etag.trim_matches('"');
     format!("\"{trimmed}\"")
@@ -129,6 +154,23 @@ pub fn unquote_etag(etag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_class_validation_accepts_known_classes_and_rejects_unknown() {
+        // Absent header is always valid (defaults to STANDARD).
+        assert!(is_valid_storage_class(None));
+        // Known S3 storage classes are accepted.
+        assert!(is_valid_storage_class(Some("STANDARD")));
+        assert!(is_valid_storage_class(Some("REDUCED_REDUNDANCY")));
+        assert!(is_valid_storage_class(Some("GLACIER")));
+        assert!(is_valid_storage_class(Some("INTELLIGENT_TIERING")));
+        // Surrounding whitespace is tolerated.
+        assert!(is_valid_storage_class(Some("  STANDARD  ")));
+        // Unknown values are rejected (mint sends "REDUCED" expecting failure).
+        assert!(!is_valid_storage_class(Some("REDUCED")));
+        assert!(!is_valid_storage_class(Some("NONSENSE123")));
+        assert!(!is_valid_storage_class(Some("standard")));
+    }
 
     #[test]
     fn etag_quote_roundtrip_uses_unquoted_internal_form() {
