@@ -1527,6 +1527,7 @@ name = "rust-s3-server"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "chrono",
  "clap",

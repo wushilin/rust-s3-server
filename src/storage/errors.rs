@@ -15,6 +15,7 @@ pub enum StorageError {
     ObjectNotFound { bucket: String, key: String },
     NoSuchUpload(String),
     InvalidMultipartUpload(String),
+    EntityTooSmall(String),
     PayloadHashMismatch { expected: String, actual: String },
     CorruptObject(String),
 }
@@ -39,6 +40,7 @@ impl fmt::Display for StorageError {
             }
             StorageError::NoSuchUpload(v) => write!(f, "multipart upload not found: {v}"),
             StorageError::InvalidMultipartUpload(v) => write!(f, "invalid multipart upload: {v}"),
+            StorageError::EntityTooSmall(v) => write!(f, "entity too small: {v}"),
             StorageError::PayloadHashMismatch { expected, actual } => {
                 write!(
                     f,
