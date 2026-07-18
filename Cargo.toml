@@ -27,6 +27,7 @@ hmac    = "0.12"
 base64  = "0.21"
 
 # Utilities
+libc        = "0.2"
 rand        = "0.8"
 chrono      = "0.4"
 urlencoding = "2.1"
@@ -37,6 +38,8 @@ clap        = { version = "4.3", features = ["derive"] }
 # Logging
 log     = "0.4"
 log4rs  = { version = "1.2.0", features = ["gzip", "background_rotation"] }
+bcrypt = "0.19.2"
+rpassword = "7.5.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -18,6 +18,10 @@ pub enum StorageError {
     EntityTooSmall(String),
     PayloadHashMismatch { expected: String, actual: String },
     CorruptObject(String),
+    /// The bucket's index is being rebuilt; all requests get 503 until done.
+    BucketRebuilding(String),
+    /// The on-disk index schema is not current; a rebuild is required.
+    IndexOutdated(String),
 }
 
 impl fmt::Display for StorageError {
@@ -48,6 +52,10 @@ impl fmt::Display for StorageError {
                 )
             }
             StorageError::CorruptObject(v) => write!(f, "corrupt object: {v}"),
+            StorageError::BucketRebuilding(v) => {
+                write!(f, "bucket index rebuild in progress: {v}")
+            }
+            StorageError::IndexOutdated(v) => write!(f, "index schema outdated: {v}"),
         }
     }
 }

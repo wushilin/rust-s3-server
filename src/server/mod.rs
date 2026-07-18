@@ -5,8 +5,11 @@
 
 pub mod auth;
 pub mod config;
+pub mod iam;
 pub mod logging;
+pub mod policy;
 pub mod range;
+pub mod ui;
 pub mod xml;
 
 use std::collections::{BTreeMap, HashMap};
@@ -28,8 +31,9 @@ use axum::Router;
 use futures::TryStreamExt;
 use regex::Regex;
 
-use self::auth::auth_middleware;
+use self::auth::{auth_middleware, AuthState};
 use self::config::AppConfig;
+use self::iam::IamStore;
 use self::range::{parse_range_header, RangeSelection};
 use self::xml::{
     complete_multipart_xml, copy_object_xml, delete_objects_xml, error_xml, initiate_multipart_xml,
@@ -62,9 +66,11 @@ pub struct S3HttpConfig {
 }
 
 #[derive(Debug, Default)]
-struct TrafficMetrics {
+pub(crate) struct TrafficMetrics {
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    active_gets: AtomicU64,
+    active_puts: AtomicU64,
     get_requests: AtomicU64,
     put_requests: AtomicU64,
     head_requests: AtomicU64,
@@ -132,6 +138,36 @@ impl TrafficMetrics {
         self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Marks an in-flight download; decremented when the guard drops
+    /// (i.e. when the response body stream finishes or is abandoned).
+    pub(crate) fn begin_get(self: &Arc<Self>) -> ActiveTransferGuard {
+        self.active_gets.fetch_add(1, Ordering::Relaxed);
+        ActiveTransferGuard { metrics: self.clone(), is_get: true }
+    }
+
+    /// Marks an in-flight upload; decremented when the guard drops.
+    pub(crate) fn begin_put(self: &Arc<Self>) -> ActiveTransferGuard {
+        self.active_puts.fetch_add(1, Ordering::Relaxed);
+        ActiveTransferGuard { metrics: self.clone(), is_get: false }
+    }
+
+    /// `(active_downloads, active_uploads)` right now.
+    pub(crate) fn active_transfers(&self) -> (u64, u64) {
+        (
+            self.active_gets.load(Ordering::Relaxed),
+            self.active_puts.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(total_bytes_in, total_bytes_out)` since start — status endpoints
+    /// let the client derive rates from successive polls.
+    pub(crate) fn byte_totals(&self) -> (u64, u64) {
+        (
+            self.bytes_in.load(Ordering::Relaxed),
+            self.bytes_out.load(Ordering::Relaxed),
+        )
+    }
+
     fn snapshot(&self) -> TrafficSnapshot {
         TrafficSnapshot {
             bytes_in: self.bytes_in.load(Ordering::Relaxed),
@@ -148,12 +184,19 @@ impl TrafficMetrics {
 
 /// Builds the Axum router.  Exported so integration tests can call it directly.
 pub fn router(store: LocalObjectStore, app_config: Arc<AppConfig>) -> Router {
-    router_with_metrics(store, app_config, Arc::new(TrafficMetrics::default()))
+    router_with_metrics(
+        store,
+        AuthState {
+            config: app_config,
+            iam: None,
+        },
+        Arc::new(TrafficMetrics::default()),
+    )
 }
 
 fn router_with_metrics(
     store: LocalObjectStore,
-    app_config: Arc<AppConfig>,
+    auth_state: AuthState,
     metrics: Arc<TrafficMetrics>,
 ) -> Router {
     Router::new()
@@ -168,10 +211,7 @@ fn router_with_metrics(
         .route("/:bucket", any(bucket_route))
         .route("/:bucket/", any(bucket_route))
         .route("/:bucket/*key", any(object_route))
-        .layer(middleware::from_fn_with_state(
-            app_config.clone(),
-            auth_middleware,
-        ))
+        .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
         .layer(middleware::from_fn_with_state(
             metrics,
             traffic_metrics_middleware,
@@ -255,6 +295,24 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// RAII marker for one in-flight transfer; dropping it (stream finished,
+/// client disconnected, handler done) decrements the gauge.
+pub(crate) struct ActiveTransferGuard {
+    metrics: Arc<TrafficMetrics>,
+    is_get: bool,
+}
+
+impl Drop for ActiveTransferGuard {
+    fn drop(&mut self) {
+        let counter = if self.is_get {
+            &self.metrics.active_gets
+        } else {
+            &self.metrics.active_puts
+        };
+        counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn traffic_metrics_middleware(
     State(metrics): State<Arc<TrafficMetrics>>,
     request: Request<Body>,
@@ -262,22 +320,53 @@ async fn traffic_metrics_middleware(
 ) -> Response {
     let (parts, body) = request.into_parts();
     metrics.add_request(&parts.method);
+    // An upload is "active" while its request body streams in.
+    let put_guard = (parts.method == Method::PUT).then(|| metrics.begin_put());
     let counted_metrics = metrics.clone();
     let counted_body = body.into_data_stream().inspect_ok(move |bytes| {
+        let _hold = &put_guard;
         counted_metrics.add_in(bytes.len() as u64);
     });
     let request = Request::from_parts(parts, Body::from_stream(counted_body));
 
+    let is_get = request.method() == Method::GET;
     let response = next.run(request).await;
     let (parts, body) = response.into_parts();
+    // A download is "active" while its response body streams out.
+    let get_guard = is_get.then(|| metrics.begin_get());
     let counted_metrics = metrics.clone();
     let counted_body = body.into_data_stream().inspect_ok(move |bytes| {
+        let _hold = &get_guard;
         counted_metrics.add_out(bytes.len() as u64);
     });
     Response::from_parts(parts, Body::from_stream(counted_body))
 }
 
 // ─── Server entry point ───────────────────────────────────────────────────────
+
+/// Takes an exclusive advisory lock on `<root>/.rusts3.lock` and refuses to
+/// start if another process holds it. The returned handle must stay alive
+/// for the process lifetime — dropping it releases the lock.
+fn acquire_process_lock(root: &FsPath) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(root)?;
+    let lock_path = root.join(".rusts3.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(format!(
+            "data directory {} is locked by another rusts3 process (flock on {} failed); \
+             exactly one process may own a data directory",
+            root.display(),
+            lock_path.display()
+        )
+        .into());
+    }
+    log::info!("acquired process lock on {}", lock_path.display());
+    Ok(file)
+}
 
 /// Starts the S3 server and blocks until shutdown.
 ///
@@ -286,17 +375,41 @@ async fn traffic_metrics_middleware(
 /// cancelling all background tasks and draining in-flight HTTP requests before
 /// returning.
 pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Exactly one process may own a data directory: the per-key in-memory
+    // locks are only meaningful under that assumption.
+    let _process_lock = acquire_process_lock(FsPath::new(&config.root))?;
+
     let store = LocalObjectStore::from_storage_config(&config.root, &config.app_config.storage);
     let shutdown = store.shutdown_token();
     let metrics = Arc::new(TrafficMetrics::default());
 
+    // Buckets with a missing or legacy-schema index rebuild in the
+    // background; they serve 503 SlowDown until their rebuild completes.
     match store.start_missing_index_rebuilds().await {
         Ok(started) => {
             if started > 0 {
-                log::warn!("rebuild_sqlite startup auto rebuilds started count={started}");
+                log::warn!("startup index rebuilds started count={started}");
             }
         }
-        Err(err) => log::warn!("rebuild_sqlite startup scan failed error={err}"),
+        Err(err) => log::warn!("startup rebuild scan failed error={err}"),
+    }
+
+    // Startup intent drain: resolve every crash-leftover intent before
+    // serving. O(operations in flight at crash time) — milliseconds.
+    match store.list_buckets().await {
+        Ok(buckets) => {
+            for (bucket, _) in &buckets {
+                match store.drain_intents(bucket).await {
+                    Ok(0) => {}
+                    Ok(n) => log::info!("startup intent drain bucket={bucket} resolved={n}"),
+                    Err(StorageError::BucketRebuilding(_)) => {
+                        // Rebuild produces a fresh (empty) intent table.
+                    }
+                    Err(err) => log::warn!("startup intent drain failed bucket={bucket} error={err}"),
+                }
+            }
+        }
+        Err(err) => log::warn!("startup intent drain failed to list buckets error={err}"),
     }
 
     // Cancel all background tasks on SIGINT / Ctrl-C.
@@ -360,52 +473,13 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let sweeper_cfg = config.app_config.sweeper.clone();
     tokio::spawn(async move {
         log::info!(
-            "maintenance task started interval_secs={} visibility_repair_batch_size={} repair_grace_period_secs={} staging_expiry_secs={} trash_expiry_secs={}",
+            "maintenance task started interval_secs={} intent_batch_size={} intent_grace_period_secs={} staging_expiry_secs={} trash_expiry_secs={}",
             sweeper_cfg.interval_secs,
-            sweeper_cfg.visibility_repair_batch_size,
-            sweeper_cfg.visibility_repair_grace_period_secs,
+            sweeper_cfg.intent_batch_size,
+            sweeper_cfg.intent_grace_period_secs,
             sweeper_cfg.staging_expiry_secs,
             sweeper_cfg.trash_expiry_secs,
         );
-        match sweeper_store.list_buckets().await {
-            Ok(buckets) => {
-                let repair_batch = sweeper_cfg.visibility_repair_batch_size.max(1);
-                for (bucket, _) in &buckets {
-                    if sweeper_shutdown.is_cancelled() {
-                        break;
-                    }
-                    let mut total_repaired = 0usize;
-                    loop {
-                        match sweeper_store
-                            .process_visibility_repairs(bucket, 0, repair_batch)
-                            .await
-                        {
-                            Ok(batch) => {
-                                total_repaired += batch.repaired;
-                                if batch.selected < repair_batch || batch.failed > 0 {
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                log::warn!(
-                                    "startup visibility repair failed bucket={} error={err}",
-                                    bucket,
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    if total_repaired > 0 {
-                        log::info!(
-                            "startup visibility repair complete bucket={} repaired={}",
-                            bucket,
-                            total_repaired,
-                        );
-                    }
-                }
-            }
-            Err(err) => log::warn!("startup visibility repair failed to list buckets error={err}"),
-        }
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(sweeper_cfg.interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -428,32 +502,24 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                             if sweeper_shutdown.is_cancelled() { break; }
                             log::info!("maintenance bucket started bucket={}", bucket);
                             let cfg = SweepConfig {
-                                visibility_repair_batch_size: sweeper_cfg.visibility_repair_batch_size,
-                                visibility_repair_grace_period_ms: sweeper_cfg.visibility_repair_grace_period_secs as i64 * 1000,
+                                intent_batch_size: sweeper_cfg.intent_batch_size,
+                                intent_grace_period_ms: sweeper_cfg.intent_grace_period_secs as i64 * 1000,
                                 staging_expiry_ms: sweeper_cfg.staging_expiry_secs as i64 * 1000,
                                 trash_expiry_ms: sweeper_cfg.trash_expiry_secs as i64 * 1000,
                                 now_ms: crate::storage::time::now_ms(),
                             };
                             match sweep_bucket(&sweeper_store, bucket, &cfg).await {
                                 Ok(stats) => {
-                                    let removed = stats.staging_dirs_removed
-                                        + stats.trash_dirs_removed
-                                        + stats.visibility_repairs_processed;
-                                    if removed > 0 {
-                                        log::info!(
-                                            "maintenance {bucket}: visibility_repairs={} staging={} trash={}",
-                                            stats.visibility_repairs_processed,
-                                            stats.staging_dirs_removed,
-                                            stats.trash_dirs_removed,
-                                        );
-                                    }
                                     log::info!(
-                                        "maintenance bucket complete bucket={} visibility_repairs={} staging={} trash={}",
+                                        "maintenance bucket complete bucket={} intents_resolved={} staging={} trash={}",
                                         bucket,
-                                        stats.visibility_repairs_processed,
+                                        stats.intents_resolved,
                                         stats.staging_dirs_removed,
                                         stats.trash_dirs_removed,
                                     );
+                                }
+                                Err(StorageError::BucketRebuilding(_)) => {
+                                    log::info!("maintenance skipped bucket={bucket} reason=rebuilding");
                                 }
                                 Err(err) => log::warn!("maintenance {bucket}: {err}"),
                             }
@@ -476,7 +542,48 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         }
     });
 
-    let app = router_with_metrics(store, config.app_config, metrics);
+    // IAM store (admin.sqlite at the data root, outside any bucket) backs
+    // runtime-managed users/keys/policies; built-in admin users come from
+    // the config and are immutable at runtime.
+    let iam = IamStore::open(FsPath::new(&config.root)).await?;
+    let auth_state = AuthState {
+        config: config.app_config.clone(),
+        iam: Some(iam.clone()),
+    };
+
+    // Management UI on its own port: web logins (user/password) only —
+    // completely separate from the access-key-authenticated S3 API.
+    if config.app_config.ui.enabled {
+        let ui_state = ui::UiState {
+            store: store.clone(),
+            iam,
+            config: config.app_config.clone(),
+            metrics: metrics.clone(),
+        };
+        let ui_bind = format!(
+            "{}:{}",
+            config
+                .app_config
+                .ui
+                .bind_address
+                .clone()
+                .unwrap_or_else(|| config.address.ip().to_string()),
+            config.app_config.ui.bind_port
+        );
+        let ui_listener = tokio::net::TcpListener::bind(&ui_bind).await?;
+        let ui_shutdown = shutdown.clone();
+        log::info!("management UI listening on {ui_bind}");
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(ui_listener, ui::router(ui_state))
+                .with_graceful_shutdown(ui_shutdown.cancelled_owned())
+                .await
+            {
+                log::error!("management UI server error: {err}");
+            }
+        });
+    }
+
+    let app = router_with_metrics(store, auth_state, metrics);
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -2026,6 +2133,18 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
             err.to_string(),
             resource,
         ),
+        StorageError::BucketRebuilding(_) => {
+            let mut response = s3_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SlowDown",
+                "Bucket index rebuild in progress; retry shortly",
+                resource,
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            response
+        }
         _ => s3_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalError",
@@ -2125,7 +2244,10 @@ mod integration_tests {
         (
             router_with_metrics(
                 LocalObjectStore::new(tmp.path()),
-                std::sync::Arc::new(super::config::AppConfig::default()),
+                super::auth::AuthState {
+                    config: std::sync::Arc::new(super::config::AppConfig::default()),
+                    iam: None,
+                },
                 metrics.clone(),
             ),
             metrics,
@@ -3347,15 +3469,34 @@ mod integration_tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::ACCEPTED);
 
-        // Give the background task a moment to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // Objects must still be listable
-        let res = app
+        // While the rebuild runs the bucket answers 503 SlowDown by design;
+        // poll until it completes instead of racing a fixed sleep.
+        let mut res = None;
+        for _ in 0..200 {
+            let attempt = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/rebuild-bucket")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if attempt.status() != StatusCode::SERVICE_UNAVAILABLE {
+                res = Some(attempt);
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+        let res = res.expect("rebuild did not finish within 5s");
+        assert_eq!(res.status(), StatusCode::OK);
+        let _unused = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("GET")
+                    .method("HEAD")
                     .uri("/rebuild-bucket")
                     .body(Body::empty())
                     .unwrap(),

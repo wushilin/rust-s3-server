@@ -14,7 +14,7 @@ Built for **local development and CI/CD** — not a production replacement for A
 | Durable | Complete object directories are published with atomic renames; each bucket has a derived SQLite listing index |
 | Self-healing | GET/DELETE and targeted visibility-repair rows reconcile stale SQLite entries; the index can still be rebuilt explicitly via HTTP |
 | Observable | Structured per-request logging (method, URI, status, size, latency) and periodic bandwidth reports; rolling log file with configurable rotation and optional gzip compression |
-| Configurable | Single `config.yaml` controls network, storage, logging, auth, and background maintenance; `--init` generates a fully-documented template |
+| Configurable | Single `config.yaml` controls network, storage, logging, auth, and background maintenance; `rusts3 init` generates a fully-documented template |
 | No hot-spot directories | Objects are spread across a 4-level SHA-1 fanout tree — no single directory ever accumulates more than a handful of entries, regardless of how many objects the bucket contains |
 
 ## Explicit non-goals
@@ -41,30 +41,29 @@ cargo build --release
 
 ## Running
 
-```
-rusts3 [OPTIONS]
-
-Options:
-  -c, --config <FILE>   Path to config.yaml
-      --init            Write a default config.yaml and exit
-  -h, --help            Print help
+```text
+rusts3 run [-c FILE]          Start the server (default: ./config.yaml)
+rusts3 validate [-c FILE]     Validate configuration without starting
+rusts3 genpassword            Generate a bcrypt console password
+rusts3 verifypassword [HASH]  Verify a bcrypt console password
+rusts3 init                   Write a documented config.yaml
 ```
 
 ### Quickstart
 
 ```bash
 # Generate a fully-documented config.yaml in the current directory:
-target/release/rusts3 --init
+target/release/rusts3 init
 
 # Edit config.yaml to taste, then start:
-target/release/rusts3 -c config.yaml
+target/release/rusts3 run
 ```
 
 ---
 
 ## Configuration reference (`config.yaml`)
 
-Run `rusts3 --init` to generate a fully-documented `config.yaml` in the current directory.
+Run `rusts3 init` to generate a fully-documented `config.yaml` in the current directory.
 All fields are optional — built-in defaults are used for anything omitted.
 
 ### `server` — network and storage root
@@ -117,6 +116,14 @@ should use the visibility-repair names above.
 | `enabled` | `false` | When `false`, the server accepts all requests without credentials (open access). Set to `true` to require AWS SigV4 signatures on every request. |
 | `credentials` | `[]` | List of `{access_key, secret_key}` pairs. Only used when `enabled: true`. Clients must present one of these pairs to authenticate. |
 | `public_hostname` | *(absent)* | The hostname (and optional port) that S3 clients are configured to use, e.g. `"mys3.company.com"` or `"localhost:8002"`. When set, presigned URL verification substitutes this value for the `host` signed header instead of reading it from the incoming HTTP request. This makes signature verification proxy-safe — a reverse proxy may rewrite the `Host` header, but the client and server still agree on the configured public hostname. When omitted, the incoming `Host` header is used directly. |
+| `public_scheme` | `"http"` | Scheme used when the console generates presigned share links. Accepted values are `http` and `https`. Signature verification is scheme-independent. |
+
+Built-in console passwords may be bcrypt hashes (recommended) or cleartext
+for backward compatibility. Generate and verify hashes with
+`rusts3 genpassword` and `rusts3 verifypassword`. Built-in `api_keys` are
+optional and remain cleartext because S3 SigV4/V2 verification requires the
+original HMAC secret; a built-in user without API keys is a valid console-only
+administrator.
 
 **Example with auth enabled:**
 
@@ -124,6 +131,7 @@ should use the visibility-repair names above.
 auth:
   enabled: true
   public_hostname: "mys3.company.com"
+  public_scheme: https
   credentials:
     - access_key: "minioadmin"
       secret_key: "minioadmin"
@@ -209,6 +217,7 @@ clients use:
 auth:
   enabled: true
   public_hostname: "mys3.company.com"
+  public_scheme: https
   credentials:
     - access_key: "minioadmin"
       secret_key: "minioadmin"

@@ -18,39 +18,103 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use super::config::AppConfig;
+use super::iam::{IamStore, Principal};
+use super::policy::{is_authorized, requirements_for_request};
 use super::xml::{error_xml, S3ErrorXml};
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
 
+/// Shared state for the auth middleware: static config credentials (root,
+/// unrestricted) plus the IAM store (policy-bound access keys).
+#[derive(Clone)]
+pub struct AuthState {
+    pub config: Arc<AppConfig>,
+    pub iam: Option<IamStore>,
+}
+
+impl AuthState {
+    /// Resolves an access key to `(secret, principal)`. Config credentials
+    /// are root; IAM keys carry their owning user.
+    fn lookup(&self, access_key: &str) -> Option<(String, Principal)> {
+        if let Some(secret) = self.config.find_secret(access_key) {
+            return Some((secret.to_string(), Principal::Root));
+        }
+        let iam = self.iam.as_ref()?;
+        let (secret, username) = iam.find_key(access_key)?;
+        Some((secret, Principal::IamUser(username)))
+    }
+}
+
 // ─── Public middleware ────────────────────────────────────────────────────────
 
-/// Tower middleware: validates SigV4 auth when `auth.enabled = true`.
+/// Tower middleware: validates SigV4 auth when `auth.enabled = true`, then
+/// enforces the caller's IAM policy (root credentials are unrestricted).
 pub async fn auth_middleware(
-    State(config): State<Arc<AppConfig>>,
+    State(state): State<AuthState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !config.auth.enabled || config.auth.credentials.is_empty() {
+    if !state.config.auth.enabled {
         return next.run(request).await;
     }
 
-    match validate_request(&config, &request) {
-        Ok(()) => next.run(request).await,
-        Err(msg) => deny(msg),
+    let principal = match validate_request(&state, &request) {
+        Ok(principal) => principal,
+        Err(msg) => {
+            log::warn!(
+                "s3 auth rejected method={} path={} reason={msg}",
+                request.method(),
+                request.uri().path(),
+            );
+            return deny(msg);
+        }
+    };
+
+    if let Principal::IamUser(username) = &principal {
+        if !authorize_iam(&state, username, &request) {
+            log::warn!(
+                "s3 access denied by policy user={username} method={} uri={}",
+                request.method(),
+                request.uri(),
+            );
+            return access_denied();
+        }
     }
+    next.run(request).await
+}
+
+/// Evaluates the IAM user's policy against the request. No policy attached
+/// means deny-everything; admin-only operations are never IAM-authorized.
+fn authorize_iam(state: &AuthState, username: &str, request: &Request<Body>) -> bool {
+    let copy_source = request
+        .headers()
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok());
+    let Some(requirements) = requirements_for_request(
+        request.method().as_str(),
+        request.uri().path(),
+        request.uri().query().unwrap_or(""),
+        copy_source,
+    ) else {
+        return false; // admin-only operation
+    };
+    let Some(policy) = state.iam.as_ref().and_then(|iam| iam.policy_for(username)) else {
+        return false; // no policy attached → deny
+    };
+    is_authorized(&policy, &requirements)
 }
 
 // ─── Core validator ───────────────────────────────────────────────────────────
 
-fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &'static str> {
+fn validate_request(state: &AuthState, request: &Request<Body>) -> Result<Principal, &'static str> {
     if matches!(
         request.uri().path(),
         "/minio/health/live" | "/minio/health/ready"
     ) || request.uri().path().starts_with("/minio/v2/metrics/")
         || request.uri().path() == "/minio/prometheus/metrics"
     {
-        return Ok(());
+        return Ok(Principal::Root);
     }
     if request.method() == axum::http::Method::POST
         && request
@@ -60,16 +124,16 @@ fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &
             .map(|v| v.starts_with("multipart/form-data"))
             .unwrap_or(false)
     {
-        return Ok(());
+        return Ok(Principal::Root);
     }
 
     let uri_str = request.uri().to_string();
 
     if uri_str.contains("X-Amz-Signature=") {
-        return validate_presigned(config, request);
+        return validate_presigned(state, request);
     }
     if uri_str.contains("AWSAccessKeyId=") && uri_str.contains("Signature=") {
-        return validate_signature_v2_query(config, request);
+        return validate_signature_v2_query(state, request);
     }
 
     let auth = request
@@ -79,7 +143,7 @@ fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &
         .ok_or("Missing Authorization header")?;
 
     if let Some(v2) = auth.strip_prefix("AWS ") {
-        return validate_signature_v2(config, request, v2);
+        return validate_signature_v2(state, request, v2);
     }
 
     if !auth.starts_with("AWS4-HMAC-SHA256 ") {
@@ -87,8 +151,8 @@ fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &
     }
 
     let parsed = parse_auth_header(auth).ok_or("Malformed Authorization header")?;
-    let secret = config
-        .find_secret(&parsed.access_key)
+    let (secret, principal) = state
+        .lookup(&parsed.access_key)
         .ok_or("Unknown access key")?;
 
     let date = request
@@ -109,24 +173,24 @@ fn validate_request(config: &AppConfig, request: &Request<Body>) -> Result<(), &
         return Err("Invalid x-amz-date header");
     }
     let date_only = &date[..8]; // "YYYYMMDD"
-    let signing_key = derive_signing_key(secret, date_only, &parsed.region, "s3");
+    let signing_key = derive_signing_key(&secret, date_only, &parsed.region, "s3");
     let expected = hex_hmac(&signing_key, string_to_sign.as_bytes());
 
     if !constant_time_eq(&expected, &parsed.signature) {
         return Err("Signature does not match");
     }
-    Ok(())
+    Ok(principal)
 }
 
 fn validate_signature_v2(
-    config: &AppConfig,
+    state: &AuthState,
     request: &Request<Body>,
     value: &str,
-) -> Result<(), &'static str> {
+) -> Result<Principal, &'static str> {
     let (access_key, signature) = value
         .split_once(':')
         .ok_or("Malformed Authorization header")?;
-    let secret = config.find_secret(access_key).ok_or("Unknown access key")?;
+    let (secret, principal) = state.lookup(access_key).ok_or("Unknown access key")?;
     let string_to_sign = signature_v2_string_to_sign(request);
     let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(string_to_sign.as_bytes());
@@ -134,13 +198,13 @@ fn validate_signature_v2(
     if !constant_time_eq(&expected, signature) {
         return Err("Signature does not match");
     }
-    Ok(())
+    Ok(principal)
 }
 
 fn validate_signature_v2_query(
-    config: &AppConfig,
+    state: &AuthState,
     request: &Request<Body>,
-) -> Result<(), &'static str> {
+) -> Result<Principal, &'static str> {
     let query = request.uri().query().ok_or("Missing query string")?;
     let access_key = query_param(query, "AWSAccessKeyId").ok_or("Missing AWSAccessKeyId")?;
     let signature = query_param(query, "Signature").ok_or("Missing Signature")?;
@@ -151,9 +215,7 @@ fn validate_signature_v2_query(
     if Utc::now().timestamp() > expires_epoch {
         return Err("Presigned URL expired");
     }
-    let secret = config
-        .find_secret(&access_key)
-        .ok_or("Unknown access key")?;
+    let (secret, principal) = state.lookup(&access_key).ok_or("Unknown access key")?;
     let string_to_sign = signature_v2_query_string_to_sign(request, &expires);
     let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(string_to_sign.as_bytes());
@@ -161,7 +223,7 @@ fn validate_signature_v2_query(
     if !constant_time_eq(&expected, &signature) {
         return Err("Signature does not match");
     }
-    Ok(())
+    Ok(principal)
 }
 
 fn signature_v2_string_to_sign(request: &Request<Body>) -> String {
@@ -304,7 +366,7 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 /// 1. Checking that the URL has not expired (`X-Amz-Date + X-Amz-Expires`).
 /// 2. Reconstructing the canonical request exactly as the signer did.
 /// 3. Verifying the HMAC-SHA256 signature.
-fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(), &'static str> {
+fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Principal, &'static str> {
     let raw_query = request.uri().query().unwrap_or("");
 
     // Decode all query parameters once.
@@ -339,7 +401,7 @@ fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(),
     let terminator = cred_parts.next().ok_or("Invalid X-Amz-Credential")?;
     let credential_scope = format!("{date}/{region}/{service}/{terminator}");
 
-    let secret = config.find_secret(access_key).ok_or("Unknown access key")?;
+    let (secret, principal) = state.lookup(access_key).ok_or("Unknown access key")?;
 
     // ── Expiry check ──────────────────────────────────────────────────────
     let signed_at = NaiveDateTime::parse_from_str(date_time_str, "%Y%m%dT%H%M%SZ")
@@ -363,7 +425,7 @@ fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(),
     // the configured public hostname).
     let signed_headers: Vec<String> = signed_headers_str.split(';').map(str::to_string).collect();
     let host_override: Option<HeaderMap> =
-        config.auth.public_hostname.as_deref().and_then(|hostname| {
+        state.config.auth.public_hostname.as_deref().and_then(|hostname| {
             if signed_headers
                 .iter()
                 .any(|h| h.eq_ignore_ascii_case("host"))
@@ -397,13 +459,13 @@ fn validate_presigned(config: &AppConfig, request: &Request<Body>) -> Result<(),
     );
 
     let string_to_sign = build_string_to_sign(date_time_str, &credential_scope, &canonical);
-    let signing_key = derive_signing_key(secret, date, region, service);
+    let signing_key = derive_signing_key(&secret, date, region, service);
     let expected = hex_hmac(&signing_key, string_to_sign.as_bytes());
 
     if !constant_time_eq(&expected, signature) {
         return Err("Presigned signature does not match");
     }
-    Ok(())
+    Ok(principal)
 }
 
 fn presigned_payload_hash(headers: &HeaderMap, signed_headers: &[String]) -> String {
@@ -660,6 +722,21 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 // ─── Error response ───────────────────────────────────────────────────────────
 
+fn access_denied() -> Response {
+    let body = error_xml(&S3ErrorXml {
+        code: "AccessDenied".to_string(),
+        message: "Access Denied by user policy".to_string(),
+        resource: "/".to_string(),
+        request_id: "rust-s3-server".to_string(),
+    });
+    axum::response::Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/xml")
+        .header("x-amz-request-id", "rust-s3-server")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 fn deny(message: &'static str) -> Response {
     let body = error_xml(&S3ErrorXml {
         code: "SignatureDoesNotMatch".to_string(),
@@ -687,7 +764,6 @@ mod hex {
 ///
 /// Returns the full query string including `X-Amz-Signature`, ready to be
 /// appended to a URL as `?<returned-string>`.
-#[cfg(test)]
 pub(crate) fn presign_query(
     method: &str,
     path: &str,
@@ -967,7 +1043,8 @@ mod tests {
             .header("authorization", format!("AWS AKID:{signature}"))
             .body(Body::empty())
             .unwrap();
-        assert_eq!(validate_request(&config, &request), Ok(()));
+        let state = AuthState { config: Arc::new(config), iam: None };
+        assert_eq!(validate_request(&state, &request), Ok(Principal::Root));
     }
 
     #[test]
@@ -999,13 +1076,15 @@ mod tests {
             ))
             .body(Body::empty())
             .unwrap();
-        assert_eq!(validate_request(&config, &request), Ok(()));
+        let state = AuthState { config: Arc::new(config), iam: None };
+        assert_eq!(validate_request(&state, &request), Ok(Principal::Root));
     }
 
     #[test]
     fn minio_health_and_metrics_paths_bypass_auth() {
         let mut config = AppConfig::default();
         config.auth.enabled = true;
+        let state = AuthState { config: Arc::new(config), iam: None };
         for path in [
             "/minio/health/live",
             "/minio/health/ready",
@@ -1020,7 +1099,7 @@ mod tests {
                 .uri(path)
                 .body(Body::empty())
                 .unwrap();
-            assert_eq!(validate_request(&config, &request), Ok(()), "{path}");
+            assert_eq!(validate_request(&state, &request), Ok(Principal::Root), "{path}");
         }
     }
 
@@ -1042,8 +1121,9 @@ mod tests {
             .header("authorization", "AWS4-HMAC-SHA256 Credential=AKID/1/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123")
             .body(Body::empty())
             .unwrap();
+        let state = AuthState { config: Arc::new(config), iam: None };
         assert_eq!(
-            validate_request(&config, &request),
+            validate_request(&state, &request),
             Err("Invalid x-amz-date header")
         );
     }

@@ -340,7 +340,7 @@ fn encode_list_value(value: &str, encode: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::index::ObjectIndexEntry;
+    use crate::storage::index::ObjectRecord;
     use crate::storage::metadata::ObjectMeta;
 
     #[test]
@@ -354,8 +354,9 @@ mod tests {
             None,
             100,
             &ListPage {
-                entries: vec![ObjectIndexEntry {
+                entries: vec![ObjectRecord {
                     object_key: "a/file".to_string(),
+                    blob_dir: "objects/aa/bb/cc/dd/V1ABCDEF_0001".to_string(),
                     size: 3,
                     etag: "abc".to_string(),
                     last_modified_ms: 0,
@@ -384,8 +385,9 @@ mod tests {
             Some("url"),
             100,
             &ListPage {
-                entries: vec![ObjectIndexEntry {
+                entries: vec![ObjectRecord {
                     object_key: "a+b c".to_string(),
+                    blob_dir: "objects/aa/bb/cc/dd/V1ABCDEF_0002".to_string(),
                     size: 3,
                     etag: "abc".to_string(),
                     last_modified_ms: 0,

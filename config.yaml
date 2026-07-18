@@ -1,91 +1,164 @@
 # rusts3 configuration file
-# Pass with: rusts3 -c config.yaml
-# All fields are optional; values shown below are the compiled-in defaults.
+# Start with: rusts3 run (uses ./config.yaml by default)
+# All fields are optional; omitted fields use the compiled-in defaults noted
+# in the comments.
 
-# ─── Server ───────────────────────────────────────────────────────────────────
+# ─── Server (S3 API) ──────────────────────────────────────────────────────────
 server:
-  # IP address to listen on.  0.0.0.0 = all interfaces.
+  # IP address to listen on.  0.0.0.0 = all interfaces.  (default 0.0.0.0)
   bind_address: "192.168.44.172"
 
-  # TCP port.
+  # TCP port of the S3 API.  (default 8002)
   bind_port: 18000
 
-  # Root directory where bucket data is stored.
-  # Each bucket gets a sub-directory: <base_dir>/buckets/<bucket-name>/
+  # Root directory where all data is stored.  Layout:
+  #   <base_dir>/buckets/<bucket>/           bucket data + per-bucket index.sqlite
+  #   <base_dir>/admin.sqlite                IAM users/keys/policies (management UI)
+  #   <base_dir>/.rusts3.lock                process-exclusivity lock
+  # Exactly ONE rusts3 process may own a base_dir (enforced via flock).
   base_dir: "./test-data"
 
 # ─── Storage ──────────────────────────────────────────────────────────────────
 storage:
-  # Maximum SQLite connections kept open per bucket index pool.
+  # Maximum SQLite READER connections per bucket index pool.  Mutations
+  # always flow through one dedicated writer connection, so this only
+  # bounds concurrent reads (lists / lookups).  (default 50)
   sqlite_max_connections: 50
 
-  # Maximum object metadata entries in the LRU cache.
+  # Maximum object metadata entries in the in-memory LRU cache.
   # Each entry is roughly 400–700 bytes; 200 000 entries ≈ 80–140 MB.
-  # HEAD and GET requests are served from this cache on warm hits.
+  # A cache hit skips the per-object meta.json disk read on GET/HEAD; the
+  # authoritative index row is still consulted on every request.  (default 200000)
   meta_cache_capacity: 200000
 
-  # Maximum entries in the SQLite-repair suppression cache.
-  # Each entry is roughly 100 bytes; 200 000 entries ≈ 20 MB.
-  sqlite_repair_cache_capacity: 200000
+  # Durability of acknowledged writes.  (default full)
+  #   full    — blob files are fsynced before the index commit and SQLite
+  #             runs synchronous=FULL: an acked PUT survives power loss.
+  #   relaxed — no per-put blob fsync, SQLite synchronous=NORMAL: faster,
+  #             but a power loss may silently drop the last few acked
+  #             writes.  Consistency is never violated either way; a plain
+  #             process crash loses nothing in either mode.
+  durability: full
+
+  # Index rebuild pipeline (runs at startup for buckets whose index is
+  # missing or on an old schema, and for the admin ?rebuildIndex API).
+  # While a bucket rebuilds, ALL its requests get 503 SlowDown so S3
+  # clients retry automatically.
+  #
+  # Parallel rebuild workers — each both traverses directories and parses
+  # meta.json.  0 = auto: one worker per CPU core (default).  Set explicitly
+  # to override (e.g. lower on spinning disks, higher on idle NVMe).
+  rebuild_reader_threads: 0
+  # Bounded queue length between the tree walker and the readers.  (default 1000)
+  rebuild_queue_bound: 1000
+  # Rows per transaction in the batch writer.  (default 1000)
+  rebuild_batch_size: 1000
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging:
-  # Log level: trace | debug | info | warn | error
+  # Minimum log level: trace | debug | info | warn | error  (default info)
+  # Security-relevant events (logins, policy denials, auth rejections, UI
+  # audit trail) are logged at info/warn — keep at least "warn" in production.
   level: "info"
 
-  # Emit aggregate bandwidth totals and rates every 10 seconds.
+  # Emit aggregate bandwidth totals and rates every 10 seconds.  (default true)
   enable_bandwidth_report: true
 
-  # Path to a rolling log file.  When omitted, logs go to stdout only.
+  # Path to a rolling log file.  Omit to log to stdout only.
   # file: "/var/log/rusts3/rusts3.log"
 
-  # Rotate when the file reaches this size (MiB).
+  # Rotate when the log file reaches this size (MiB).  (default 100)
   rotation_size_mb: 100
 
-  # Number of archived log files to keep alongside the active log.
+  # Number of archived log files to keep alongside the active log.  (default 5)
   keep_files: 5
 
-  # Compress archived files with gzip (.gz extension added automatically).
+  # Compress archived files with gzip (.gz added automatically).  (default false)
   compress: false
 
-# ─── Background maintenance ───────────────────────────────────────────────────
+# ─── Background maintenance (hygiene only — never correctness) ────────────────
+# If the sweeper never ran, all acked data would still be perfectly
+# consistent; only disk space from staging/trash/orphans would accumulate.
 sweeper:
-  # How often background maintenance runs (seconds).
+  # How often background maintenance runs (seconds).  (default 300)
   interval_secs: 300
 
-  # Targeted visibility repair batch size.
-  # One maintenance pass drains all eligible rows in batches of this size.
-  visibility_repair_batch_size: 100
+  # Stale-intent resolution batch size.  Intents are the write-ahead records
+  # of in-flight publishes/retirements; leftovers only exist after crashes
+  # or failed operations.  One pass drains all eligible intents in batches
+  # of this size.  (default 100; legacy alias: visibility_repair_batch_size)
+  intent_batch_size: 100
 
-  # Minimum age of a targeted visibility repair during normal runtime (seconds).
-  visibility_repair_grace_period_secs: 86400
+  # Minimum age (seconds) before the resolver may act on an intent — an
+  # in-flight operation's intent must never be mistaken for an abandoned
+  # one, so keep this comfortably above your longest plausible upload.
+  # Crash leftovers are drained at startup regardless of this value.
+  # (default 3600; legacy alias: visibility_repair_grace_period_secs)
+  intent_grace_period_secs: 3600
 
-  # Minimum idle age of an abandoned staging directory before removal (seconds).
+  # Minimum idle age of an abandoned staging directory (unfinished uploads,
+  # abandoned multiparts) before removal (seconds).  (default 86400)
   staging_expiry_secs: 86400
 
-  # Minimum idle age of a trash directory before removal (seconds).
+  # Minimum age of a trash directory (retired/overwritten/deleted blobs)
+  # before permanent removal (seconds).  This is also the undo window after
+  # an accidental delete.  (default 600)
   trash_expiry_secs: 600
 
-# ─── Authentication ───────────────────────────────────────────────────────────
+# ─── Authentication (S3 API) ──────────────────────────────────────────────────
 auth:
-  # Set to true to require SigV4 signatures on every request.
-  # When false the server accepts all requests without credentials.
+  # true  — every S3 request must carry a valid AWS SigV4/V2 signature.
+  # false — open access, all requests accepted (default).
+  # NOTE: IAM policies are only enforced when auth is enabled.
   enabled: false
 
   # The hostname (and optional port) that S3 clients are configured to use.
-  # Example: "mys3.company.com" or "localhost:8002"
+  # Example: "mys3.company.com" or "192.168.44.172:18000"
   #
-  # When set, presigned URL verification uses this value for the `host` signed
-  # header instead of the incoming HTTP Host header.  This makes presigned URLs
-  # work correctly behind a reverse proxy that rewrites the Host header.
-  # Clients must configure their endpoint to match this value exactly.
-  #
+  # When set, presigned URL verification substitutes this value for the
+  # `host` signed header instead of the incoming HTTP Host header, which
+  # makes presigned URLs work behind a reverse proxy that rewrites Host.
   # When omitted (default), the incoming Host header is used directly.
-  # public_hostname: "localhost:18000"
+  public_hostname: "192.168.44.172:18000"
 
-  # List of valid access-key / secret-key pairs.
-  credentials:
-    - access_key: "minioadmin"
-      secret_key: "minioadmin"
-    - access_key: "AKIAIOSFODNN7EXAMPLE"
-      secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  # URL scheme for generated presigned share links. This does not affect
+  # signature verification; it only determines whether links use HTTP or HTTPS.
+  # Accepted values: http, https. (default http)
+  public_scheme: http
+
+  # Built-in admin users.  Held in memory, NON-ALTERABLE at runtime (the
+  # management UI shows them read-only), and unrestricted — no policy
+  # applies.  They are the bootstrap identities that always work, even
+  # against a bare data directory.
+  #   password  — bcrypt (recommended) or cleartext console password.
+  #   api_keys  — optional cleartext root access keys for the S3 API.
+  # Run `rusts3 genpassword` to generate a bcrypt console password.
+  # Runtime-managed IAM users (policy-bound, with their own access keys)
+  # are created in the management UI and stored in <base_dir>/admin.sqlite.
+  # (A legacy flat `credentials:` list of access_key/secret_key pairs is
+  # still accepted, but keys defined here also appear in the console.)
+  users:
+    - user: admin
+      # Uncomment and set to enable web-console login for this user:
+      # password: "change-me"
+      api_keys:
+        - ak: "minioadmin"
+          secret: "minioadmin"
+        - ak: "AKIAIOSFODNN7EXAMPLE"
+          secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+# ─── Management UI ────────────────────────────────────────────────────────────
+# Web console on its OWN port, fully separate from the S3 API:
+#   * web logins use username/password only (built-in users above, or IAM
+#     users created in the console),
+#   * the S3 API accepts access keys only,
+#   * IAM policies are enforced identically on both.
+ui:
+  # Enable the web console.  (default true)
+  enabled: true
+
+  # Listen address for the console.  Defaults to server.bind_address.
+  # bind_address: "192.168.44.172"
+
+  # Console TCP port.  (default 8003)
+  bind_port: 18001

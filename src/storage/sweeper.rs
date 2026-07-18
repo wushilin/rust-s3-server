@@ -1,13 +1,20 @@
-//! Background maintenance for bounded, non-live cleanup.
+//! Background maintenance — hygiene only, never correctness.
 //!
-//! A staging directory is safe to delete only when BOTH its folder-name epoch
-//! is older than the expiry window AND every file inside it has an mtime
-//! older than the expiry window.  The second condition prevents racing against
-//! an in-progress multipart upload whose upload-id happens to look old.
+//! Under the SQLite-as-truth design the request path is self-sufficient:
+//! consistency is established synchronously at the row commit. Everything
+//! here only reclaims space:
 //!
-//! The maintenance pass does not scan the live object namespace or every SQLite
-//! object row. SQLite drift is repaired only through the targeted
-//! visibility_repair_queue.
+//! * **Stale intents** — abandoned publishes / unfinished retirements left
+//!   by failed operations while the process kept running (crash leftovers
+//!   are drained at startup). Reads a near-empty table; never walks the
+//!   tree.
+//! * **Staging expiry** — abandoned uploads and multiparts.
+//! * **Trash expiry** — retired blob dirs past their grace window.
+//!
+//! A staging directory is safe to delete only when BOTH its folder-name
+//! epoch is older than the expiry window AND every file inside it has an
+//! mtime older than the window — the second condition prevents racing an
+//! in-progress multipart upload whose upload-id happens to look old.
 
 use std::path::Path;
 use std::time::SystemTime;
@@ -21,8 +28,10 @@ use super::time::now_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepConfig {
-    pub visibility_repair_batch_size: usize,
-    pub visibility_repair_grace_period_ms: i64,
+    pub intent_batch_size: usize,
+    /// Only intents older than this are resolved — an in-flight operation's
+    /// intent must never be mistaken for an abandoned one.
+    pub intent_grace_period_ms: i64,
     pub staging_expiry_ms: i64,
     pub trash_expiry_ms: i64,
     pub now_ms: i64,
@@ -30,20 +39,16 @@ pub struct SweepConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepStats {
-    pub sqlite_orphans_removed: usize,
-    pub physical_orphans_removed: usize,
+    pub intents_resolved: usize,
     pub staging_dirs_removed: usize,
     pub trash_dirs_removed: usize,
-    pub fanout_dirs_removed: usize,
-    pub sqlite_entries_checked: usize,
-    pub visibility_repairs_processed: usize,
 }
 
 impl Default for SweepConfig {
     fn default() -> Self {
         Self {
-            visibility_repair_batch_size: 100,
-            visibility_repair_grace_period_ms: 24 * 60 * 60 * 1000,
+            intent_batch_size: 100,
+            intent_grace_period_ms: 60 * 60 * 1000,
             staging_expiry_ms: 24 * 60 * 60 * 1000,
             trash_expiry_ms: 10 * 60 * 1000,
             now_ms: now_ms(),
@@ -58,17 +63,13 @@ pub async fn sweep_bucket(
     config: &SweepConfig,
 ) -> Result<SweepStats> {
     let mut stats = SweepStats::default();
-    let batch_size = config.visibility_repair_batch_size.max(1);
+    let batch_size = config.intent_batch_size.max(1);
     loop {
-        let batch = store
-            .process_visibility_repairs(
-                bucket,
-                config.visibility_repair_grace_period_ms,
-                batch_size,
-            )
+        let outcome = store
+            .resolve_stale_intents(bucket, config.intent_grace_period_ms, batch_size)
             .await?;
-        stats.visibility_repairs_processed += batch.selected;
-        if batch.selected < batch_size || batch.failed > 0 {
+        stats.intents_resolved += outcome.resolved;
+        if outcome.selected < batch_size || outcome.failed > 0 {
             break;
         }
         yield_now().await;
@@ -221,8 +222,8 @@ mod tests {
             &store,
             "bucket",
             &SweepConfig {
-                visibility_repair_batch_size: 100,
-                visibility_repair_grace_period_ms: 1,
+                intent_batch_size: 100,
+                intent_grace_period_ms: 1,
                 staging_expiry_ms: 1_000,
                 trash_expiry_ms: 1_000,
                 now_ms: 10_000,
@@ -256,8 +257,8 @@ mod tests {
             &store,
             "bucket",
             &SweepConfig {
-                visibility_repair_batch_size: 100,
-                visibility_repair_grace_period_ms: 1,
+                intent_batch_size: 100,
+                intent_grace_period_ms: 1,
                 staging_expiry_ms: 1_000,
                 trash_expiry_ms: 1_000,
                 now_ms: 10_000,
@@ -268,49 +269,6 @@ mod tests {
 
         assert_eq!(stats.staging_dirs_removed, 1);
         assert!(!staging_dir.exists());
-    }
-
-    #[tokio::test]
-    async fn repairs_queued_sqlite_orphan_after_grace_period() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalObjectStore::new(tmp.path());
-        store.create_bucket("bucket").await.unwrap();
-        store
-            .put_object("bucket", "key", b"hello", None, None, false)
-            .await
-            .unwrap();
-        let read = store.read_object("bucket", "key").await.unwrap();
-        let object_dir = read.object_dir.clone();
-        tokio::fs::remove_file(object_dir.join("meta.json"))
-            .await
-            .unwrap();
-        let index = store.index("bucket").await.unwrap();
-        index
-            .put(&crate::storage::index::ObjectIndexEntry {
-                object_key: "key".to_string(),
-                size: 5,
-                etag: "etag".to_string(),
-                last_modified_ms: 0,
-            })
-            .await
-            .unwrap();
-        index.enqueue_visibility_repair("key", 0).await.unwrap();
-
-        let stats = sweep_bucket(
-            &store,
-            "bucket",
-            &SweepConfig {
-                visibility_repair_batch_size: 10,
-                visibility_repair_grace_period_ms: 1,
-                staging_expiry_ms: 1000,
-                trash_expiry_ms: 1000,
-                now_ms: 10_000,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(stats.visibility_repairs_processed, 1);
-        assert!(index.get("key").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -334,8 +292,8 @@ mod tests {
             &store,
             "bucket",
             &SweepConfig {
-                visibility_repair_batch_size: 100,
-                visibility_repair_grace_period_ms: 0,
+                intent_batch_size: 100,
+                intent_grace_period_ms: 0,
                 staging_expiry_ms: 1000,
                 trash_expiry_ms: 0,
                 now_ms: now_ms(),
@@ -348,27 +306,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn visibility_repair_queue_drains_all_eligible_rows_in_batches() {
+    async fn sweep_resolves_stale_intents_in_batches() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         let index = store.index("bucket").await.unwrap();
+        // Five abandoned publish intents pointing at nonexistent dirs.
         for i in 1..=5u32 {
             index
-                .enqueue_visibility_repair(&format!("key-{i:02}"), 0)
+                .insert_publish_intent(&format!("key-{i:02}"), &format!("objects/none-{i}"), 0)
                 .await
                 .unwrap();
         }
 
         let cfg = SweepConfig {
-            visibility_repair_batch_size: 2,
-            visibility_repair_grace_period_ms: 1,
+            intent_batch_size: 2,
+            intent_grace_period_ms: 1,
             staging_expiry_ms: 1000,
             trash_expiry_ms: 1000,
             now_ms: now_ms(),
         };
 
         let stats = sweep_bucket(&store, "bucket", &cfg).await.unwrap();
-        assert_eq!(stats.visibility_repairs_processed, 5);
+        assert_eq!(stats.intents_resolved, 5);
+        assert!(index
+            .stale_intents(now_ms(), 0, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
