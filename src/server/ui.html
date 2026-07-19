@@ -65,24 +65,34 @@
   /* App shell */
   #appView { min-height:100%; }
   .sidebar { position:fixed; inset:0 auto 0 0; width:var(--sidebar); z-index:30; display:flex; flex-direction:column; background:var(--nav); color:var(--nav-text); }
-  .sidebar-brand { height:66px; display:flex; align-items:center; gap:11px; padding:0 20px; color:#fff; border-bottom:1px solid rgba(255,255,255,.07); font-weight:700; font-size:17px; }
+  .sidebar-brand { height:66px; display:flex; align-items:center; gap:11px; padding:0 16px 0 20px; color:#fff; border-bottom:1px solid rgba(255,255,255,.07); font-weight:700; font-size:17px; }
   .sidebar-brand .brand-mark { width:31px; height:31px; box-shadow:none; }
+  .sidebar-toggle { flex:0 0 auto; border:0; background:transparent; color:#8594a8; width:30px; height:30px; border-radius:6px; display:grid; place-items:center; cursor:pointer; transition:.14s; }
+  .sidebar-toggle:hover { background:var(--nav-hover); color:#fff; }
+  .sidebar { transition:width .16s ease; }
+  /* Collapsed: an icon-only rail. */
+  body.sidebar-collapsed { --sidebar:66px; }
+  body.sidebar-collapsed .brand-name, body.sidebar-collapsed .nav-label, body.sidebar-collapsed .server-state-copy { display:none; }
+  body.sidebar-collapsed .sidebar-brand { justify-content:center; gap:0; padding:0; }
+  body.sidebar-collapsed .sidebar-brand .brand-mark { display:none; }
+  body.sidebar-collapsed .nav-item { width:44px; margin:2px auto; padding:0; justify-content:center; gap:0; font-size:0; }
+  body.sidebar-collapsed .server-state { justify-content:center; padding:10px 0; }
   .nav-label { margin:25px 20px 8px; color:#607086; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.13em; }
   .nav-item { width:calc(100% - 20px); margin:2px 10px; height:42px; padding:0 12px; border:0; border-radius:6px; background:transparent; color:var(--nav-text); display:flex; align-items:center; gap:12px; cursor:pointer; text-align:left; transition:.14s ease; }
   .nav-item:hover { color:#e9eef5; background:var(--nav-hover); }
   .nav-item.active { color:var(--nav-active); background:#1b293a; box-shadow:inset 3px 0 var(--accent); }
   .sidebar-foot { margin-top:auto; padding:14px 10px 16px; border-top:1px solid rgba(255,255,255,.07); }
-  .server-state { display:flex; align-items:center; gap:9px; padding:10px 12px; color:#8594a8; font-size:12px; }
+  .server-state { display:flex; align-items:flex-start; gap:9px; padding:10px 12px; color:#8594a8; font-size:12px; }
+  .server-state .state-dot { margin-top:4px; flex:0 0 auto; }
+  .server-state-copy { display:flex; flex-direction:column; gap:3px; min-width:0; }
+  .server-version { color:#607086; font-size:10px; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+  .server-state.offline .state-dot { background:#d65a68; box-shadow:0 0 0 3px rgba(214,90,104,.12); }
   .state-dot { width:7px; height:7px; border-radius:50%; background:#3ac58d; box-shadow:0 0 0 3px rgba(58,197,141,.12); }
   .app-main { min-height:100vh; margin-left:var(--sidebar); }
   .topbar { position:sticky; top:0; z-index:20; height:66px; background:rgba(255,255,255,.96); backdrop-filter:blur(10px); border-bottom:1px solid var(--line); display:flex; align-items:center; padding:0 28px; gap:16px; }
-  .mobile-menu { display:none; }
   .page-heading h1 { margin:0; font-size:17px; letter-spacing:-.015em; }
   .page-heading p { margin:1px 0 0; color:var(--muted); font-size:12px; }
   #activity { display:flex; align-items:center; gap:6px; }
-  .activity-chip { display:inline-flex; align-items:center; gap:7px; padding:5px 9px; background:var(--surface-soft); border:1px solid var(--line); border-radius:99px; color:var(--muted); font-size:11px; white-space:nowrap; }
-  .activity-chip.busy { color:#315d9b; background:#f1f6fd; border-color:#dbe8f8; }
-  .activity-chip.rebuild { color:var(--warning); background:var(--warning-soft); border-color:#f4e3ba; }
   .pulse { width:6px; height:6px; border-radius:50%; background:currentColor; animation:pulse 1.3s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity:.3; } }
   .user-menu { display:flex; align-items:center; gap:10px; padding:5px 7px 5px 5px; background:transparent; border:0; border-radius:7px; cursor:pointer; }
@@ -94,6 +104,52 @@
   .profile-popover { position:absolute; right:24px; top:58px; min-width:190px; padding:6px; background:#fff; border:1px solid var(--line); border-radius:8px; box-shadow:var(--shadow); }
   .profile-popover button { width:100%; border:0; background:transparent; border-radius:5px; padding:9px 10px; display:flex; align-items:center; gap:9px; cursor:pointer; }
   .profile-popover button:hover { background:var(--surface-soft); }
+  .task-wrap { position:relative; }
+  .task-badge { display:inline-flex; align-items:center; gap:7px; height:34px; padding:0 13px; border:1px solid var(--line-strong); border-radius:999px; background:#fff; color:var(--text); font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap; transition:border .15s, box-shadow .15s; }
+  .task-badge:hover { border-color:var(--line-strong); }
+  .task-badge-sep { width:1px; height:15px; background:var(--line-strong); margin:0 2px; }
+  .task-rate { font-variant-numeric:tabular-nums; font-weight:600; font-size:11.5px; white-space:nowrap; }
+  .task-rate .rate-up { color:var(--accent); }
+  .task-rate .rate-dn { color:var(--muted); }
+  .task-dot { width:8px; height:8px; border-radius:50%; flex:none; }
+  /* Busy: pulsing accent dot + label. */
+  .task-badge:not(.idle) .task-dot { background:var(--accent); box-shadow:0 0 0 0 rgba(197,31,56,.5); animation:dotpulse 1.8s infinite; }
+  .task-badge:not(.idle) #taskBadgeLabel { color:var(--accent); }
+  /* Idle: calm green dot + "Idle". */
+  .task-badge.idle .task-dot { background:#1f9d57; }
+  .task-badge.idle #taskBadgeLabel { color:#1f9d57; }
+  @keyframes dotpulse { 0%{box-shadow:0 0 0 0 rgba(197,31,56,.45)} 70%{box-shadow:0 0 0 7px rgba(197,31,56,0)} 100%{box-shadow:0 0 0 0 rgba(197,31,56,0)} }
+  .tasks-popover { position:absolute; right:0; top:44px; width:420px; max-width:calc(100vw - 32px); background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:var(--shadow); overflow:hidden; z-index:40; }
+  .tasks-head { display:flex; align-items:center; gap:8px; padding:12px 14px; border-bottom:1px solid var(--line); }
+  .tasks-head strong { font-size:13px; }
+  .tasks-head .muted { font-size:11px; }
+  .tasks-open { width:26px; height:26px; border-radius:6px; display:grid; place-items:center; color:var(--muted); text-decoration:none; }
+  .tasks-open:hover { background:var(--surface-soft); color:var(--text); }
+  .tasks-open .icon { width:15px; height:15px; }
+  .tasks-body { max-height:min(60vh,420px); overflow-y:auto; }
+  .task-row { display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); }
+  .task-row:last-child { border-bottom:0; }
+  /* Compact icon badge — the operation name is verbose, so an icon carries the
+     category and the full name lives in the row's tooltip. */
+  .task-op { flex:none; width:30px; height:30px; border-radius:7px; display:grid; place-items:center; background:var(--surface-soft); color:var(--muted); }
+  .task-op .icon { width:16px; height:16px; }
+  .task-op.job { background:var(--accent-soft); color:var(--accent); }
+  .task-op.done { background:#e4f5ea; color:#1f9d57; }
+  .task-row.done { max-height:80px; opacity:.85; }
+  .task-row.vanish { max-height:0!important; opacity:0; padding-top:0; padding-bottom:0; overflow:hidden; transition:max-height .3s ease, opacity .28s ease, padding .3s ease; }
+  .task-main { min-width:0; flex:1; display:flex; flex-direction:column; gap:2px; }
+  .task-target { font-size:12.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .task-status { font-size:11.5px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .task-bar { height:3px; border-radius:2px; background:var(--line); overflow:hidden; margin-top:5px; }
+  .task-bar > span { display:block; height:100%; background:var(--accent); border-radius:2px; transition:width .3s ease; }
+  .task-bar.indet > span { width:32%; animation:taskindet 1.1s ease-in-out infinite; }
+  @keyframes taskindet { 0%{margin-left:-32%} 100%{margin-left:100%} }
+  .task-up { flex:0 0 auto; align-self:center; font-size:11px; font-weight:700; color:var(--accent); background:var(--accent-soft); border:1px solid #f2c2ca; border-radius:999px; padding:3px 9px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .task-cancel { flex:none; width:24px; height:24px; border:0; border-radius:5px; background:var(--accent); display:grid; place-items:center; cursor:pointer; transition:background .12s; }
+  .task-cancel:hover { background:var(--accent-hover); }
+  .task-cancel .stop { width:9px; height:9px; background:#fff; border-radius:1.5px; }
+  .task-cancel-spacer { flex:none; width:24px; }
+  .tasks-empty { padding:22px 14px; text-align:center; color:var(--muted); font-size:12.5px; }
   .page { padding:25px 28px 40px; }
 
   /* Shared controls */
@@ -146,11 +202,12 @@
   .bucket-item .icon { color:var(--accent); }
   .object-area { min-width:0; display:flex; flex-direction:column; background:#fff; }
   .object-head { min-height:62px; padding:10px 15px; display:flex; align-items:center; gap:8px; border-bottom:1px solid var(--line); }
-  .crumbs { display:flex; min-width:0; align-items:center; gap:3px; overflow:hidden; }
-  .crumb-btn { border:0; background:transparent; padding:5px 6px; border-radius:5px; color:var(--muted); cursor:pointer; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .crumb-btn:hover { background:#f0f3f6; color:var(--text); }
-  .crumb-btn.current { color:var(--text); font-weight:600; }
-  .crumb-sep { color:#aeb7c3; }
+  .crumbs { display:flex; min-width:0; align-items:center; gap:1px; overflow:hidden; }
+  .crumb-btn { border:1px solid var(--line); background:#fff; padding:5px 11px; border-radius:6px; color:var(--muted); font-size:12.5px; font-weight:500; cursor:pointer; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; transition:.12s; }
+  .crumb-btn:hover { color:var(--text); border-color:var(--line-strong); background:var(--surface-soft); }
+  .crumb-btn.current { color:var(--text); font-weight:700; background:var(--accent-soft); border-color:#f2c2ca; }
+  .crumb-sep { flex:0 0 auto; display:inline-grid; place-items:center; color:var(--subtle); padding:0 1px; }
+  .crumb-sep .icon { width:15px; height:15px; stroke-width:2.5; }
   .object-toolbar { flex-wrap:wrap; }
   .object-count { color:var(--muted); font-size:12px; white-space:nowrap; }
   .object-name { display:flex; align-items:center; gap:10px; min-width:240px; }
@@ -187,6 +244,14 @@
   .identity-icon { width:34px; height:34px; border-radius:50%; display:grid; place-items:center; background:#e9edf2; color:#596779; font-weight:700; }
   .identity strong, .identity small { display:block; }
   .identity small { color:var(--muted); margin-top:2px; }
+  .badge-list { display:flex; flex-wrap:wrap; gap:5px; }
+  .check-list { max-height:310px; overflow:auto; border:1px solid var(--line); border-radius:7px; }
+  .check-row { min-height:48px; padding:8px 12px; display:flex; align-items:center; gap:10px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .check-row:last-child { border-bottom:0; }
+  .check-row:hover { background:var(--surface-soft); }
+  .check-row input { width:16px; height:16px; accent-color:var(--accent); }
+  .check-copy strong, .check-copy small { display:block; }
+  .check-copy small { color:var(--muted); margin-top:2px; }
   code.key { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:#344256; }
 
   /* Dialogs & feedback */
@@ -201,6 +266,15 @@
   .dialog-body { padding:19px 20px; }
   .dialog-actions { padding:13px 20px; display:flex; justify-content:flex-end; gap:8px; background:#fafbfc; border-top:1px solid var(--line); }
   .preset-row { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:12px; }
+  .editor-tabs { display:inline-flex; padding:3px; margin-bottom:14px; border:1px solid var(--line); border-radius:7px; background:var(--surface-soft); }
+  .editor-tab { min-height:30px; padding:0 12px; border:0; border-radius:5px; background:transparent; color:var(--muted); font-size:12px; font-weight:600; cursor:pointer; }
+  .editor-tab.active { background:#fff; color:var(--text); box-shadow:var(--shadow-sm); }
+  .rule-list { display:flex; flex-direction:column; gap:10px; }
+  .policy-rule { display:grid; grid-template-columns:105px 155px minmax(150px,1fr) minmax(150px,1fr) 32px; gap:9px; align-items:end; padding:13px; border:1px solid var(--line); border-radius:8px; background:var(--surface-soft); }
+  .policy-rule .field { gap:5px; margin:0; }
+  .policy-rule .field label { color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.05em; }
+  .policy-rule .input { height:36px; background:#fff; }
+  .rule-note { margin:10px 0 0; color:var(--muted); font-size:11.5px; }
   .secret-box { margin:12px 0 4px; padding:14px; border:1px solid var(--line); border-radius:7px; background:#f7f9fb; font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; word-break:break-all; }
   .share-result { margin-top:15px; }
   .share-result .input { padding-right:48px; }
@@ -231,12 +305,14 @@
     .hide-tablet { display:none; }
   }
   @media (max-width:720px) {
-    :root { --sidebar:260px; }
-    .sidebar { transform:translateX(-105%); transition:transform .2s ease; box-shadow:var(--shadow); }
-    body.nav-open .sidebar { transform:translateX(0); }
-    .app-main { margin-left:0; } .mobile-menu { display:inline-grid; }
+    /* Sidebar becomes a fixed icon-only rail (no drawer). */
+    :root { --sidebar:66px; }
+    .brand-name, .nav-label, .server-state-copy, .sidebar-toggle { display:none; }
+    .sidebar-brand { justify-content:center; gap:0; padding:0; }
+    .nav-item { width:44px; margin:2px auto; padding:0; justify-content:center; gap:0; font-size:0; }
+    .server-state { justify-content:center; padding:10px 0; }
     .topbar { padding:0 14px; } .page { padding:16px 14px 28px; }
-    .user-meta, #activity { display:none; }
+    .user-meta { display:none; }
     .browser-shell { display:block; min-height:0; }
     .bucket-rail { border-right:0; border-bottom:1px solid var(--line); }
     .rail-head { height:51px; } .bucket-list { display:flex; gap:5px; overflow:auto; padding:7px; }
@@ -250,6 +326,8 @@
     .content-head { flex-wrap:wrap; } .content-head .spacer { display:none; width:100%; }
     .content-head .btn { margin-left:auto; }
     .transfer-center { right:15px; bottom:15px; }
+    .policy-rule { grid-template-columns:1fr 1fr; }
+    .policy-rule .row-action { align-self:end; }
   }
 </style>
 </head>
@@ -293,21 +371,27 @@
 
 <div id="appView" class="hidden">
   <aside class="sidebar">
-    <div class="sidebar-brand"><span class="brand-mark" data-icon="layers"></span> RustS3</div>
+    <div class="sidebar-brand"><span class="brand-mark" data-icon="layers"></span><span class="brand-name">RustS3</span><span class="spacer"></span><button class="sidebar-toggle" onclick="toggleSidebar()" title="Collapse / expand menu" aria-label="Toggle menu"><span data-icon="menu"></span></button></div>
     <div class="nav-label">Storage</div>
     <button class="nav-item active" data-tab="objects"><span data-icon="folder"></span> Object Browser</button>
     <div class="nav-label">Access</div>
-    <button class="nav-item" data-tab="users" id="usersTabBtn"><span data-icon="users"></span> IAM Users</button>
+    <button class="nav-item" data-tab="users" id="usersTabBtn" data-admin-only><span data-icon="users"></span> IAM Users</button>
+    <button class="nav-item" data-tab="groups" id="groupsTabBtn" data-admin-only><span data-icon="shield"></span> IAM Groups</button>
     <button class="nav-item" data-tab="keys"><span data-icon="key"></span> My Access Keys</button>
-    <div class="sidebar-foot"><div class="server-state"><span class="state-dot"></span><span id="serverStateText">Server connected</span></div></div>
+    <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span></div></div></div>
   </aside>
 
   <div class="app-main">
     <header class="topbar">
-      <button class="btn icon-only mobile-menu" onclick="toggleNav()" aria-label="Open navigation"><span data-icon="menu"></span></button>
       <div class="page-heading"><h1 id="pageTitle">Object Browser</h1><p id="pageSubtitle">Manage buckets and objects</p></div>
       <div class="spacer"></div>
-      <div id="activity"><span class="activity-chip"><span class="state-dot"></span> Ready</span></div>
+      <div class="task-wrap">
+        <button class="task-badge idle hidden" id="taskBadge" onclick="toggleTasks()" title="Active tasks and live throughput (last ~5s) — click to view"><span class="task-dot"></span><span id="taskBadgeLabel">Idle</span><span class="task-badge-sep"></span><span class="task-rate" id="taskBadgeRate"><span class="rate-up">↑&nbsp;0&nbsp;B/s</span>&nbsp;<span class="rate-dn">↓&nbsp;0&nbsp;B/s</span></span></button>
+        <div id="tasksPopover" class="tasks-popover hidden">
+          <div class="tasks-head"><strong>Active tasks</strong><span class="muted">live</span><span class="spacer"></span><a class="tasks-open" href="/tasks" target="_blank" rel="noopener" title="Open in a new tab"><span data-icon="external"></span></a></div>
+          <div class="tasks-body"><div id="tasksActive"></div><div id="tasksDone"></div><div id="tasksEmpty" class="tasks-empty">Nothing running right now.</div></div>
+        </div>
+      </div>
       <button class="user-menu" onclick="toggleProfile()">
         <span class="avatar" id="avatar">A</span><span class="user-meta"><strong id="whoami"></strong><span id="userRole"></span></span><span data-icon="chevron-down"></span>
       </button>
@@ -325,6 +409,7 @@
             <div class="object-head">
               <div class="crumbs" id="crumbs"></div><span class="spacer"></span>
               <input type="file" id="fileInput" multiple class="hidden" onchange="uploadFiles(this.files)">
+              <button class="btn icon-only" data-admin-only id="rebuildBucketBtn" onclick="rebuildBucket()" title="Rebuild this bucket's index"><span data-icon="database"></span></button>
               <button class="btn danger icon-only" id="deleteBucketBtn" onclick="confirmDeleteBucket()" title="Delete bucket"><span data-icon="trash"></span></button>
               <button class="btn primary" id="uploadBtn" onclick="$('fileInput').click()"><span data-icon="upload"></span> Upload</button>
             </div>
@@ -349,8 +434,17 @@
         <div class="content-head"><div><h2>IAM Users</h2><p>Manage console users, S3 policies, and user access keys.</p></div><span class="spacer"></span><button class="btn primary" onclick="openUserDialog()"><span data-icon="user-plus"></span> Create user</button></div>
         <div class="panel">
           <div class="panel-title"><div><h3>Users</h3><p>Built-in administrators are managed in the server configuration.</p></div><span class="spacer"></span><span class="badge" id="userCount"></span></div>
-          <div class="table-wrap"><table><thead><tr><th>User</th><th>Account type</th><th>Policy</th><th style="width:145px"></th></tr></thead><tbody id="userRows"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>User</th><th>Account type</th><th>Groups</th><th>Explicit policy</th><th style="width:180px"></th></tr></thead><tbody id="userRows"></tbody></table></div>
           <div id="userEmpty" class="empty hidden"></div>
+        </div>
+      </section>
+
+      <section id="tab_groups" class="page hidden">
+        <div class="content-head"><div><h2>IAM Groups</h2><p>Reuse S3 policies across users and assign console administration.</p></div><span class="spacer"></span><button class="btn primary" onclick="openGroupDialog()"><span data-icon="plus"></span> Create group</button></div>
+        <div class="panel">
+          <div class="panel-title"><div><h3>Groups</h3><p>The system admin group is immutable, grants control-plane authority, and contributes an allow-all S3 policy.</p></div><span class="spacer"></span><span class="badge" id="groupCount"></span></div>
+          <div class="table-wrap"><table><thead><tr><th>Group</th><th>Type</th><th>Policy</th><th>Members</th><th style="width:90px"></th></tr></thead><tbody id="groupRows"></tbody></table></div>
+          <div id="groupEmpty" class="empty hidden"></div>
         </div>
       </section>
 
@@ -386,6 +480,20 @@
   </form>
 </dialog>
 
+<dialog id="groupDlg">
+  <form onsubmit="createGroup(event)">
+    <div class="dialog-head"><div><h3>Create IAM group</h3><p>Create a reusable policy container for IAM users.</p></div><button type="button" class="dialog-close" onclick="groupDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body"><div class="field"><label for="ng_name">Group name</label><input class="input" id="ng_name" placeholder="e.g. backup-operators" autocomplete="off"><span class="muted" style="font-size:11.5px">The reserved name “admin” cannot be used.</span></div><div id="groupError" class="inline-error"></div></div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="groupDlg.close()">Cancel</button><button class="btn primary" type="submit">Create group</button></div>
+  </form>
+</dialog>
+
+<dialog id="membershipDlg">
+  <div class="dialog-head"><div><h3>Groups for <span id="mg_user"></span></h3><p>Changes apply immediately to console sessions and access keys.</p></div><button class="dialog-close" onclick="membershipDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-body"><div id="membershipList" class="check-list"></div><div id="membershipError" class="inline-error"></div></div>
+  <div class="dialog-actions"><button class="btn" onclick="membershipDlg.close()">Cancel</button><button class="btn primary" onclick="saveMemberships()">Save groups</button></div>
+</dialog>
+
 <dialog id="emptyBucketDlg">
   <form onsubmit="emptyAndDeleteBucket(event)">
     <div class="dialog-head"><div><h3>Empty and delete bucket</h3><p id="emptyBucketSubtitle"></p></div><button type="button" class="dialog-close" id="emptyBucketClose" onclick="emptyBucketDlg.close()"><span data-icon="x"></span></button></div>
@@ -416,8 +524,13 @@
 </dialog>
 
 <dialog id="policyDlg" class="wide">
-  <div class="dialog-head"><div><h3>Policy for <span id="pd_user"></span></h3><p>Choose a preset or edit the S3-compatible policy document directly.</p></div><button class="dialog-close" onclick="policyDlg.close()"><span data-icon="x"></span></button></div>
-  <div class="dialog-body"><div class="preset-row"><button class="btn small" onclick="preset('full-all')">Full access</button><button class="btn small" onclick="preset('ro-all')">Read-only</button><button class="btn small" onclick="preset('full-bucket')">Bucket full access</button><button class="btn small" onclick="preset('ro-bucket')">Bucket read-only</button><button class="btn small" onclick="preset('wo-bucket')">Bucket ingest</button></div><textarea class="input" id="pd_text" spellcheck="false" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px"></textarea><div id="policyError" class="inline-error"></div></div>
+  <div class="dialog-head"><div><h3>Policy for <span id="pd_target"></span></h3><p>Build common S3 rules visually or edit the exact policy JSON.</p></div><button class="dialog-close" onclick="policyDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-body">
+    <div class="editor-tabs"><button class="editor-tab active" id="rulesTab" onclick="setPolicyMode('rules')">Rule builder</button><button class="editor-tab" id="jsonTab" onclick="setPolicyMode('json')">JSON</button></div>
+    <div id="rulesEditor"><div id="ruleList" class="rule-list"></div><button class="btn small" style="margin-top:11px" onclick="addPolicyRule()"><span data-icon="plus"></span> Add rule</button><p class="rule-note">Prefix scopes object operations and object/version listings. AWS multipart-upload listing remains bucket-scoped. Batch deletes authorize every object independently. An explicit Deny always overrides every Allow.</p></div>
+    <div id="jsonEditor" class="hidden"><div class="preset-row"><button class="btn small" onclick="preset('full-all')">Full access</button><button class="btn small" onclick="preset('ro-all')">Read-only</button><button class="btn small" onclick="preset('full-bucket')">Bucket full access</button><button class="btn small" onclick="preset('ro-bucket')">Bucket read-only</button><button class="btn small" onclick="preset('wo-bucket')">Bucket ingest</button></div><textarea class="input" id="pd_text" spellcheck="false" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px"></textarea></div>
+    <datalist id="policyBuckets"></datalist><div id="policyError" class="inline-error"></div>
+  </div>
   <div class="dialog-actions"><button class="btn danger" onclick="savePolicy(null)">Detach policy</button><span class="spacer"></span><button class="btn" onclick="policyDlg.close()">Cancel</button><button class="btn primary" onclick="savePolicy()">Save policy</button></div>
 </dialog>
 
@@ -447,166 +560,10 @@
 
 <div class="toast-stack" id="toasts"></div>
 
-<script>
-const icons = {
-  layers:'<svg viewBox="0 0 24 24" class="icon"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 17l9 5 9-5"/></svg>',
-  folder:'<svg viewBox="0 0 24 24" class="icon"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H9l2 2h7.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5v-10Z"/></svg>',
-  users:'<svg viewBox="0 0 24 24" class="icon"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
-  key:'<svg viewBox="0 0 24 24" class="icon"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 8-8M15 8l2 2M18 5l2 2"/></svg>',
-  database:'<svg viewBox="0 0 24 24" class="icon"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v7c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12v7c0 1.7 4 3 9 3s9-1.3 9-3v-7"/></svg>',
-  shield:'<svg viewBox="0 0 24 24" class="icon"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>',
-  zap:'<svg viewBox="0 0 24 24" class="icon"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/></svg>',
-  plus:'<svg viewBox="0 0 24 24" class="icon"><path d="M12 5v14M5 12h14"/></svg>',
-  upload:'<svg viewBox="0 0 24 24" class="icon"><path d="M12 16V3m0 0L7 8m5-5 5 5M5 21h14"/></svg>',
-  download:'<svg viewBox="0 0 24 24" class="icon"><path d="M12 3v13m0 0 5-5m-5 5-5-5M5 21h14"/></svg>',
-  search:'<svg viewBox="0 0 24 24" class="icon"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>',
-  refresh:'<svg viewBox="0 0 24 24" class="icon"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11m16 2-2 4.5A7 7 0 0 1 5.5 15"/></svg>',
-  file:'<svg viewBox="0 0 24 24" class="icon"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>',
-  share:'<svg viewBox="0 0 24 24" class="icon"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"/></svg>',
-  trash:'<svg viewBox="0 0 24 24" class="icon"><path d="M3 6h18M8 6V4h8v2m3 0-1 15H6L5 6M10 11v6M14 11v6"/></svg>',
-  info:'<svg viewBox="0 0 24 24" class="icon"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>',
-  eye:'<svg viewBox="0 0 24 24" class="icon"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>',
-  menu:'<svg viewBox="0 0 24 24" class="icon"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
-  logout:'<svg viewBox="0 0 24 24" class="icon"><path d="M10 17l5-5-5-5M15 12H3M15 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/></svg>',
-  'chevron-down':'<svg viewBox="0 0 24 24" class="icon sm"><path d="m7 10 5 5 5-5"/></svg>',
-  'chevron-right':'<svg viewBox="0 0 24 24" class="icon sm"><path d="m9 18 6-6-6-6"/></svg>',
-  x:'<svg viewBox="0 0 24 24" class="icon"><path d="m6 6 12 12M18 6 6 18"/></svg>',
-  copy:'<svg viewBox="0 0 24 24" class="icon"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
-  link:'<svg viewBox="0 0 24 24" class="icon"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>',
-  'user-plus':'<svg viewBox="0 0 24 24" class="icon"><path d="M15 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8" cy="7" r="4"/><path d="M19 8v6M16 11h6"/></svg>'
-};
-const $ = id => document.getElementById(id);
-const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const enc = value => encodeURIComponent(value).replace(/'/g,'%27');
-const fmtSize = n => n < 1024 ? n+' B' : n < 1048576 ? (n/1024).toFixed(1)+' KiB' : n < 1073741824 ? (n/1048576).toFixed(1)+' MiB' : (n/1073741824).toFixed(2)+' GiB';
-const fmtTime = ms => ms ? new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(ms)) : '—';
-function hydrateIcons(root=document) { root.querySelectorAll('[data-icon]').forEach(el=>{ const name=el.dataset.icon; if(icons[name]) el.innerHTML=icons[name]; }); }
-hydrateIcons();
-
-let me=null, buckets=[], bucket=null, prefix='', nextAfter=null, objectItems=[], users=[], shareKey=null, detailObject=null, pollTimer=null;
-async function api(method,url,body) {
-  const opts={method,headers:{}};
-  if(body!==undefined){opts.headers['content-type']='application/json';opts.body=JSON.stringify(body);}
-  const resp=await fetch(url,opts); const data=await resp.json().catch(()=>({}));
-  if(!resp.ok){if(resp.status===401&&me) location.reload();throw new Error(data.error||resp.statusText||'Request failed');}
-  return data;
-}
-function setInlineError(id,message=''){const el=$(id);el.textContent=message;el.classList.toggle('show',!!message);}
-function toast(title,message='',ok=true){const el=document.createElement('div');el.className='toast '+(ok?'ok':'err');el.innerHTML=`<span class="toast-symbol">${icons[ok?'shield':'info']}</span><div><strong>${esc(title)}</strong>${message?`<span>${esc(message)}</span>`:''}</div>`;$('toasts').append(el);setTimeout(()=>el.remove(),4200);}
-function setBusy(button,busy,label){if(!button)return;if(busy){button.dataset.label=button.innerHTML;button.disabled=true;button.textContent=label||'Working…';}else{button.disabled=false;if(button.dataset.label)button.innerHTML=button.dataset.label;hydrateIcons(button);}}
-
-async function boot(){try{me=await api('GET','/api/me');onLoggedIn();}catch{$('loginView').classList.remove('hidden');}}
-async function login(event){event.preventDefault();setInlineError('li_msg');const btn=$('loginBtn');setBusy(btn,true,'Signing in…');try{me=await api('POST','/api/login',{username:$('li_user').value.trim(),password:$('li_pass').value});onLoggedIn();}catch(e){setInlineError('li_msg',e.message);setBusy(btn,false);}}
-async function logout(){try{await api('POST','/api/logout');}finally{location.reload();}}
-function togglePassword(){const input=$('li_pass');input.type=input.type==='password'?'text':'password';}
-function onLoggedIn(){
-  $('loginView').classList.add('hidden');$('appView').classList.remove('hidden');
-  $('whoami').textContent=me.username;$('userRole').textContent=me.is_root?'Administrator':'IAM user';$('avatar').textContent=(me.username[0]||'U').toUpperCase();$('usersTabBtn').classList.toggle('hidden',!me.is_root);
-  showTab('objects');loadBuckets();if(me.is_root){pollStatus();pollTimer=setInterval(pollStatus,2500);}else{$('activity').classList.add('hidden');}
-}
-function toggleNav(){document.body.classList.toggle('nav-open');}
-function toggleProfile(){$('profilePopover').classList.toggle('hidden');}
-document.addEventListener('click',e=>{if(!e.target.closest('.user-menu')&&!e.target.closest('#profilePopover'))$('profilePopover')?.classList.add('hidden');});
-document.querySelectorAll('.nav-item').forEach(btn=>btn.onclick=()=>showTab(btn.dataset.tab));
-const pageMeta={objects:['Object Browser','Manage buckets and objects'],users:['IAM Users','Manage users and policies'],keys:['My Access Keys','Manage your application credentials']};
-function showTab(tab){
-  document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
-  ['objects','users','keys'].forEach(t=>$('tab_'+t).classList.toggle('hidden',t!==tab));
-  $('pageTitle').textContent=pageMeta[tab][0];$('pageSubtitle').textContent=pageMeta[tab][1];document.body.classList.remove('nav-open');closeDetails();
-  if(tab==='users')loadUsers();if(tab==='keys')loadMyKeys();
-}
-
-let lastTotals=null,lastTotalsAt=0,hadRebuilds=false;
-async function pollStatus(){try{const s=await api('GET','/api/status');const chips=[];for(const r of s.rebuilds)chips.push(`<span class="activity-chip rebuild"><span class="pulse"></span>Rebuilding ${esc(r.bucket)} · ${Number(r.objects_indexed).toLocaleString()}</span>`);if(s.active.uploads)chips.push(`<span class="activity-chip busy"><span class="pulse"></span>${s.active.uploads} upload${s.active.uploads>1?'s':''}</span>`);if(s.active.downloads)chips.push(`<span class="activity-chip busy"><span class="pulse"></span>${s.active.downloads} download${s.active.downloads>1?'s':''}</span>`);if(lastTotals&&s.now_ms>lastTotalsAt){const dt=(s.now_ms-lastTotalsAt)/1000,inRate=Math.max(0,(s.totals.bytes_in-lastTotals.bytes_in)/dt),outRate=Math.max(0,(s.totals.bytes_out-lastTotals.bytes_out)/dt);if(inRate>10240||outRate>10240)chips.push(`<span class="activity-chip">↑ ${fmtSize(Math.round(inRate))}/s · ↓ ${fmtSize(Math.round(outRate))}/s</span>`);}lastTotals=s.totals;lastTotalsAt=s.now_ms;$('activity').innerHTML=chips.length?chips.join(''):'<span class="activity-chip"><span class="state-dot"></span> Ready</span>';$('serverStateText').textContent='Server connected';const rebuilding=s.rebuilds.length>0;if(hadRebuilds&&!rebuilding)loadBuckets(true);hadRebuilds=rebuilding;}catch{$('serverStateText').textContent='Connection interrupted';}}
-
-async function loadBuckets(preserve=false){
-  try{const data=await api('GET','/api/buckets');buckets=data.buckets||[];if(!preserve||!buckets.some(b=>b.name===bucket))bucket=buckets[0]?.name||null;renderBuckets();if(bucket){prefix=preserve?prefix:'';await loadObjects();}else{objectItems=[];renderCrumbs();renderObjects();}}catch(e){toast('Could not load buckets',e.message,false);}
-}
-function renderBuckets(){
-  $('bucketList').innerHTML=buckets.length?buckets.map((b,i)=>`<button class="bucket-item ${b.name===bucket?'active':''}" onclick="selectBucket(${i})" title="${esc(b.name)}">${icons.database}<span>${esc(b.name)}</span></button>`).join(''):`<div style="padding:20px 10px;text-align:center;color:var(--muted);font-size:12px">No buckets yet</div>`;
-}
-function selectBucket(i){bucket=buckets[i].name;prefix='';objectItems=[];renderBuckets();loadObjects();}
-function renderCrumbs(){
-  if(!bucket){$('crumbs').innerHTML='<span class="muted">Create a bucket to get started</span>';$('uploadBtn').disabled=true;$('deleteBucketBtn').disabled=true;return;}
-  $('uploadBtn').disabled=false;$('deleteBucketBtn').disabled=false;const parts=prefix.split('/').filter(Boolean);let acc='';let html=`<button class="crumb-btn ${parts.length?'':'current'}" onclick="goPrefix('')">${esc(bucket)}</button>`;parts.forEach((part,i)=>{acc+=part+'/';html+=`<span class="crumb-sep">${icons['chevron-right']}</span><button class="crumb-btn ${i===parts.length-1?'current':''}" onclick="goPrefix(decodeURIComponent('${enc(acc)}'))">${esc(part)}</button>`;});$('crumbs').innerHTML=html;
-}
-function goPrefix(value){prefix=value;closeDetails();loadObjects();}
-async function loadObjects(more=false){
-  if(!bucket){renderObjects();return;}if(!more){nextAfter=null;objectItems=[];}renderCrumbs();
-  try{const q=new URLSearchParams({bucket,prefix});if(more&&nextAfter)q.set('after',nextAfter);const data=await api('GET','/api/objects?'+q);objectItems.push(...data.common_prefixes.map(value=>({type:'folder',key:value,name:value.slice(prefix.length).replace(/\/$/,''),size:null,last_modified_ms:null})),...data.entries.map(value=>({...value,type:'object',name:value.key.slice(prefix.length)})));nextAfter=data.is_truncated?data.next_after:null;$('moreWrap').classList.toggle('hidden',!nextAfter);renderObjects();}catch(e){toast('Could not load objects',e.message,false);renderObjects();}
-}
-function renderObjects(){
-  renderCrumbs();const query=$('objectSearch').value.trim().toLowerCase();const visible=objectItems.filter(o=>o.name.toLowerCase().includes(query));$('objectCount').textContent=bucket?`${visible.length}${nextAfter?'+':''} item${visible.length===1?'':'s'}`:'';
-  $('objRows').innerHTML=visible.map((o,i)=>o.type==='folder'?`<tr><td><div class="object-name"><span class="file-icon folder">${icons.folder}</span><button onclick="goPrefix(decodeURIComponent('${enc(o.key)}'))">${esc(o.name)}</button></div></td><td class="hide-mobile muted">—</td><td class="hide-tablet muted">—</td><td class="actions"><button class="row-action" title="Open folder" onclick="goPrefix(decodeURIComponent('${enc(o.key)}'))">${icons['chevron-right']}</button></td></tr>`:`<tr><td><div class="object-name"><span class="file-icon">${icons.file}</span><button onclick="openDetails(${objectItems.indexOf(o)})" title="${esc(o.name)}">${esc(o.name)}</button></div></td><td class="hide-mobile">${fmtSize(o.size)}</td><td class="hide-tablet muted">${fmtTime(o.last_modified_ms)}</td><td class="actions"><a class="row-action" title="Download" href="${objectUrl(o.key)}" download>${icons.download}</a><button class="row-action" title="Share" onclick="openShare(decodeURIComponent('${enc(o.key)}'))">${icons.share}</button><button class="row-action danger" title="Delete" onclick="confirmDeleteObject(decodeURIComponent('${enc(o.key)}'))">${icons.trash}</button></td></tr>`).join('');
-  const empty=!visible.length;$('objectTableWrap').querySelector('table').classList.toggle('hidden',empty);$('objectEmpty').classList.toggle('hidden',!empty);if(empty)$('objectEmpty').innerHTML=`<div class="empty-icon">${icons[bucket?'folder':'database']}</div><h3>${query?'No matching objects':bucket?'This location is empty':'No buckets yet'}</h3><p>${query?'Try a different filter.':bucket?'Upload files by using the button above or dragging them into this window.':'Create your first bucket to begin storing objects.'}</p>${!bucket&&me?.is_root?'<button class="btn primary" onclick="openBucketDialog()">Create bucket</button>':''}`;
-}
-function objectUrl(key){return `/api/object?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(key)}`;}
-function openBucketDialog(){$('newBucketName').value='';setInlineError('bucketError');$('bucketDlg').showModal();setTimeout(()=>$('newBucketName').focus(),50);}
-async function createBucket(event){event.preventDefault();const name=$('newBucketName').value.trim();if(!name){setInlineError('bucketError','Enter a bucket name.');return;}try{await api('POST','/api/buckets',{name});$('bucketDlg').close();toast('Bucket created',name);await loadBuckets();const index=buckets.findIndex(b=>b.name===name);if(index>=0)selectBucket(index);}catch(e){setInlineError('bucketError',e.message);}}
-let deletingBucket=null,deletingObjectCount=0;
-async function confirmDeleteBucket(){
-  if(!bucket)return;const target=bucket;
-  try{const stats=await api('GET','/api/buckets/'+encodeURIComponent(target)+'/stats');if(stats.objects===0){showConfirm('Delete empty bucket?',target,'The empty bucket will be permanently deleted.',async()=>{await api('DELETE','/api/buckets/'+encodeURIComponent(target));toast('Bucket deleted',target);await loadBuckets();});return;}deletingBucket=target;deletingObjectCount=Number(stats.objects);$('emptyBucketSubtitle').textContent=`${deletingObjectCount.toLocaleString()} object${deletingObjectCount===1?' is':'s are'} still in “${target}”. Empty the bucket before deleting it?`;$('emptyBucketConfirm').value='';$('emptyBucketConfirm').disabled=false;$('emptyBucketProgress').classList.add('hidden');$('emptyBucketProgressBar').style.width='0';$('emptyBucketPercent').textContent='0%';$('emptyBucketAction').disabled=false;$('emptyBucketCancel').disabled=false;$('emptyBucketClose').disabled=false;setInlineError('emptyBucketError');$('emptyBucketDlg').showModal();setTimeout(()=>$('emptyBucketConfirm').focus(),50);}catch(e){toast('Cannot delete bucket',e.message,false);}
-}
-async function emptyAndDeleteBucket(event){
-  event.preventDefault();if($('emptyBucketConfirm').value!=='CONFIRM'){setInlineError('emptyBucketError','Type CONFIRM exactly to continue.');return;}
-  const target=deletingBucket;let deleted=0;setInlineError('emptyBucketError');$('emptyBucketConfirm').disabled=true;$('emptyBucketAction').disabled=true;$('emptyBucketCancel').disabled=true;$('emptyBucketClose').disabled=true;$('emptyBucketProgress').classList.remove('hidden');cancelUploadsForBucket(target);
-  try{
-    while(true){const data=await api('GET','/api/objects?'+new URLSearchParams({bucket:target,prefix:'',recursive:'true'}));const entries=data.entries||[];if(!entries.length)break;for(let i=0;i<entries.length;i+=6){const batch=entries.slice(i,i+6);await Promise.all(batch.map(entry=>api('DELETE',`/api/object?bucket=${encodeURIComponent(target)}&key=${encodeURIComponent(entry.key)}`)));deleted+=batch.length;const percent=Math.min(99,Math.round(deleted/Math.max(deletingObjectCount,deleted)*100));$('emptyBucketStatus').textContent=`Deleted ${deleted.toLocaleString()} of ${Math.max(deletingObjectCount,deleted).toLocaleString()} objects`;$('emptyBucketPercent').textContent=percent+'%';$('emptyBucketProgressBar').style.width=percent+'%';}}
-    $('emptyBucketStatus').textContent='Deleting bucket…';await api('DELETE','/api/buckets/'+encodeURIComponent(target));$('emptyBucketPercent').textContent='100%';$('emptyBucketProgressBar').style.width='100%';$('emptyBucketDlg').close();toast('Bucket emptied and deleted',target);await loadBuckets();
-  }catch(e){setInlineError('emptyBucketError',e.message);$('emptyBucketAction').disabled=false;$('emptyBucketCancel').disabled=false;$('emptyBucketClose').disabled=false;}
-}
-
-const dropZone=$('dropZone');let dragDepth=0;
-dropZone.addEventListener('dragenter',e=>{e.preventDefault();dragDepth++;dropZone.classList.add('drop-active');});
-dropZone.addEventListener('dragover',e=>e.preventDefault());
-dropZone.addEventListener('dragleave',e=>{e.preventDefault();dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)dropZone.classList.remove('drop-active');});
-dropZone.addEventListener('drop',e=>{e.preventDefault();dragDepth=0;dropZone.classList.remove('drop-active');uploadFiles(e.dataTransfer.files);});
-let uploadTaskId=0,uploadTasks=[],activeUploadCount=0,uploadReloadTimer=null;
-function uploadFiles(fileList){const files=[...fileList];if(!files.length||!bucket)return;const targetBucket=bucket,targetPrefix=prefix;for(const file of files)uploadTasks.push({id:++uploadTaskId,file,bucket:targetBucket,key:targetPrefix+file.name,status:'queued',progress:0,xhr:null,error:''});$('fileInput').value='';renderTransfers();processUploadQueue();}
-function processUploadQueue(){while(activeUploadCount<3){const task=uploadTasks.find(t=>t.status==='queued');if(!task)break;task.status='uploading';activeUploadCount++;renderTransfers();runUpload(task).then(()=>{task.status='complete';task.progress=100;scheduleUploadRefresh(task);}).catch(e=>{if(task.status!=='cancelled'){task.status='error';task.error=e.message;}}).finally(()=>{task.xhr=null;activeUploadCount--;renderTransfers();processUploadQueue();});}}
-function runUpload(task){return new Promise((resolve,reject)=>{const xhr=task.xhr=new XMLHttpRequest();xhr.open('PUT',`/api/object?bucket=${encodeURIComponent(task.bucket)}&key=${encodeURIComponent(task.key)}`);xhr.setRequestHeader('content-type',task.file.type||'application/octet-stream');xhr.upload.onprogress=e=>{if(e.lengthComputable){task.progress=e.loaded/e.total*100;renderTransfers();}};xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)resolve();else{let message=xhr.statusText;try{message=JSON.parse(xhr.responseText).error||message;}catch{}reject(new Error(message||'Upload failed'));}};xhr.onerror=()=>reject(new Error('Network error during upload'));xhr.onabort=()=>reject(new Error('Upload cancelled'));xhr.send(task.file);});}
-function cancelUpload(id){const task=uploadTasks.find(t=>t.id===id);if(!task||!['queued','uploading'].includes(task.status))return;task.status='cancelled';task.error='';if(task.xhr)task.xhr.abort();renderTransfers();processUploadQueue();}
-function cancelUploadsForBucket(name){uploadTasks.filter(t=>t.bucket===name&&['queued','uploading'].includes(t.status)).forEach(t=>cancelUpload(t.id));}
-function clearTransfers(){uploadTasks=uploadTasks.filter(t=>['queued','uploading'].includes(t.status));renderTransfers();}
-function scheduleUploadRefresh(task){if(task.bucket!==bucket||!task.key.startsWith(prefix))return;clearTimeout(uploadReloadTimer);uploadReloadTimer=setTimeout(()=>loadObjects(),350);}
-function renderTransfers(){const center=$('transferCenter');center.classList.toggle('hidden',!uploadTasks.length);if(!uploadTasks.length)return;const pending=uploadTasks.filter(t=>['queued','uploading'].includes(t.status)).length;$('transferCount').textContent=pending?`${pending} active`:`${uploadTasks.length} finished`;$('clearTransfersBtn').disabled=uploadTasks.every(t=>['queued','uploading'].includes(t.status));$('transferList').innerHTML=uploadTasks.map(task=>{const status=task.status==='uploading'?Math.round(task.progress)+'%':task.status==='queued'?'Waiting':task.status==='complete'?'Complete':task.status==='cancelled'?'Cancelled':'Failed';const stateClass=task.status==='complete'?'ok':['error','cancelled'].includes(task.status)?'err':'';return `<div class="transfer-row"><div class="transfer-name"><strong title="${esc(task.file.name)}">${esc(task.file.name)}</strong><span title="${esc(task.bucket+'/'+task.key)}">${esc(task.bucket+'/'+task.key)} · ${fmtSize(task.file.size)}${task.error?' · '+esc(task.error):''}</span>${task.status==='uploading'?`<div class="progress"><span style="width:${task.progress}%"></span></div>`:''}</div><div class="transfer-state ${stateClass}">${status}</div>${['queued','uploading'].includes(task.status)?`<button class="row-action danger" title="Cancel upload" onclick="cancelUpload(${task.id})">${icons.x}</button>`:'<span></span>'}</div>`;}).join('');}
-
-function openDetails(index){const o=objectItems[index];if(!o||o.type!=='object')return;detailObject=o;$('detailList').innerHTML=`<div class="detail-row"><dt>Object name</dt><dd>${esc(o.name)}</dd></div><div class="detail-row"><dt>Full path</dt><dd>${esc(o.key)}</dd></div><div class="detail-row"><dt>Bucket</dt><dd>${esc(bucket)}</dd></div><div class="detail-row"><dt>Size</dt><dd>${fmtSize(o.size)}</dd></div><div class="detail-row"><dt>Modified</dt><dd>${fmtTime(o.last_modified_ms)}</dd></div><div class="detail-row"><dt>ETag</dt><dd><code>${esc(o.etag||'—')}</code></dd></div>`;$('detailDownload').href=objectUrl(o.key);$('detailDownload').setAttribute('download','');$('detailsPanel').classList.add('open');}
-function closeDetails(){$('detailsPanel').classList.remove('open');detailObject=null;}
-function openShareFromDetails(){if(detailObject)openShare(detailObject.key);}
-function openShare(key){shareKey=key;$('shareObjectName').textContent=key;$('shareResult').classList.add('hidden');$('sh_url').value='';$('shareAction').innerHTML=icons.link+' Generate link';$('shareAction').onclick=doPresign;setInlineError('shareError');$('shareDlg').showModal();}
-async function doPresign(){try{const data=await api('POST','/api/presign',{bucket,key:shareKey,expires_secs:+$('sh_exp').value});$('sh_url').value=data.url;$('shareResult').classList.remove('hidden');$('shareAction').innerHTML=icons.copy+' Copy link';$('shareAction').onclick=copyShare;}catch(e){setInlineError('shareError',e.message);}}
-async function copyShare(){await copyText($('sh_url').value);toast('Link copied');}
-function confirmDeleteObject(key){showConfirm('Delete object?',key,`This permanently deletes “${key}”. This action cannot be undone.`,async()=>{await api('DELETE',objectUrl(key));closeDetails();toast('Object deleted',key);await loadObjects();});}
-function showConfirm(title,subtitle,message,action){$('confirmTitle').textContent=title;$('confirmSubtitle').textContent=subtitle;$('confirmMessage').textContent=message;const btn=$('confirmAction');btn.onclick=async()=>{setBusy(btn,true,'Deleting…');try{await action();$('confirmDlg').close();}catch(e){toast('Action failed',e.message,false);}finally{setBusy(btn,false);}};$('confirmDlg').showModal();}
-
-async function loadUsers(){try{const data=await api('GET','/api/users');users=data.users||[];$('userCount').textContent=`${users.length} user${users.length===1?'':'s'}`;$('userRows').innerHTML=users.map((u,i)=>`<tr><td><div class="identity"><span class="identity-icon">${esc((u.username[0]||'U').toUpperCase())}</span><div><strong>${esc(u.username)}</strong><small>${u.builtin?'Server administrator':'IAM user'}</small></div></div></td><td><span class="badge ${u.builtin?'amber':''}">${u.builtin?'Built-in':'Managed'}</span></td><td>${u.builtin?'<span class="badge green">Unrestricted</span>':u.has_policy?'<span class="badge green">Attached</span>':'<span class="badge">Deny all</span>'}</td><td class="actions"><button class="row-action" title="View access keys" onclick="manageKeys(${i})">${icons.key}</button>${u.builtin?'':`<button class="row-action" title="Reset password" onclick="openPasswordDialog(${i})">${icons.refresh}</button><button class="row-action" title="Edit policy" onclick="editPolicy(${i})">${icons.shield}</button><button class="row-action danger" title="Delete user" onclick="confirmDeleteUser(${i})">${icons.trash}</button>`}</td></tr>`).join('');const empty=!users.length;$('userRows').closest('table').classList.toggle('hidden',empty);$('userEmpty').classList.toggle('hidden',!empty);if(empty)$('userEmpty').innerHTML=`<div class="empty-icon">${icons.users}</div><h3>No users yet</h3><p>Create a user, attach a policy, and issue an access key.</p>`;}catch(e){toast('Could not load users',e.message,false);}}
-function openUserDialog(){$('nu_name').value='';$('nu_pass').value='';setInlineError('userError');$('userDlg').showModal();setTimeout(()=>$('nu_name').focus(),50);}
-async function createUser(event){event.preventDefault();try{await api('POST','/api/users',{username:$('nu_name').value.trim(),password:$('nu_pass').value});$('userDlg').close();toast('User created',$('nu_name').value.trim());loadUsers();}catch(e){setInlineError('userError',e.message);}}
-function confirmDeleteUser(i){const name=users[i].username;showConfirm('Delete user?',name,`This permanently deletes “${name}” and all access keys owned by this user.`,async()=>{await api('DELETE','/api/users/'+encodeURIComponent(name));toast('User deleted',name);await loadUsers();});}
-let passwordUser=null;
-function openPasswordDialog(i){passwordUser=users[i].username;$('rp_user').textContent=passwordUser;$('rp_password').value='';$('rp_confirm').value='';setInlineError('passwordError');$('passwordDlg').showModal();setTimeout(()=>$('rp_password').focus(),50);}
-async function resetPassword(event){event.preventDefault();const password=$('rp_password').value;if(password.length<8){setInlineError('passwordError','Password must be at least 8 characters.');return;}if(password!==$('rp_confirm').value){setInlineError('passwordError','Passwords do not match.');return;}try{await api('PUT','/api/users/'+encodeURIComponent(passwordUser)+'/password',{password});$('passwordDlg').close();toast('Password reset',passwordUser);}catch(e){setInlineError('passwordError',e.message);}}
-let policyUser=null;
-function editPolicy(i){const u=users[i];policyUser=u.username;$('pd_user').textContent=u.username;$('pd_text').value=u.policy?JSON.stringify(u.policy,null,2):JSON.stringify({Version:'2012-10-17',Statement:[{Effect:'Allow',Action:['s3:GetObject','s3:ListBucket'],Resource:['arn:aws:s3:::mybucket','arn:aws:s3:::mybucket/*']}]},null,2);setInlineError('policyError');$('policyDlg').showModal();}
-function preset(kind){const doc={Version:'2012-10-17',Statement:[]},needsBucket=kind.endsWith('-bucket');let b=bucket;if(needsBucket&&!b){setInlineError('policyError','Select a bucket in the Object Browser first.');return;}if(kind==='full-all')doc.Statement.push({Sid:'FullAccessAllBuckets',Effect:'Allow',Action:'s3:*',Resource:'arn:aws:s3:::*'});if(kind==='ro-all')doc.Statement.push({Sid:'ReadOnlyAllBuckets',Effect:'Allow',Action:['s3:Get*','s3:List*'],Resource:'arn:aws:s3:::*'});if(kind==='full-bucket'){doc.Statement.push({Sid:'ListBucketNames',Effect:'Allow',Action:'s3:ListAllMyBuckets',Resource:'arn:aws:s3:::*'},{Sid:'FullAccessOneBucket',Effect:'Allow',Action:'s3:*',Resource:[`arn:aws:s3:::${b}`,`arn:aws:s3:::${b}/*`]});}if(kind==='ro-bucket'){doc.Statement.push({Sid:'ListBucketNames',Effect:'Allow',Action:'s3:ListAllMyBuckets',Resource:'arn:aws:s3:::*'},{Sid:'ReadOnlyOneBucket',Effect:'Allow',Action:['s3:GetObject','s3:ListBucket','s3:ListBucketVersions'],Resource:[`arn:aws:s3:::${b}`,`arn:aws:s3:::${b}/*`]});}if(kind==='wo-bucket')doc.Statement.push({Sid:'WriteOnlyIngest',Effect:'Allow',Action:['s3:PutObject','s3:AbortMultipartUpload','s3:ListMultipartUploadParts'],Resource:`arn:aws:s3:::${b}/*`});$('pd_text').value=JSON.stringify(doc,null,2);setInlineError('policyError');}
-async function savePolicy(detach){try{const body=detach===null?null:JSON.parse($('pd_text').value);await api('PUT','/api/users/'+encodeURIComponent(policyUser)+'/policy',body);$('policyDlg').close();toast(detach===null?'Policy detached':'Policy saved',policyUser);loadUsers();}catch(e){setInlineError('policyError',e.message);}}
-let managedKeyUser=null,managedKeyBuiltin=false,managedKeys=[];
-async function manageKeys(i){managedKeyUser=users[i].username;managedKeyBuiltin=!!users[i].builtin;$('uk_user').textContent=managedKeyUser;$('managedKeyCreate').classList.toggle('hidden',managedKeyBuiltin);setInlineError('managedKeyError');$('userKeysDlg').showModal();await loadManagedKeys();}
-async function loadManagedKeys(){try{const data=await api('GET','/api/users/'+encodeURIComponent(managedKeyUser)+'/keys');managedKeys=data.keys||[];$('managedKeyList').innerHTML=managedKeys.length?managedKeys.map((k,i)=>`<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)"><span class="file-icon">${icons.key}</span><div style="min-width:0"><code class="key">${esc(k.access_key)}</code><div class="muted" style="font-size:11px;margin-top:3px">${k.builtin?'Built-in · Config managed':'Created '+fmtTime(k.created_at_ms)}</div></div><span class="spacer"></span>${k.builtin?'':`<button class="row-action danger" title="Delete key" onclick="deleteManagedKey(${i})">${icons.trash}</button>`}</div>`).join(''):`<div class="empty" style="padding:30px 10px"><div class="empty-icon">${icons.key}</div><h3>No access keys</h3><p>${managedKeyBuiltin?'Add API keys in the server configuration.':'Create a key for this user to connect an application.'}</p></div>`;}catch(e){setInlineError('managedKeyError',e.message);}}
-async function createManagedKey(){try{const key=await api('POST','/api/users/'+encodeURIComponent(managedKeyUser)+'/keys');$('userKeysDlg').close();showSecret(key);}catch(e){setInlineError('managedKeyError',e.message);}}
-function deleteManagedKey(i){const ak=managedKeys[i].access_key;showConfirm('Delete access key?',ak,'Applications using this key will immediately lose access.',async()=>{await api('DELETE','/api/keys/'+encodeURIComponent(ak));toast('Access key deleted');await loadManagedKeys();});}
-
-async function loadMyKeys(){try{const data=await api('GET','/api/users/'+encodeURIComponent(me.username)+'/keys');const keys=data.keys||[];$('keyCount').textContent=`${keys.length} key${keys.length===1?'':'s'}`;$('keyRows').innerHTML=keys.map(k=>`<tr><td><code class="key">${esc(k.access_key)}</code> ${k.builtin?'<span class="badge amber">Built-in</span>':''}</td><td class="muted">${k.builtin?'Config managed':fmtTime(k.created_at_ms)}</td><td class="actions">${k.builtin?'':`<button class="row-action danger" title="Delete key" onclick="confirmDeleteKey(decodeURIComponent('${enc(k.access_key)}'))">${icons.trash}</button>`}</td></tr>`).join('');const empty=!keys.length;$('keyRows').closest('table').classList.toggle('hidden',empty);$('keyEmpty').classList.toggle('hidden',!empty);if(empty)$('keyEmpty').innerHTML=`<div class="empty-icon">${icons.key}</div><h3>No access keys</h3><p>Create a key to connect an S3-compatible application.</p><button class="btn primary" onclick="createMyKey()">Create access key</button>`;}catch(e){toast('Could not load access keys',e.message,false);}}
-async function createMyKey(){try{const key=await api('POST','/api/users/'+encodeURIComponent(me.username)+'/keys');showSecret(key);loadMyKeys();}catch(e){toast('Could not create access key',e.message,false);}}
-function showSecret(key){$('sd_text').textContent=`access_key: ${key.access_key}\nsecret_key: ${key.secret_key}`;$('secretDlg').showModal();}
-async function copySecret(){await copyText($('sd_text').textContent);toast('Credentials copied');}
-function confirmDeleteKey(ak){showConfirm('Delete access key?',ak,'Applications using this key will immediately lose access.',async()=>{await api('DELETE','/api/keys/'+encodeURIComponent(ak));toast('Access key deleted');await loadMyKeys();});}
-async function copyText(value){try{await navigator.clipboard.writeText(value);}catch{const area=document.createElement('textarea');area.value=value;document.body.append(area);area.select();document.execCommand('copy');area.remove();}}
-
-document.addEventListener('keydown',e=>{if(e.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!$('tab_objects').classList.contains('hidden')){e.preventDefault();$('objectSearch').focus();}if(e.key==='Escape'){closeDetails();$('profilePopover').classList.add('hidden');}});
-boot();
-</script>
+<script src="/assets/core.js"></script>
+<script src="/assets/tasks.js"></script>
+<script src="/assets/objects.js"></script>
+<script src="/assets/iam.js"></script>
+<script src="/assets/main.js"></script>
 </body>
 </html>

@@ -22,19 +22,19 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use md5::{Digest, Md5};
 use sha2::Sha256;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use super::aws_chunked::decode_aws_chunked;
 use super::cache::BoundedLruCache;
 use super::config::{DurabilityMode, StorageConfig};
 use super::encoding::{
-    fanout_segments, object_dir_prefix, object_dir_random_suffix, validate_bucket_name,
+    fanout_segment, object_dir_prefix, object_dir_random_suffix, validate_bucket_name,
     validate_object_key,
 };
 use super::errors::{Result, StorageError};
@@ -55,6 +55,7 @@ const CACHE_SHARDS: usize = 64;
 const INDEX_CACHE_WARN_THRESHOLD: usize = 500;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 const REBUILD_PROGRESS_EVERY: usize = 1000;
+const COPY_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Filesystem-backed S3-compatible object store.
 ///
@@ -364,13 +365,15 @@ impl LocalObjectStore {
         content_encoding: Option<&str>,
         aws_chunked: bool,
     ) -> Result<PutResult> {
+        let decoded;
         let payload = if aws_chunked {
-            decode_aws_chunked(bytes)?
+            decoded = decode_aws_chunked(bytes)?;
+            decoded.as_slice()
         } else {
-            bytes.to_vec()
+            bytes
         };
         let staging_id = self
-            .stage_put(bucket, key, &payload, content_type, content_encoding)
+            .stage_put(bucket, key, payload, content_type, content_encoding)
             .await?;
         self.commit_staged_put(bucket, key, &staging_id).await
     }
@@ -889,12 +892,19 @@ impl LocalObjectStore {
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.delete_object_with_size(bucket, key).await.map(|_| ())
+    }
+
+    /// Deletes an object and returns its indexed size when it existed. This
+    /// avoids an extra metadata read for operation audit logging.
+    pub async fn delete_object_with_size(&self, bucket: &str, key: &str) -> Result<Option<u64>> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let index = self.index(bucket).await?;
         let _guard = self.locks.lock(bucket, key).await;
         let Some(row) = index.get(key).await? else {
-            return Ok(()); // Idempotent: deleting an absent key succeeds.
+            return Ok(None); // Idempotent: deleting an absent key succeeds.
         };
+        let deleted_size = row.size;
         let retire_id = index.commit_delete(key, &row.blob_dir, now_ms()).await?;
         self.crash_point("delete_after_commit");
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
@@ -910,7 +920,7 @@ impl LocalObjectStore {
                 );
             }
         }
-        Ok(())
+        Ok(Some(deleted_size))
     }
 
     // ── intent resolution (the only deletion authority) ───────────────────────
@@ -1073,22 +1083,13 @@ impl LocalObjectStore {
         let bucket_dir = self.layout.bucket_dir(bucket)?;
 
         let mut versions = Vec::new();
-        let mut after: Option<String> = if prefix.is_empty() {
-            None
-        } else {
-            // Start just before the prefix range.
-            None
-        };
+        // Walk only the prefix range via the indexed, paginated listing —
+        // never the whole bucket. Each live key has exactly one version, so
+        // every row here is the latest.
+        let mut after: Option<String> = None;
         loop {
-            let batch = index.all_entries_after(after.as_deref(), 1000).await?;
-            if batch.is_empty() {
-                break;
-            }
-            after = batch.last().map(|r| r.object_key.clone());
-            for row in batch {
-                if !row.object_key.starts_with(prefix) {
-                    continue;
-                }
+            let page = index.list(prefix, None, after.as_deref(), 1000).await?;
+            for row in &page.entries {
                 let dir = bucket_dir.join(&row.blob_dir);
                 let Ok(meta) = read_json::<ObjectMeta>(&dir.join("meta.json")).await else {
                     log::warn!(
@@ -1108,6 +1109,13 @@ impl LocalObjectStore {
                     version_id,
                     is_latest: true,
                 });
+            }
+            if !page.is_truncated {
+                break;
+            }
+            after = page.next_after.clone();
+            if after.is_none() {
+                break;
             }
         }
         // Retired versions still in trash are reported as non-latest.
@@ -1187,10 +1195,12 @@ impl LocalObjectStore {
                 "invalid part number {part_number}"
             )));
         }
+        let decoded;
         let payload = if aws_chunked {
-            decode_aws_chunked(bytes)?
+            decoded = decode_aws_chunked(bytes)?;
+            decoded.as_slice()
         } else {
-            bytes.to_vec()
+            bytes
         };
         let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
         let file_name = format!("part.{part_number}");
@@ -1278,22 +1288,38 @@ impl LocalObjectStore {
         src_key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<PutResult> {
+        self.validate_upload(dst_bucket, dst_key, upload_id).await?;
+        if part_number == 0 || part_number > 10_000 {
+            return Err(StorageError::InvalidMultipartUpload(format!(
+                "invalid part number {part_number}"
+            )));
+        }
+        let _source_guard = self.locks.lock(src_bucket, src_key).await;
         let src = self.read_object(src_bucket, src_key).await?;
-        let mut bytes: Vec<u8> = Vec::with_capacity(src.meta.size as usize);
-        for part in &src.meta.parts {
-            let data = tokio::fs::read(src.object_dir.join(&part.file)).await?;
-            bytes.extend_from_slice(&data);
-        }
-        if let Some((start, end)) = range {
-            if start > end || end >= bytes.len() as u64 {
-                return Err(StorageError::InvalidMultipartUpload(
-                    "invalid copy source range".to_string(),
-                ));
-            }
-            bytes = bytes[start as usize..=end as usize].to_vec();
-        }
-        self.put_multipart_part(dst_bucket, dst_key, upload_id, part_number, &bytes, false)
-            .await
+        let staging_dir = self.layout.multipart_staging_dir(dst_bucket, upload_id)?;
+        let file_name = format!("part.{part_number}");
+        let written = copy_object_data_with_hashes(
+            &src,
+            &staging_dir.join(&file_name),
+            range,
+        )
+        .await?;
+        let part = PartMeta {
+            number: part_number,
+            file: file_name,
+            size: written.size,
+            etag: written.md5.clone(),
+        };
+        write_json_atomic(
+            &staging_dir.join(format!("part.{part_number}.meta.json")),
+            &part,
+        )
+        .await?;
+        Ok(PutResult {
+            etag: written.md5,
+            size: written.size,
+            last_modified_ms: now_ms(),
+        })
     }
 
     pub async fn complete_multipart(
@@ -1390,12 +1416,9 @@ impl LocalObjectStore {
         replacement_content_type: Option<&str>,
         replacement_content_language: Option<&str>,
     ) -> Result<PutResult> {
+        self.ensure_bucket_and_key(dst_bucket, dst_key).await?;
+        let _source_guard = self.locks.lock(src_bucket, src_key).await;
         let src = self.read_object(src_bucket, src_key).await?;
-        let mut bytes: Vec<u8> = Vec::with_capacity(src.meta.size as usize);
-        for part in &src.meta.parts {
-            let data = tokio::fs::read(src.object_dir.join(&part.file)).await?;
-            bytes.extend_from_slice(&data);
-        }
         let content_type = replacement_content_type
             .map(str::to_string)
             .unwrap_or_else(|| src.meta.content_type.clone());
@@ -1409,19 +1432,25 @@ impl LocalObjectStore {
         let user_meta = replacement_user_meta
             .cloned()
             .unwrap_or_else(|| src.meta.user_meta.clone());
-        drop(src);
-        let staging_id = self
-            .stage_put_with_metadata(
-                dst_bucket,
-                dst_key,
-                &bytes,
-                Some(&content_type),
-                content_encoding.as_deref(),
-                Some(&copied_storage_class),
-                content_language.as_deref(),
-                &user_meta,
-            )
-            .await?;
+        let staging_id = new_staging_id(now_ms());
+        let staging_dir = self.layout.put_staging_dir(dst_bucket, &staging_id)?;
+        tokio::fs::create_dir_all(&staging_dir).await?;
+        let written = copy_object_data_with_hashes(&src, &staging_dir.join("part.1"), None).await?;
+        let meta = PutMeta {
+            bucket: dst_bucket.to_string(),
+            object_key: dst_key.to_string(),
+            write_id: staging_id.clone(),
+            initiated_at_ms: now_ms(),
+            size: written.size,
+            etag: written.md5,
+            content_type,
+            content_encoding,
+            content_language,
+            storage_class: copied_storage_class,
+            user_meta,
+        };
+        write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
+        drop(_source_guard);
         self.commit_staged_put(dst_bucket, dst_key, &staging_id)
             .await
     }
@@ -1488,6 +1517,179 @@ impl LocalObjectStore {
     }
 
     // ── rebuild (migration + disaster recovery) ───────────────────────────────
+
+    /// Raises the data-plane 503 gate for `bucket` if it isn't already up.
+    /// Returns `false` if a rebuild is already in progress. The caller owns the
+    /// rebuild and must call [`end_rebuild`](Self::end_rebuild) when done — this
+    /// lets the *server* layer run a rebuild as a registry-tracked job while the
+    /// storage layer keeps owning the gate. `start_rebuild_background` uses the
+    /// same gate, so triggers from either layer dedupe against each other.
+    pub fn try_begin_rebuild(&self, bucket: &str) -> bool {
+        let mut guard = self.rebuilding.lock().unwrap();
+        if guard.contains(bucket) {
+            return false;
+        }
+        guard.insert(bucket.to_string());
+        true
+    }
+
+    /// Lowers the data-plane 503 gate for `bucket` (rebuild finished).
+    pub fn end_rebuild(&self, bucket: &str) {
+        self.rebuilding.lock().unwrap().remove(bucket);
+    }
+
+    /// One empty-directory reclamation pass: `remove_dir` each fanout dir at the
+    /// `objects/` root. The single-level layout means every fanout dir is a
+    /// direct child of `objects/`, and object (leaf) dirs are always valid — so
+    /// there is nothing to walk or inspect. `remove_dir` (never `remove_dir_all`)
+    /// removes a fanout dir **iff it is empty**; one that still holds objects
+    /// fails with `DirectoryNotEmpty` and is skipped. **Every error is ignored**
+    /// (best-effort): `DirectoryNotEmpty` = in use, `NotFound` = already gone, and
+    /// a concurrent publish that lost a `create_dir` race retries on `ENOENT`, so
+    /// no object data can ever be touched and no write ever fails.
+    ///
+    /// Legacy 4-level fanout chains are cleaned by the migration job as it
+    /// vacates them (`migrate_object_layout` removes the chain bottom-up), so
+    /// this pass never needs to descend. `reclaimed` is incremented live (for
+    /// status display); the pass yields after each removal to stay low priority.
+    pub async fn reclaim_empty_dirs_pass(
+        &self,
+        bucket: &str,
+        cancel: &CancellationToken,
+        reclaimed: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<usize> {
+        use std::sync::atomic::Ordering;
+        validate_bucket_name(bucket)?;
+        let objects_dir = self.layout.bucket_dir(bucket)?.join("objects");
+        let mut entries = match tokio::fs::read_dir(&objects_dir).await {
+            Ok(entries) => entries,
+            Err(_) => return Ok(0), // no objects/ dir yet
+        };
+        let mut removed = 0usize;
+        while let Some(entry) = entries.next_entry().await? {
+            if cancel.is_cancelled() || self.shutdown.is_cancelled() {
+                break;
+            }
+            if tokio::fs::remove_dir(entry.path()).await.is_ok() {
+                reclaimed.fetch_add(1, Ordering::Relaxed);
+                removed += 1;
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Relocates one object's blob dir from the legacy 4-level fanout layout to
+    /// the current single-level layout via **hardlink → atomic index flip →
+    /// unlink** — metadata-only, no object bytes are copied.
+    ///
+    /// Idempotent: `Ok(false)` if the object is gone or already current.
+    /// Safe under concurrent reads (both paths hold the same inodes across the
+    /// atomic flip, and `read_object` retries on a vanished path) and crashes
+    /// (the tree is self-describing, so a rebuild dedups any orphan left behind).
+    /// Serialised with publish/delete of the same key by the per-key lock.
+    pub async fn migrate_object_layout(&self, bucket: &str, key: &str) -> Result<bool> {
+        validate_bucket_name(bucket)?;
+        let bucket_dir = self.layout.bucket_dir(bucket)?;
+        let index = self.index(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+
+        let Some(row) = index.get(key).await? else {
+            return Ok(false); // gone
+        };
+        if !is_legacy_layout(&row.blob_dir) {
+            return Ok(false); // already on the current layout
+        }
+        let old_dir = bucket_dir.join(&row.blob_dir);
+
+        // 1. Fresh single-level dir; hardlink every file from the old dir into
+        //    it. Retry the random leaf name on the (astronomically rare) clash.
+        let (new_rel, new_dir) = loop {
+            let new_rel = new_blob_rel(bucket, key);
+            let new_dir = bucket_dir.join(&new_rel);
+            tokio::fs::create_dir_all(bucket_dir.join(blob_rel_parent(&new_rel))).await?;
+            match tokio::fs::create_dir(&new_dir).await {
+                Ok(()) => break (new_rel, new_dir),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        };
+        let mut entries = tokio::fs::read_dir(&old_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            // Object leaves hold files only (meta.json + part.N), no subdirs.
+            tokio::fs::hard_link(old_dir.join(entry.file_name()), new_dir.join(entry.file_name()))
+                .await?;
+        }
+        if self.durability == Durability::Full {
+            fsync_dir(&new_dir).await?;
+        }
+
+        // 2. Atomic pivot: repoint the index row, guarded by the old path so a
+        //    concurrent overwrite (should the lock ever not hold) can't be lost.
+        if !index.update_blob_dir(key, &row.blob_dir, &new_rel).await? {
+            let _ = tokio::fs::remove_dir_all(&new_dir).await; // abandon the orphan copy
+            return Ok(false);
+        }
+        self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+
+        // 3. Clean up the old leaf. Its files are hardlinks, so unlinking just
+        //    drops the extra link — the inodes live on under new_dir.
+        let _ = tokio::fs::remove_dir_all(&old_dir).await;
+        // Reclaim the now-empty legacy 4-level fanout chain bottom-up. This is
+        // race-free: new writes only ever create single-level dirs, so nothing
+        // recreates these old paths; a sibling object still under the chain just
+        // makes `remove_dir` fail (`DirectoryNotEmpty`) and we stop. The reclaim
+        // job doesn't descend, so migration owns cleaning what it vacates.
+        let objects_root = bucket_dir.join("objects");
+        let mut parent = old_dir.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = parent {
+            if dir == objects_root || tokio::fs::remove_dir(&dir).await.is_err() {
+                break;
+            }
+            parent = dir.parent().map(|p| p.to_path_buf());
+        }
+        Ok(true)
+    }
+
+    /// Up to `limit` keys in `bucket` still on the legacy 4-level layout.
+    pub async fn legacy_layout_keys(&self, bucket: &str, limit: usize) -> Result<Vec<String>> {
+        self.index(bucket).await?.legacy_layout_keys(limit).await
+    }
+
+    /// Cheap check for whether `bucket` still has any legacy layout structure:
+    /// legacy fanout dirs at `objects/` root have 2-char names, the current
+    /// layout uses 4-char names. One `read_dir` of the root (early-returns on
+    /// the first 2-char entry) — far cheaper than a `LIKE` scan of the index,
+    /// and lets migration skip clean buckets without touching SQLite.
+    pub async fn has_legacy_layout_dirs(&self, bucket: &str) -> Result<bool> {
+        let objects_dir = self.layout.bucket_dir(bucket)?.join("objects");
+        let mut entries = match tokio::fs::read_dir(&objects_dir).await {
+            Ok(entries) => entries,
+            Err(_) => return Ok(false),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name().as_encoded_bytes().len() == 2 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Buckets whose index is missing, legacy-schema, or otherwise not current
+    /// and therefore need a rebuild before they can serve. Used by the server
+    /// layer to launch registry-tracked startup rebuilds.
+    pub async fn buckets_needing_rebuild(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (bucket, _) in self.list_buckets().await? {
+            let bucket_dir = self.layout.bucket_dir(&bucket)?;
+            match index::needs_rebuild(&bucket_dir).await {
+                Ok(true) => out.push(bucket),
+                Ok(false) => {}
+                Err(err) => log::warn!("rebuild check failed bucket={bucket} error={err}"),
+            }
+        }
+        Ok(out)
+    }
 
     /// Spawns a background rebuild task for `bucket`. While it runs, every
     /// request against the bucket fails with `BucketRebuilding` (503).
@@ -1861,13 +2063,15 @@ impl RebuildFrontier {
 // ── free helpers ─────────────────────────────────────────────────────────────
 
 /// Fresh, unique, opaque blob dir path relative to the bucket dir:
-/// `objects/aa/bb/cc/dd/V1XXXXXX_YYYY`. Every publish gets its own name —
-/// live dirs are never written into, so old and new versions coexist until
-/// the row flip retires the old one.
+/// `objects/<4hex>/V1XXXXXX_YYYY` — a single 4-char fanout level. Every publish
+/// gets its own name (deterministic folder + prefix, random suffix), so old and
+/// new versions coexist until the row flip retires the old one. Legacy objects
+/// on the old 4-level layout are read via their stored path and migrated by the
+/// `migrate_layout` job.
 fn new_blob_rel(bucket: &str, key: &str) -> String {
-    let [a, b, c, d] = fanout_segments(bucket, key);
     format!(
-        "objects/{a}/{b}/{c}/{d}/{}_{}",
+        "objects/{}/{}_{}",
+        fanout_segment(bucket, key),
         object_dir_prefix(key),
         object_dir_random_suffix()
     )
@@ -1875,6 +2079,13 @@ fn new_blob_rel(bucket: &str, key: &str) -> String {
 
 fn blob_rel_parent(rel: &str) -> &str {
     rel.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
+}
+
+/// A blob dir is on the legacy 4-level layout iff it has more path components
+/// than the current single-level `objects/<seg>/<leaf>` (3 components). Used by
+/// the layout migration to decide whether a row needs relocating.
+fn is_legacy_layout(blob_rel: &str) -> bool {
+    blob_rel.split('/').filter(|s| !s.is_empty()).count() > 3
 }
 
 async fn fsync_file(path: &Path) -> Result<()> {
@@ -1986,6 +2197,73 @@ async fn write_file_with_md5(path: &Path, bytes: &[u8]) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Copies an immutable object (or inclusive byte range) into one staging file.
+/// A single fixed-size buffer is reused across every source part, so multipart
+/// sources do not require object-sized memory or one allocation per part.
+async fn copy_object_data_with_hashes(
+    source: &ReadObject,
+    path: &Path,
+    range: Option<(u64, u64)>,
+) -> Result<WrittenHashes> {
+    let (range_start, range_end) = match range {
+        Some((start, end)) if start <= end && end < source.meta.size => (start, end),
+        Some(_) => {
+            return Err(StorageError::InvalidMultipartUpload(
+                "invalid copy source range".to_string(),
+            ))
+        }
+        None if source.meta.size == 0 => (0, 0),
+        None => (0, source.meta.size - 1),
+    };
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut output = tokio::fs::File::create(path).await?;
+    let mut md5 = Md5::new();
+    let mut sha256 = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+
+    if source.meta.size != 0 {
+        for (part, &part_start) in source.meta.parts.iter().zip(&source.part_offsets) {
+            let part_end = part_start.saturating_add(part.size);
+            let copy_start = range_start.max(part_start);
+            let copy_end = range_end.saturating_add(1).min(part_end);
+            if copy_start >= copy_end {
+                continue;
+            }
+            let mut input = tokio::fs::File::open(source.object_dir.join(&part.file)).await?;
+            let skip = copy_start - part_start;
+            if skip != 0 {
+                input.seek(SeekFrom::Start(skip)).await?;
+            }
+            let mut remaining = copy_end - copy_start;
+            while remaining != 0 {
+                let wanted = remaining.min(buffer.len() as u64) as usize;
+                let read = input.read(&mut buffer[..wanted]).await?;
+                if read == 0 {
+                    return Err(StorageError::CorruptObject(format!(
+                        "part {} ended before its recorded size",
+                        part.file
+                    )));
+                }
+                let chunk = &buffer[..read];
+                md5.update(chunk);
+                sha256.update(chunk);
+                output.write_all(chunk).await?;
+                size += read as u64;
+                remaining -= read as u64;
+            }
+        }
+    }
+    output.flush().await?;
+    Ok(WrittenHashes {
+        size,
+        md5: format!("{:x}", md5.finalize()),
+        sha256: format!("{:x}", sha256.finalize()),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WrittenHashes {
     size: u64,
@@ -2035,7 +2313,7 @@ where
     let mut md5 = Md5::new();
     let mut sha256 = Sha256::new();
     let mut size = 0u64;
-    let mut buffer = Vec::<u8>::new();
+    let mut buffer = BytesMut::new();
     let mut saw_final_chunk = false;
 
     while let Some(chunk) = stream.next().await {
@@ -2079,7 +2357,7 @@ where
             md5.update(data);
             sha256.update(data);
             file.write_all(data).await?;
-            buffer.drain(..data_end + 2);
+            buffer.advance(data_end + 2);
         }
 
         if saw_final_chunk {
@@ -2250,11 +2528,328 @@ fn hex_to_bytes(value: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Read-only rebuild phase benchmark against a REAL `objects/` tree. Reuses
+    /// the production parallel walker but never trashes dirs or swaps any index,
+    /// so it's safe to run against a live bucket. Attributes wall time to the
+    /// three phases: FS traversal, meta.json read, SQLite insert.
+    ///
+    ///   BENCH_OBJECTS_DIR=/opt/rusts3/rusts3-data/buckets/doris/objects \
+    ///   cargo test -p rust-s3-server --release bench_rebuild_phases -- --ignored --nocapture
+    ///
+    /// Optional: BENCH_WORKERS=N (default = CPU count), BENCH_BATCH=N (default 1000).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_rebuild_phases() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        let objects_dir = std::path::PathBuf::from(
+            std::env::var("BENCH_OBJECTS_DIR").expect("set BENCH_OBJECTS_DIR"),
+        );
+        let bucket_dir = objects_dir.parent().unwrap().to_path_buf();
+        let workers_n: usize = std::env::var("BENCH_WORKERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+            });
+        let batch_size: usize = std::env::var("BENCH_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let idx =
+            SqliteObjectIndex::open_at(&tmp.path().join("bench.sqlite"), Durability::Relaxed, 2)
+                .await
+                .unwrap();
+        idx.create_schema().await.unwrap();
+
+        let walk_nanos = Arc::new(AtomicU64::new(0));
+        let json_nanos = Arc::new(AtomicU64::new(0));
+        let dirs = Arc::new(AtomicUsize::new(0));
+        let objs = Arc::new(AtomicUsize::new(0));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ObjectRecord>(4096);
+        let frontier = Arc::new(RebuildFrontier::new());
+        frontier.push(objects_dir.clone());
+
+        let t0 = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..workers_n.max(1) {
+            let frontier = Arc::clone(&frontier);
+            let tx = tx.clone();
+            let bucket_dir = bucket_dir.clone();
+            let (walk_nanos, json_nanos, dirs, objs) = (
+                Arc::clone(&walk_nanos),
+                Arc::clone(&json_nanos),
+                Arc::clone(&dirs),
+                Arc::clone(&objs),
+            );
+            handles.push(tokio::spawn(async move {
+                while let Some(dir) = frontier.pop().await {
+                    dirs.fetch_add(1, Ordering::Relaxed);
+                    // ── phase: FS traversal (read_dir + per-entry file_type) ──
+                    let w = Instant::now();
+                    let mut has_meta = false;
+                    let mut subdirs = Vec::new();
+                    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            if entry.file_name() == "meta.json" {
+                                has_meta = true;
+                            } else if matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+                                subdirs.push(entry.path());
+                            }
+                        }
+                    }
+                    walk_nanos.fetch_add(w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    if has_meta {
+                        // ── phase: meta.json read + parse ──
+                        let j = Instant::now();
+                        let parsed = read_json::<ObjectMeta>(&dir.join("meta.json")).await;
+                        json_nanos.fetch_add(j.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        if let Ok(meta) = parsed {
+                            objs.fetch_add(1, Ordering::Relaxed);
+                            let rel = dir
+                                .strip_prefix(&bucket_dir)
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let _ = tx
+                                .send(ObjectRecord {
+                                    object_key: meta.object_key.clone(),
+                                    blob_dir: rel,
+                                    size: meta.size,
+                                    etag: meta.etag.clone(),
+                                    last_modified_ms: meta.last_modified_ms,
+                                })
+                                .await;
+                        }
+                    } else {
+                        for sub in subdirs {
+                            frontier.push(sub);
+                        }
+                    }
+                    frontier.task_done();
+                }
+            }));
+        }
+        drop(tx);
+
+        // ── phase: SQLite batched insert (serial writer) ──
+        let mut sqlite_nanos = 0u64;
+        let mut batch: Vec<ObjectRecord> = Vec::with_capacity(batch_size);
+        let mut inserted = 0usize;
+        while let Some(rec) = rx.recv().await {
+            batch.push(rec);
+            if batch.len() >= batch_size {
+                let s = Instant::now();
+                inserted += idx.insert_rebuild_batch(&batch).await.unwrap().inserted;
+                sqlite_nanos += s.elapsed().as_nanos() as u64;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            let s = Instant::now();
+            inserted += idx.insert_rebuild_batch(&batch).await.unwrap().inserted;
+            sqlite_nanos += s.elapsed().as_nanos() as u64;
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let wall = t0.elapsed();
+
+        let ms = |n: u64| n / 1_000_000;
+        let per_worker = |n: u64| ms(n) / workers_n.max(1) as u64;
+        eprintln!("──────── rebuild phase benchmark ────────");
+        eprintln!("workers={workers_n} batch={batch_size}");
+        eprintln!("dirs scanned : {}", dirs.load(Ordering::Relaxed));
+        eprintln!("objects      : {} (inserted {inserted})", objs.load(Ordering::Relaxed));
+        eprintln!("WALL         : {wall:?}");
+        eprintln!(
+            "walk  (fs)   : {} ms aggregate (~{} ms/worker) — read_dir + file_type",
+            ms(walk_nanos.load(Ordering::Relaxed)),
+            per_worker(walk_nanos.load(Ordering::Relaxed))
+        );
+        eprintln!(
+            "json  (read) : {} ms aggregate (~{} ms/worker) — meta.json read+parse",
+            ms(json_nanos.load(Ordering::Relaxed)),
+            per_worker(json_nanos.load(Ordering::Relaxed))
+        );
+        eprintln!("sqlite(write): {} ms (serial)", ms(sqlite_nanos));
+    }
+
     async fn store_and_bucket() -> (tempfile::TempDir, LocalObjectStore) {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
         (tmp, store)
+    }
+
+    #[tokio::test]
+    async fn reclaim_removes_empty_fanout_dirs_but_never_objects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_tmp, store) = store_and_bucket().await;
+        // A live object — its fanout dir holds it and must survive.
+        store.put_object("bucket", "keep/me", b"hi", None, None, false).await.unwrap();
+        let objects = store.layout().bucket_dir("bucket").unwrap().join("objects");
+        // Empty single-level fanout dirs, as a delete leaves behind.
+        tokio::fs::create_dir(objects.join("dead")).await.unwrap();
+        tokio::fs::create_dir(objects.join("beef")).await.unwrap();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let reclaimed = std::sync::Arc::new(AtomicUsize::new(0));
+        // One pass (no drain): reclaim is single-level now.
+        let removed = store.reclaim_empty_dirs_pass("bucket", &cancel, &reclaimed).await.unwrap();
+
+        assert_eq!(read_body(&store, "bucket", "keep/me").await, b"hi", "object untouched");
+        assert!(!tokio::fs::try_exists(objects.join("dead")).await.unwrap(), "empty dir reclaimed");
+        assert!(!tokio::fs::try_exists(objects.join("beef")).await.unwrap());
+        assert!(tokio::fs::try_exists(&objects).await.unwrap(), "objects/ root kept");
+        assert!(removed >= 2 && reclaimed.load(Ordering::Relaxed) >= 2);
+        assert_invariants(&store, "bucket").await;
+    }
+
+    // The critical race: an aggressive reclaimer running concurrently with a
+    // stream of PUT/DELETEs must never fail a PUT (publish retries on ENOENT)
+    // and never lose an object (remove_dir can't touch a non-empty dir).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publish_and_reclaim_lose_nothing_and_fail_no_put() {
+        use std::sync::atomic::AtomicUsize;
+        let (_tmp, store) = store_and_bucket().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let reclaimed = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // Reclaimer hammering the tree as fast as it can.
+        let reclaimer = {
+            let store = store.clone();
+            let cancel = cancel.clone();
+            let reclaimed = std::sync::Arc::clone(&reclaimed);
+            tokio::spawn(async move {
+                while !cancel.is_cancelled() {
+                    let _ = store.reclaim_empty_dirs_pass("bucket", &cancel, &reclaimed).await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Overlapping keys so overwrites/deletes constantly empty fanout dirs
+        // that new puts must re-create — maximising the race window.
+        for i in 0..300 {
+            let key = format!("dir{}/obj{}", i % 8, i % 20);
+            store
+                .put_object("bucket", &key, format!("v{i}").as_bytes(), None, None, false)
+                .await
+                .unwrap_or_else(|e| panic!("PUT {i} failed under concurrent reclaim: {e}"));
+            if i % 3 == 0 {
+                store.delete_object("bucket", &key).await.unwrap();
+            }
+        }
+
+        cancel.cancel();
+        let _ = reclaimer.await;
+
+        // Every object still indexed must be fully readable (dir intact).
+        let page = store.list_objects("bucket", "", None, None, 10_000).await.unwrap();
+        for entry in &page.entries {
+            let _ = read_body(&store, "bucket", &entry.object_key).await;
+        }
+        assert_invariants(&store, "bucket").await;
+    }
+
+    /// Writes an object (single-level), then relocates it to a legacy 4-level
+    /// path + repoints the index — simulating a pre-migration object.
+    async fn make_legacy_object(store: &LocalObjectStore, key: &str, data: &[u8]) -> String {
+        store.put_object("bucket", key, data, None, None, false).await.unwrap();
+        let index = store.index("bucket").await.unwrap();
+        let row = index.get(key).await.unwrap().unwrap();
+        let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
+        let leaf = row.blob_dir.rsplit('/').next().unwrap();
+        let legacy_rel = format!("objects/aa/bb/cc/dd/{leaf}");
+        let legacy_dir = bucket_dir.join(&legacy_rel);
+        tokio::fs::create_dir_all(legacy_dir.parent().unwrap()).await.unwrap();
+        tokio::fs::rename(bucket_dir.join(&row.blob_dir), &legacy_dir).await.unwrap();
+        index.update_blob_dir(key, &row.blob_dir, &legacy_rel).await.unwrap();
+        legacy_rel
+    }
+
+    #[tokio::test]
+    async fn migrate_relocates_legacy_object_and_is_idempotent() {
+        let (_tmp, store) = store_and_bucket().await;
+        let legacy_rel = make_legacy_object(&store, "docs/a", b"hello").await;
+        let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
+        assert!(is_legacy_layout(&legacy_rel));
+        assert_eq!(read_body(&store, "bucket", "docs/a").await, b"hello");
+        assert!(tokio::fs::try_exists(bucket_dir.join(&legacy_rel)).await.unwrap());
+
+        assert!(store.migrate_object_layout("bucket", "docs/a").await.unwrap());
+
+        let row = store.index("bucket").await.unwrap().get("docs/a").await.unwrap().unwrap();
+        assert!(!is_legacy_layout(&row.blob_dir), "now single-level: {}", row.blob_dir);
+        assert_eq!(read_body(&store, "bucket", "docs/a").await, b"hello", "content intact");
+        assert!(
+            !tokio::fs::try_exists(bucket_dir.join(&legacy_rel)).await.unwrap(),
+            "old leaf removed"
+        );
+        // Idempotent: a second call is a no-op.
+        assert!(!store.migrate_object_layout("bucket", "docs/a").await.unwrap());
+        assert_invariants(&store, "bucket").await;
+    }
+
+    // A read concurrent with a migration of the same object may *transiently*
+    // fail (the old path can vanish between resolve and open — this is allowed),
+    // but it must never return wrong/partial content, and every object must end
+    // up migrated and fully readable. This guards against loss/corruption, not
+    // the accepted transient window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn migration_under_concurrent_reads_loses_nothing() {
+        let (_tmp, store) = store_and_bucket().await;
+        for i in 0..40 {
+            make_legacy_object(&store, &format!("k{i}"), format!("v{i}").as_bytes()).await;
+        }
+        let stop = tokio_util::sync::CancellationToken::new();
+        let reader = {
+            let store = store.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.is_cancelled() {
+                    for i in 0..40 {
+                        let want = format!("v{i}").into_bytes();
+                        // Tolerate a transient failure (old path vanished mid-read);
+                        // only a *successful* read is held to correctness.
+                        if let Ok(read) = store.read_object("bucket", &format!("k{i}")).await {
+                            let mut body = Vec::new();
+                            let mut complete = true;
+                            for part in &read.meta.parts {
+                                match tokio::fs::read(read.object_dir.join(&part.file)).await {
+                                    Ok(bytes) => body.extend(bytes),
+                                    Err(_) => {
+                                        complete = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if complete {
+                                assert_eq!(body, want, "a successful read must return correct content");
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        for i in 0..40 {
+            store.migrate_object_layout("bucket", &format!("k{i}")).await.unwrap();
+        }
+        stop.cancel();
+        reader.await.unwrap();
+
+        // Every object migrated and fully readable afterwards — no loss.
+        for i in 0..40 {
+            let row = store.index("bucket").await.unwrap().get(&format!("k{i}")).await.unwrap().unwrap();
+            assert!(!is_legacy_layout(&row.blob_dir), "all migrated: {}", row.blob_dir);
+            assert_eq!(read_body(&store, "bucket", &format!("k{i}")).await, format!("v{i}").into_bytes());
+        }
+        assert_invariants(&store, "bucket").await;
     }
 
     /// The two machine-checkable invariants: every row's blob dir is intact
@@ -2631,5 +3226,50 @@ mod tests {
         let read = store.read_object("bucket", "dst").await.unwrap();
         assert_eq!(read.meta.content_type, "text/plain");
         assert_invariants(&store, "bucket").await;
+    }
+
+    #[tokio::test]
+    async fn copy_object_to_same_key_does_not_deadlock() {
+        let (_tmp, store) = store_and_bucket().await;
+        store
+            .put_object("bucket", "key", b"payload", None, None, false)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.copy_object("bucket", "key", "bucket", "key"),
+        )
+        .await
+        .expect("self-copy must release its source guard before publishing")
+        .unwrap();
+        assert_eq!(read_body(&store, "bucket", "key").await, b"payload");
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_streams_inclusive_range() {
+        let (_tmp, store) = store_and_bucket().await;
+        store
+            .put_object("bucket", "src", b"0123456789", None, None, false)
+            .await
+            .unwrap();
+        let upload_id = store
+            .initiate_multipart("bucket", "dst", None, None)
+            .await
+            .unwrap();
+        let copied = store
+            .copy_multipart_part(
+                "bucket",
+                "dst",
+                &upload_id,
+                1,
+                "bucket",
+                "src",
+                Some((2, 6)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(copied.size, 5);
+        let staging = store.layout.multipart_staging_dir("bucket", &upload_id).unwrap();
+        assert_eq!(tokio::fs::read(staging.join("part.1")).await.unwrap(), b"23456");
     }
 }

@@ -102,8 +102,10 @@ sweeper:
 
   # Minimum age of a trash directory (retired/overwritten/deleted blobs)
   # before permanent removal (seconds).  This is also the undo window after
-  # an accidental delete.  (default 600)
-  trash_expiry_secs: 600
+  # an accidental delete and protects long-running downloads that retain a
+  # stable handle to the retired object. Values below 10800 (3 hours) are
+  # rejected at validation/startup.  (default 86400 — one day)
+  trash_expiry_secs: 86400
 
 # ─── Authentication (S3 API) ──────────────────────────────────────────────────
 auth:

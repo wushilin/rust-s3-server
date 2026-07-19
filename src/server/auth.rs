@@ -19,8 +19,11 @@ use sha2::{Digest, Sha256};
 
 use super::config::AppConfig;
 use super::iam::{IamStore, Principal};
-use super::policy::{is_authorized, requirements_for_request};
+use super::identity::Identity;
+use super::logging::{TARGET_AUTH, TARGET_AUTHZ};
+use super::policy::{is_authorized, requirements_for_request, PolicyDocument};
 use super::xml::{error_xml, S3ErrorXml};
+use super::OperationActor;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
@@ -35,14 +38,29 @@ pub struct AuthState {
 
 impl AuthState {
     /// Resolves an access key to `(secret, principal)`. Config credentials
-    /// are root; IAM keys carry their owning user.
+    /// are root; IAM keys carry their owning user; hidden `RSWEB_…` signing
+    /// keys resolve to their owner's access (so console-generated share links
+    /// are authorized exactly as the user who created them).
     fn lookup(&self, access_key: &str) -> Option<(String, Principal)> {
         if let Some(secret) = self.config.find_secret(access_key) {
             return Some((secret.to_string(), Principal::Root));
         }
         let iam = self.iam.as_ref()?;
-        let (secret, username) = iam.find_key(access_key)?;
-        Some((secret, Principal::IamUser(username)))
+        if let Some((secret, username)) = iam.find_key(access_key) {
+            return Some((secret, Principal::IamUser(username)));
+        }
+        if let Some((secret, username, is_builtin)) = iam.find_web_key(access_key) {
+            if is_builtin {
+                // A built-in admin's web key is only honored while that admin
+                // still exists in config (removing them revokes their shares).
+                return self
+                    .config
+                    .find_builtin_user(&username)
+                    .map(|_| (secret, Principal::Root));
+            }
+            return Some((secret, Principal::IamUser(username)));
+        }
+        None
     }
 }
 
@@ -52,41 +70,160 @@ impl AuthState {
 /// enforces the caller's IAM policy (root credentials are unrestricted).
 pub async fn auth_middleware(
     State(state): State<AuthState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let rid = request_id(&request);
     if !state.config.auth.enabled {
+        log::debug!(target: TARGET_AUTH, "[{rid}] authn skipped (auth disabled)");
         return next.run(request).await;
     }
 
+    // Browser-based POST uploads (multipart/form-data to a bucket) carry their
+    // SigV4 authorization inside the form body (`policy` + `x-amz-signature`),
+    // which this header-only middleware cannot inspect. Hand such requests to
+    // the bucket handler with the auth state attached so it can verify the
+    // form signature itself. This is deliberately scoped to *bucket-level*
+    // POSTs: object-level POSTs (e.g. multipart-upload completion) still go
+    // through normal header validation below.
+    if is_browser_post_upload(&request) {
+        log::debug!(target: TARGET_AUTH, "[{rid}] authn deferred to browser-POST form verification");
+        request.extensions_mut().insert(state.clone());
+        return next.run(request).await;
+    }
+
+    // Phase 1 — authentication: prove the caller holds a valid credential.
+    let authn_start = std::time::Instant::now();
     let principal = match validate_request(&state, &request) {
         Ok(principal) => principal,
         Err(msg) => {
+            // Explicit "not proceeding" record for every rejected request.
             log::warn!(
-                "s3 auth rejected method={} path={} reason={msg}",
+                target: TARGET_AUTH,
+                "[{rid}] authn DENY method={} path={} reason={msg} ({}µs)",
                 request.method(),
                 request.uri().path(),
+                authn_start.elapsed().as_micros(),
             );
-            return deny(msg);
+            let access_key = claimed_access_key(&request);
+            let resolved = access_key
+                .as_deref()
+                .and_then(|key| state.lookup(key).map(|(_, principal)| principal));
+            let actor = operation_actor(&state, resolved.as_ref(), access_key);
+            return with_operation_actor(deny(msg), actor);
         }
     };
+    log::debug!(
+        target: TARGET_AUTH,
+        "[{rid}] authn ok principal={principal:?} ({}µs)",
+        authn_start.elapsed().as_micros()
+    );
+    let actor = operation_actor(&state, Some(&principal), claimed_access_key(&request));
 
-    if let Principal::IamUser(username) = &principal {
-        if !authorize_iam(&state, username, &request) {
-            log::warn!(
-                "s3 access denied by policy user={username} method={} uri={}",
-                request.method(),
-                request.uri(),
+    // Phase 2 — authorization: enforce the IAM policy bound to the caller
+    // (root config credentials are unrestricted and skip this), then attach the
+    // resolved identity so body-aware handlers (e.g. multi-object delete) can
+    // authorize per item through the same `Identity::authorize` path.
+    let identity = match &principal {
+        Principal::Root => Identity::root(actor.username.clone(), actor.access_key.clone()),
+        Principal::IamUser(username) => {
+            let authz_start = std::time::Instant::now();
+            let Some(policy) = state.iam.as_ref().and_then(|iam| iam.policy_for(username)) else {
+                log::warn!(target: TARGET_AUTHZ, "[{rid}] authz DENY user={username} reason=no_policy_attached");
+                return with_operation_actor(access_denied(), actor);
+            };
+            if !authorize_iam(&policy, &request) {
+                log::warn!(
+                    target: TARGET_AUTHZ,
+                    "[{rid}] authz DENY user={username} method={} uri={} ({}µs)",
+                    request.method(),
+                    request.uri(),
+                    authz_start.elapsed().as_micros(),
+                );
+                return with_operation_actor(access_denied(), actor);
+            }
+            log::debug!(
+                target: TARGET_AUTHZ,
+                "[{rid}] authz ok user={username} ({}µs)",
+                authz_start.elapsed().as_micros()
             );
-            return access_denied();
+            Identity::iam(username.clone(), Some(policy))
+        }
+    };
+    request.extensions_mut().insert(identity);
+    with_operation_actor(next.run(request).await, actor)
+}
+
+/// The correlation id injected by the outer logging layer, or `"-"` if this
+/// request somehow bypassed it (e.g. a unit test calling the middleware
+/// directly).
+fn request_id(request: &Request<Body>) -> String {
+    request
+        .extensions()
+        .get::<super::RequestId>()
+        .map(|id| id.0.clone())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn with_operation_actor(mut response: Response, actor: OperationActor) -> Response {
+    response.extensions_mut().insert(actor);
+    response
+}
+
+fn operation_actor(
+    state: &AuthState,
+    principal: Option<&Principal>,
+    access_key: Option<String>,
+) -> OperationActor {
+    let username = match principal {
+        Some(Principal::IamUser(username)) => Some(username.clone()),
+        Some(Principal::Root) => access_key.as_deref().and_then(|access_key| {
+            state
+                .config
+                .auth
+                .users
+                .iter()
+                .find(|user| user.api_keys.iter().any(|key| key.ak == access_key))
+                .map(|user| user.user.clone())
+        }),
+        None => None,
+    };
+    OperationActor {
+        username,
+        access_key,
+    }
+}
+
+fn claimed_access_key(request: &Request<Body>) -> Option<String> {
+    if let Some(auth) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(parsed) = parse_auth_header(auth) {
+            return Some(parsed.access_key);
+        }
+        if let Some(v2) = auth.strip_prefix("AWS ") {
+            return v2.split_once(':').map(|(access_key, _)| access_key.to_string());
         }
     }
-    next.run(request).await
+    request.uri().query().and_then(|query| {
+        query.split('&').find_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            let key = urlencoding::decode(key).ok()?;
+            let value = urlencoding::decode(value).ok()?;
+            match key.as_ref() {
+                "X-Amz-Credential" => value.split('/').next().map(str::to_string),
+                "AWSAccessKeyId" => Some(value.into_owned()),
+                _ => None,
+            }
+        })
+    })
 }
 
 /// Evaluates the IAM user's policy against the request. No policy attached
 /// means deny-everything; admin-only operations are never IAM-authorized.
-fn authorize_iam(state: &AuthState, username: &str, request: &Request<Body>) -> bool {
+fn authorize_iam(policy: &PolicyDocument, request: &Request<Body>) -> bool {
     let copy_source = request
         .headers()
         .get("x-amz-copy-source")
@@ -99,10 +236,186 @@ fn authorize_iam(state: &AuthState, username: &str, request: &Request<Body>) -> 
     ) else {
         return false; // admin-only operation
     };
-    let Some(policy) = state.iam.as_ref().and_then(|iam| iam.policy_for(username)) else {
-        return false; // no policy attached → deny
+    is_authorized(policy, &requirements)
+}
+
+/// True for a bucket-level `multipart/form-data` POST — a browser-style form
+/// upload whose credentials live in the body, not the headers.
+fn is_browser_post_upload(request: &Request<Body>) -> bool {
+    if request.method() != axum::http::Method::POST {
+        return false;
+    }
+    let is_multipart = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("multipart/form-data"))
+        .unwrap_or(false);
+    if !is_multipart {
+        return false;
+    }
+    // Bucket-level path only: `/bucket` or `/bucket/`, never `/bucket/key`.
+    let trimmed = request.uri().path().trim_matches('/');
+    !trimmed.is_empty() && !trimmed.contains('/')
+}
+
+/// Verifies a browser POST upload's SigV4 form signature and authorizes it.
+///
+/// Returns the resolved [`OperationActor`] on success, or a ready-to-send
+/// error response on failure. The form fields are the parsed `multipart/
+/// form-data` values; the signature covers the base64 `policy` field, per the
+/// S3 POST-upload signing scheme.
+pub(crate) fn authorize_browser_post(
+    state: &AuthState,
+    fields: &std::collections::BTreeMap<String, String>,
+    bucket: &str,
+    key: &str,
+) -> Result<OperationActor, Response> {
+    if !state.config.auth.enabled {
+        return Ok(OperationActor::default());
+    }
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     };
-    is_authorized(&policy, &requirements)
+
+    let algorithm = field("x-amz-algorithm").unwrap_or("");
+    if algorithm != "AWS4-HMAC-SHA256" {
+        return Err(deny("Unsupported or missing POST x-amz-algorithm"));
+    }
+    let policy_b64 = field("policy").ok_or_else(|| deny("Missing POST policy"))?;
+    let signature = field("x-amz-signature").ok_or_else(|| deny("Missing x-amz-signature"))?;
+    let credential = field("x-amz-credential").ok_or_else(|| deny("Missing x-amz-credential"))?;
+
+    let mut parts = credential.splitn(5, '/');
+    let access_key = parts.next().unwrap_or("");
+    let date = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
+    let region = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
+    let service = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
+    let _terminator = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
+
+    let (secret, principal) = state
+        .lookup(access_key)
+        .ok_or_else(|| deny("Unknown access key"))?;
+
+    // The POST string-to-sign is the base64 policy document verbatim.
+    let signing_key = derive_signing_key(&secret, date, region, service);
+    let expected = hex_hmac(&signing_key, policy_b64.as_bytes());
+    if !constant_time_eq(&expected, signature) {
+        return Err(deny("POST signature does not match"));
+    }
+
+    // Enforce the policy document: it must be unexpired and its conditions
+    // must actually cover this bucket/key, so a captured signature cannot be
+    // replayed against a different target.
+    verify_post_policy_document(policy_b64, bucket, key)?;
+
+    // An IAM principal is still bound by its user policy.
+    if let Principal::IamUser(username) = &principal {
+        let Some(policy) = state.iam.as_ref().and_then(|iam| iam.policy_for(username)) else {
+            return Err(access_denied());
+        };
+        if !is_authorized(
+            &policy,
+            &[super::policy::Requirement::object("s3:PutObject", bucket, key)],
+        ) {
+            log::warn!(target: TARGET_AUTHZ, "s3 browser POST denied by policy user={username} bucket={bucket} key={key}");
+            return Err(access_denied());
+        }
+    }
+
+    let username = match &principal {
+        Principal::IamUser(username) => Some(username.clone()),
+        Principal::Root => state
+            .config
+            .auth
+            .users
+            .iter()
+            .find(|user| user.api_keys.iter().any(|k| k.ak == access_key))
+            .map(|user| user.user.clone()),
+    };
+    Ok(OperationActor {
+        username,
+        access_key: Some(access_key.to_string()),
+    })
+}
+
+/// Decodes and enforces the base64 POST policy: rejects an absent/expired
+/// `expiration`, and requires the `conditions` to match the target bucket and
+/// key (exact `eq`, `starts-with`, or the `{"bucket": …}` form).
+fn verify_post_policy_document(policy_b64: &str, bucket: &str, key: &str) -> Result<(), Response> {
+    let raw = BASE64_STANDARD
+        .decode(policy_b64.as_bytes())
+        .map_err(|_| deny("POST policy is not valid base64"))?;
+    let doc: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|_| deny("POST policy is not valid JSON"))?;
+
+    let expiration = doc
+        .get("expiration")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| deny("POST policy has no expiration"))?;
+    let expires_at = DateTime::parse_from_rfc3339(expiration)
+        .map_err(|_| deny("POST policy expiration is malformed"))?
+        .with_timezone(&Utc);
+    if Utc::now() > expires_at {
+        return Err(deny("POST policy has expired"));
+    }
+
+    let conditions = doc
+        .get("conditions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| deny("POST policy has no conditions"))?;
+
+    let mut bucket_ok = false;
+    let mut key_ok = false;
+    for condition in conditions {
+        match condition {
+            // Object form: {"bucket": "name"} or {"key": "value"}.
+            serde_json::Value::Object(map) => {
+                if let Some(v) = map.get("bucket").and_then(|v| v.as_str()) {
+                    if v != bucket {
+                        return Err(deny("POST policy bucket condition does not match"));
+                    }
+                    bucket_ok = true;
+                }
+                if let Some(v) = map.get("key").and_then(|v| v.as_str()) {
+                    if v != key {
+                        return Err(deny("POST policy key condition does not match"));
+                    }
+                    key_ok = true;
+                }
+            }
+            // Array form: ["eq", "$key", "value"] or ["starts-with", "$key", "prefix"].
+            serde_json::Value::Array(items) => {
+                let op = items.first().and_then(|v| v.as_str()).unwrap_or("");
+                let target = items.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                let value = items.get(2).and_then(|v| v.as_str()).unwrap_or("");
+                let subject = match target {
+                    "$key" => Some((&mut key_ok, key)),
+                    "$bucket" => Some((&mut bucket_ok, bucket)),
+                    _ => None,
+                };
+                if let Some((flag, actual)) = subject {
+                    let matches = match op {
+                        "eq" => actual == value,
+                        "starts-with" => actual.starts_with(value),
+                        _ => true, // unrecognized op on a known field — don't constrain
+                    };
+                    if !matches {
+                        return Err(deny("POST policy condition does not match request"));
+                    }
+                    *flag = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !bucket_ok || !key_ok {
+        return Err(deny("POST policy does not constrain bucket and key"));
+    }
+    Ok(())
 }
 
 // ─── Core validator ───────────────────────────────────────────────────────────
@@ -113,16 +426,6 @@ fn validate_request(state: &AuthState, request: &Request<Body>) -> Result<Princi
         "/minio/health/live" | "/minio/health/ready"
     ) || request.uri().path().starts_with("/minio/v2/metrics/")
         || request.uri().path() == "/minio/prometheus/metrics"
-    {
-        return Ok(Principal::Root);
-    }
-    if request.method() == axum::http::Method::POST
-        && request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.starts_with("multipart/form-data"))
-            .unwrap_or(false)
     {
         return Ok(Principal::Root);
     }
@@ -410,6 +713,12 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
     let expires_secs: i64 = expires_str
         .parse()
         .map_err(|_| "Invalid X-Amz-Expires value")?;
+    // AWS rejects presigned URLs whose lifetime exceeds 7 days; enforce the
+    // same ceiling so an over-long X-Amz-Expires can't mint a near-permanent
+    // bearer URL.
+    if expires_secs < 0 || expires_secs > 604_800 {
+        return Err("X-Amz-Expires is out of range");
+    }
     let expires_at = signed_at + chrono::Duration::seconds(expires_secs);
     if Utc::now() > expires_at {
         return Err("Presigned URL has expired");
@@ -1125,6 +1434,172 @@ mod tests {
         assert_eq!(
             validate_request(&state, &request),
             Err("Invalid x-amz-date header")
+        );
+    }
+
+    fn signed_post_fields(
+        access_key: &str,
+        secret: &str,
+        bucket: &str,
+        key_prefix: &str,
+        expiration: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        let region = "us-east-1";
+        let date = "20260719";
+        let policy_json = format!(
+            r#"{{"expiration":"{expiration}","conditions":[{{"bucket":"{bucket}"}},["starts-with","$key","{key_prefix}"]]}}"#
+        );
+        let policy_b64 = BASE64_STANDARD.encode(policy_json.as_bytes());
+        let signing_key = derive_signing_key(secret, date, region, "s3");
+        let signature = hex_hmac(&signing_key, policy_b64.as_bytes());
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("policy".to_string(), policy_b64);
+        fields.insert("x-amz-algorithm".to_string(), "AWS4-HMAC-SHA256".to_string());
+        fields.insert(
+            "x-amz-credential".to_string(),
+            format!("{access_key}/{date}/{region}/s3/aws4_request"),
+        );
+        fields.insert("x-amz-signature".to_string(), signature);
+        fields
+    }
+
+    fn auth_state_with_root_key(access_key: &str, secret: &str) -> AuthState {
+        let mut config = AppConfig::default();
+        config.auth.enabled = true;
+        config.auth.credentials.push(super::super::config::Credential {
+            access_key: access_key.to_string(),
+            secret_key: secret.to_string(),
+        });
+        AuthState {
+            config: Arc::new(config),
+            iam: None,
+        }
+    }
+
+    #[test]
+    fn browser_post_accepts_valid_signature_and_rejects_tampering() {
+        let state = auth_state_with_root_key("AKID", "secret");
+        let bucket = "b";
+        let key = "uploads/photo.jpg";
+        let expiration = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let fields = signed_post_fields("AKID", "secret", bucket, "uploads/", &expiration);
+
+        // Correctly signed and scoped: authorized.
+        assert!(authorize_browser_post(&state, &fields, bucket, key).is_ok());
+
+        // Missing signature: rejected.
+        let mut no_sig = fields.clone();
+        no_sig.remove("x-amz-signature");
+        assert_eq!(
+            authorize_browser_post(&state, &no_sig, bucket, key)
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Tampered signature: rejected.
+        let mut bad_sig = fields.clone();
+        bad_sig.insert("x-amz-signature".to_string(), "deadbeef".to_string());
+        assert!(authorize_browser_post(&state, &bad_sig, bucket, key).is_err());
+
+        // Unknown access key: rejected.
+        let wrong_key = signed_post_fields("NOPE", "secret", bucket, "uploads/", &expiration);
+        assert!(authorize_browser_post(&state, &wrong_key, bucket, key).is_err());
+    }
+
+    #[test]
+    fn browser_post_signature_cannot_be_retargeted_or_replayed() {
+        let state = auth_state_with_root_key("AKID", "secret");
+        let expiration = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let fields = signed_post_fields("AKID", "secret", "b", "uploads/", &expiration);
+
+        // Same (validly signed) form, different bucket than the policy allows.
+        assert!(authorize_browser_post(&state, &fields, "other", "uploads/x").is_err());
+        // Key outside the signed prefix.
+        assert!(authorize_browser_post(&state, &fields, "b", "secret/x").is_err());
+
+        // Expired policy is rejected even with a valid signature.
+        let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let expired = signed_post_fields("AKID", "secret", "b", "uploads/", &past);
+        assert!(authorize_browser_post(&state, &expired, "b", "uploads/x").is_err());
+    }
+
+    #[test]
+    fn browser_post_upload_is_bucket_level_multipart_post_only() {
+        let multipart_bucket = Request::builder()
+            .method("POST")
+            .uri("/my-bucket")
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=x")
+            .body(Body::empty())
+            .unwrap();
+        assert!(is_browser_post_upload(&multipart_bucket));
+
+        // Object-level POST (multipart completion) must NOT be treated as a
+        // browser upload — it still goes through header signature validation.
+        let object_post = Request::builder()
+            .method("POST")
+            .uri("/my-bucket/key?uploadId=abc")
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=x")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_browser_post_upload(&object_post));
+
+        // Non-multipart bucket POST is not a browser upload.
+        let json_post = Request::builder()
+            .method("POST")
+            .uri("/my-bucket")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_browser_post_upload(&json_post));
+    }
+
+    #[test]
+    fn presigned_expires_over_seven_days_is_rejected() {
+        let state = auth_state_with_root_key("AKID", "secret");
+        let datetime = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let query = presign_query(
+            "GET",
+            "/bucket/key",
+            "localhost",
+            "AKID",
+            "secret",
+            "us-east-1",
+            &datetime,
+            604_801, // one second over the 7-day ceiling
+            &[],
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/bucket/key?{query}"))
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            validate_request(&state, &request),
+            Err("X-Amz-Expires is out of range")
+        );
+    }
+
+    #[test]
+    fn claimed_access_key_is_extracted_without_logging_secrets() {
+        let v4 = Request::builder()
+            .uri("/bucket/key")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AK323434/20260719/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=secret-signature",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(claimed_access_key(&v4).as_deref(), Some("AK323434"));
+
+        let presigned = Request::builder()
+            .uri("/bucket/key?X-Amz-Credential=AKPRESIGNED%2F20260719%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=secret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            claimed_access_key(&presigned).as_deref(),
+            Some("AKPRESIGNED")
         );
     }
 }

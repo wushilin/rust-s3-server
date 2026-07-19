@@ -103,7 +103,7 @@ The sweeper performs bounded maintenance only. It cleans old staging/trash direc
 | `visibility_repair_batch_size` | `100` | Targeted visibility repair batch size. One maintenance pass drains all eligible rows in batches of this size. |
 | `visibility_repair_grace_period_secs` | `86400` | Minimum age (seconds) of a targeted visibility-repair row during normal runtime. Startup repair bypasses this delay because pre-restart requests are no longer running. |
 | `staging_expiry_secs` | `86400` | Minimum idle age (seconds) an abandoned staging directory must have before the sweeper deletes it. Covers interrupted single-PUT and multipart uploads. Default is 24 hours. |
-| `trash_expiry_secs` | `600` | Minimum idle age (seconds) a trash directory must have before recursive deletion. Default is 10 minutes. |
+| `trash_expiry_secs` | `86400` | Minimum idle age (seconds) a trash directory must have before recursive deletion. Default is one day; values below `10800` (3 hours) are rejected at validation and startup. |
 
 Older configs using `visibility_repair_max_per_pass`, `max_objects_per_pass`,
 and `orphan_grace_period_secs` are still accepted as aliases, but new configs

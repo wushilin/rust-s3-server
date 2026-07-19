@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const MIN_TRASH_RETENTION_SECS: u64 = 3 * 60 * 60;
+
 pub use crate::storage::config::StorageConfig;
 
 /// Network and storage settings.
@@ -22,7 +24,13 @@ pub struct ServerConfig {
 /// Log rotation and output settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
-    /// Path to the log file. If absent, logs go to stdout only.
+    /// Directory for split log files. When set, logs are written to
+    /// `auth.log`, `authz.log`, `audit.log`, and `server.log` inside this
+    /// folder, each with the rotation/compression settings below. Takes
+    /// precedence over `file`. The directory is created if it does not exist.
+    pub dir: Option<String>,
+    /// Path to a single combined log file. If both this and `dir` are absent,
+    /// logs go to stdout only.
     pub file: Option<String>,
     /// Minimum log level: "trace", "debug", "info", "warn", "error".
     #[serde(default = "default_log_level")]
@@ -152,6 +160,12 @@ pub struct SweeperConfig {
     /// Minimum idle age of a trash directory before it is removed (seconds).
     #[serde(default = "default_trash_expiry_secs")]
     pub trash_expiry_secs: u64,
+    /// How often (seconds) the empty-directory reclaimer idles between full
+    /// drains. It starts immediately and, while it is still removing dirs,
+    /// re-runs on a short internal cadence; once a drain removes nothing it
+    /// idles for this interval before checking again.
+    #[serde(default = "default_reclaim_interval_secs")]
+    pub reclaim_interval_secs: u64,
 }
 
 impl Default for SweeperConfig {
@@ -162,6 +176,7 @@ impl Default for SweeperConfig {
             intent_grace_period_secs: default_intent_grace_period_secs(),
             staging_expiry_secs: default_staging_expiry_secs(),
             trash_expiry_secs: default_trash_expiry_secs(),
+            reclaim_interval_secs: default_reclaim_interval_secs(),
         }
     }
 }
@@ -240,6 +255,11 @@ impl AppConfig {
                         .to_string(),
                 );
             }
+        }
+        if self.sweeper.trash_expiry_secs < MIN_TRASH_RETENTION_SECS {
+            return Err(format!(
+                "sweeper.trash_expiry_secs must be at least {MIN_TRASH_RETENTION_SECS} seconds (3 hours)"
+            ));
         }
 
         let mut usernames = std::collections::HashSet::new();
@@ -347,6 +367,7 @@ impl Default for ServerConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
+            dir: None,
             file: None,
             level: default_log_level(),
             enable_bandwidth_report: default_enable_bandwidth_report(),
@@ -381,6 +402,9 @@ fn default_keep_files() -> u32 {
 fn default_sweep_interval_secs() -> u64 {
     300
 }
+fn default_reclaim_interval_secs() -> u64 {
+    300
+}
 fn default_intent_batch_size() -> usize {
     100
 }
@@ -391,7 +415,7 @@ fn default_staging_expiry_secs() -> u64 {
     86400
 }
 fn default_trash_expiry_secs() -> u64 {
-    600
+    24 * 60 * 60
 }
 
 #[cfg(test)]
@@ -404,6 +428,27 @@ mod tests {
 
         let config: AppConfig = serde_yaml::from_str("logging: {}\n").unwrap();
         assert!(config.logging.enable_bandwidth_report);
+    }
+
+    #[test]
+    fn trash_retention_defaults_to_one_day() {
+        assert_eq!(AppConfig::default().sweeper.trash_expiry_secs, 86_400);
+        let config: AppConfig = serde_yaml::from_str("sweeper: {}\n").unwrap();
+        assert_eq!(config.sweeper.trash_expiry_secs, 86_400);
+    }
+
+    #[test]
+    fn trash_retention_enforces_three_hour_minimum() {
+        let below: AppConfig =
+            serde_yaml::from_str("sweeper:\n  trash_expiry_secs: 10799\n").unwrap();
+        assert_eq!(
+            below.validate().unwrap_err(),
+            "sweeper.trash_expiry_secs must be at least 10800 seconds (3 hours)"
+        );
+
+        let boundary: AppConfig =
+            serde_yaml::from_str("sweeper:\n  trash_expiry_secs: 10800\n").unwrap();
+        assert!(boundary.validate().is_ok());
     }
 
     #[test]

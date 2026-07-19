@@ -50,34 +50,73 @@ impl Default for SweepConfig {
             intent_batch_size: 100,
             intent_grace_period_ms: 60 * 60 * 1000,
             staging_expiry_ms: 24 * 60 * 60 * 1000,
-            trash_expiry_ms: 10 * 60 * 1000,
+            trash_expiry_ms: 24 * 60 * 60 * 1000,
             now_ms: now_ms(),
         }
     }
 }
 
-/// Runs bounded maintenance for one bucket.
+/// Runs all three maintenance purposes for one bucket. Retained as a
+/// convenience (and for tests); the scheduler drives the three single-purpose
+/// entry points below independently.
 pub async fn sweep_bucket(
     store: &LocalObjectStore,
     bucket: &str,
     config: &SweepConfig,
 ) -> Result<SweepStats> {
-    let mut stats = SweepStats::default();
+    Ok(SweepStats {
+        intents_resolved: resolve_intents_bucket(store, bucket, config).await?,
+        staging_dirs_removed: delete_staging_bucket(store, bucket, config).await?,
+        trash_dirs_removed: delete_trash_bucket(store, bucket, config).await?,
+    })
+}
+
+/// Purpose 1 — drain resolvable stale intents for one bucket. Returns the
+/// number resolved.
+pub async fn resolve_intents_bucket(
+    store: &LocalObjectStore,
+    bucket: &str,
+    config: &SweepConfig,
+) -> Result<usize> {
     let batch_size = config.intent_batch_size.max(1);
+    let mut resolved = 0;
     loop {
         let outcome = store
             .resolve_stale_intents(bucket, config.intent_grace_period_ms, batch_size)
             .await?;
-        stats.intents_resolved += outcome.resolved;
+        resolved += outcome.resolved;
         if outcome.selected < batch_size || outcome.failed > 0 {
             break;
         }
         yield_now().await;
     }
+    Ok(resolved)
+}
+
+/// Purpose 2 — delete expired staging directories for one bucket. Returns the
+/// number removed.
+pub async fn delete_staging_bucket(
+    store: &LocalObjectStore,
+    bucket: &str,
+    config: &SweepConfig,
+) -> Result<usize> {
+    let mut stats = SweepStats::default();
     let bucket_dir = store.layout().bucket_dir(bucket)?;
     sweep_staging(&bucket_dir.join("staging"), config, &mut stats).await?;
+    Ok(stats.staging_dirs_removed)
+}
+
+/// Purpose 3 — delete expired trash directories for one bucket. Returns the
+/// number removed.
+pub async fn delete_trash_bucket(
+    store: &LocalObjectStore,
+    bucket: &str,
+    config: &SweepConfig,
+) -> Result<usize> {
+    let mut stats = SweepStats::default();
+    let bucket_dir = store.layout().bucket_dir(bucket)?;
     sweep_trash(&bucket_dir.join("trash"), config, &mut stats).await?;
-    Ok(stats)
+    Ok(stats.trash_dirs_removed)
 }
 
 async fn sweep_staging(

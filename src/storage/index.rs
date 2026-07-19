@@ -253,6 +253,45 @@ impl SqliteObjectIndex {
         Ok(row.map(row_to_record))
     }
 
+    /// Repoints a key's row at a new blob dir — the atomic pivot of a layout
+    /// migration (hardlink → **flip** → unlink). The `expected` guard makes it a
+    /// no-op if the row moved under us (e.g. a concurrent overwrite), so it can
+    /// never clobber a newer version. Returns whether a row was updated.
+    pub async fn update_blob_dir(
+        &self,
+        key: &str,
+        expected: &str,
+        new_blob_dir: &str,
+    ) -> Result<bool> {
+        let mut tx = self.writer.begin().await?;
+        let affected = sqlx::query(
+            "UPDATE objects SET blob_dir = ?1 WHERE object_key = ?2 AND blob_dir = ?3",
+        )
+        .bind(new_blob_dir)
+        .bind(key)
+        .bind(expected)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(affected > 0)
+    }
+
+    /// Up to `limit` keys still on the legacy 4-level fanout layout
+    /// (`objects/xx/xx/xx/xx/…`). Empty once migration is complete. The `_`
+    /// wildcards match exactly the four 2-char fanout levels, so single-level
+    /// (`objects/xxxx/…`) rows are excluded. Only consulted after the cheap
+    /// root-dir check finds legacy structure, so it never scans a clean bucket.
+    pub async fn legacy_layout_keys(&self, limit: usize) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT object_key FROM objects WHERE blob_dir LIKE 'objects/__/__/__/__/%' LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.reader)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("object_key")).collect())
+    }
+
     pub async fn is_empty(&self) -> Result<bool> {
         Ok(self.object_count().await? == 0)
     }
@@ -546,9 +585,9 @@ impl SqliteObjectIndex {
         max_keys: usize,
     ) -> Result<ListPage> {
         if max_keys == 0 {
-            let has_any: Option<i64> = sqlx::query_scalar(
+            let next_key: Option<String> = sqlx::query_scalar(
                 r#"
-                SELECT 1 FROM objects
+                SELECT object_key FROM objects
                 WHERE object_key >= ?1 AND object_key > ?2
                 ORDER BY object_key
                 LIMIT 1
@@ -561,26 +600,10 @@ impl SqliteObjectIndex {
             return Ok(ListPage {
                 entries: Vec::new(),
                 common_prefixes: Vec::new(),
-                is_truncated: has_any.is_some(),
+                is_truncated: next_key.is_some_and(|key| key.starts_with(prefix)),
                 next_after: after.map(str::to_string),
             });
         }
-
-        let lower = after.unwrap_or("");
-        let rows = sqlx::query(
-            r#"
-            SELECT object_key, blob_dir, size, etag, last_modified_ms
-            FROM objects
-            WHERE object_key >= ?1 AND object_key > ?2
-            ORDER BY object_key
-            LIMIT ?3
-            "#,
-        )
-        .bind(prefix)
-        .bind(lower)
-        .bind((max_keys + 1).max(1) as i64 * 8)
-        .fetch_all(&self.reader)
-        .await?;
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
         let mut entries = Vec::new();
@@ -600,32 +623,58 @@ impl SqliteObjectIndex {
             }
         }
         let mut more_matching = false;
-        for row in rows {
-            let entry = row_to_record(row);
-            if !entry.object_key.starts_with(prefix) {
+        let mut cursor = after.unwrap_or("").to_string();
+        let fetch_size = (max_keys + 1).clamp(256, 4096) as i64;
+        'pages: loop {
+            let rows = sqlx::query(
+                r#"
+                SELECT object_key, blob_dir, size, etag, last_modified_ms
+                FROM objects
+                WHERE object_key >= ?1 AND object_key > ?2
+                ORDER BY object_key
+                LIMIT ?3
+                "#,
+            )
+            .bind(prefix)
+            .bind(&cursor)
+            .bind(fetch_size)
+            .fetch_all(&self.reader)
+            .await?;
+            let fetched = rows.len();
+            if fetched == 0 {
                 break;
             }
-            if entries.len() + common_prefixes.len() >= max_keys {
-                more_matching = true;
-                break;
-            }
-            if let Some(delimiter) = delimiter {
-                let rest = &entry.object_key[prefix.len()..];
-                if let Some(idx) = rest.find(delimiter) {
-                    let common = format!("{}{}", prefix, &rest[..idx + delimiter.len()]);
-                    if !skipped_common_prefixes.insert(common.clone()) {
+            for row in rows {
+                let entry = row_to_record(row);
+                cursor.clone_from(&entry.object_key);
+                if !entry.object_key.starts_with(prefix) {
+                    break 'pages;
+                }
+                if entries.len() + common_prefixes.len() >= max_keys {
+                    more_matching = true;
+                    break 'pages;
+                }
+                if let Some(delimiter) = delimiter {
+                    let rest = &entry.object_key[prefix.len()..];
+                    if let Some(idx) = rest.find(delimiter) {
+                        let common = format!("{}{}", prefix, &rest[..idx + delimiter.len()]);
+                        if !skipped_common_prefixes.insert(common.clone()) {
+                            next_after = Some(entry.object_key);
+                            continue;
+                        }
+                        if common_prefixes.last() != Some(&common) {
+                            common_prefixes.push(common);
+                        }
                         next_after = Some(entry.object_key);
                         continue;
                     }
-                    if common_prefixes.last() != Some(&common) {
-                        common_prefixes.push(common);
-                    }
-                    next_after = Some(entry.object_key);
-                    continue;
                 }
+                next_after = Some(entry.object_key.clone());
+                entries.push(entry);
             }
-            next_after = Some(entry.object_key.clone());
-            entries.push(entry);
+            if fetched < fetch_size as usize {
+                break;
+            }
         }
 
         Ok(ListPage {
@@ -853,5 +902,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.common_prefixes, vec!["a/c/"]);
+    }
+
+    #[tokio::test]
+    async fn delimiter_listing_reads_past_large_common_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        let mut tx = index.writer.begin().await.unwrap();
+        for n in 0..300 {
+            let key = format!("a/large/{n:04}");
+            sqlx::query(
+                "INSERT INTO objects(object_key, blob_dir, size, etag, last_modified_ms) VALUES (?1, 'd', 1, 'e', 1)",
+            )
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO objects(object_key, blob_dir, size, etag, last_modified_ms) VALUES ('a/next/1', 'd', 1, 'e', 1)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let page = index.list("a/", Some("/"), None, 2).await.unwrap();
+        assert_eq!(page.common_prefixes, vec!["a/large/", "a/next/"]);
+        assert!(!page.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn zero_max_keys_ignores_lexically_later_nonmatching_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        let i = index.insert_publish_intent("z", "d", 1).await.unwrap();
+        index
+            .commit_publish(&record("z", "d", 1), i, None, 1)
+            .await
+            .unwrap();
+
+        let page = index.list("a/", None, None, 0).await.unwrap();
+        assert!(!page.is_truncated);
     }
 }

@@ -105,6 +105,15 @@ pub fn fanout_id(bucket: &str, key: &str) -> String {
     out
 }
 
+/// Single-level fanout segment: the first 4 hex chars (16 bits → 65,536 slots)
+/// of the key's hash. The current on-disk layout places each object at
+/// `objects/<segment>/<leaf>`. Legacy objects use the 4-level
+/// [`fanout_segments`] layout and coexist untouched — the index records each
+/// object's real path, so reads never recompute the fanout.
+pub fn fanout_segment(bucket: &str, key: &str) -> String {
+    fanout_id(bucket, key)[0..4].to_string()
+}
+
 pub fn fanout_segments(bucket: &str, key: &str) -> [String; 4] {
     let id = fanout_id(bucket, key);
     [

@@ -11,7 +11,7 @@ futures     = "0.3"
 bytes       = "1"
 
 # HTTP framework
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 
 # Storage / serialisation
 serde       = { version = "1",   features = ["derive"] }

@@ -145,7 +145,9 @@ sweeper:
   staging_expiry_secs: 86400
 
   # Minimum idle age of a trash directory before removal (seconds).
-  trash_expiry_secs: 600
+  # One day protects long-running downloads of retired object snapshots;
+  # values below 10800 (3 hours) are rejected at validation/startup.
+  trash_expiry_secs: 86400
 
 # ─── Authentication ───────────────────────────────────────────────────────────
 auth:
