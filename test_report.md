@@ -1,139 +1,99 @@
 # MinIO Mint S3 Compatibility Test Report
 
-Date: 2026-06-26
+Date: 2026-07-19
 
 ## Target
 
 - Server: `target/release/rusts3`
-- Config: `mint-test-config.yaml`
-- Endpoint tested from Podman: `host.containers.internal:19015`
+- Config: `/tmp/rusts3-mint-config-afterfix2-20260719.yaml`
+- Endpoint tested from Podman: `host.containers.internal:29015`
 - Access key: `minioadmin`
 - Secret key: `minioadmin`
 - Mint mode: `core`
-- Mint logs: `/private/tmp/rusts3-mint-log`
+- Continue on failure: `RUN_ON_FAIL=1`
+- Mint logs: `/tmp/rusts3-mint-log-afterfix2-20260719`
 
 ## Commands
 
 ```sh
+cargo test
 cargo build --release
-target/release/rusts3 -c mint-test-config.yaml
+target/release/rusts3 -c /tmp/rusts3-mint-config-afterfix2-20260719.yaml
 
-podman run --rm \
-  -e SERVER_ENDPOINT=host.containers.internal:19015 \
+podman run --rm --security-opt label=disable \
+  -e SERVER_ENDPOINT=host.containers.internal:29015 \
   -e ACCESS_KEY=minioadmin \
   -e SECRET_KEY=minioadmin \
   -e ENABLE_HTTPS=0 \
-  -e MINT_MODE=core \
   -e RUN_ON_FAIL=1 \
   -e SERVER_REGION=us-east-1 \
-  -v /private/tmp/rusts3-mint-log:/mint/log \
+  -v /tmp/rusts3-mint-log-afterfix2-20260719:/mint/log \
   minio/mint
 ```
 
 ## Result Summary
 
-Parsed from `/private/tmp/rusts3-mint-log/log.json`:
+Parsed from `/tmp/rusts3-mint-log-afterfix2-20260719/log.json`.
 
 | Status | Count |
 | --- | ---: |
-| PASS | 75 |
-| FAIL | 12 |
-| NA | 10 |
-| TOTAL | 97 |
+| PASS | 361 |
+| FAIL | 40 |
+| NA | 15 |
+| TOTAL | 416 |
 
-Grouped by client/test suite:
+MINT executed all 15 suites and reported 7 suite-level successes.
 
-| Suite | PASS | FAIL | NA | TOTAL |
-| --- | ---: | ---: | ---: | ---: |
-| aws-sdk-php | 2 | 1 | 0 | 3 |
-| aws-sdk-ruby | 12 | 1 | 0 | 13 |
-| awscli | 8 | 1 | 0 | 9 |
-| minio-java | 14 | 8 | 10 | 32 |
-| minio-js | 39 | 1 | 0 | 40 |
+## Suite Breakdown
 
-## Failures
+| Suite | PASS | FAIL | NA |
+| --- | ---: | ---: | ---: |
+| aws-sdk-go | 2 | 1 | 0 |
+| aws-sdk-php | 12 | 1 | 0 |
+| aws-sdk-ruby | 13 | 0 | 0 |
+| awscli | 13 | 1 | 0 |
+| healthcheck | 6 | 0 | 0 |
+| mc | 26 | 1 | 0 |
+| minio-go | 0 | 1 | 1 |
+| minio-java | 43 | 21 | 11 |
+| minio-js | 225 | 11 | 0 |
+| minio-py | 13 | 1 | 3 |
+| s3cmd | 8 | 0 | 0 |
+| s3select | 0 | 1 | 0 |
+| versioning | 0 | 1 | 0 |
 
-1. `aws-sdk-php`
-   - Function: `listObjects ( array $params = [] )`
-   - Error: expected `listObjects` with invalid arguments to fail with `InvalidArgument`, but it did not.
+## Fixed In This Run
 
-2. `aws-sdk-ruby`
-   - Function: `presignedPost(bucket_name,file_name,expires_in_sec,max_byte_size)`
-   - Error: expected object was not created.
+- `mc` `test_presigned_post_policy_error` now passes. Object-path `multipart/form-data` POSTs are routed to the object verb path and return `405 MethodNotAllowed`.
+- MinIO JS non-versioned force-delete-prefix now passes. MinIO JS sends `DELETE /bucket/<prefix>` with `x-minio-force-delete: true`; `rusts3` now treats that as a prefix delete extension instead of deleting the literal key.
 
-3. `awscli`
-   - Function: `head-object` after `copy-object`
-   - Error: `StorageClass was not applied`.
+## Remaining Compatibility Gaps
 
-4. `minio-java`
-   - Function: `listBuckets()`
-   - Error: dotted bucket name `minio-java-test-25gnlqr.withperiod` was rejected with `InvalidArgument`.
+Expected or explicitly unimplemented feature areas:
 
-5. `minio-java`
-   - Function: `getObjectLockConfiguration()`
-   - Error: XML parser expected `ObjectLockEnabled` but response did not include it.
+- Object versioning: the dedicated `versioning` suite failed with `501 NotImplemented`; MinIO JS versioning tests also failed because uploaded objects returned `versionId: null`.
+- S3 Select: `aws-sdk-go`, `minio-js`, and `s3select` failed on `SelectObjectContent` with `501 NotImplemented`; `minio-py` marked it `NA`.
+- Bucket lifecycle: AWS CLI `get-bucket-lifecycle-configuration` failed with `501 NotImplemented`; Java lifecycle reads were `NA`.
+- Bucket policy: PHP `putBucketPolicy` failed; MinIO Go `SetBucketPolicy` failed with `SignatureDoesNotMatch`; MinIO JS `setBucketPolicy` returned a response parsed as `S3Error: 200`; Java marked `getBucketPolicy` as `NA`.
+- Bucket replication: `mc test_bucket_replication` failed while configuring a remote target; Java replication set/get/delete tests were `NA`.
+- Object lock, legal hold, and retention-related APIs: Java failed parsing object lock and legal-hold XML responses.
+- Bucket/object tagging: Java `getObjectTags` failed XML parsing and `deleteObjectTags` hit `NoSuchKey`; Java bucket tag reads were `NA`; JS tag cleanup had `NoSuchBucket` cascade failures.
+- Bucket encryption: Java `getBucketEncryption` failed XML parsing, and delete encryption cascaded into `NoSuchBucket`.
+- Bucket notifications and listen APIs: Java listen failed with `SignatureDoesNotMatch`; JS invalid-event listen test got XML where it expected the MinIO notification error text; Java notification set/get/delete were `NA`.
+- MinIO admin APIs: Java admin tests for add/list/delete users and canned policies all hit `/minio/admin/v3/...` paths and returned `NoSuchBucket`.
+- Snowball object upload/extraction: Java and Python snowball upload tests failed because only part of the expected extracted object set was visible afterward.
 
-6. `minio-java`
-   - Function: `getBucketEncryption()`
-   - Error: XML parser mismatch for encryption configuration response.
+## Passing Coverage
 
-7. `minio-java`
-   - Function: `deleteBucketEncryption()`
-   - Error: `NoSuchBucket` during follow-up location lookup.
+Core behavior passed broadly across the suites:
 
-8. `minio-java`
-   - Function: `deleteBucketTags()`
-   - Error: `NoSuchBucket`.
-
-9. `minio-java`
-   - Function: `deleteBucketPolicy()`
-   - Error: `NoSuchBucket`.
-
-10. `minio-java`
-    - Function: `deleteBucketLifecycle()`
-    - Error: `NoSuchBucket`.
-
-11. `minio-java`
-    - Function: `listenBucketNotification()`
-    - Error: `SignatureDoesNotMatch`.
-
-12. `minio-js`
-    - Function: `statObject(bucketName, objectName, cb)`
-    - Error: metadata `"randomstuff"` mismatch for `datafile-65-MB`.
-
-Additional terminal output from `minio-java` reported:
-
-```text
-Exception in thread "main" java.lang.AssertionError: object count; expected=6, got=0 expected:<0> but was:<6>
-    at FunctionalTest.testListObjects(FunctionalTest.java:1412)
-```
-
-## Caveats
-
-The Mint image pulled was `linux/amd64`, while Podman reported the expected platform as `linux/arm64`. The Go-based Mint suites crashed inside the test binaries with SIGSEGV under emulation:
-
-- `aws-sdk-go`
-- `minio-go`
-- `healthcheck`
-
-Those crashes should be treated as test-runtime failures, not confirmed `rusts3` compatibility failures, unless reproduced on a native `amd64` runner or with a compatible Mint image.
-
-The Mint run was manually interrupted after `minio-js` stopped making progress for several minutes following the metadata mismatch. Both the Mint container and `rusts3` server were stopped cleanly afterward.
-
-## Notes
-
-Core bucket/object operations showed substantial success across Java, Ruby, PHP, AWS CLI, and JS clients, including:
-
-- bucket create/head/list/delete
+- bucket create/list/head/delete
 - object put/head/get/delete
-- range GET
-- multipart upload, including a 65 MiB JS object
-- server-side copy at the basic object-copy level
-
-The highest-value follow-up fixes appear to be:
-
-1. Preserve and return user metadata consistently, including multipart uploads and copied objects.
-2. Validate list object parameters such as `max-keys=-1`.
-3. Preserve/apply `StorageClass` metadata on copy/head flows.
-4. Decide whether presigned POST support is in scope.
-5. Return clearer unsupported-feature responses for object lock, encryption, tagging, policy, lifecycle, and notifications.
+- range and partial reads
+- basic list objects and list objects v2
+- multipart upload, list uploads/list parts, abort, and completion paths
+- copy and compose object flows
+- presigned GET/PUT and browser POST flows
+- MinIO JS non-versioned force-delete-prefix
+- health and metrics endpoints
+- `s3cmd`, `aws-sdk-ruby`, `aws-sdk-java`, `aws-sdk-java-v2`, and healthcheck suites had no failures in this run.

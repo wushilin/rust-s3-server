@@ -1082,6 +1082,12 @@ async fn object_route(
         Method::POST if has_upload_id => {
             handlers::complete_multipart::handle(store, ctx, body).await
         }
+        Method::POST if handlers::browser_post::is_form(&ctx.headers) => s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource",
+            &ctx.resource(),
+        ),
         Method::POST => s3_error(
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",

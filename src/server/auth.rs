@@ -81,13 +81,12 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Browser-based POST uploads (multipart/form-data to a bucket) carry their
-    // SigV4 authorization inside the form body (`policy` + `x-amz-signature`),
-    // which this header-only middleware cannot inspect. Hand such requests to
-    // the bucket handler with the auth state attached so it can verify the
-    // form signature itself. This is deliberately scoped to *bucket-level*
-    // POSTs: object-level POSTs (e.g. multipart-upload completion) still go
-    // through normal header validation below.
+    // Browser-based POST uploads carry their SigV4 authorization inside the
+    // form body (`policy` + `x-amz-signature`), which this header-only
+    // middleware cannot inspect. Hand multipart POSTs to the router with the
+    // auth state attached: bucket-level POSTs verify the form signature in the
+    // browser-POST handler, while object-level form POSTs return S3's
+    // MethodNotAllowed response.
     if is_browser_post_upload(&request) {
         log::debug!(target: TARGET_AUTH, "[{rid}] authn deferred to browser-POST form verification");
         request.extensions_mut().insert(state.clone());
@@ -241,24 +240,18 @@ fn authorize_iam(policy: &PolicyDocument, request: &Request<Body>) -> bool {
     is_authorized(policy, &requirements)
 }
 
-/// True for a bucket-level `multipart/form-data` POST — a browser-style form
-/// upload whose credentials live in the body, not the headers.
+/// True for a `multipart/form-data` POST whose credentials may live in the
+/// body, not the headers.
 fn is_browser_post_upload(request: &Request<Body>) -> bool {
     if request.method() != axum::http::Method::POST {
         return false;
     }
-    let is_multipart = request
+    request
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.starts_with("multipart/form-data"))
-        .unwrap_or(false);
-    if !is_multipart {
-        return false;
-    }
-    // Bucket-level path only: `/bucket` or `/bucket/`, never `/bucket/key`.
-    let trimmed = request.uri().path().trim_matches('/');
-    !trimmed.is_empty() && !trimmed.contains('/')
+        .unwrap_or(false)
 }
 
 /// Verifies a browser POST upload's SigV4 form signature and authorizes it.
@@ -1591,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_post_upload_is_bucket_level_multipart_post_only() {
+    fn browser_post_upload_is_multipart_post() {
         let multipart_bucket = Request::builder()
             .method("POST")
             .uri("/my-bucket")
@@ -1600,15 +1593,16 @@ mod tests {
             .unwrap();
         assert!(is_browser_post_upload(&multipart_bucket));
 
-        // Object-level POST (multipart completion) must NOT be treated as a
-        // browser upload — it still goes through header signature validation.
+        // Object-level multipart/form-data POSTs also defer to routing. The
+        // object handler returns MethodNotAllowed, matching S3's response for
+        // browser POST uploads sent to an object resource.
         let object_post = Request::builder()
             .method("POST")
             .uri("/my-bucket/key?uploadId=abc")
             .header(header::CONTENT_TYPE, "multipart/form-data; boundary=x")
             .body(Body::empty())
             .unwrap();
-        assert!(!is_browser_post_upload(&object_post));
+        assert!(is_browser_post_upload(&object_post));
 
         // Non-multipart bucket POST is not a browser upload.
         let json_post = Request::builder()

@@ -1514,6 +1514,41 @@
     }
 
     #[tokio::test]
+    async fn browser_post_to_object_path_returns_method_not_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+        let boundary = "object-post-boundary";
+        let body = concat!(
+            "--object-post-boundary\r\n",
+            "Content-Disposition: form-data; name=\"key\"\r\n\r\n",
+            "posted.txt\r\n",
+            "--object-post-boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"posted.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "hello\r\n",
+            "--object-post-boundary--\r\n"
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/post-bucket/posted.txt")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = body_text(res).await;
+        assert!(body.contains("<Code>MethodNotAllowed</Code>"));
+    }
+
+    #[tokio::test]
     async fn put_object_rejects_user_metadata_over_s3_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let app = make_app(&tmp);
@@ -1951,6 +1986,61 @@
             "quiet mode must omit <Deleted>"
         );
         assert!(!body.contains("<Error>"), "no errors expected");
+    }
+
+    #[tokio::test]
+    async fn force_delete_prefix_removes_matching_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/force-delete-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/force-delete-bucket/my-prefix/datafile-100-kB")
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/force-delete-bucket/%2Fmy-prefix")
+                    .header("x-minio-force-delete", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/force-delete-bucket?list-type=2&prefix=my-prefix")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(!body.contains("<Contents>"), "{body}");
     }
 
     #[tokio::test]
