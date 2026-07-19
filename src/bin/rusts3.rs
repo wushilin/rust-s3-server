@@ -4,7 +4,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use rust_s3_server::server::{config::AppConfig, logging::init_logging, serve, S3HttpConfig};
 
-/// S3-compatible local dev server.
+/// S3-compatible single-node S3 server.
 ///
 /// All configuration lives in a YAML file.
 /// Run `rusts3 init` to generate a documented `config.yaml` in the current

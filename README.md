@@ -1,4 +1,4 @@
-# rusts3 — S3-compatible local object storage
+# rusts3 — S3-compatible single-node S3 server
 
 `rusts3` is a lightweight S3-compatible server written in Rust. It is designed
 for local development, integration tests, CI, and small trusted deployments. It
@@ -24,19 +24,21 @@ is not a drop-in replacement for the complete AWS S3 or MinIO feature set.
   throughput and task progress; MinIO-compatible health and metrics paths.
 ## Screenshots
 
-Reserved for project screenshots. Replace each placeholder with a GitHub image
-URL or uncomment and populate the suggested repository path.
+### Management console
 
-| Management console | IAM and policies |
-|---|---|
-| <img width="1728" height="908" alt="image" src="https://github.com/user-attachments/assets/1505c045-4664-460d-b910-48ad6c3ce562" />
- | <img width="818" height="621" alt="image" src="https://github.com/user-attachments/assets/b9755499-1cd0-415a-85d6-eadcac48f157" />
- |
-| **Object browser** | **Live tasks** |
-| <img width="1728" height="907" alt="image" src="https://github.com/user-attachments/assets/2c01dd4c-d65b-4a63-b959-c47de7e5a696" />
- | <img width="457" height="175" alt="image" src="https://github.com/user-attachments/assets/b8adaa59-d218-473d-9d15-d6af9954be63" />
- |
+<img width="1728" height="908" alt="Management console" src="https://github.com/user-attachments/assets/1505c045-4664-460d-b910-48ad6c3ce562" />
 
+### IAM and policies
+
+<img width="818" height="621" alt="IAM and policies" src="https://github.com/user-attachments/assets/b9755499-1cd0-415a-85d6-eadcac48f157" />
+
+### Object browser
+
+<img width="1728" height="907" alt="Object browser" src="https://github.com/user-attachments/assets/2c01dd4c-d65b-4a63-b959-c47de7e5a696" />
+
+### Live tasks
+
+<img width="457" height="175" alt="Live tasks" src="https://github.com/user-attachments/assets/b8adaa59-d218-473d-9d15-d6af9954be63" />
 
 ## Compatibility snapshot
 
