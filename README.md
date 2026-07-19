@@ -1,391 +1,351 @@
-# rusts3 — S3-compatible local dev server
+# rusts3 — S3-compatible local object storage
 
-A lightweight S3-compatible object storage server written in Rust.
-Built for **local development and CI/CD** — not a production replacement for AWS S3 or MinIO.
+`rusts3` is a lightweight S3-compatible server written in Rust. It is designed
+for local development, integration tests, CI, and small trusted deployments. It
+is not a drop-in replacement for the complete AWS S3 or MinIO feature set.
 
----
+## Highlights
 
-## Design goals
+- Streaming single-part and multipart uploads and downloads; object bodies are
+  not buffered in memory.
+- AWS Signature V4 and V2 authentication, including presigned URLs, SigV4
+  streaming (`aws-chunked`), and signed browser POST uploads.
+- A built-in management console on a separate port for buckets, objects, IAM
+  users, groups, policies, access keys, share links, and live tasks.
+- AWS-style IAM policy evaluation with explicit deny, wildcard actions and
+  resources, prefix/delimiter conditions, user policies, and group policies.
+- Server-side copy, multipart copy, range reads, conditional reads/copies,
+  bulk delete, metadata, storage-class headers, and ListObjects v1/v2.
+- SQLite-primary object indexes with immutable blob directories, write-ahead
+  intents, atomic publication, crash recovery, and configurable durability.
+- Automatic index rebuilds, migration from the legacy four-level layout,
+  staging/trash cleanup, and empty-directory reclamation.
+- Request, authentication, authorization, and operation audit logs; live
+  throughput and task progress; MinIO-compatible health and metrics paths.
 
-| Goal | Notes |
-|------|-------|
-| S3 wire-compatible | Works with the AWS CLI, AWS SDKs, and any library that targets the S3 API |
-| Low overhead | Streaming reads/writes — objects are never fully buffered in memory |
-| Durable | Complete object directories are published with atomic renames; each bucket has a derived SQLite listing index |
-| Self-healing | GET/DELETE and targeted visibility-repair rows reconcile stale SQLite entries; the index can still be rebuilt explicitly via HTTP |
-| Observable | Structured per-request logging (method, URI, status, size, latency) and periodic bandwidth reports; rolling log file with configurable rotation and optional gzip compression |
-| Configurable | Single `config.yaml` controls network, storage, logging, auth, and background maintenance; `rusts3 init` generates a fully-documented template |
-| No hot-spot directories | Objects are spread across a 4-level SHA-1 fanout tree — no single directory ever accumulates more than a handful of entries, regardless of how many objects the bucket contains |
+## Compatibility snapshot
 
-## Explicit non-goals
+The latest MinIO Mint core run exercised all 15 suites and recorded **361
+passes out of 416 checks**, with 40 failures and 15 not-applicable results.
+Seven suites reported suite-level success. Core bucket/object CRUD, ranged
+reads, ListObjects v1/v2, multipart flows, copy/compose, presigned GET/PUT,
+browser POST, health checks, and metrics all passed broadly across clients.
 
-The following S3 features are **intentionally not implemented**.
-If you need them, use MinIO or a real S3-compatible service.
+| Client/suite | Result in the latest run |
+|---|---|
+| `s3cmd` | 8 pass, 0 fail |
+| AWS SDK for Ruby | 13 pass, 0 fail |
+| Health checks | 6 pass, 0 fail |
+| AWS CLI | 13 pass, 1 expected feature-gap failure |
+| MinIO Client (`mc`) | 26 pass, 1 feature-gap failure |
+| MinIO JavaScript | 225 pass, 11 feature-gap failures |
 
-- **Versioning** — only the latest version of each object exists
-- **ACLs / IAM** — auth is all-or-nothing per credential pair
-- **Lifecycle policies** — no automatic object expiry or tiering
-- **Server-side encryption (SSE)** — objects are stored in plaintext
-- **TLS** — run behind [Caddy](https://caddyserver.com/) or [Ferron](https://ferron.rs/) for HTTPS
+See the dated [MinIO Mint compatibility report](test_report.md) for the exact
+command, suite-by-suite results, passing coverage, and remaining gaps. The
+report is the source of truth; the summary above is intentionally not a claim
+of complete S3 or MinIO compatibility.
 
----
+## Intentional limits
 
-## Building
+The following APIs are not implemented:
+
+- bucket versioning and delete markers;
+- bucket policies through the S3 API (rusts3 IAM policies are managed in the
+  console instead), ACLs, CORS, websites, lifecycle rules, and tagging;
+- object lock, retention/legal hold, replication, notifications, and S3 Select;
+- server-side encryption and storage-tier behavior (a storage-class value is
+  metadata only);
+- MinIO admin APIs and Snowball archive extraction;
+- TLS termination. Put rusts3 behind a reverse proxy such as
+  [Caddy](https://caddyserver.com/) for HTTPS.
+
+`GET /{bucket}?versions` is a compatibility view of the current object and any
+overwritten/deleted snapshots still present in trash. It is not durable S3
+versioning: the normal trash-retention job eventually removes those snapshots,
+and `?versioning` is not implemented.
+
+## Build and run
 
 ```bash
 cargo build --release
-# binary: target/release/rusts3
-```
-
----
-
-## Running
-
-```text
-rusts3 run [-c FILE]          Start the server (default: ./config.yaml)
-rusts3 validate [-c FILE]     Validate configuration without starting
-rusts3 genpassword            Generate a bcrypt console password
-rusts3 verifypassword [HASH]  Verify a bcrypt console password
-rusts3 init                   Write a documented config.yaml
-```
-
-### Quickstart
-
-```bash
-# Generate a fully-documented config.yaml in the current directory:
 target/release/rusts3 init
-
-# Edit config.yaml to taste, then start:
+# Edit config.yaml, then:
 target/release/rusts3 run
 ```
 
----
+The binary is `target/release/rusts3`. The CLI commands are:
 
-## Configuration reference (`config.yaml`)
+```text
+rusts3 run [-c FILE]                   Start the server (default: config.yaml)
+rusts3 validate [-c FILE]              Validate configuration and exit
+rusts3 genpassword [--cost N]          Generate a bcrypt console password
+rusts3 verifypassword [HASH]           Verify a bcrypt console password
+rusts3 init                            Write a documented config.yaml
+```
 
-Run `rusts3 init` to generate a fully-documented `config.yaml` in the current directory.
-All fields are optional — built-in defaults are used for anything omitted.
+Running `rusts3` without a subcommand remains supported: it uses built-in
+defaults, or the file supplied with the legacy `-c` option. Only one process
+may own a data directory; rusts3 enforces this with `<base_dir>/.rusts3.lock`.
 
-### `server` — network and storage root
+## Configuration
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `bind_address` | `"0.0.0.0"` | IP address to listen on. `"0.0.0.0"` binds all interfaces; use `"127.0.0.1"` to restrict to localhost. |
-| `bind_port` | `8002` | TCP port the HTTP server listens on. |
-| `base_dir` | `"./rusts3-data"` | Root directory where all bucket data is stored on disk. Created automatically if it does not exist. |
+Every field is optional. `rusts3 init` writes a commented configuration file.
 
-### `storage` — storage engine tuning
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `sqlite_max_connections` | `50` | Maximum SQLite connections kept open per bucket index pool. Increase if you see pool-exhaustion errors under high concurrency. |
-| `meta_cache_capacity` | `200000` | Maximum object metadata entries in the in-process LRU cache. Each entry is roughly 400–700 bytes; 200 000 entries ≈ 80–140 MB. `HEAD` and `GET` requests are served from cache on warm hits without touching SQLite. |
-| `sqlite_repair_cache_capacity` | `200000` | Maximum entries in the SQLite-repair suppression cache. Prevents the server from repeatedly attempting to repair the same broken index row within a short window. Each entry is roughly 100 bytes; 200 000 ≈ 20 MB. |
-
-### `logging` — log output and rotation
+### Server and UI
 
 | Field | Default | Description |
-|-------|---------|-------------|
-| `level` | `"info"` | Minimum log level. Accepted values: `trace`, `debug`, `info`, `warn`, `error`. |
-| `enable_bandwidth_report` | `true` | When `true`, logs aggregate read/write bandwidth totals and rates every 10 seconds. Useful for monitoring throughput without a metrics backend. |
-| `file` | *(absent)* | Path to a rolling log file (e.g. `"/var/log/rusts3/rusts3.log"`). When omitted, all output goes to stdout only. When set, logs go to **both** stdout and the file. |
-| `rotation_size_mb` | `100` | Rotate the log file when it reaches this size in MiB. Only applies when `file` is set. |
-| `keep_files` | `5` | Number of archived (rotated) log files to keep alongside the active file. Older archives are deleted automatically. |
-| `compress` | `false` | When `true`, archived log files are compressed with gzip (`.gz` extension appended). |
+|---|---:|---|
+| `server.bind_address` | `0.0.0.0` | S3 API listen address. |
+| `server.bind_port` | `8002` | S3 API listen port. |
+| `server.base_dir` | `./rusts3-data` | Object, index, and IAM data root. |
+| `ui.enabled` | `true` | Enable the management console. |
+| `ui.bind_address` | S3 bind address | Optional separate console listen address. |
+| `ui.bind_port` | `8003` | Console listen port. |
 
-### `sweeper` — background maintenance
+The S3 API and console are deliberately separate. S3 clients authenticate with
+access keys; console users authenticate with username/password sessions.
 
-The sweeper performs bounded maintenance only. It cleans old staging/trash directories and processes targeted visibility-repair rows; it does not automatically crawl all live objects or all SQLite index rows.
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `interval_secs` | `300` | How often (in seconds) background maintenance wakes up for each bucket. |
-| `visibility_repair_batch_size` | `100` | Targeted visibility repair batch size. One maintenance pass drains all eligible rows in batches of this size. |
-| `visibility_repair_grace_period_secs` | `86400` | Minimum age (seconds) of a targeted visibility-repair row during normal runtime. Startup repair bypasses this delay because pre-restart requests are no longer running. |
-| `staging_expiry_secs` | `86400` | Minimum idle age (seconds) an abandoned staging directory must have before the sweeper deletes it. Covers interrupted single-PUT and multipart uploads. Default is 24 hours. |
-| `trash_expiry_secs` | `86400` | Minimum idle age (seconds) a trash directory must have before recursive deletion. Default is one day; values below `10800` (3 hours) are rejected at validation and startup. |
-
-Older configs using `visibility_repair_max_per_pass`, `max_objects_per_pass`,
-and `orphan_grace_period_secs` are still accepted as aliases, but new configs
-should use the visibility-repair names above.
-
-### `auth` — SigV4 authentication
+### Storage
 
 | Field | Default | Description |
-|-------|---------|-------------|
-| `enabled` | `false` | When `false`, the server accepts all requests without credentials (open access). Set to `true` to require AWS SigV4 signatures on every request. |
-| `credentials` | `[]` | List of `{access_key, secret_key}` pairs. Only used when `enabled: true`. Clients must present one of these pairs to authenticate. |
-| `public_hostname` | *(absent)* | The hostname (and optional port) that S3 clients are configured to use, e.g. `"mys3.company.com"` or `"localhost:8002"`. When set, presigned URL verification substitutes this value for the `host` signed header instead of reading it from the incoming HTTP request. This makes signature verification proxy-safe — a reverse proxy may rewrite the `Host` header, but the client and server still agree on the configured public hostname. When omitted, the incoming `Host` header is used directly. |
-| `public_scheme` | `"http"` | Scheme used when the console generates presigned share links. Accepted values are `http` and `https`. Signature verification is scheme-independent. |
+|---|---:|---|
+| `storage.sqlite_max_connections` | `50` | SQLite reader connections per bucket. Mutations use a dedicated writer. |
+| `storage.meta_cache_capacity` | `200000` | Maximum cached object metadata entries. |
+| `storage.durability` | `full` | `full` fsyncs blobs and uses SQLite `synchronous=FULL`; `relaxed` skips per-PUT blob fsync and uses `NORMAL`. |
+| `storage.rebuild_reader_threads` | `0` | Parallel index-rebuild workers; `0` selects one per CPU core. |
+| `storage.rebuild_queue_bound` | `1000` | Bounded rebuild pipeline queue. |
+| `storage.rebuild_batch_size` | `1000` | SQLite rows written per rebuild transaction. |
 
-Built-in console passwords may be bcrypt hashes (recommended) or cleartext
-for backward compatibility. Generate and verify hashes with
-`rusts3 genpassword` and `rusts3 verifypassword`. Built-in `api_keys` are
-optional and remain cleartext because S3 SigV4/V2 verification requires the
-original HMAC secret; a built-in user without API keys is a valid console-only
-administrator.
+`full` is the safe default for power-loss durability. `relaxed` improves write
+throughput but can lose the last acknowledged writes after power loss. A normal
+process crash preserves committed writes in either mode.
 
-**Example with auth enabled:**
+### Authentication and IAM
+
+| Field | Default | Description |
+|---|---:|---|
+| `auth.enabled` | `false` | Require signatures on the S3 API. Health and metrics endpoints remain public. |
+| `auth.credentials` | `[]` | Legacy unrestricted `{access_key, secret_key}` pairs. |
+| `auth.users` | `[]` | Built-in, unrestricted bootstrap administrators. |
+| `auth.public_hostname` | absent | Public hostname and optional port used to verify proxy-safe signatures and generate console share links. Do not include a scheme. |
+| `auth.public_scheme` | `http` | `http` or `https`, used for generated share links. |
+
+A built-in administrator can have a console password, any number of S3 API
+keys, or both:
 
 ```yaml
 auth:
   enabled: true
-  public_hostname: "mys3.company.com"
+  public_hostname: "s3.example.test"
   public_scheme: https
-  credentials:
-    - access_key: "minioadmin"
-      secret_key: "minioadmin"
-    - access_key: "AKIAIOSFODNN7EXAMPLE"
-      secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  users:
+    - user: admin
+      password: "$2b$12$..." # generate with: rusts3 genpassword
+      api_keys:
+        - ak: "ROOTKEY001"
+          secret: "replace-this-secret"
+
+ui:
+  enabled: true
+  bind_port: 8003
 ```
 
----
+Built-in users live in configuration, cannot be edited at runtime, and bypass
+policy checks. Runtime users, groups, access keys, and policies live in
+`<base_dir>/admin.sqlite`. Runtime users are default-deny unless an attached
+user/group policy allows the request; a matching explicit deny wins. The
+console provides both a read/write rule builder and a JSON policy editor.
 
-## Using with the AWS CLI
+Bcrypt is recommended for built-in console passwords. Cleartext remains
+accepted for compatibility. S3 secrets must remain recoverable because request
+authentication requires the original HMAC key.
 
-Configure a profile that points at the local server:
+### Logging
+
+| Field | Default | Description |
+|---|---:|---|
+| `logging.level` | `info` | `trace`, `debug`, `info`, `warn`, or `error`. |
+| `logging.enable_bandwidth_report` | `true` | Log aggregate bytes, rates, request totals, and QPS every 10 seconds. |
+| `logging.dir` | absent | Split logs into `auth.log`, `authz.log`, `audit.log`, and `server.log`. Takes precedence over `file`. |
+| `logging.file` | absent | Combined rolling log file. With neither `dir` nor `file`, logs go to stdout only. |
+| `logging.rotation_size_mb` | `100` | Rotate a file at this size. |
+| `logging.keep_files` | `5` | Number of rotated archives to keep. |
+| `logging.compress` | `false` | Gzip rotated archives. |
+
+File logging also echoes to stdout. Every S3 and console request receives a
+correlation ID, returned in `x-amz-request-id` and included in logs.
+
+### Background maintenance
+
+| Field | Default | Description |
+|---|---:|---|
+| `sweeper.interval_secs` | `300` | Schedule interval for intent resolution, staging/trash cleanup, and legacy-layout migration. |
+| `sweeper.intent_batch_size` | `100` | Stale intents processed per batch; a run drains all eligible batches. |
+| `sweeper.intent_grace_period_secs` | `3600` | Minimum intent age during normal operation. Startup recovery bypasses the grace period. |
+| `sweeper.staging_expiry_secs` | `86400` | Idle age before abandoned PUT/multipart staging is removed. |
+| `sweeper.trash_expiry_secs` | `86400` | Idle age before retired blobs are removed; values below 10800 (3 hours) are rejected. |
+| `sweeper.reclaim_interval_secs` | `300` | Interval for reclaiming empty fanout directories. |
+
+Older visibility-repair setting names are accepted as aliases for the intent
+batch/grace settings.
+
+## Management console
+
+With its defaults, open `http://127.0.0.1:8003`. Configure at least one
+`auth.users` entry with a password to bootstrap console administration.
+
+The console supports:
+
+- creating/deleting buckets and browsing, uploading, downloading, and deleting
+  objects;
+- generating presigned share links (requires `auth.public_hostname`);
+- creating runtime users and groups, resetting passwords, rotating access
+  keys, and editing user/group policies;
+- bucket statistics and operator-triggered index rebuilds;
+- a WebSocket-powered task monitor for active/recent S3 requests and jobs,
+  transfer progress and throughput, with cancellation for safe cancellable
+  work.
+
+Console-generated share links carry the creator's current authority. Deleting
+the user or changing their policy therefore revokes or narrows existing links.
+
+## Screenshots
+
+Reserved for project screenshots. Replace each placeholder with a GitHub image
+URL or uncomment and populate the suggested repository path.
+
+| Management console | IAM and policies |
+|---|---|
+| _Screenshot slot 1_<!-- ![Management console](docs/screenshots/console.png) --> | _Screenshot slot 2_<!-- ![IAM and policies](docs/screenshots/iam.png) --> |
+| **Object browser** | **Live tasks** |
+| _Screenshot slot 3_<!-- ![Object browser](docs/screenshots/objects.png) --> | _Screenshot slot 4_<!-- ![Live tasks](docs/screenshots/tasks.png) --> |
+
+## AWS CLI
+
+Configure a profile whose keys match a built-in or runtime access key:
 
 ```bash
 aws configure --profile local
-# AWS Access Key ID:     minioadmin   (must match config.yaml when auth.enabled = true)
-# AWS Secret Access Key: minioadmin
-# Default region:        us-east-1
-# Default output format: json
-```
+# region: us-east-1
 
-Add `--profile local --endpoint-url http://127.0.0.1:8002` to every command, or set:
-
-```bash
 export AWS_PROFILE=local
 export AWS_ENDPOINT_URL=http://127.0.0.1:8002
-```
 
-### Common operations
-
-```bash
-# Create bucket
 aws s3 mb s3://my-bucket
-
-# Upload
-aws s3 cp ~/file.bin s3://my-bucket/path/file.bin
-
-# Download
-aws s3 cp s3://my-bucket/path/file.bin ./file.bin
-
-# List
+aws s3 cp ./file.bin s3://my-bucket/path/file.bin
 aws s3 ls s3://my-bucket/
-
-# Delete single object
-aws s3 rm s3://my-bucket/path/file.bin
-
-# Delete multiple objects (bulk delete)
+aws s3 cp s3://my-bucket/path/file.bin ./download.bin
+aws s3 cp s3://my-bucket/path/file.bin s3://my-bucket/copy.bin
 aws s3 rm s3://my-bucket/path/ --recursive
-
-# Copy object (server-side)
-aws s3 cp s3://my-bucket/src.bin s3://my-bucket/dst.bin
-
-# Multipart upload (automatic for files > 8 MB by default)
-aws s3 cp ~/large.iso s3://my-bucket/large.iso
-
-# List in-progress multipart uploads
-aws s3api list-multipart-uploads --bucket my-bucket
-
-# List parts of an in-progress upload
-aws s3api list-parts --bucket my-bucket --key large.iso --upload-id <id>
+aws s3 presign s3://my-bucket/copy.bin --expires-in 3600
 ```
 
-### Pre-signed URLs
+Multipart upload is selected automatically by the AWS CLI for sufficiently
+large files. Low-level multipart operations are also available through
+`aws s3api`.
 
-```bash
-# Generate a pre-signed download URL valid for 1 hour:
-aws s3 presign s3://my-bucket/file.bin --expires-in 3600
+When a reverse proxy changes the `Host` header, set `auth.public_hostname` to
+the exact hostname (including a nonstandard port) configured in clients. This
+keeps presigned SigV4 verification consistent through the proxy.
+
+## Supported S3 operations
+
+### Buckets
+
+| Method | Resource | Operation |
+|---|---|---|
+| `GET` | `/` | List buckets. |
+| `PUT` / `HEAD` / `DELETE` | `/{bucket}` | Create, inspect, or delete an empty bucket. |
+| `GET` | `/{bucket}` | ListObjects v1/v2 with prefix, delimiter, marker/continuation token, encoding, and pagination. |
+| `GET` | `/{bucket}?location` | Get bucket location. |
+| `GET` | `/{bucket}?uploads` | List multipart uploads. |
+| `GET` | `/{bucket}?versions` | Compatibility listing of retained current/retired snapshots; not S3 versioning. |
+| `POST` | `/{bucket}?delete` | Multi-object delete, including quiet mode. |
+| `POST` | `/{bucket}?rebuildIndex` | Start an index rebuild (`202`; `409` if already running). |
+| `POST` | `/{bucket}` | SigV4 browser form upload with policy validation. |
+
+### Objects
+
+| Method | Resource | Operation |
+|---|---|---|
+| `PUT` | `/{bucket}/{key}` | Streaming upload, including `aws-chunked`, content hashes, metadata, and storage class. |
+| `GET` / `HEAD` | `/{bucket}/{key}` | Streaming read, single byte ranges, conditional reads, response-header overrides, and metadata. |
+| `DELETE` | `/{bucket}/{key}` | Idempotent delete. `forceDelete=true` / `x-minio-force-delete` deletes a prefix for MinIO compatibility. |
+| `PUT` | object + `x-amz-copy-source` | Server-side copy with metadata directive and source preconditions. |
+| `POST` | object + `?uploads` | Initiate multipart upload. |
+| `PUT` | object + `uploadId`, `partNumber` | Upload a part, or copy a source/range into a part. |
+| `GET` | object + `uploadId` | List uploaded parts. |
+| `POST` | object + `uploadId` | Complete multipart upload. |
+| `DELETE` | object + `uploadId` | Abort multipart upload. |
+
+Authentication supports header and query-string SigV4/SigV2 requests.
+Presigned SigV4 URLs enforce AWS's seven-day maximum expiry. Browser POST
+policies validate expiry and form conditions before accepting the object.
+
+## Health and metrics
+
+These unauthenticated compatibility endpoints are available on the S3 port:
+
+```text
+GET /minio/health/live
+GET /minio/health/ready
+GET /minio/prometheus/metrics
+GET /minio/v2/metrics/{cluster,node,bucket,resource}
 ```
 
-The full SigV4 signature is verified on use. The URL works with any HTTP client —
-no AWS credentials needed at download time.
+The metrics endpoints currently expose a minimal `rusts3_up 1` Prometheus
+gauge. Detailed request/byte totals and rates are available in periodic logs
+and the console task view.
 
-#### Presigned URLs behind a reverse proxy
+## Storage and recovery model
 
-When a reverse proxy (nginx, Caddy, etc.) sits in front of rusts3 and rewrites
-the `Host` header, presigned URL signatures will fail because the client signed
-against the public hostname but the server sees the internal one.
+Each bucket has an authoritative SQLite index. Object data is stored in an
+immutable, self-describing blob directory and the index records that directory's
+path. A mutation follows this protocol:
 
-Set `auth.public_hostname` to the hostname (and port, if non-standard) that
-clients use:
+1. Stream a complete blob into staging.
+2. Commit a publish intent.
+3. Atomically rename the blob into the live tree.
+4. Atomically switch the index row and record retirement of any old blob.
+5. Move the old blob to trash and clear the retirement intent.
 
-```yaml
-auth:
-  enabled: true
-  public_hostname: "mys3.company.com"
-  public_scheme: https
-  credentials:
-    - access_key: "minioadmin"
-      secret_key: "minioadmin"
-```
+After a crash, startup drains the small intent table instead of scanning every
+object. Reads and listings use SQLite as the source of truth. Per-key locking,
+monotonic modification timestamps, and immutable snapshots keep concurrent
+overwrites/deletes consistent with in-flight downloads.
 
-With this set, presigned URL verification always substitutes the configured
-value for the `host` signed header, regardless of what the proxy forwards.
+The current layout uses a single 16-bit fanout directory:
 
----
-
-## S3 API reference
-
-### Bucket operations
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | List all buckets |
-| `PUT` | `/{bucket}` | Create bucket |
-| `HEAD` | `/{bucket}` | Check bucket exists (200 / 404) |
-| `DELETE` | `/{bucket}` | Delete bucket (must be empty) |
-| `GET` | `/{bucket}` | List objects (v2 `continuation-token` / v1 `marker`; `prefix`, `delimiter`) |
-| `GET` | `/{bucket}?location` | Get bucket region |
-| `GET` | `/{bucket}?uploads` | List in-progress multipart uploads |
-| `POST` | `/{bucket}?delete` | Delete multiple objects (bulk delete, quiet mode supported) |
-| `POST` | `/{bucket}?rebuildIndex` | Rebuild SQLite index from `meta.json` files on disk |
-
-### Object operations
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `PUT` | `/{bucket}/{key}` | Upload object (plain or `aws-chunked` SigV4 streaming) |
-| `PUT` | `/{bucket}/{key}` + `x-amz-copy-source` | Server-side object copy |
-| `GET` | `/{bucket}/{key}` | Download object; `Range` header supported; `If-None-Match` / `If-Modified-Since` → 304 |
-| `HEAD` | `/{bucket}/{key}` | Object metadata; `If-None-Match` / `If-Modified-Since` → 304 |
-| `DELETE` | `/{bucket}/{key}` | Delete object |
-| `POST` | `/{bucket}/{key}?uploads` | Initiate multipart upload |
-| `PUT` | `/{bucket}/{key}?uploadId=…&partNumber=…` | Upload a part |
-| `GET` | `/{bucket}/{key}?uploadId=…` | List uploaded parts |
-| `POST` | `/{bucket}/{key}?uploadId=…` | Complete multipart upload |
-| `DELETE` | `/{bucket}/{key}?uploadId=…` | Abort multipart upload |
-
-### Authentication
-
-| Flow | How it works |
-|------|-------------|
-| Open (default) | `auth.enabled: false` — all requests accepted without credentials |
-| SigV4 | `auth.enabled: true` — every request must carry a valid `Authorization` header |
-| Presigned URLs | Standard `?X-Amz-Signature=…` query-string auth; expiry enforced |
-| Proxy-safe presigned | Set `auth.public_hostname` so server and clients agree on the hostname |
-
----
-
-## Source layout
-
-```
-src/
-  storage/          # storage engine (no HTTP knowledge)
-    store.rs        # public API: put/get/delete/list/copy/multipart
-    resolver.rs     # find or allocate an object directory by (bucket, key)
-    index.rs        # SQLite index for sorted key listing
-    encoding.rs     # object dir naming (V1 prefix + fanout)
-    layout.rs       # maps (bucket, key) → fanout leaf directory path
-    metadata.rs     # ObjectMeta / PutMeta / UploadMeta / BucketMeta structs
-    staging.rs      # staging directory helpers
-    sweeper.rs      # bounded background maintenance
-    cache.rs        # LRU metadata cache
-    locks.rs        # per-key async mutex
-    aws_chunked.rs  # aws-chunked streaming decoder
-    config.rs       # StorageConfig
-    errors.rs       # StorageError type
-    time.rs         # timestamp helpers
-
-  server/           # HTTP layer (depends on storage, not vice versa)
-    mod.rs          # Axum routing, handlers, middleware, integration tests
-    auth.rs         # SigV4 / presigned-URL verification
-    config.rs       # AppConfig (re-exports StorageConfig)
-    logging.rs      # rolling log setup
-    range.rs        # HTTP Range header parsing
-    xml.rs          # S3 XML serialisation / deserialisation
-
-  bin/
-    rusts3.rs       # CLI entry point
-```
-
----
-
-## On-disk layout
-
-```
+```text
 <base_dir>/
-  buckets/
-    <bucket>/
-      bucket.json            # bucket metadata (creation time, storage_version)
-      index.sqlite           # SQLite object index
-      objects/
-        <2>/<2>/<2>/<2>/     # 4-level SHA-1 fanout (8 hex chars of SHA1(bucket+key))
-          V1<6hex>/          # object directory  e.g. V1AB3F7C/
-          V1<6hex>_<4hex>/   # collision suffix (rare)  e.g. V1AB3F7C_91FE/
-            meta.json        # object metadata + part list
-            part.1           # object data (single-part)
-            part.1, part.2   # multipart data (one file per part)
-      staging/
-        put/<id>/            # unpublished single PUT (cleaned by maintenance)
-        multipart/<id>/      # unpublished multipart upload (cleaned by maintenance)
-      trash/
-        <id>/                # complete objects removed from live visibility
+  .rusts3.lock
+  admin.sqlite
+  buckets/<bucket>/
+    bucket.json
+    index.sqlite
+    objects/<4-hex>/V1<6-hex>_<unique>/
+      meta.json
+      part.1, part.2, ...
+    staging/put/<id>/
+    staging/multipart/<upload-id>/
+    trash/<id>/
 ```
 
-PUT and multipart completion prepare a complete object directory in staging,
-including `meta.json`, then publish it into `objects/` with an atomic rename.
-DELETE moves the live object directory to `trash/` with an atomic rename and
-removes the SQLite row afterward. Overwrite PUT is documented as delete-then-put:
-if the process crashes between moving the old object to trash and publishing the
-new object, the key may be absent, but no partial live object directory is left
-behind.
+Older four-level fanout objects remain readable and are migrated in the
+background. Empty directories are reclaimed without deleting non-empty object
+directories.
 
-SQLite stores a derived listing index. The live `objects/` namespace is
-authoritative; reads/deletes and targeted visibility-repair rows reconcile SQLite
-when drift is detected.
-
-### Object Directory Names
-
-Object directory names are always 8 chars (`V1` + 6 uppercase hex digits), e.g.
-`V1AB3F7C`. The optional `_<4hex>` suffix (e.g. `V1AB3F7C_91FE`) handles the
-rare case where two different keys hash to the same 6-char prefix within the
-same fanout leaf. Lookup scans entries starting with the key-derived prefix and
-confirms the match via `meta.json`.
-
-SQLite stores only logical listing fields (`object_key`, size, ETag, and last
-modified time). It does not store physical directory names. Physical location is
-resolved from the key's deterministic fanout leaf and the `meta.json` files
-inside that leaf.
-
-`bucket.json` carries `storage_version: "v1"` for this initial on-disk format.
-
-### Uniform object distribution — no directory hot-spots
-
-The 4-level fanout is derived from `SHA1(bucket + key)`, not from the key name
-itself. Objects are spread uniformly across `256^4 = 4 billion` possible leaf
-directories regardless of naming patterns — sequential keys, common prefixes,
-and deeply nested paths all distribute evenly. No single directory ever
-accumulates more than a handful of entries, so filesystem limits caused by
-oversized flat directories are not a concern.
-
----
-
-## Index rebuild
-
-If the SQLite index ever drifts from disk (e.g. after a crash or manual file
-manipulation), trigger a background rebuild:
+If an index is missing or uses an old schema, rusts3 starts a parallel rebuild
+from `meta.json`. The affected bucket returns `503 SlowDown` while rebuilding,
+so normal S3 retry behavior applies. An operator can also trigger the same
+tracked job from the console or with:
 
 ```bash
-curl -X POST http://127.0.0.1:8002/my-bucket?rebuildIndex
-# 202 Accepted — running in background
-# 409 Conflict — already running
+curl -X POST 'http://127.0.0.1:8002/my-bucket?rebuildIndex'
 ```
-
-The rebuild streams the live `objects/` tree and upserts each discovered object
-directly into SQLite with a rebuild timestamp. When the scan finishes, SQLite
-rows not seen since the rebuild started are removed. This keeps memory bounded
-and fixes both missing rows and stale rows. Progress is logged at INFO level
-every 100 objects.
-
----
 
 ## Graceful shutdown
 
-`SIGINT` (Ctrl-C) triggers a graceful shutdown:
-1. The HTTP server stops accepting new connections and drains in-flight requests.
-2. The background maintenance task and any running index rebuild are cooperatively cancelled.
-3. The process exits cleanly.
+`SIGINT` (Ctrl-C) stops accepting new connections, drains the S3 server,
+cancels background work through cooperative cancellation, releases the
+data-root lock, and exits cleanly.
