@@ -1,18 +1,21 @@
 server:
   bind_address: "0.0.0.0"
-  bind_port: 19015
-  base_dir: "/private/tmp/rusts3-mint-data"
+  bind_port: 29015
+  base_dir: "/tmp/rusts3-mint-data-20260719"
 
 logging:
   level: "info"
   enable_bandwidth_report: false
+
+ui:
+  enabled: false
 
 sweeper:
   interval_secs: 300
   visibility_repair_batch_size: 100
   visibility_repair_grace_period_secs: 86400
   staging_expiry_secs: 86400
-  trash_expiry_secs: 600
+  trash_expiry_secs: 10800
 
 auth:
   enabled: true

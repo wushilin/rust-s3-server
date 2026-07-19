@@ -132,4 +132,18 @@
         assert_eq!(query.get("delimiter").map(String::as_str), Some("/"));
     }
 
+    #[test]
+    fn s3_query_parser_decodes_utf8_without_corruption() {
+        let query = parse_s3_query("prefix=%E2%82%AC%2F%E6%96%87%E4%BB%B6");
+        assert_eq!(query.get("prefix").map(String::as_str), Some("€/文件"));
+    }
+
+    #[test]
+    fn delete_xml_entities_are_decoded_exactly_once() {
+        let (keys, _) = parse_delete_objects_xml(
+            "<Delete><Object><Key>&amp;lt;</Key></Object></Delete>",
+        );
+        assert_eq!(keys, vec!["&lt;"]);
+    }
+
         

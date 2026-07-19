@@ -2343,11 +2343,16 @@ where
                 break;
             }
 
-            let data_end = data_start + chunk_size;
-            if buffer.len() < data_end + 2 {
+            let data_end = data_start.checked_add(chunk_size).ok_or_else(|| {
+                StorageError::InvalidAwsChunkedBody("chunk size overflow".into())
+            })?;
+            let framed_end = data_end.checked_add(2).ok_or_else(|| {
+                StorageError::InvalidAwsChunkedBody("chunk size overflow".into())
+            })?;
+            if buffer.len() < framed_end {
                 break;
             }
-            if &buffer[data_end..data_end + 2] != b"\r\n" {
+            if &buffer[data_end..framed_end] != b"\r\n" {
                 return Err(StorageError::InvalidAwsChunkedBody(
                     "chunk data missing trailing CRLF".into(),
                 ));
@@ -2357,7 +2362,7 @@ where
             md5.update(data);
             sha256.update(data);
             file.write_all(data).await?;
-            buffer.advance(data_end + 2);
+            buffer.advance(framed_end);
         }
 
         if saw_final_chunk {
@@ -3271,5 +3276,14 @@ mod tests {
         assert_eq!(copied.size, 5);
         let staging = store.layout.multipart_staging_dir("bucket", &upload_id).unwrap();
         assert_eq!(tokio::fs::read(staging.join("part.1")).await.unwrap(), b"23456");
+    }
+
+    #[tokio::test]
+    async fn streamed_aws_chunked_rejects_size_overflow_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!("{:x}\r\nx\r\n", usize::MAX);
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(body))]);
+        let result = write_aws_chunked_stream_with_hashes(&tmp.path().join("part"), stream).await;
+        assert!(matches!(result, Err(StorageError::InvalidAwsChunkedBody(_))));
     }
 }

@@ -1166,11 +1166,13 @@ fn parse_delete_objects_xml(xml: &str) -> (Vec<String>, bool) {
 
 fn unescape_xml(value: &str) -> String {
     value
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
+        // Decode ampersand last so `&amp;lt;` remains the literal text `&lt;`
+        // instead of being decoded twice into `<`.
+        .replace("&amp;", "&")
 }
 
 fn parse_copy_source(raw: &str) -> Option<(String, String)> {
@@ -1266,23 +1268,23 @@ fn etag_condition_contains(value: &str, etag: &str) -> bool {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
                 if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b as char);
+                    out.push(b);
                     i += 3;
                     continue;
                 }
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_s3_query(raw: &str) -> HashMap<String, String> {

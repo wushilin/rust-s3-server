@@ -34,6 +34,8 @@ urlencoding = "2.1"
 httpdate    = "1"
 regex       = "1.9"
 clap        = { version = "4.3", features = ["derive"] }
+multer      = "3"
+tempfile    = "3"
 
 # Logging
 log     = "0.4"
@@ -42,7 +44,6 @@ bcrypt = "0.19.2"
 rpassword = "7.5.4"
 
 [dev-dependencies]
-tempfile = "3"
 tower    = { version = "0.4", features = ["util"] }
 
 [[bin]]

@@ -28,6 +28,8 @@ use super::OperationActor;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
 
+const MAX_SIGNATURE_CLOCK_SKEW_SECS: i64 = 15 * 60;
+
 /// Shared state for the auth middleware: static config credentials (root,
 /// unrestricted) plus the IAM store (policy-bound access keys).
 #[derive(Clone)]
@@ -470,12 +472,21 @@ fn validate_request(state: &AuthState, request: &Request<Body>) -> Result<Princi
         .and_then(|v| v.to_str().ok())
         .unwrap_or("UNSIGNED-PAYLOAD");
 
-    let canonical = build_canonical_request(request, &parsed.signed_headers, payload_hash);
-    let string_to_sign = build_string_to_sign(date, &parsed.credential_scope, &canonical);
-    if date.len() < 8 || !date[..8].chars().all(|c| c.is_ascii_digit()) {
-        return Err("Invalid x-amz-date header");
+    let signed_at = parse_sigv4_time(date)?;
+    let now = Utc::now();
+    if (now - signed_at).num_seconds().abs() > MAX_SIGNATURE_CLOCK_SKEW_SECS {
+        return Err("Request timestamp is outside the allowed clock skew");
     }
     let date_only = &date[..8]; // "YYYYMMDD"
+    if parsed.scope_date != date_only
+        || parsed.service != "s3"
+        || parsed.terminator != "aws4_request"
+    {
+        return Err("Invalid credential scope");
+    }
+
+    let canonical = build_canonical_request(request, &parsed.signed_headers, payload_hash);
+    let string_to_sign = build_string_to_sign(date, &parsed.credential_scope, &canonical);
     let signing_key = derive_signing_key(&secret, date_only, &parsed.region, "s3");
     let expected = hex_hmac(&signing_key, string_to_sign.as_bytes());
 
@@ -702,6 +713,9 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
     let region = cred_parts.next().ok_or("Invalid X-Amz-Credential")?;
     let service = cred_parts.next().ok_or("Invalid X-Amz-Credential")?;
     let terminator = cred_parts.next().ok_or("Invalid X-Amz-Credential")?;
+    if service != "s3" || terminator != "aws4_request" {
+        return Err("Invalid X-Amz-Credential scope");
+    }
     let credential_scope = format!("{date}/{region}/{service}/{terminator}");
 
     let (secret, principal) = state.lookup(access_key).ok_or("Unknown access key")?;
@@ -710,6 +724,9 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
     let signed_at = NaiveDateTime::parse_from_str(date_time_str, "%Y%m%dT%H%M%SZ")
         .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
         .map_err(|_| "Invalid X-Amz-Date format")?;
+    if date != signed_at.format("%Y%m%d").to_string() {
+        return Err("X-Amz-Date does not match credential scope");
+    }
     let expires_secs: i64 = expires_str
         .parse()
         .map_err(|_| "Invalid X-Amz-Expires value")?;
@@ -720,7 +737,11 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
         return Err("X-Amz-Expires is out of range");
     }
     let expires_at = signed_at + chrono::Duration::seconds(expires_secs);
-    if Utc::now() > expires_at {
+    let now = Utc::now();
+    if signed_at > now + chrono::Duration::seconds(MAX_SIGNATURE_CLOCK_SKEW_SECS) {
+        return Err("X-Amz-Date is too far in the future");
+    }
+    if now > expires_at {
         return Err("Presigned URL has expired");
     }
 
@@ -839,23 +860,23 @@ fn decode(s: &str) -> String {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
                 if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b as char);
+                    out.push(b);
                     i += 3;
                     continue;
                 }
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ─── Canonical request construction ──────────────────────────────────────────
@@ -975,7 +996,10 @@ fn hex_sha256(data: &[u8]) -> String {
 struct ParsedAuth {
     access_key: String,
     credential_scope: String,
+    scope_date: String,
     region: String,
+    service: String,
+    terminator: String,
     signed_headers: Vec<String>,
     signature: String,
 }
@@ -1000,10 +1024,13 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuth> {
     let credential = credential?;
     let mut parts = credential.splitn(6, '/');
     let access_key = parts.next()?.to_string();
-    let date = parts.next()?;
+    let date = parts.next()?.to_string();
     let region = parts.next()?.to_string();
-    let service = parts.next()?;
-    let terminator = parts.next()?;
+    let service = parts.next()?.to_string();
+    let terminator = parts.next()?.to_string();
+    if parts.next().is_some() {
+        return None;
+    }
     let credential_scope = format!("{date}/{region}/{service}/{terminator}");
 
     let headers = signed_headers?.split(';').map(str::to_string).collect();
@@ -1011,10 +1038,19 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuth> {
     Some(ParsedAuth {
         access_key,
         credential_scope,
+        scope_date: date,
         region,
+        service,
+        terminator,
         signed_headers: headers,
         signature: signature?,
     })
+}
+
+fn parse_sigv4_time(value: &str) -> Result<DateTime<Utc>, &'static str> {
+    NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%SZ")
+        .map(|value| DateTime::<Utc>::from_naive_utc_and_offset(value, Utc))
+        .map_err(|_| "Invalid x-amz-date header")
 }
 
 // ─── Constant-time compare ────────────────────────────────────────────────────
@@ -1437,6 +1473,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn regular_sigv4_rejects_stale_replay() {
+        let state = auth_state_with_root_key("AKID", "secret");
+        let datetime = (Utc::now() - chrono::Duration::hours(1))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        let authorization = compute_auth_header(
+            "GET",
+            "/bucket/key",
+            "",
+            "localhost",
+            "AKID",
+            "secret",
+            "us-east-1",
+            &datetime,
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header("x-amz-date", datetime)
+            .header(header::AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            validate_request(&state, &request),
+            Err("Request timestamp is outside the allowed clock skew")
+        );
+    }
+
     fn signed_post_fields(
         access_key: &str,
         secret: &str,
@@ -1578,6 +1644,35 @@ mod tests {
         assert_eq!(
             validate_request(&state, &request),
             Err("X-Amz-Expires is out of range")
+        );
+    }
+
+    #[test]
+    fn presigned_url_rejects_a_far_future_start_time() {
+        let state = auth_state_with_root_key("AKID", "secret");
+        let datetime = (Utc::now() + chrono::Duration::hours(1))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        let query = presign_query(
+            "GET",
+            "/bucket/key",
+            "localhost",
+            "AKID",
+            "secret",
+            "us-east-1",
+            &datetime,
+            60,
+            &[],
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/bucket/key?{query}"))
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            validate_request(&state, &request),
+            Err("X-Amz-Date is too far in the future")
         );
     }
 

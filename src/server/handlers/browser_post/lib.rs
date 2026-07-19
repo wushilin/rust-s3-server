@@ -6,9 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 
 use crate::server as srv;
 use crate::server::auth::authorize_browser_post;
@@ -16,6 +18,8 @@ use crate::server::handlers::BucketCtx;
 use crate::server::OperationActor;
 use crate::storage::metadata::quote_etag;
 use crate::storage::store::LocalObjectStore;
+
+const MAX_FORM_FIELD_BYTES: usize = 2 * 1024 * 1024;
 
 /// True for a `multipart/form-data` request — the router uses this to pick
 /// this verb.
@@ -40,24 +44,13 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
             )
         }
     };
-    let raw = match to_bytes(body, 128 * 1024 * 1024).await {
+    let form = match parse_multipart_form(body, &boundary).await {
         Ok(v) => v,
         Err(err) => {
             return srv::s3_error(
                 StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                err.to_string(),
-                &format!("/{bucket}"),
-            )
-        }
-    };
-    let form = match parse_multipart_form(&raw, &boundary) {
-        Ok(v) => v,
-        Err(message) => {
-            return srv::s3_error(
-                StatusCode::BAD_REQUEST,
                 "MalformedPOSTRequest",
-                message,
+                err,
                 &format!("/{bucket}"),
             )
         }
@@ -116,16 +109,21 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
         .get("Content-Language")
         .or_else(|| form.fields.get("content-language"))
         .map(String::as_str);
+    let input = match tokio::fs::File::open(file.temp.path()).await {
+        Ok(file) => file,
+        Err(err) => return srv::storage_error_response(err.into(), &format!("/{bucket}/{key}")),
+    };
     let staging_id = match store
-        .stage_put_with_metadata(
+        .stage_put_stream_with_metadata(
             &bucket,
             &key,
-            &file.bytes,
+            ReaderStream::new(input),
             content_type,
             None,
             storage_class,
             content_language,
             &user_meta,
+            None,
         )
         .await
     {
@@ -158,7 +156,7 @@ struct MultipartForm {
 #[derive(Debug)]
 struct FormFile {
     content_type: Option<String>,
-    bytes: Vec<u8>,
+    temp: tempfile::NamedTempFile,
 }
 
 fn multipart_boundary(headers: &HeaderMap) -> Option<String> {
@@ -170,85 +168,66 @@ fn multipart_boundary(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-fn parse_multipart_form(raw: &[u8], boundary: &str) -> Result<MultipartForm, &'static str> {
-    let marker = format!("--{boundary}").into_bytes();
+async fn parse_multipart_form(body: Body, boundary: &str) -> Result<MultipartForm, String> {
+    if boundary.is_empty() {
+        return Err("Multipart boundary is empty".to_string());
+    }
+    let mut multipart = multer::Multipart::new(body.into_data_stream(), boundary);
     let mut fields = BTreeMap::new();
     let mut file = None;
-    for mut part in split_bytes(raw, &marker).into_iter().skip(1) {
-        part = trim_prefix_bytes(part, b"\r\n");
-        if part.starts_with(b"--") {
-            break;
-        }
-        let Some(header_end) = find_bytes(part, b"\r\n\r\n") else {
+    while let Some(mut part) = multipart
+        .next_field()
+        .await
+        .map_err(|err| format!("Invalid multipart body: {err}"))?
+    {
+        let Some(name) = part.name().map(str::to_string) else {
             continue;
         };
-        let headers_raw = &part[..header_end];
-        let mut body_raw = &part[header_end + 4..];
-        body_raw = trim_suffix_bytes(body_raw, b"\r\n");
-        let mut name = None;
-        let mut filename = None;
-        let mut content_type = None;
-        let headers_text =
-            std::str::from_utf8(headers_raw).map_err(|_| "Multipart headers are not UTF-8")?;
-        for line in headers_text.split("\r\n") {
-            let Some((header_name, header_value)) = line.split_once(':') else {
-                continue;
-            };
-            if header_name.eq_ignore_ascii_case("content-disposition") {
-                for attr in header_value.split(';').map(str::trim) {
-                    if let Some(v) = attr.strip_prefix("name=") {
-                        name = Some(v.trim_matches('"').to_string());
-                    } else if let Some(v) = attr.strip_prefix("filename=") {
-                        filename = Some(v.trim_matches('"').to_string());
-                    }
-                }
-            } else if header_name.eq_ignore_ascii_case("content-type") {
-                content_type = Some(header_value.trim().to_string());
+        let is_file = part.file_name().is_some() || name == "file";
+        let content_type = part.content_type().map(ToString::to_string);
+        if is_file {
+            let temp = tempfile::NamedTempFile::new()
+                .map_err(|err| format!("Could not create upload spool: {err}"))?;
+            let std_file = temp
+                .reopen()
+                .map_err(|err| format!("Could not open upload spool: {err}"))?;
+            let mut output = tokio::fs::File::from_std(std_file);
+            while let Some(chunk) = part
+                .chunk()
+                .await
+                .map_err(|err| format!("Invalid multipart file data: {err}"))?
+            {
+                output
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|err| format!("Could not spool upload: {err}"))?;
             }
-        }
-        let Some(name) = name else {
-            continue;
-        };
-        if filename.is_some() || name == "file" {
+            output
+                .flush()
+                .await
+                .map_err(|err| format!("Could not flush upload spool: {err}"))?;
             file = Some(FormFile {
                 content_type,
-                bytes: body_raw.to_vec(),
+                temp,
             });
         } else {
-            fields.insert(
-                name,
-                String::from_utf8(body_raw.to_vec())
-                    .map_err(|_| "Multipart form field is not UTF-8")?,
-            );
+            let mut value = Vec::new();
+            while let Some(chunk) = part
+                .chunk()
+                .await
+                .map_err(|err| format!("Invalid multipart field data: {err}"))?
+            {
+                if value.len().saturating_add(chunk.len()) > MAX_FORM_FIELD_BYTES {
+                    return Err(format!("Multipart field {name} is too large"));
+                }
+                value.extend_from_slice(&chunk);
+            }
+            let value = String::from_utf8(value)
+                .map_err(|_| format!("Multipart field {name} is not UTF-8"))?;
+            fields.insert(name, value);
         }
     }
     Ok(MultipartForm { fields, file })
-}
-
-fn split_bytes<'a>(haystack: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    while let Some(pos) = find_bytes(&haystack[start..], needle) {
-        parts.push(&haystack[start..start + pos]);
-        start += pos + needle.len();
-    }
-    parts.push(&haystack[start..]);
-    parts
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn trim_prefix_bytes<'a>(value: &'a [u8], prefix: &[u8]) -> &'a [u8] {
-    value.strip_prefix(prefix).unwrap_or(value)
-}
-
-fn trim_suffix_bytes<'a>(value: &'a [u8], suffix: &[u8]) -> &'a [u8] {
-    value.strip_suffix(suffix).unwrap_or(value)
 }
 
 fn post_object_xml(location: &str, bucket: &str, key: &str, etag: &str) -> String {
@@ -268,4 +247,30 @@ fn escape_xml_local(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn multipart_boundary_text_inside_file_is_preserved() {
+        let body = concat!(
+            "--BOUNDARY\r\n",
+            "Content-Disposition: form-data; name=\"key\"\r\n\r\n",
+            "object\r\n",
+            "--BOUNDARY\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n",
+            "Content-Type: application/octet-stream\r\n\r\n",
+            "abc--BOUNDARYxyz\r\n",
+            "--BOUNDARY--\r\n",
+        );
+        let parsed = parse_multipart_form(Body::from(body), "BOUNDARY")
+            .await
+            .unwrap();
+        assert_eq!(parsed.fields.get("key").map(String::as_str), Some("object"));
+        let file = parsed.file.unwrap();
+        assert_eq!(tokio::fs::read(file.temp.path()).await.unwrap(), b"abc--BOUNDARYxyz");
+    }
 }
