@@ -1,0 +1,3 @@
+# librocksdb-sys runs bindgen, which needs libclang at build time.
+[env]
+LIBCLANG_PATH = "/usr/lib/llvm-21/lib"

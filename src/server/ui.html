@@ -378,6 +378,8 @@
     <button class="nav-item" data-tab="users" id="usersTabBtn" data-admin-only><span data-icon="users"></span> IAM Users</button>
     <button class="nav-item" data-tab="groups" id="groupsTabBtn" data-admin-only><span data-icon="shield"></span> IAM Groups</button>
     <button class="nav-item" data-tab="keys"><span data-icon="key"></span> My Access Keys</button>
+    <div class="nav-label" data-admin-only>Maintenance</div>
+    <button class="nav-item" data-tab="backup" id="backupTabBtn" data-admin-only><span data-icon="database"></span> Backup &amp; Restore</button>
     <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span></div></div></div>
   </aside>
 
@@ -454,6 +456,28 @@
           <div class="panel-title"><div><h3>My access keys</h3><p>Secrets are only shown once when a key is created.</p></div><span class="spacer"></span><span class="badge" id="keyCount"></span></div>
           <div class="table-wrap"><table><thead><tr><th>Access key</th><th>Created</th><th style="width:80px"></th></tr></thead><tbody id="keyRows"></tbody></table></div>
           <div id="keyEmpty" class="empty hidden"></div>
+        </div>
+      </section>
+
+      <section id="tab_backup" class="page hidden">
+        <div class="content-head"><div><h2>Backup &amp; Restore</h2><p>Export or import the global IAM database — users, groups, access keys, and policies. Per-bucket object indexes are not included; they are rebuilt from stored objects.</p></div></div>
+        <div class="panel">
+          <div class="panel-title"><div><h3>Export</h3><p>Download a complete, point-in-time dump of the IAM database. Store it somewhere safe.</p></div></div>
+          <div style="padding:20px">
+            <button class="btn primary" id="exportBtn" onclick="exportIam()"><span data-icon="download"></span> Export IAM database</button>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="panel-title"><div><h3>Import</h3><p>Restore from a dump produced by Export. The file is fully validated before anything is written, and applied atomically.</p></div></div>
+          <div style="padding:20px">
+            <div class="field"><label for="importFile">Dump file</label><input class="input" type="file" id="importFile" accept=".rs3pb,application/octet-stream"></div>
+            <div class="field"><label>Mode</label>
+              <label style="display:flex;gap:9px;align-items:flex-start;font-weight:400;margin-bottom:8px;cursor:pointer"><input type="radio" name="importMode" value="merge" checked style="margin-top:3px"><span><strong>Merge</strong> — upsert rows from the dump; keep anything not present in it.</span></label>
+              <label style="display:flex;gap:9px;align-items:flex-start;font-weight:400;cursor:pointer"><input type="radio" name="importMode" value="replace" style="margin-top:3px"><span><strong>Replace</strong> — erase the IAM database first, then load. An exact restore; removes anything not in the dump.</span></label>
+            </div>
+            <button class="btn primary" id="importBtn" onclick="importIam()"><span data-icon="upload"></span> Import</button>
+            <div id="importResult" class="hidden" style="margin-top:18px"></div>
+          </div>
         </div>
       </section>
     </main>
@@ -564,6 +588,7 @@
 <script src="/assets/tasks.js"></script>
 <script src="/assets/objects.js"></script>
 <script src="/assets/iam.js"></script>
+<script src="/assets/backup.js"></script>
 <script src="/assets/main.js"></script>
 </body>
 </html>

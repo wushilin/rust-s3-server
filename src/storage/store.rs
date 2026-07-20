@@ -39,7 +39,7 @@ use super::encoding::{
 };
 use super::errors::{Result, StorageError};
 use super::index::{
-    self, Durability, IntentRecord, ListPage, ObjectRecord, SqliteObjectIndex, INTENT_RETIRE,
+    self, Durability, IntentRecord, ListPage, ObjectRecord, ObjectIndex, INTENT_RETIRE,
 };
 use super::layout::StorageLayout;
 use super::locks::ObjectLockTable;
@@ -69,7 +69,7 @@ pub struct LocalObjectStore {
     rebuild_queue_bound: usize,
     rebuild_batch_size: usize,
     locks: ObjectLockTable,
-    index_cache: Arc<Mutex<HashMap<String, SqliteObjectIndex>>>,
+    index_cache: Arc<Mutex<HashMap<String, ObjectIndex>>>,
     meta_cache: Arc<BoundedLruCache<ObjectCacheKey, CachedObjectMeta>>,
     /// Buckets currently undergoing a blocking index rebuild; every request
     /// against them fails with [`StorageError::BucketRebuilding`] (503).
@@ -311,7 +311,7 @@ impl LocalObjectStore {
     /// index is missing (with blobs present) or on a legacy schema trigger a
     /// background rebuild and fail with `BucketRebuilding` until it
     /// completes.
-    pub async fn index(&self, bucket: &str) -> Result<SqliteObjectIndex> {
+    pub async fn index(&self, bucket: &str) -> Result<ObjectIndex> {
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
@@ -326,7 +326,7 @@ impl LocalObjectStore {
             self.start_rebuild_background(bucket);
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
         }
-        let index = match SqliteObjectIndex::open(
+        let index = match ObjectIndex::open(
             &bucket_dir,
             self.durability,
             self.sqlite_reader_connections,
@@ -966,7 +966,7 @@ impl LocalObjectStore {
 
     async fn resolve_one_intent(
         &self,
-        index: &SqliteObjectIndex,
+        index: &ObjectIndex,
         bucket_dir: &Path,
         bucket: &str,
         stale: &IntentRecord,
@@ -1785,12 +1785,11 @@ impl LocalObjectStore {
             old.close().await;
         }
 
-        let tmp_path = bucket_dir.join("index.rebuild.sqlite");
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = tokio::fs::remove_file(bucket_dir.join(format!("index.rebuild.sqlite{suffix}")))
-                .await;
-        }
-        let tmp = SqliteObjectIndex::open_at(&tmp_path, Durability::Relaxed, 2).await?;
+        // A RocksDB "database" is a directory, so the temp index is a directory
+        // built alongside the live one and swapped in wholesale at the end.
+        let tmp_path = bucket_dir.join("index.rebuild.rocksdb");
+        let _ = tokio::fs::remove_dir_all(&tmp_path).await;
+        let tmp = ObjectIndex::open_at(&tmp_path, Durability::Relaxed, 2).await?;
         tmp.create_schema().await?;
 
         // One pool of workers traverses and parses concurrently over a
@@ -1952,16 +1951,15 @@ impl LocalObjectStore {
         tmp.checkpoint_truncate().await?;
         tmp.close().await;
 
+        // Remove the prior live index (a RocksDB directory) plus any legacy
+        // SQLite leftovers from before the switch, then atomically swap the
+        // freshly built directory into place.
+        let live_path = index::index_db_path(&bucket_dir);
+        let _ = tokio::fs::remove_dir_all(&live_path).await;
         for suffix in ["", "-wal", "-shm"] {
             let _ = tokio::fs::remove_file(bucket_dir.join(format!("index.sqlite{suffix}"))).await;
-            if !suffix.is_empty() {
-                let _ = tokio::fs::remove_file(
-                    bucket_dir.join(format!("index.rebuild.sqlite{suffix}")),
-                )
-                .await;
-            }
         }
-        tokio::fs::rename(&tmp_path, index::index_db_path(&bucket_dir)).await?;
+        tokio::fs::rename(&tmp_path, &live_path).await?;
         if self.durability == Durability::Full {
             fsync_dir(&bucket_dir).await?;
         }
@@ -2565,7 +2563,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let idx =
-            SqliteObjectIndex::open_at(&tmp.path().join("bench.sqlite"), Durability::Relaxed, 2)
+            ObjectIndex::open_at(&tmp.path().join("bench.rocksdb"), Durability::Relaxed, 2)
                 .await
                 .unwrap();
         idx.create_schema().await.unwrap();
@@ -3111,9 +3109,7 @@ mod tests {
         // Simulate total index loss.
         let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
         store.index_cache.lock().unwrap().clear();
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = tokio::fs::remove_file(bucket_dir.join(format!("index.sqlite{suffix}"))).await;
-        }
+        let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
         let count = store.rebuild_sqlite("bucket").await.unwrap();
         assert_eq!(count, 3);
         assert_eq!(read_body(&store, "bucket", "a/1").await, b"a/1");
@@ -3147,9 +3143,7 @@ mod tests {
         write_json_atomic(&dup_abs.join("meta.json"), &old_meta).await.unwrap();
 
         store.index_cache.lock().unwrap().clear();
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = tokio::fs::remove_file(bucket_dir.join(format!("index.sqlite{suffix}"))).await;
-        }
+        let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
         let count = store.rebuild_sqlite("bucket").await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(read_body(&store, "bucket", "k").await, b"new");
@@ -3166,9 +3160,7 @@ mod tests {
             .unwrap();
         let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
         store.index_cache.lock().unwrap().clear();
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = tokio::fs::remove_file(bucket_dir.join(format!("index.sqlite{suffix}"))).await;
-        }
+        let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
         // First access trips the gate and starts a background rebuild.
         let err = store.read_object("bucket", "k").await;
         assert!(matches!(err, Err(StorageError::BucketRebuilding(_))));

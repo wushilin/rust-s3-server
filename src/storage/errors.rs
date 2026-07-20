@@ -10,7 +10,7 @@ pub enum StorageError {
     InvalidAwsChunkedBody(String),
     Io(String),
     Json(String),
-    Sqlite(String),
+    Db(String),
     BucketNotFound(String),
     ObjectNotFound { bucket: String, key: String },
     NoSuchUpload(String),
@@ -37,7 +37,7 @@ impl fmt::Display for StorageError {
             StorageError::InvalidAwsChunkedBody(v) => write!(f, "invalid aws-chunked body: {v}"),
             StorageError::Io(v) => write!(f, "io error: {v}"),
             StorageError::Json(v) => write!(f, "json error: {v}"),
-            StorageError::Sqlite(v) => write!(f, "sqlite error: {v}"),
+            StorageError::Db(v) => write!(f, "db error: {v}"),
             StorageError::BucketNotFound(v) => write!(f, "bucket not found: {v}"),
             StorageError::ObjectNotFound { bucket, key } => {
                 write!(f, "object not found: {bucket}/{key}")
@@ -76,8 +76,8 @@ impl From<serde_json::Error> for StorageError {
     }
 }
 
-impl From<sqlx::Error> for StorageError {
-    fn from(value: sqlx::Error) -> Self {
-        StorageError::Sqlite(value.to_string())
+impl From<rocksdb::Error> for StorageError {
+    fn from(value: rocksdb::Error) -> Self {
+        StorageError::Db(value.to_string())
     }
 }

@@ -7,6 +7,7 @@ pub mod index;
 pub mod layout;
 pub mod locks;
 pub mod metadata;
+pub mod rawdb;
 pub mod staging;
 pub mod store;
 pub mod sweeper;

@@ -27,9 +27,15 @@ use super::policy::{
     compile_rules, decompile_rules, PolicyDocument, PolicyRule, Requirement,
 };
 use crate::storage::errors::StorageError;
+use crate::storage::rawdb;
 use crate::storage::store::LocalObjectStore;
 
 const SESSION_COOKIE: &str = "rusts3_ui_session";
+
+/// Hard ceiling on an IAM import upload. The global IAM database is small by
+/// nature; this bounds memory use and rejects an oversized/malicious upload
+/// (413) rather than buffering it. Far above any realistic dump.
+const IAM_IMPORT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct UiState {
@@ -76,6 +82,15 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/:name", delete(delete_bucket))
         .route("/api/buckets/:name/stats", get(bucket_stats))
         .route("/api/buckets/:name/rebuild", post(rebuild_bucket))
+        .route("/api/admin/export", get(export_iam))
+        // Import buffers and fully validates the dump before an atomic apply, so
+        // the body is held in memory. The global IAM database is small by nature
+        // (users/keys/policies, not object data), but we never *assume* that: a
+        // hard cap rejects an oversized upload (413) instead of risking OOM.
+        .route(
+            "/api/admin/import",
+            post(import_iam).layer(DefaultBodyLimit::max(IAM_IMPORT_LIMIT_BYTES)),
+        )
         .route(
             "/api/object",
             get(download_object)
@@ -119,6 +134,7 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
         "tasks.js" => include_str!("assets/tasks.js"),
         "objects.js" => include_str!("assets/objects.js"),
         "iam.js" => include_str!("assets/iam.js"),
+        "backup.js" => include_str!("assets/backup.js"),
         "main.js" => include_str!("assets/main.js"),
         _ => return error_response(StatusCode::NOT_FOUND, "asset not found"),
     };
@@ -1077,6 +1093,100 @@ async fn rebuild_bucket(
             StatusCode::CONFLICT,
             "a rebuild is already running for this bucket",
         )
+    }
+}
+
+/// Admin-only. Streams the whole global IAM database (`admin.rocksdb`) as a
+/// downloadable dump — a length-delimited protobuf stream of raw
+/// `(column-family, key, value)` rows. Per-bucket object indexes are not
+/// exported: they are derived from the blob tree and rebuilt on demand.
+async fn export_iam(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+) -> Response {
+    let actor = match require_root(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    match state.iam.export_raw().await {
+        Ok(bytes) => {
+            audit(&state, &rid.0, &actor.username, "export_iam", "admin.rocksdb");
+            let mut response = (StatusCode::OK, bytes).into_response();
+            let out = response.headers_mut();
+            out.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            out.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"rusts3-iam.rs3pb\""),
+            );
+            response
+        }
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportQuery {
+    /// `merge` (default) upserts; `replace` erases the IAM families first.
+    #[serde(default)]
+    mode: String,
+}
+
+/// Admin-only. Imports an uploaded dump into the global IAM database. The body
+/// is the raw dump produced by [`export_iam`]. Returns a per-family summary so
+/// the console can show exactly what landed. Must be the last extractor (it
+/// consumes the request body).
+async fn import_iam(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Query(query): Query<ImportQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = match require_root(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let mode = match query.mode.as_str() {
+        "" | "merge" => rawdb::ImportMode::Merge,
+        "replace" => rawdb::ImportMode::Replace,
+        other => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unknown import mode {other:?} (use \"merge\" or \"replace\")"),
+            )
+        }
+    };
+    if body.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "empty dump");
+    }
+    match state.iam.import_raw(body.to_vec(), mode).await {
+        Ok(report) => {
+            audit(
+                &state,
+                &rid.0,
+                &actor.username,
+                "import_iam",
+                format!("mode={} erased={} imported={}", report.mode, report.erased, report.total),
+            );
+            let families: Vec<_> = report
+                .per_cf
+                .iter()
+                .map(|(family, rows)| json!({ "family": family, "rows": rows }))
+                .collect();
+            Json(json!({
+                "ok": true,
+                "mode": report.mode,
+                "erased": report.erased,
+                "imported": report.total,
+                "families": families,
+            }))
+            .into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
