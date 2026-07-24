@@ -368,13 +368,13 @@ impl ObjectIndex {
     /// [`StorageError::IndexOutdated`] if the on-disk schema is not current —
     /// callers must run a rebuild first; this function never migrates.
     ///
-    /// `_reader_connections` is accepted for source compatibility with the old
-    /// pooled backend and ignored: RocksDB manages its own read concurrency.
-    pub async fn open(bucket_dir: &Path, durability: Durability, _reader_connections: u32) -> Result<Self> {
+    /// RocksDB manages its own read concurrency, so there is no reader-pool
+    /// size to configure.
+    pub async fn open(bucket_dir: &Path, durability: Durability) -> Result<Self> {
         tokio::fs::create_dir_all(bucket_dir).await?;
         let db_path = index_db_path(bucket_dir);
         let existed = db_path.exists();
-        let index = Self::open_at(&db_path, durability, _reader_connections).await?;
+        let index = Self::open_at(&db_path, durability).await?;
         let version = index.schema_version().await?;
         match version {
             Some(v) if v == SCHEMA_VERSION => Ok(index),
@@ -398,7 +398,7 @@ impl ObjectIndex {
     /// Opens a database directly (used by the rebuild pipeline for the
     /// temporary database it constructs). Does not stamp the schema version —
     /// call [`create_schema`](Self::create_schema) for that.
-    pub async fn open_at(db_path: &Path, durability: Durability, _reader_connections: u32) -> Result<Self> {
+    pub async fn open_at(db_path: &Path, durability: Durability) -> Result<Self> {
         let path = db_path.to_path_buf();
         let (db, seed) = run_blocking(move || {
             let db = open_db(&path)?;
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     async fn open_tmp(tmp: &tempfile::TempDir) -> ObjectIndex {
-        ObjectIndex::open(tmp.path(), Durability::Relaxed, 4).await.unwrap()
+        ObjectIndex::open(tmp.path(), Durability::Relaxed).await.unwrap()
     }
 
     /// Commits an object through the normal publish path.
@@ -1145,7 +1145,7 @@ mod tests {
         // Stamp an outdated schema version directly, then close.
         {
             let db_path = index_db_path(tmp.path());
-            let index = ObjectIndex::open_at(&db_path, Durability::Relaxed, 1).await.unwrap();
+            let index = ObjectIndex::open_at(&db_path, Durability::Relaxed).await.unwrap();
             let meta = cf(&index.db, CF_META).unwrap();
             index
                 .db
@@ -1153,7 +1153,7 @@ mod tests {
                 .unwrap();
             index.db.flush().unwrap();
         }
-        let err = ObjectIndex::open(tmp.path(), Durability::Relaxed, 1).await;
+        let err = ObjectIndex::open(tmp.path(), Durability::Relaxed).await;
         assert!(matches!(err, Err(StorageError::IndexOutdated(_))));
     }
 

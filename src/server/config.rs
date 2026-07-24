@@ -67,7 +67,7 @@ pub struct ApiKeyPair {
 /// held in memory, are **not alterable at runtime**, and are unrestricted
 /// (no policy applies): they are the bootstrap identities that always work,
 /// even against a bare data directory. Runtime-managed IAM users live in
-/// `admin.sqlite` instead.
+/// `admin.rocksdb` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuiltinUser {
     pub user: String,
@@ -248,6 +248,14 @@ impl AppConfig {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
         })?;
         Ok(config)
+    }
+
+    /// Serializes this config to YAML. `rusts3 init` writes the serialization
+    /// of [`AppConfig::default`], so the generated file can never drift out of
+    /// sync with the parser — every supported field is emitted from the struct
+    /// itself rather than a hand-maintained template.
+    pub fn to_yaml(&self) -> std::result::Result<String, serde_yaml::Error> {
+        serde_yaml::to_string(self)
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
@@ -476,12 +484,27 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_pool_size_defaults_and_can_be_overridden() {
-        assert_eq!(AppConfig::default().storage.sqlite_max_connections, 50);
+    fn storage_defaults_and_ignores_removed_sqlite_knobs() {
+        assert_eq!(AppConfig::default().storage.meta_cache_capacity, 200_000);
 
+        // Legacy SQLite knobs are gone; configs that still carry them must
+        // parse (unknown fields ignored) and fall back to defaults.
         let config: AppConfig =
             serde_yaml::from_str("storage:\n  sqlite_max_connections: 12\n").unwrap();
-        assert_eq!(config.storage.sqlite_max_connections, 12);
+        assert_eq!(config.storage.meta_cache_capacity, 200_000);
+    }
+
+    #[test]
+    fn default_config_round_trips_through_yaml() {
+        // `rusts3 init` writes exactly this; it must parse and validate.
+        let yaml = AppConfig::default().to_yaml().unwrap();
+        let parsed: AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.storage.meta_cache_capacity,
+            AppConfig::default().storage.meta_cache_capacity
+        );
+        assert!(!yaml.contains("sqlite"));
     }
 
     #[test]

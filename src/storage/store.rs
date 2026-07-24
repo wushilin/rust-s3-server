@@ -64,7 +64,6 @@ const COPY_BUFFER_SIZE: usize = 256 * 1024;
 pub struct LocalObjectStore {
     layout: StorageLayout,
     durability: Durability,
-    sqlite_reader_connections: u32,
     rebuild_reader_threads: usize,
     rebuild_queue_bound: usize,
     rebuild_batch_size: usize,
@@ -171,17 +170,6 @@ impl LocalObjectStore {
         Self::from_storage_config(root, &StorageConfig::default())
     }
 
-    pub fn new_with_sqlite_max_connections(
-        root: impl Into<PathBuf>,
-        sqlite_max_connections: u32,
-    ) -> Self {
-        let config = StorageConfig {
-            sqlite_max_connections,
-            ..StorageConfig::default()
-        };
-        Self::from_storage_config(root, &config)
-    }
-
     pub fn from_storage_config(root: impl Into<PathBuf>, config: &StorageConfig) -> Self {
         Self::inner(StorageLayout::new(root), config)
     }
@@ -197,7 +185,6 @@ impl LocalObjectStore {
                 DurabilityMode::Full => Durability::Full,
                 DurabilityMode::Relaxed => Durability::Relaxed,
             },
-            sqlite_reader_connections: config.sqlite_max_connections.max(1),
             rebuild_reader_threads: config.rebuild_reader_threads, // 0 = auto (core count)
             rebuild_queue_bound: config.rebuild_queue_bound.max(1),
             rebuild_batch_size: config.rebuild_batch_size.max(1),
@@ -348,13 +335,7 @@ impl LocalObjectStore {
             self.start_rebuild_background(bucket);
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
         }
-        let index = match ObjectIndex::open(
-            &bucket_dir,
-            self.durability,
-            self.sqlite_reader_connections,
-        )
-        .await
-        {
+        let index = match ObjectIndex::open(&bucket_dir, self.durability).await {
             Ok(index) => index,
             Err(StorageError::IndexOutdated(_)) => {
                 self.start_rebuild_background(bucket);
@@ -1942,7 +1923,7 @@ impl LocalObjectStore {
         // built alongside the live one and swapped in wholesale at the end.
         let tmp_path = bucket_dir.join("index.rebuild.rocksdb");
         let _ = tokio::fs::remove_dir_all(&tmp_path).await;
-        let tmp = ObjectIndex::open_at(&tmp_path, Durability::Relaxed, 2).await?;
+        let tmp = ObjectIndex::open_at(&tmp_path, Durability::Relaxed).await?;
         tmp.create_schema().await?;
 
         // One pool of workers traverses and parses concurrently over a
@@ -2732,7 +2713,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let idx =
-            ObjectIndex::open_at(&tmp.path().join("bench.rocksdb"), Durability::Relaxed, 2)
+            ObjectIndex::open_at(&tmp.path().join("bench.rocksdb"), Durability::Relaxed)
                 .await
                 .unwrap();
         idx.create_schema().await.unwrap();

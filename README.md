@@ -16,7 +16,7 @@ is not a drop-in replacement for the complete AWS S3 or MinIO feature set.
   resources, prefix/delimiter conditions, user policies, and group policies.
 - Server-side copy, multipart copy, range reads, conditional reads/copies,
   bulk delete, metadata, storage-class headers, and ListObjects v1/v2.
-- SQLite-primary object indexes with immutable blob directories, write-ahead
+- RocksDB-primary object indexes with immutable blob directories, write-ahead
   intents, atomic publication, crash recovery, and configurable durability.
 - Automatic index rebuilds, migration from the legacy four-level layout,
   staging/trash cleanup, and empty-directory reclamation.
@@ -97,7 +97,7 @@ rusts3 run [-c FILE]                   Start the server (default: config.yaml)
 rusts3 validate [-c FILE]              Validate configuration and exit
 rusts3 genpassword [--cost N]          Generate a bcrypt console password
 rusts3 verifypassword [HASH]           Verify a bcrypt console password
-rusts3 init                            Write a documented config.yaml
+rusts3 init                            Write a config.yaml with every option at its default
 ```
 
 Running `rusts3` without a subcommand remains supported: it uses built-in
@@ -106,7 +106,17 @@ may own a data directory; rusts3 enforces this with `<base_dir>/.rusts3.lock`.
 
 ## Configuration
 
-Every field is optional. `rusts3 init` writes a commented configuration file.
+Every field is optional; an absent field (or an absent section) falls back to
+the default shown below.
+
+`rusts3 init` writes a `config.yaml` by serializing the built-in defaults, so
+the generated file is always a complete, exact image of every supported option
+— it can never drift out of sync with the parser. The trade-off is that the
+generated file has **no inline comments**: the serializer (`serde_yaml`) cannot
+emit them, and `clap` only documents CLI flags, not the config file. Field
+documentation therefore lives in this section and in the config source types
+(`src/server/config.rs`, `src/storage/config.rs`). Optional fields with no value
+are written as `null` (e.g. `logging.file: null`), which parses back to "unset".
 
 ### Server and UI
 
@@ -126,12 +136,11 @@ access keys; console users authenticate with username/password sessions.
 
 | Field | Default | Description |
 |---|---:|---|
-| `storage.sqlite_max_connections` | `50` | SQLite reader connections per bucket. Mutations use a dedicated writer. |
 | `storage.meta_cache_capacity` | `200000` | Maximum cached object metadata entries. |
-| `storage.durability` | `full` | `full` fsyncs blobs and uses SQLite `synchronous=FULL`; `relaxed` skips per-PUT blob fsync and uses `NORMAL`. |
+| `storage.durability` | `full` | `full` fsyncs blobs and syncs the RocksDB index WAL on every write; `relaxed` skips per-PUT blob fsync and leaves the WAL to the OS. |
 | `storage.rebuild_reader_threads` | `0` | Parallel index-rebuild workers; `0` selects one per CPU core. |
 | `storage.rebuild_queue_bound` | `1000` | Bounded rebuild pipeline queue. |
-| `storage.rebuild_batch_size` | `1000` | SQLite rows written per rebuild transaction. |
+| `storage.rebuild_batch_size` | `1000` | Index rows written per rebuild batch. |
 
 `full` is the safe default for power-loss durability. `relaxed` improves write
 throughput but can lose the last acknowledged writes after power loss. A normal
@@ -169,7 +178,7 @@ ui:
 
 Built-in users live in configuration, cannot be edited at runtime, and bypass
 policy checks. Runtime users, groups, access keys, and policies live in
-`<base_dir>/admin.sqlite`. Runtime users are default-deny unless an attached
+`<base_dir>/admin.rocksdb`. Runtime users are default-deny unless an attached
 user/group policy allows the request; a matching explicit deny wins. The
 console provides both a read/write rule builder and a JSON policy editor.
 
@@ -199,7 +208,8 @@ correlation ID, returned in `x-amz-request-id` and included in logs.
 | `sweeper.interval_secs` | `300` | Schedule interval for intent resolution, staging/trash cleanup, and legacy-layout migration. |
 | `sweeper.intent_batch_size` | `100` | Stale intents processed per batch; a run drains all eligible batches. |
 | `sweeper.intent_grace_period_secs` | `3600` | Minimum intent age during normal operation. Startup recovery bypasses the grace period. |
-| `sweeper.staging_expiry_secs` | `86400` | Idle age before abandoned PUT/multipart staging is removed. |
+| `sweeper.staging_expiry_secs` | `86400` | Idle age before abandoned single-PUT staging is removed. |
+| `sweeper.multipart_upload_expiry_secs` | `2592000` | Idle age before an incomplete multipart upload is removed; `0` keeps them forever (S3 behavior). |
 | `sweeper.trash_expiry_secs` | `86400` | Idle age before retired blobs are removed; values below 10800 (3 hours) are rejected. |
 | `sweeper.reclaim_interval_secs` | `300` | Interval for reclaiming empty fanout directories. |
 
@@ -305,7 +315,7 @@ and the console task view.
 
 ## Storage and recovery model
 
-Each bucket has an authoritative SQLite index. Object data is stored in an
+Each bucket has an authoritative RocksDB index. Object data is stored in an
 immutable, self-describing blob directory and the index records that directory's
 path. A mutation follows this protocol:
 
@@ -316,7 +326,7 @@ path. A mutation follows this protocol:
 5. Move the old blob to trash and clear the retirement intent.
 
 After a crash, startup drains the small intent table instead of scanning every
-object. Reads and listings use SQLite as the source of truth. Per-key locking,
+object. Reads and listings use the RocksDB index as the source of truth. Per-key locking,
 monotonic modification timestamps, and immutable snapshots keep concurrent
 overwrites/deletes consistent with in-flight downloads.
 
@@ -325,10 +335,10 @@ The current layout uses a single 16-bit fanout directory:
 ```text
 <base_dir>/
   .rusts3.lock
-  admin.sqlite
+  admin.rocksdb/
   buckets/<bucket>/
     bucket.json
-    index.sqlite
+    index.rocksdb/
     objects/<4-hex>/V1<6-hex>_<unique>/
       meta.json
       part.1, part.2, ...
