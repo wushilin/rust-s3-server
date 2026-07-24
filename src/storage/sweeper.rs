@@ -32,7 +32,11 @@ pub struct SweepConfig {
     /// Only intents older than this are resolved — an in-flight operation's
     /// intent must never be mistaken for an abandoned one.
     pub intent_grace_period_ms: i64,
+    /// Idle-age threshold for single-PUT staging dirs.
     pub staging_expiry_ms: i64,
+    /// Idle-age threshold for incomplete multipart uploads. `0` (or negative)
+    /// disables multipart cleanup entirely, matching S3's keep-forever default.
+    pub multipart_expiry_ms: i64,
     pub trash_expiry_ms: i64,
     pub now_ms: i64,
 }
@@ -50,6 +54,7 @@ impl Default for SweepConfig {
             intent_batch_size: 100,
             intent_grace_period_ms: 60 * 60 * 1000,
             staging_expiry_ms: 24 * 60 * 60 * 1000,
+            multipart_expiry_ms: 30 * 24 * 60 * 60 * 1000,
             trash_expiry_ms: 24 * 60 * 60 * 1000,
             now_ms: now_ms(),
         }
@@ -125,6 +130,21 @@ async fn sweep_staging(
     stats: &mut SweepStats,
 ) -> Result<()> {
     for kind in ["put", "multipart"] {
+        // Single-PUT staging is client-invisible orphaned temp data; an
+        // incomplete multipart upload is client-visible and resumable, so it
+        // gets its own (longer, S3-friendlier) window — and `0` disables its
+        // cleanup entirely, matching S3's keep-forever behavior. Because
+        // `all_files_old_enough` inspects every part's mtime, uploading any part
+        // refreshes the window, so an actively-progressing upload is never
+        // reaped — only one idle for the full window.
+        let expiry_ms = if kind == "multipart" {
+            config.multipart_expiry_ms
+        } else {
+            config.staging_expiry_ms
+        };
+        if expiry_ms <= 0 {
+            continue; // cleanup disabled for this kind
+        }
         let dir = staging_dir.join(kind);
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -144,8 +164,8 @@ async fn sweep_staging(
                     .saturating_sub(path_age_ms(&path, config.now_ms).unwrap_or(0))
             });
             let staging_age = config.now_ms.saturating_sub(created_ms);
-            if staging_age >= config.staging_expiry_ms
-                && all_files_old_enough(&path, config.now_ms, config.staging_expiry_ms)
+            if staging_age >= expiry_ms
+                && all_files_old_enough(&path, config.now_ms, expiry_ms)
             {
                 match tokio::fs::remove_dir_all(&path).await {
                     Ok(()) => {
@@ -277,6 +297,7 @@ mod tests {
                 intent_batch_size: 100,
                 intent_grace_period_ms: 1,
                 staging_expiry_ms: 1_000,
+                multipart_expiry_ms: 1_000,
                 trash_expiry_ms: 1_000,
                 now_ms: 10_000,
             },
@@ -312,6 +333,7 @@ mod tests {
                 intent_batch_size: 100,
                 intent_grace_period_ms: 1,
                 staging_expiry_ms: 1_000,
+                multipart_expiry_ms: 1_000,
                 trash_expiry_ms: 1_000,
                 now_ms: 10_000,
             },
@@ -347,6 +369,7 @@ mod tests {
                 intent_batch_size: 100,
                 intent_grace_period_ms: 0,
                 staging_expiry_ms: 1000,
+                multipart_expiry_ms: 1000,
                 trash_expiry_ms: 0,
                 now_ms: now_ms(),
             },
@@ -375,6 +398,7 @@ mod tests {
             intent_batch_size: 2,
             intent_grace_period_ms: 1,
             staging_expiry_ms: 1000,
+            multipart_expiry_ms: 1000,
             trash_expiry_ms: 1000,
             now_ms: now_ms(),
         };

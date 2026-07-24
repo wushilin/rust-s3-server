@@ -1324,17 +1324,38 @@ async fn download_object(
             }
         },
     );
-    let filename = q.key.rsplit('/').next().unwrap_or(&q.key).to_string();
-    Response::builder()
+    // Object keys may legally contain control bytes (e.g. `\n`), which would
+    // make the Content-Disposition header value invalid and previously panicked
+    // the handler via `.unwrap()`. Strip control chars / quotes / backslashes so
+    // the header is always well-formed, and handle any residual build error
+    // (e.g. an odd stored content-type) instead of unwrapping.
+    let filename = q
+        .key
+        .rsplit('/')
+        .next()
+        .unwrap_or(&q.key)
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .collect::<String>();
+    match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, read.meta.content_type.clone())
         .header(header::CONTENT_LENGTH, read.meta.size)
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename.replace('"', "")),
+            format!("attachment; filename=\"{filename}\""),
         )
         .body(Body::from_stream(stream))
-        .unwrap()
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            log::error!("download response build failed key={}: {err}", q.key);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .expect("empty 500 response is always valid")
+        }
+    }
 }
 
 async fn upload_object(
@@ -1696,7 +1717,15 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn verify_builtin_password(configured: &str, candidate: &str) -> bool {
-    bcrypt::verify(candidate, configured).unwrap_or(false) || constant_time_eq(configured, candidate)
+    // A bcrypt-hashed config password is verified ONLY against the hash. We must
+    // never fall through to a plaintext compare for it, or the stored hash
+    // itself would be a usable password (pass-the-hash) — defeating the point of
+    // hashing the config value. The plaintext branch exists solely for legacy
+    // cleartext config passwords.
+    if configured.starts_with("$2") {
+        return bcrypt::verify(candidate, configured).unwrap_or(false);
+    }
+    constant_time_eq(configured, candidate)
 }
 
 #[cfg(test)]

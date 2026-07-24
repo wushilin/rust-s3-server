@@ -21,18 +21,25 @@ pub fn decode_aws_chunked(input: &[u8]) -> Result<Vec<u8>> {
         let data_end = pos.checked_add(size).ok_or_else(|| {
             StorageError::InvalidAwsChunkedBody("chunk size overflow".to_string())
         })?;
-        if data_end + 2 > input.len() {
+        // `data_end + 2` (the trailing CRLF) must be computed with a checked add
+        // too — `size` comes straight from the attacker-controlled hex header, so
+        // an unchecked `data_end + 2` can overflow and turn the truncation guard
+        // into an out-of-bounds slice panic.
+        let chunk_end = data_end.checked_add(2).ok_or_else(|| {
+            StorageError::InvalidAwsChunkedBody("chunk size overflow".to_string())
+        })?;
+        if chunk_end > input.len() {
             return Err(StorageError::InvalidAwsChunkedBody(
                 "chunk data truncated".to_string(),
             ));
         }
         output.extend_from_slice(&input[pos..data_end]);
-        if &input[data_end..data_end + 2] != b"\r\n" {
+        if &input[data_end..chunk_end] != b"\r\n" {
             return Err(StorageError::InvalidAwsChunkedBody(
                 "missing chunk data CRLF".to_string(),
             ));
         }
-        pos = data_end + 2;
+        pos = chunk_end;
     }
 }
 

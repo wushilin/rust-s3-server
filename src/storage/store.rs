@@ -797,13 +797,44 @@ impl LocalObjectStore {
         // cleaner may race dir creation — the retry recreates it) and
         // choosing a fresh name on collision (never publish into an
         // existing dir).
+        let mut attempts = 0u32;
         let dest = loop {
+            // Backstop against any unforeseen non-converging retry: the loop
+            // runs while holding the per-key lock, so it must never spin
+            // unbounded.
+            attempts += 1;
+            if attempts > 10_000 {
+                let _ = index.delete_intent(intent_id).await;
+                return Err(StorageError::Io(format!(
+                    "publish of {}/{key} did not converge after {attempts} attempts",
+                    bucket
+                )));
+            }
             let leaf = bucket_dir.join(blob_rel_parent(&blob_rel));
             tokio::fs::create_dir_all(&leaf).await?;
             let dest = bucket_dir.join(&blob_rel);
             match tokio::fs::rename(publish_dir, &dest).await {
                 Ok(()) => break dest,
-                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    // ENOENT is ambiguous: it can mean the destination fanout
+                    // leaf was reclaimed out from under us (recreate + retry),
+                    // OR the *source* dir vanished — e.g. a racing abort/second
+                    // complete removed the staging. If the source is gone there
+                    // is nothing to publish; drop the now-pointless intent and
+                    // fail, rather than loop forever holding the key lock.
+                    let source_gone = matches!(
+                        tokio::fs::metadata(publish_dir).await,
+                        Err(e) if e.kind() == ErrorKind::NotFound
+                    );
+                    if source_gone {
+                        let _ = index.delete_intent(intent_id).await;
+                        return Err(StorageError::Io(format!(
+                            "publish source vanished (concurrent abort/complete?): {}",
+                            publish_dir.display()
+                        )));
+                    }
+                    continue;
+                }
                 Err(err)
                     if err.kind() == ErrorKind::AlreadyExists
                         || err.kind() == ErrorKind::DirectoryNotEmpty =>
@@ -1221,6 +1252,45 @@ impl LocalObjectStore {
         Ok(upload_id)
     }
 
+    /// Atomically commit a fully-written, size-verified temp part into place.
+    ///
+    /// Holds a short per-`(upload_id, part_number)` lock so the data file and
+    /// its `meta.json` are swapped as a unit — concurrent uploads of the *same*
+    /// part number resolve last-writer-wins without interleaving, matching S3.
+    /// The byte transfer runs BEFORE this call, unlocked, so uploads of
+    /// different parts never contend and a big transfer never holds the lock.
+    async fn commit_staged_part(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u16,
+        temp_path: &Path,
+        size: u64,
+        etag: &str,
+    ) -> Result<()> {
+        let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
+        let file_name = format!("part.{part_number}");
+        let part = PartMeta {
+            number: part_number,
+            file: file_name.clone(),
+            size,
+            etag: etag.to_string(),
+        };
+        // `\0mpu/` prefix (NUL is illegal in object keys) guarantees this lock
+        // never collides with a real object-key lock.
+        let _guard = self
+            .locks
+            .lock(bucket, &format!("\0mpu/{upload_id}/part.{part_number}"))
+            .await;
+        tokio::fs::rename(temp_path, staging_dir.join(&file_name)).await?;
+        write_json_atomic(
+            &staging_dir.join(format!("part.{part_number}.meta.json")),
+            &part,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn put_multipart_part(
         &self,
         bucket: &str,
@@ -1244,22 +1314,26 @@ impl LocalObjectStore {
             bytes
         };
         let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
-        let file_name = format!("part.{part_number}");
-        let etag = write_file_with_md5(&staging_dir.join(&file_name), &payload).await?;
-        let part = PartMeta {
-            number: part_number,
-            file: file_name,
-            size: payload.len() as u64,
-            etag: etag.clone(),
+        // Stream to a per-attempt temp, then atomically swap into place.
+        let temp_path = part_temp_path(&staging_dir, part_number);
+        let etag = match write_file_with_md5(&temp_path, &payload).await {
+            Ok(etag) => etag,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(err);
+            }
         };
-        write_json_atomic(
-            &staging_dir.join(format!("part.{part_number}.meta.json")),
-            &part,
-        )
-        .await?;
+        let size = payload.len() as u64;
+        if let Err(err) = self
+            .commit_staged_part(bucket, upload_id, part_number, &temp_path, size, &etag)
+            .await
+        {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err);
+        }
         Ok(PutResult {
             etag,
-            size: payload.len() as u64,
+            size,
             last_modified_ms: now_ms(),
         })
     }
@@ -1273,6 +1347,7 @@ impl LocalObjectStore {
         stream: S,
         aws_chunked: bool,
         expected_sha256: Option<&str>,
+        expected_decoded_len: Option<u64>,
     ) -> Result<PutResult>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -1285,33 +1360,57 @@ impl LocalObjectStore {
             )));
         }
         let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
-        let file_name = format!("part.{part_number}");
-        let part_path = staging_dir.join(&file_name);
-        let written = if aws_chunked {
-            write_aws_chunked_stream_with_hashes(&part_path, stream).await?
+        // Stream to a per-attempt temp (unlocked); swap in only after the part
+        // is verified complete, so a truncated/racing upload never becomes a
+        // committed part.
+        let temp_path = part_temp_path(&staging_dir, part_number);
+        let written = match if aws_chunked {
+            write_aws_chunked_stream_with_hashes(&temp_path, stream).await
         } else {
-            write_stream_with_hashes(&part_path, stream).await?
+            write_stream_with_hashes(&temp_path, stream).await
+        } {
+            Ok(written) => written,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(err);
+            }
         };
         if let Some(expected) = expected_sha256 {
             if !expected.eq_ignore_ascii_case(&written.sha256) {
-                let _ = tokio::fs::remove_file(&part_path).await;
+                let _ = tokio::fs::remove_file(&temp_path).await;
                 return Err(StorageError::PayloadHashMismatch {
                     expected: expected.to_string(),
                     actual: written.sha256,
                 });
             }
         }
-        let part = PartMeta {
-            number: part_number,
-            file: file_name,
-            size: written.size,
-            etag: written.md5.clone(),
-        };
-        write_json_atomic(
-            &staging_dir.join(format!("part.{part_number}.meta.json")),
-            &part,
-        )
-        .await?;
+        // Completeness gate: an aws-chunked part must decode to the declared
+        // length, else it is a truncated body (S3's `IncompleteBody`). The
+        // non-chunked path is covered by the body stream erroring on an
+        // under-length transfer.
+        if let Some(expected) = expected_decoded_len {
+            if written.size != expected {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(StorageError::InvalidAwsChunkedBody(format!(
+                    "decoded part length {} does not match declared x-amz-decoded-content-length {}",
+                    written.size, expected
+                )));
+            }
+        }
+        if let Err(err) = self
+            .commit_staged_part(
+                bucket,
+                upload_id,
+                part_number,
+                &temp_path,
+                written.size,
+                &written.md5,
+            )
+            .await
+        {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err);
+        }
         Ok(PutResult {
             etag: written.md5,
             size: written.size,
@@ -1335,27 +1434,35 @@ impl LocalObjectStore {
                 "invalid part number {part_number}"
             )));
         }
-        let _source_guard = self.locks.lock(src_bucket, src_key).await;
-        let src = self.read_object(src_bucket, src_key).await?;
         let staging_dir = self.layout.multipart_staging_dir(dst_bucket, upload_id)?;
-        let file_name = format!("part.{part_number}");
-        let written = copy_object_data_with_hashes(
-            &src,
-            &staging_dir.join(&file_name),
-            range,
-        )
-        .await?;
-        let part = PartMeta {
-            number: part_number,
-            file: file_name,
-            size: written.size,
-            etag: written.md5.clone(),
+        let temp_path = part_temp_path(&staging_dir, part_number);
+        // Hold the source lock only while reading/copying the source bytes into
+        // the temp; drop it before the (separately-locked) commit swap.
+        let written = {
+            let _source_guard = self.locks.lock(src_bucket, src_key).await;
+            let src = self.read_object(src_bucket, src_key).await?;
+            match copy_object_data_with_hashes(&src, &temp_path, range).await {
+                Ok(written) => written,
+                Err(err) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return Err(err);
+                }
+            }
         };
-        write_json_atomic(
-            &staging_dir.join(format!("part.{part_number}.meta.json")),
-            &part,
-        )
-        .await?;
+        if let Err(err) = self
+            .commit_staged_part(
+                dst_bucket,
+                upload_id,
+                part_number,
+                &temp_path,
+                written.size,
+                &written.md5,
+            )
+            .await
+        {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err);
+        }
         Ok(PutResult {
             etag: written.md5,
             size: written.size,
@@ -1551,10 +1658,15 @@ impl LocalObjectStore {
         self.validate_upload(bucket, key, upload_id).await?;
         let _guard = self.locks.lock(bucket, key).await;
         let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
-        tokio::fs::remove_dir_all(&staging_dir)
-            .await
-            .map_err(|_| StorageError::NoSuchUpload(upload_id.to_string()))?;
-        Ok(())
+        match tokio::fs::remove_dir_all(&staging_dir).await {
+            Ok(()) => Ok(()),
+            // Only a missing upload is NoSuchUpload; a real IO failure (e.g.
+            // permissions) must surface as an error, not be masked as "gone".
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                Err(StorageError::NoSuchUpload(upload_id.to_string()))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     // ── rebuild (migration + disaster recovery) ───────────────────────────────
@@ -2226,6 +2338,15 @@ async fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Resul
     file.flush().await?;
     tokio::fs::rename(tmp, path).await?;
     Ok(())
+}
+
+/// A unique temp path for an in-flight part upload, inside the upload's own
+/// folder so the swap into `part.N` is an atomic same-directory rename. The
+/// `.tmp.` infix keeps it invisible to `list_parts` (which matches
+/// `part.*.meta.json`) and to Complete (which reads exact `part.N`), so a
+/// partial or racing upload is never observed as a committed part.
+fn part_temp_path(staging_dir: &Path, part_number: u16) -> PathBuf {
+    staging_dir.join(format!("part.{part_number}.tmp.{}", new_staging_id(now_ms())))
 }
 
 async fn write_file_with_md5(path: &Path, bytes: &[u8]) -> Result<String> {
@@ -3254,6 +3375,68 @@ mod tests {
         let read = store.read_object("bucket", "big").await.unwrap();
         assert_eq!(read.meta.parts.len(), 2);
         assert_invariants(&store, "bucket").await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_part_upload_stays_consistent() {
+        // Two concurrent uploads of the SAME part number must resolve
+        // last-writer-wins with the committed part.N and its meta.json always
+        // agreeing — never an interleaved byte-mix. Repeat to shake out races.
+        let (_tmp, store) = store_and_bucket().await;
+        for round in 0..25u32 {
+            let upload_id = store
+                .initiate_multipart("bucket", "k", None, None)
+                .await
+                .unwrap();
+            // Equal-length, distinct payloads — the dangerous case (a byte-mix
+            // would still pass a length check).
+            let a = vec![b'A'; 4096];
+            let b = vec![b'B'; 4096];
+            let (sa, sb) = (store.clone(), store.clone());
+            let (ida, idb) = (upload_id.clone(), upload_id.clone());
+            let ha = tokio::spawn(async move {
+                sa.put_multipart_part("bucket", "k", &ida, 1, &a, false).await
+            });
+            let hb = tokio::spawn(async move {
+                sb.put_multipart_part("bucket", "k", &idb, 1, &b, false).await
+            });
+            ha.await.unwrap().unwrap();
+            hb.await.unwrap().unwrap();
+
+            let staging = store
+                .layout()
+                .multipart_staging_dir("bucket", &upload_id)
+                .unwrap();
+            let data = tokio::fs::read(staging.join("part.1")).await.unwrap();
+            let meta: PartMeta =
+                read_json(&staging.join("part.1.meta.json")).await.unwrap();
+            let mut hasher = Md5::new();
+            hasher.update(&data);
+            let data_etag = format!("{:x}", hasher.finalize());
+
+            assert!(
+                data == vec![b'A'; 4096] || data == vec![b'B'; 4096],
+                "round {round}: part.1 is an interleaved mix, not one whole upload"
+            );
+            assert_eq!(
+                meta.size,
+                data.len() as u64,
+                "round {round}: meta size disagrees with part.1"
+            );
+            assert_eq!(
+                meta.etag, data_etag,
+                "round {round}: meta etag does not match part.1 bytes"
+            );
+            // No stray temp files left behind.
+            let mut entries = tokio::fs::read_dir(&staging).await.unwrap();
+            while let Some(e) = entries.next_entry().await.unwrap() {
+                let name = e.file_name().into_string().unwrap();
+                assert!(
+                    !name.contains(".tmp."),
+                    "round {round}: leftover temp file {name}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

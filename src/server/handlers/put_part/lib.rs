@@ -24,6 +24,16 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
     };
     let aws_chunked = srv::is_aws_chunked(&ctx.headers);
     let expected_sha256 = srv::expected_payload_sha256(&ctx.headers, aws_chunked);
+    // For aws-chunked parts the client declares the true payload size; the store
+    // rejects a body that decodes to a different length (truncated part).
+    let expected_decoded_len = if aws_chunked {
+        ctx.headers
+            .get("x-amz-decoded-content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    } else {
+        None
+    };
     match store
         .put_multipart_part_stream(
             &ctx.bucket,
@@ -33,6 +43,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             body.into_data_stream(),
             aws_chunked,
             expected_sha256.as_deref(),
+            expected_decoded_len,
         )
         .await
     {

@@ -1530,14 +1530,24 @@
         assert_eq!(res.status(), StatusCode::OK);
 
         // Each operation-selecting POST, unsigned but claiming to be a form.
+        // Includes percent-encoded spellings of the operation key (e.g.
+        // `%64elete` == `delete`): the router percent-decodes query keys, so the
+        // auth gate must decode them too or the bypass reopens.
         for (uri, body) in [
             (
                 "/victim?delete",
                 r#"<Delete><Object><Key>secret.txt</Key></Object></Delete>"#,
             ),
+            (
+                "/victim?%64elete",
+                r#"<Delete><Object><Key>secret.txt</Key></Object></Delete>"#,
+            ),
             ("/victim/secret.txt?uploads", ""),
+            ("/victim/secret.txt?%75ploads", ""),
             ("/victim/secret.txt?uploadId=0_0000000000000000", ""),
+            ("/victim/secret.txt?uplo%61dId=0_0000000000000000", ""),
             ("/victim?rebuildIndex", ""),
+            ("/victim?rebuild%49ndex", ""),
         ] {
             let res = app
                 .clone()

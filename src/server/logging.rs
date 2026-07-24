@@ -70,7 +70,9 @@ fn rolling_appender(
 
 pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
     let level: LevelFilter = config.level.parse().unwrap_or(LevelFilter::Info);
-    let rotation_bytes = config.rotation_size_mb * 1024 * 1024;
+    // Clamp to at least 1 MiB (0 would rotate on every write) and use a checked
+    // multiply so an absurd config value can't overflow and panic.
+    let rotation_bytes = config.rotation_size_mb.max(1).saturating_mul(1024 * 1024);
 
     let console = ConsoleAppender::builder().encoder(encoder()).build();
     let mut builder =

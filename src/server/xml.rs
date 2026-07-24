@@ -268,7 +268,17 @@ pub fn upload_part_copy_xml(etag: &str, last_modified_ms: i64) -> String {
     )
 }
 
-pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[PartMeta]) -> String {
+#[allow(clippy::too_many_arguments)]
+pub fn list_parts_xml(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[PartMeta],
+    max_parts: usize,
+    part_number_marker: u16,
+    is_truncated: bool,
+    next_part_number_marker: Option<u16>,
+) -> String {
     let mut body = String::new();
     for part in parts {
         body.push_str(&format!(
@@ -278,8 +288,11 @@ pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[PartMet
             part.size,
         ));
     }
+    let next_marker_xml = next_part_number_marker
+        .map(|m| format!("<NextPartNumberMarker>{m}</NextPartNumberMarker>"))
+        .unwrap_or_default();
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><IsTruncated>false</IsTruncated>{body}</ListPartsResult>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><PartNumberMarker>{part_number_marker}</PartNumberMarker>{next_marker_xml}<MaxParts>{max_parts}</MaxParts><IsTruncated>{is_truncated}</IsTruncated>{body}</ListPartsResult>"#,
         escape_xml(bucket),
         escape_xml(key),
         escape_xml(upload_id),
@@ -362,12 +375,25 @@ pub fn delete_objects_xml(results: &[DeleteObjectResult], quiet: bool) -> String
 }
 
 fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        // Characters illegal in XML 1.0 (control chars other than tab/LF/CR) are
+        // not well-formed even when entity-escaped, and object keys may legally
+        // contain them. Drop them so one bad key can't make the whole response
+        // unparseable to strict SDK XML parsers.
+        if ch.is_control() && ch != '\t' && ch != '\n' && ch != '\r' {
+            continue;
+        }
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn encode_list_value(value: &str, encode: bool) -> String {

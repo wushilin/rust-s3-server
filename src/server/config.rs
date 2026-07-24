@@ -154,9 +154,19 @@ pub struct SweeperConfig {
         alias = "orphan_grace_period_secs"
     )]
     pub intent_grace_period_secs: u64,
-    /// Minimum idle age of a staging directory before it is removed (seconds).
+    /// Minimum idle age of a single-PUT staging directory before it is removed
+    /// (seconds). Single-PUT staging is orphaned temp data with no client-visible
+    /// handle, so this cleanup is invisible to clients.
     #[serde(default = "default_staging_expiry_secs")]
     pub staging_expiry_secs: u64,
+    /// Minimum idle age of an *incomplete multipart upload* before it is removed
+    /// (seconds). Unlike single-PUT staging, an in-progress multipart upload is
+    /// client-visible (ListMultipartUploads/ListParts) and resumable, so S3 keeps
+    /// it until aborted or a lifecycle rule fires. We keep it for this long since
+    /// its last part activity (uploading any part refreshes the window); `0`
+    /// disables cleanup entirely (S3's "keep forever" behavior).
+    #[serde(default = "default_multipart_upload_expiry_secs")]
+    pub multipart_upload_expiry_secs: u64,
     /// Minimum idle age of a trash directory before it is removed (seconds).
     #[serde(default = "default_trash_expiry_secs")]
     pub trash_expiry_secs: u64,
@@ -175,6 +185,7 @@ impl Default for SweeperConfig {
             intent_batch_size: default_intent_batch_size(),
             intent_grace_period_secs: default_intent_grace_period_secs(),
             staging_expiry_secs: default_staging_expiry_secs(),
+            multipart_upload_expiry_secs: default_multipart_upload_expiry_secs(),
             trash_expiry_secs: default_trash_expiry_secs(),
             reclaim_interval_secs: default_reclaim_interval_secs(),
         }
@@ -413,6 +424,12 @@ fn default_intent_grace_period_secs() -> u64 {
 }
 fn default_staging_expiry_secs() -> u64 {
     86400
+}
+fn default_multipart_upload_expiry_secs() -> u64 {
+    // 30 days of inactivity. S3 keeps incomplete uploads forever (until aborted
+    // or a lifecycle rule), so this is a conservative disk safety net that a
+    // well-behaved client never trips; `0` restores S3's keep-forever behavior.
+    30 * 24 * 60 * 60
 }
 fn default_trash_expiry_secs() -> u64 {
     24 * 60 * 60

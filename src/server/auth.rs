@@ -258,8 +258,14 @@ fn post_selects_operation(request: &Request<Body>) -> bool {
         .unwrap_or("")
         .split('&')
         .any(|part| {
-            let key = part.split('=').next().unwrap_or("");
-            matches!(key, "delete" | "uploads" | "uploadId" | "rebuildIndex")
+            // Decode the key with the SAME normalization the router uses
+            // (`parse_s3_query` percent-decodes keys). Matching the raw bytes
+            // here would let `?%64elete` (decodes to `delete`) slip past this
+            // gate while the router still dispatches the operation — a parser
+            // differential that reopens the unauthenticated-operation bypass.
+            let raw_key = part.split('=').next().unwrap_or("");
+            let key = super::percent_decode(raw_key);
+            matches!(key.as_str(), "delete" | "uploads" | "uploadId" | "rebuildIndex")
         })
 }
 

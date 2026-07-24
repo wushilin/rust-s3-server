@@ -40,6 +40,7 @@ pub(crate) async fn run_once(
             intent_batch_size: cfg.intent_batch_size,
             intent_grace_period_ms: cfg.intent_grace_period_secs as i64 * 1000,
             staging_expiry_ms: cfg.staging_expiry_secs as i64 * 1000,
+            multipart_expiry_ms: cfg.multipart_upload_expiry_secs as i64 * 1000,
             trash_expiry_ms: cfg.trash_expiry_secs as i64 * 1000,
             now_ms: now_ms(),
         };

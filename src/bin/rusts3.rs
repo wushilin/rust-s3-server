@@ -290,6 +290,26 @@ async fn run_server(cfg: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
+    // `auth.enabled` defaults to false, so an omitted/incomplete `auth:` section
+    // silently boots a fully open server. Make that impossible to miss — and
+    // shout louder when credentials are configured but auth is off, which is
+    // almost certainly a misconfiguration.
+    if !cfg.auth.enabled {
+        let has_creds = !cfg.auth.credentials.is_empty() || !cfg.auth.users.is_empty();
+        if has_creds {
+            log::warn!(
+                "SECURITY: auth.enabled is FALSE but credentials are configured — the S3 API \
+                 is UNAUTHENTICATED and accepts ALL requests. Set `auth.enabled: true` to \
+                 enforce them."
+            );
+        } else {
+            log::warn!(
+                "SECURITY: authentication is DISABLED — the S3 API accepts ALL requests without \
+                 verification. Set `auth.enabled: true` (with credentials) to secure it."
+            );
+        }
+    }
+
     serve(S3HttpConfig {
         address,
         root: cfg.server.base_dir.clone(),
