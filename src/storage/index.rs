@@ -836,7 +836,14 @@ impl ObjectIndex {
                 if after.as_deref().map(str::as_bytes) == Some(&key) {
                     continue; // `after` is exclusive
                 }
-                out.push(decode_object(&key, &value)?);
+                // Skip (don't fail the whole scan on) a single undecodable row.
+                match decode_object(&key, &value) {
+                    Ok(entry) => out.push(entry),
+                    Err(err) => log::warn!(
+                        "skipping undecodable object row during scan key={} error={err}",
+                        String::from_utf8_lossy(&key)
+                    ),
+                }
             }
             Ok(out)
         })
@@ -911,7 +918,19 @@ fn list_blocking(
         if after.is_some() && key.as_ref() == after_str.as_bytes() {
             continue; // `after` is exclusive
         }
-        let entry = decode_object(&key, &value)?;
+        // One undecodable row (corrupt JSON, or a value stamped with a newer
+        // entity version) must not blind the whole bucket's listing — skip and
+        // log it rather than failing the entire request.
+        let entry = match decode_object(&key, &value) {
+            Ok(entry) => entry,
+            Err(err) => {
+                log::warn!(
+                    "skipping undecodable object row during list key={} error={err}",
+                    String::from_utf8_lossy(&key)
+                );
+                continue;
+            }
+        };
         if !entry.object_key.starts_with(prefix) {
             break;
         }

@@ -78,6 +78,15 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
         }
     };
 
+    // S3 POST uploads support the `${filename}` variable in the key, replaced
+    // with the uploaded file's own name (e.g. `uploads/${filename}` ->
+    // `uploads/photo.jpg`). Without this the literal `${filename}` is stored.
+    let key = if key.contains("${filename}") {
+        key.replace("${filename}", file.filename.as_deref().unwrap_or(""))
+    } else {
+        key
+    };
+
     // Authorize before touching storage.
     let actor = if let Some(state) = &ctx.auth_state {
         match authorize_browser_post(state, &form.fields, &bucket, &key) {
@@ -156,6 +165,7 @@ struct MultipartForm {
 #[derive(Debug)]
 struct FormFile {
     content_type: Option<String>,
+    filename: Option<String>,
     temp: tempfile::NamedTempFile,
 }
 
@@ -183,7 +193,8 @@ async fn parse_multipart_form(body: Body, boundary: &str) -> Result<MultipartFor
         let Some(name) = part.name().map(str::to_string) else {
             continue;
         };
-        let is_file = part.file_name().is_some() || name == "file";
+        let filename = part.file_name().map(str::to_string);
+        let is_file = filename.is_some() || name == "file";
         let content_type = part.content_type().map(ToString::to_string);
         if is_file {
             let temp = tempfile::NamedTempFile::new()
@@ -208,6 +219,7 @@ async fn parse_multipart_form(body: Body, boundary: &str) -> Result<MultipartFor
                 .map_err(|err| format!("Could not flush upload spool: {err}"))?;
             file = Some(FormFile {
                 content_type,
+                filename,
                 temp,
             });
         } else {

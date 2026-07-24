@@ -87,7 +87,14 @@ pub async fn auth_middleware(
     // auth state attached: bucket-level POSTs verify the form signature in the
     // browser-POST handler, while object-level form POSTs return S3's
     // MethodNotAllowed response.
-    if is_browser_post_upload(&request) {
+    // Only a genuine bucket-level browser form upload may defer authentication
+    // to the form-signature check. A multipart/form-data POST that *also*
+    // selects a real S3 operation via its query string (`?delete`, `?uploads`,
+    // `?uploadId`, `?rebuildIndex`) must NOT be deferred — those routes are
+    // dispatched before the form handler and perform no auth of their own, so
+    // deferring them would let an attacker run them unauthenticated merely by
+    // setting a `multipart/form-data` Content-Type header.
+    if is_browser_post_upload(&request) && !post_selects_operation(&request) {
         log::debug!(target: TARGET_AUTH, "[{rid}] authn deferred to browser-POST form verification");
         request.extensions_mut().insert(state.clone());
         return next.run(request).await;
@@ -238,6 +245,22 @@ fn authorize_iam(policy: &PolicyDocument, request: &Request<Body>) -> bool {
         return false; // admin-only operation
     };
     is_authorized(policy, &requirements)
+}
+
+/// True when a POST's query string selects a concrete S3 operation whose
+/// handler runs before (and instead of) the browser-POST form handler. Such
+/// requests must always be authenticated through the header path; they can
+/// never legitimately carry their credentials in a form body.
+fn post_selects_operation(request: &Request<Body>) -> bool {
+    request
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .any(|part| {
+            let key = part.split('=').next().unwrap_or("");
+            matches!(key, "delete" | "uploads" | "uploadId" | "rebuildIndex")
+        })
 }
 
 /// True for a `multipart/form-data` POST whose credentials may live in the
@@ -498,6 +521,24 @@ fn validate_signature_v2(
         .split_once(':')
         .ok_or("Malformed Authorization header")?;
     let (secret, principal) = state.lookup(access_key).ok_or("Unknown access key")?;
+
+    // Freshness: bound the replay window using the signed date header (the same
+    // value that goes into the string-to-sign). Without this, a captured SigV2
+    // header request could be replayed verbatim forever — every other auth path
+    // enforces skew/expiry, so this closes the one gap.
+    let date_str = if request.headers().contains_key("x-amz-date") {
+        header_str(request.headers(), "x-amz-date")
+    } else {
+        header_str(request.headers(), "date")
+    }
+    .ok_or("Missing Date header")?;
+    let signed_at = DateTime::parse_from_rfc2822(date_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| "Invalid Date header")?;
+    if (Utc::now() - signed_at).num_seconds().abs() > MAX_SIGNATURE_CLOCK_SKEW_SECS {
+        return Err("Request timestamp is outside the allowed clock skew");
+    }
+
     let string_to_sign = signature_v2_string_to_sign(request);
     let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(string_to_sign.as_bytes());
@@ -1364,10 +1405,13 @@ mod tests {
                 access_key: "AKID".to_string(),
                 secret_key: "secret".to_string(),
             });
+        // Use a current date: SigV2 now enforces a clock-skew window, so a fixed
+        // historical timestamp would (correctly) be rejected as a replay.
+        let date = Utc::now().format("%a, %d %b %Y %H:%M:%S +0000").to_string();
         let unsigned = Request::builder()
             .method("PUT")
             .uri("/bucket")
-            .header("date", "Tue, 27 Mar 2007 19:36:42 +0000")
+            .header("date", &date)
             .body(Body::empty())
             .unwrap();
         let string_to_sign = signature_v2_string_to_sign(&unsigned);
@@ -1377,7 +1421,7 @@ mod tests {
         let request = Request::builder()
             .method("PUT")
             .uri("/bucket")
-            .header("date", "Tue, 27 Mar 2007 19:36:42 +0000")
+            .header("date", &date)
             .header("authorization", format!("AWS AKID:{signature}"))
             .body(Body::empty())
             .unwrap();

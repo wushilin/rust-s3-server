@@ -35,31 +35,79 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         Err(err) => return srv::storage_error_response(err, &format!("/{bucket}/{key}")),
     };
 
-    // Conditional request checks (If-None-Match / If-Modified-Since).
+    // Conditional request checks. Per RFC 7232 the precedence is:
+    //   1. If-Match             -> 412 when it does not match
+    //   2. If-Unmodified-Since  -> 412 when the object was modified after
+    //   3. If-None-Match        -> 304 when it matches
+    //   4. If-Modified-Since    -> 304 when not modified (ignored if If-None-Match present)
     let etag_quoted = quote_etag(&object.meta.etag);
+    let server_etag = object.meta.etag.trim_matches('"');
+
+    // 1. If-Match: the client pins a specific ETag (or `*` = "any current
+    // version"). A mismatch means the object changed under it -> 412.
+    if let Some(im) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
+        let matched = im
+            .split(',')
+            .map(|tok| tok.trim().trim_matches('"'))
+            .any(|tok| tok == "*" || tok == server_etag);
+        if !matched {
+            return srv::s3_error(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                "At least one of the pre-conditions you specified did not hold",
+                &format!("/{bucket}/{key}"),
+            );
+        }
+    }
+
+    // 2. If-Unmodified-Since: 412 if the object was modified after the given date.
+    if let Some(ius) = headers
+        .get(header::IF_UNMODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(since_ms) = parse_http_date_ms(ius) {
+            if object.meta.last_modified_ms > since_ms {
+                return srv::s3_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                    &format!("/{bucket}/{key}"),
+                );
+            }
+        }
+    }
+
+    // 3. If-None-Match.
+    let has_if_none_match = headers.contains_key(header::IF_NONE_MATCH);
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
-        let client_etag = inm.trim().trim_matches('"');
-        let server_etag = object.meta.etag.trim_matches('"');
-        if client_etag == "*" || client_etag == server_etag {
+        let matched = inm
+            .split(',')
+            .map(|tok| tok.trim().trim_matches('"'))
+            .any(|tok| tok == "*" || tok == server_etag);
+        if matched {
             let mut resp = srv::empty_response(StatusCode::NOT_MODIFIED);
             resp.headers_mut()
                 .insert(header::ETAG, HeaderValue::from_str(&etag_quoted).unwrap());
             return resp;
         }
     }
-    if let Some(ims) = headers
-        .get(header::IF_MODIFIED_SINCE)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(since_ms) = parse_http_date_ms(ims) {
-            if object.meta.last_modified_ms <= since_ms {
-                let mut resp = srv::empty_response(StatusCode::NOT_MODIFIED);
-                resp.headers_mut()
-                    .insert(header::ETAG, HeaderValue::from_str(&etag_quoted).unwrap());
-                return resp;
+
+    // 4. If-Modified-Since — only consulted when If-None-Match is absent.
+    if !has_if_none_match {
+        if let Some(ims) = headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(since_ms) = parse_http_date_ms(ims) {
+                if object.meta.last_modified_ms <= since_ms {
+                    let mut resp = srv::empty_response(StatusCode::NOT_MODIFIED);
+                    resp.headers_mut()
+                        .insert(header::ETAG, HeaderValue::from_str(&etag_quoted).unwrap());
+                    return resp;
+                }
             }
         }
     }

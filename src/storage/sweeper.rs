@@ -183,8 +183,21 @@ async fn sweep_trash(trash_dir: &Path, config: &SweepConfig, stats: &mut SweepSt
         if !path.is_dir() {
             continue;
         }
-        let old_enough = path_age_ms(&path, config.now_ms)? >= config.trash_expiry_ms;
-        if !old_enough || !all_files_old_enough(&path, config.now_ms, config.trash_expiry_ms) {
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        // The trash dir name is a staging id stamped at *deletion* time, so the
+        // grace window is measured from when the object was deleted — not from
+        // the blob's mtime, which `rename` preserves from publish time and
+        // would make any not-recently-written object eligible for purge on the
+        // very next sweep. Fall back to mtime only if the name is unparseable.
+        let deleted_ms = epoch_ms_from_staging_id(name).unwrap_or_else(|_| {
+            config
+                .now_ms
+                .saturating_sub(path_age_ms(&path, config.now_ms).unwrap_or(0))
+        });
+        let trash_age = config.now_ms.saturating_sub(deleted_ms);
+        if trash_age < config.trash_expiry_ms {
             continue;
         }
         match tokio::fs::remove_dir_all(&path).await {

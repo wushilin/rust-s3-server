@@ -31,12 +31,38 @@ pub(crate) fn spawn(store: LocalObjectStore, bucket: String, tasks: Arc<TaskRegi
         let guard = tasks.register_uncancellable(&run_id, TaskKind::Job, JOB, format!("/{bucket}"));
         log::info!("[{run_id}] {JOB} started bucket={bucket}");
 
+        // The 503 gate (`try_begin_rebuild`/`end_rebuild`) is separate from the
+        // task guard. Lower it via a Drop guard so that even if `rebuild_sqlite`
+        // panics (e.g. a poisoned mutex), the bucket is never left permanently
+        // stuck returning `BucketRebuilding`.
+        struct GateGuard {
+            store: LocalObjectStore,
+            bucket: String,
+        }
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.store.end_rebuild(&self.bucket);
+            }
+        }
+        let _gate = GateGuard {
+            store: store.clone(),
+            bucket: bucket.clone(),
+        };
+
         // Live progress: the rebuild engine records objects-indexed / trashed in
         // the store's status map; mirror it onto the task so the panel shows a
         // climbing object count (total is unknown until done → indeterminate
         // bar).
         let progress = guard.progress();
         let done = Arc::new(AtomicBool::new(false));
+        // Abort the progress poller if the rebuild body unwinds, so a panic can
+        // never leak a task spinning on the 400ms timer forever.
+        struct PollerGuard(tokio::task::JoinHandle<()>);
+        impl Drop for PollerGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
         let poller = {
             let store = store.clone();
             let bucket = bucket.clone();
@@ -60,16 +86,18 @@ pub(crate) fn spawn(store: LocalObjectStore, bucket: String, tasks: Arc<TaskRegi
                 }
             })
         };
+        let mut poller = PollerGuard(poller);
 
         match store.rebuild_sqlite(&bucket).await {
             Ok(count) => log::info!("[{run_id}] {JOB} complete bucket={bucket} objects={count}"),
             Err(err) => log::error!("[{run_id}] {JOB} failed bucket={bucket} error={err}"),
         }
+        // Normal path: stop the poller and let it finish its last tick, then the
+        // guards drop in reverse order (poller aborted if still live, task
+        // deregistered, 503 gate lowered last so no request slips in against a
+        // half-swapped index).
         done.store(true, Ordering::Relaxed);
-        let _ = poller.await;
-        // Lower the gate last, so no request slips in against a half-swapped
-        // index. The guard drops here too, deregistering the task.
-        store.end_rebuild(&bucket);
+        let _ = (&mut poller.0).await;
     });
     true
 }

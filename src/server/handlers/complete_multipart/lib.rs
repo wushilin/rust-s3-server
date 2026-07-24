@@ -12,7 +12,10 @@ use crate::storage::store::LocalObjectStore;
 pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) -> Response {
     let resource = ctx.resource();
     let upload_id = ctx.query.get("uploadId").cloned().unwrap_or_default();
-    let raw = match to_bytes(body, 1024 * 1024).await {
+    // A CompleteMultipartUpload manifest can list up to 10,000 parts; a
+    // pretty-printed body approaches a few MiB, so a 1 MiB cap would reject
+    // legitimate requests. 16 MiB leaves ample headroom.
+    let raw = match to_bytes(body, 16 * 1024 * 1024).await {
         Ok(raw) => raw,
         Err(err) => {
             return srv::s3_error(

@@ -70,6 +70,12 @@ pub struct LocalObjectStore {
     rebuild_batch_size: usize,
     locks: ObjectLockTable,
     index_cache: Arc<Mutex<HashMap<String, ObjectIndex>>>,
+    /// Per-bucket async locks that serialise the "cache miss -> open the
+    /// RocksDB index" window. RocksDB takes an exclusive directory LOCK on
+    /// open, so two tasks opening the same bucket concurrently would collide
+    /// and one would surface a spurious 5xx; this ensures only one open is in
+    /// flight per bucket and the rest await it.
+    index_open_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     meta_cache: Arc<BoundedLruCache<ObjectCacheKey, CachedObjectMeta>>,
     /// Buckets currently undergoing a blocking index rebuild; every request
     /// against them fails with [`StorageError::BucketRebuilding`] (503).
@@ -197,6 +203,7 @@ impl LocalObjectStore {
             rebuild_batch_size: config.rebuild_batch_size.max(1),
             locks: ObjectLockTable::default(),
             index_cache: Arc::new(Mutex::new(HashMap::new())),
+            index_open_locks: Arc::new(Mutex::new(HashMap::new())),
             meta_cache: Arc::new(BoundedLruCache::new(
                 config.meta_cache_capacity.max(1),
                 CACHE_SHARDS,
@@ -322,6 +329,21 @@ impl LocalObjectStore {
         if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
             return Ok(index);
         }
+        // Serialise the open per bucket: RocksDB takes an exclusive directory
+        // LOCK on open, so concurrent first-touches of the same bucket would
+        // otherwise race and one would get a spurious error. Whoever wins the
+        // lock opens and caches; everyone else re-checks the cache below.
+        let open_lock = {
+            let mut locks = self.index_open_locks.lock().unwrap();
+            locks
+                .entry(bucket.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _open_guard = open_lock.lock().await;
+        if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
+            return Ok(index);
+        }
         if index::needs_rebuild(&bucket_dir).await? {
             self.start_rebuild_background(bucket);
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
@@ -403,6 +425,7 @@ impl LocalObjectStore {
             &BTreeMap::new(),
             aws_chunked,
             expected_sha256,
+            None,
         )
         .await
     }
@@ -419,6 +442,7 @@ impl LocalObjectStore {
         user_meta: &BTreeMap<String, String>,
         aws_chunked: bool,
         expected_sha256: Option<&str>,
+        expected_decoded_len: Option<u64>,
     ) -> Result<PutResult>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -434,6 +458,7 @@ impl LocalObjectStore {
                 storage_class,
                 content_language,
                 user_meta,
+                expected_decoded_len,
             )
             .await?
         } else {
@@ -610,6 +635,7 @@ impl LocalObjectStore {
             None,
             None,
             &BTreeMap::new(),
+            None,
         )
         .await
     }
@@ -624,6 +650,7 @@ impl LocalObjectStore {
         storage_class: Option<&str>,
         content_language: Option<&str>,
         user_meta: &BTreeMap<String, String>,
+        expected_decoded_len: Option<u64>,
     ) -> Result<String>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -641,6 +668,20 @@ impl LocalObjectStore {
                 return Err(err);
             }
         };
+        // Reject a truncated (or over-long) chunked body: the client declares the
+        // real payload size via `x-amz-decoded-content-length`, and a mismatch
+        // means the stream did not carry what it promised. AWS answers such a
+        // request with `IncompleteBody` rather than silently storing a short
+        // object with an ETag over the wrong bytes.
+        if let Some(expected) = expected_decoded_len {
+            if written.size != expected {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(StorageError::InvalidAwsChunkedBody(format!(
+                    "decoded body length {} does not match declared x-amz-decoded-content-length {}",
+                    written.size, expected
+                )));
+            }
+        }
         let meta = PutMeta {
             bucket: bucket.to_string(),
             object_key: key.to_string(),
@@ -2047,6 +2088,13 @@ impl RebuildFrontier {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
+            // Enrol as a waiter BEFORE inspecting the stack / pending counter.
+            // `notify_waiters()` (called by `push`/`task_done`) wakes only
+            // already-enrolled waiters and stores no permit, so a notification
+            // that fires between `notified()` and `.await` would otherwise be
+            // lost — fatally so for the final `pending 1 -> 0` transition, which
+            // has no follow-up notification to re-wake a missed worker.
+            notified.as_mut().enable();
             if let Some(dir) = self.stack.lock().unwrap().pop() {
                 return Some(dir);
             }

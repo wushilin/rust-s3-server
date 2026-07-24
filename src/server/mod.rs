@@ -842,7 +842,10 @@ fn spawn_maintenance_jobs(
                         }
                         _ = interval.tick() => {
                             let run_id = new_request_id();
-                            $run(&store, &cfg, &cancel, &tasks, &run_id).await;
+                            let fut = $run(&store, &cfg, &cancel, &tasks, &run_id);
+                            if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await.is_err() {
+                                log::error!("job {} panicked run_id={run_id}; scheduler continues", $name);
+                            }
                         }
                     }
                 }
@@ -871,7 +874,10 @@ fn spawn_maintenance_jobs(
                     break;
                 }
                 let run_id = new_request_id();
-                jobs::migrate_layout::run_once(&store, &cancel, &tasks, &run_id).await;
+                let fut = jobs::migrate_layout::run_once(&store, &cancel, &tasks, &run_id);
+                if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await.is_err() {
+                    log::error!("job migrate_layout panicked run_id={run_id}; scheduler continues");
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         log::info!("job scheduler stopping job=migrate_layout");
@@ -901,7 +907,10 @@ fn spawn_maintenance_jobs(
                     break;
                 }
                 let run_id = new_request_id();
-                jobs::reclaim::run_once(&store, &cancel, &tasks, &run_id).await;
+                let fut = jobs::reclaim::run_once(&store, &cancel, &tasks, &run_id);
+                if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await.is_err() {
+                    log::error!("job reclaim_dirs panicked run_id={run_id}; scheduler continues");
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         log::info!("job scheduler stopping job=reclaim_dirs");
@@ -1070,6 +1079,15 @@ async fn object_route(
         Method::PUT if has_upload_id && has_part_number => {
             handlers::put_part::handle(store, ctx, body).await
         }
+        // `partNumber` is only meaningful with an `uploadId`; without one this is
+        // a malformed request, not a plain object PUT (which would silently
+        // store the body under the key and drop the caller's part intent).
+        Method::PUT if has_part_number => s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "partNumber requires an uploadId",
+            &ctx.resource(),
+        ),
         Method::PUT if is_copy => handlers::copy_object::handle(store, ctx, body).await,
         Method::PUT => handlers::put_object::handle(store, ctx, body).await,
         Method::GET if has_upload_id => handlers::list_parts::handle(store, ctx, body).await,
@@ -1182,6 +1200,10 @@ fn unescape_xml(value: &str) -> String {
 }
 
 fn parse_copy_source(raw: &str) -> Option<(String, String)> {
+    // An `x-amz-copy-source` may carry a `?versionId=…` suffix; strip it so it
+    // never becomes part of the source key. This server addresses only the
+    // current version, so the version id is simply ignored.
+    let raw = raw.split('?').next().unwrap_or(raw);
     let path = percent_decode(raw.trim_start_matches('/'));
     let slash = path.find('/')?;
     let bucket = path[..slash].to_string();

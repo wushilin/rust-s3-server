@@ -13,7 +13,9 @@ use crate::storage::store::LocalObjectStore;
 
 pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) -> Response {
     let resource = ctx.resource();
-    let raw = match to_bytes(body, 1024 * 1024).await {
+    // DeleteObjects allows up to 1,000 keys of up to 1,024 bytes each, so the
+    // body alone can exceed 1 MiB before XML overhead. 16 MiB leaves headroom.
+    let raw = match to_bytes(body, 16 * 1024 * 1024).await {
         Ok(b) => b,
         Err(err) => {
             return srv::s3_error(

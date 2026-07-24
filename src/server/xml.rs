@@ -186,11 +186,16 @@ pub fn list_objects_v1_xml(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn list_object_versions_xml(
     bucket: &str,
     prefix: &str,
     encoding_type: Option<&str>,
     versions: &[ObjectVersionEntry],
+    max_keys: usize,
+    key_marker: &str,
+    is_truncated: bool,
+    next_key_marker: Option<&str>,
 ) -> String {
     let encode_keys = encoding_type == Some("url");
     let mut body = String::new();
@@ -212,10 +217,19 @@ pub fn list_object_versions_xml(
     let encoding_xml = encoding_type
         .map(|v| format!("<EncodingType>{}</EncodingType>", escape_xml(v)))
         .unwrap_or_default();
+    let next_markers_xml = if is_truncated {
+        format!(
+            "<NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>",
+            escape_xml(&encode_list_value(next_key_marker.unwrap_or(""), encode_keys)),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix>{encoding_xml}<KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{body}</ListVersionsResult>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix>{encoding_xml}<KeyMarker>{}</KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{is_truncated}</IsTruncated>{next_markers_xml}{body}</ListVersionsResult>"#,
         escape_xml(bucket),
         escape_xml(&encode_list_value(prefix, encode_keys)),
+        escape_xml(&encode_list_value(key_marker, encode_keys)),
     )
 }
 
@@ -272,7 +286,18 @@ pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[PartMet
     )
 }
 
-pub fn list_multipart_uploads_xml(bucket: &str, uploads: &[UploadMeta]) -> String {
+#[allow(clippy::too_many_arguments)]
+pub fn list_multipart_uploads_xml(
+    bucket: &str,
+    uploads: &[UploadMeta],
+    prefix: &str,
+    max_uploads: usize,
+    key_marker: &str,
+    upload_id_marker: &str,
+    is_truncated: bool,
+    next_key_marker: Option<&str>,
+    next_upload_id_marker: Option<&str>,
+) -> String {
     let mut body = String::new();
     for upload in uploads {
         body.push_str(&format!(
@@ -282,9 +307,25 @@ pub fn list_multipart_uploads_xml(bucket: &str, uploads: &[UploadMeta]) -> Strin
             iso_utc_ms(upload.initiated_at_ms),
         ));
     }
+    let prefix_xml = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("<Prefix>{}</Prefix>", escape_xml(prefix))
+    };
+    let next_markers_xml = if is_truncated {
+        format!(
+            "<NextKeyMarker>{}</NextKeyMarker><NextUploadIdMarker>{}</NextUploadIdMarker>",
+            escape_xml(next_key_marker.unwrap_or("")),
+            escape_xml(next_upload_id_marker.unwrap_or("")),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><MaxUploads>1000</MaxUploads><IsTruncated>false</IsTruncated>{body}</ListMultipartUploadsResult>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket>{prefix_xml}<KeyMarker>{}</KeyMarker><UploadIdMarker>{}</UploadIdMarker><MaxUploads>{max_uploads}</MaxUploads><IsTruncated>{is_truncated}</IsTruncated>{next_markers_xml}{body}</ListMultipartUploadsResult>"#,
         escape_xml(bucket),
+        escape_xml(key_marker),
+        escape_xml(upload_id_marker),
     )
 }
 
@@ -430,7 +471,8 @@ mod tests {
             version_id: "V1ED6836".to_string(),
             is_latest: true,
         }];
-        let xml = list_object_versions_xml("bucket", "my-prefix", None, &versions);
+        let xml =
+            list_object_versions_xml("bucket", "my-prefix", None, &versions, 1000, "", false, None);
         assert!(xml.contains("<VersionId>null</VersionId>"));
         assert!(!xml.contains("V1ED6836"));
         assert!(xml.contains("<IsLatest>true</IsLatest>"));
@@ -449,7 +491,8 @@ mod tests {
             storage_class: "STANDARD".to_string(),
             user_meta: std::collections::BTreeMap::new(),
         }];
-        let xml = list_multipart_uploads_xml("bucket", &uploads);
+        let xml =
+            list_multipart_uploads_xml("bucket", &uploads, "", 1000, "", "", false, None, None);
         assert!(xml.contains("<Initiator><ID>rust-s3-server</ID>"));
         assert!(xml.contains("<Owner><ID>rust-s3-server</ID>"));
     }

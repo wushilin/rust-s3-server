@@ -1514,6 +1514,57 @@
     }
 
     #[tokio::test]
+    async fn multipart_content_type_cannot_bypass_auth_on_operation_routes() {
+        // Security regression: a `multipart/form-data` Content-Type on a POST
+        // that selects a real S3 operation (?delete / ?uploads / ?uploadId /
+        // ?rebuildIndex) must NOT skip authentication. It previously did, which
+        // allowed an unauthenticated bulk delete.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        // Authenticated setup: create a bucket + object.
+        let res = signed_request(app.clone(), "PUT", "/victim", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res =
+            signed_request(app.clone(), "PUT", "/victim/secret.txt", "", Body::from("data")).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Each operation-selecting POST, unsigned but claiming to be a form.
+        for (uri, body) in [
+            (
+                "/victim?delete",
+                r#"<Delete><Object><Key>secret.txt</Key></Object></Delete>"#,
+            ),
+            ("/victim/secret.txt?uploads", ""),
+            ("/victim/secret.txt?uploadId=0_0000000000000000", ""),
+            ("/victim?rebuildIndex", ""),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "multipart/form-data; boundary=x")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::FORBIDDEN,
+                "unauthenticated POST {uri} was not rejected"
+            );
+        }
+
+        // The object must still be there.
+        let head =
+            signed_request(app.clone(), "HEAD", "/victim/secret.txt", "", Body::empty()).await;
+        assert_eq!(head.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn browser_post_to_object_path_returns_method_not_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         let app = make_auth_app(&tmp);

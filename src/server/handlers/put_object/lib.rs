@@ -31,6 +31,16 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         }
     };
     let expected_sha256 = srv::expected_payload_sha256(&ctx.headers, aws_chunked);
+    // For aws-chunked uploads the client declares the true payload size here;
+    // the storage layer rejects a body that decodes to a different length.
+    let expected_decoded_len = if aws_chunked {
+        ctx.headers
+            .get("x-amz-decoded-content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    } else {
+        None
+    };
     match store
         .put_object_stream_with_metadata(
             &ctx.bucket,
@@ -43,6 +53,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             &user_meta,
             aws_chunked,
             expected_sha256.as_deref(),
+            expected_decoded_len,
         )
         .await
     {
