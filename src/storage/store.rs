@@ -243,6 +243,14 @@ impl LocalObjectStore {
                 storage_version: "v2".to_string(),
             };
             write_json_atomic(&bucket_meta_path, &meta).await?;
+            if self.durability == Durability::Full {
+                // `bucket_exists` gates every object operation on this marker.
+                // Make it (and the directory entry created for it) durable
+                // before we ack, so a crash can't hide a bucket whose synced
+                // index and blobs already exist.
+                fsync_file(&bucket_meta_path).await?;
+                fsync_dir(&bucket_dir).await?;
+            }
         }
         let _ = self.index(bucket).await?;
         Ok(())
@@ -297,7 +305,15 @@ impl LocalObjectStore {
         if let Some(index) = removed {
             index.close().await;
         }
-        tokio::fs::remove_dir_all(bucket_dir).await?;
+        tokio::fs::remove_dir_all(&bucket_dir).await?;
+        if self.durability == Durability::Full {
+            // Make the directory-entry removal durable before we ack, so a
+            // crash can't resurrect the just-deleted bucket. The parent is
+            // `buckets/`; if it's already gone there is nothing to sync.
+            if let Some(parent) = bucket_dir.parent() {
+                let _ = fsync_dir(parent).await;
+            }
+        }
         Ok(())
     }
 
@@ -771,6 +787,11 @@ impl LocalObjectStore {
             write_json_atomic(&publish_dir.join("meta.json"), &object_meta).await?;
             if self.durability == Durability::Full {
                 fsync_file(&publish_dir.join("meta.json")).await?;
+                // `write_json_atomic` swaps meta.json in via a same-dir rename;
+                // fsyncing the file alone leaves that directory-entry change
+                // unstable. Fsync `publish_dir` so the rewrite survives a crash
+                // (the later parent fsync only covers publish_dir's own name).
+                fsync_dir(publish_dir).await?;
             }
         }
 
@@ -1264,11 +1285,18 @@ impl LocalObjectStore {
             .lock(bucket, &format!("\0mpu/{upload_id}/part.{part_number}"))
             .await;
         tokio::fs::rename(temp_path, staging_dir.join(&file_name)).await?;
-        write_json_atomic(
-            &staging_dir.join(format!("part.{part_number}.meta.json")),
-            &part,
-        )
-        .await?;
+        let part_meta_path = staging_dir.join(format!("part.{part_number}.meta.json"));
+        write_json_atomic(&part_meta_path, &part).await?;
+        if self.durability == Durability::Full {
+            // UploadPart returns an ETag the client treats as committed, so the
+            // part must be on stable storage before we ack: the part bytes, its
+            // sidecar meta, and the staging directory entries for both renames.
+            // Complete re-fsyncs at publish, but a crash between here and
+            // Complete must not lose an acked part.
+            fsync_file(&staging_dir.join(&file_name)).await?;
+            fsync_file(&part_meta_path).await?;
+            fsync_dir(&staging_dir).await?;
+        }
         Ok(())
     }
 
