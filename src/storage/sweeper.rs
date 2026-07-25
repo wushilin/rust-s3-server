@@ -1,6 +1,6 @@
 //! Background maintenance — hygiene only, never correctness.
 //!
-//! Under the SQLite-as-truth design the request path is self-sufficient:
+//! Under the index-as-truth design the request path is self-sufficient:
 //! consistency is established synchronously at the row commit. Everything
 //! here only reclaims space:
 //!
@@ -38,7 +38,6 @@ pub struct SweepConfig {
     /// disables multipart cleanup entirely, matching S3's keep-forever default.
     pub multipart_expiry_ms: i64,
     pub trash_expiry_ms: i64,
-    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,24 +55,8 @@ impl Default for SweepConfig {
             staging_expiry_ms: 24 * 60 * 60 * 1000,
             multipart_expiry_ms: 30 * 24 * 60 * 60 * 1000,
             trash_expiry_ms: 24 * 60 * 60 * 1000,
-            now_ms: now_ms(),
         }
     }
-}
-
-/// Runs all three maintenance purposes for one bucket. Retained as a
-/// convenience (and for tests); the scheduler drives the three single-purpose
-/// entry points below independently.
-pub async fn sweep_bucket(
-    store: &LocalObjectStore,
-    bucket: &str,
-    config: &SweepConfig,
-) -> Result<SweepStats> {
-    Ok(SweepStats {
-        intents_resolved: resolve_intents_bucket(store, bucket, config).await?,
-        staging_dirs_removed: delete_staging_bucket(store, bucket, config).await?,
-        trash_dirs_removed: delete_trash_bucket(store, bucket, config).await?,
-    })
 }
 
 /// Purpose 1 — drain resolvable stale intents for one bucket. Returns the
@@ -98,35 +81,39 @@ pub async fn resolve_intents_bucket(
     Ok(resolved)
 }
 
-/// Purpose 2 — delete expired staging directories for one bucket. Returns the
-/// number removed.
+/// Purpose 2 — delete expired staging directories for one bucket, with ages
+/// evaluated against the caller-supplied `now_ms` ("a sweep pass at time T").
+/// Returns the number removed.
 pub async fn delete_staging_bucket(
     store: &LocalObjectStore,
     bucket: &str,
     config: &SweepConfig,
+    now_ms: i64,
 ) -> Result<usize> {
     let mut stats = SweepStats::default();
     let bucket_dir = store.layout().bucket_dir(bucket)?;
-    sweep_staging(&bucket_dir.join("staging"), config, &mut stats).await?;
+    sweep_staging(&bucket_dir.join("staging"), config, now_ms, &mut stats).await?;
     Ok(stats.staging_dirs_removed)
 }
 
-/// Purpose 3 — delete expired trash directories for one bucket. Returns the
-/// number removed.
+/// Purpose 3 — delete expired trash directories for one bucket, with ages
+/// evaluated against the caller-supplied `now_ms`. Returns the number removed.
 pub async fn delete_trash_bucket(
     store: &LocalObjectStore,
     bucket: &str,
     config: &SweepConfig,
+    now_ms: i64,
 ) -> Result<usize> {
     let mut stats = SweepStats::default();
     let bucket_dir = store.layout().bucket_dir(bucket)?;
-    sweep_trash(&bucket_dir.join("trash"), config, &mut stats).await?;
+    sweep_trash(&bucket_dir.join("trash"), config, now_ms, &mut stats).await?;
     Ok(stats.trash_dirs_removed)
 }
 
 async fn sweep_staging(
     staging_dir: &Path,
     config: &SweepConfig,
+    now_ms: i64,
     stats: &mut SweepStats,
 ) -> Result<()> {
     for kind in ["put", "multipart"] {
@@ -159,14 +146,10 @@ async fn sweep_staging(
                 continue;
             };
             let created_ms = epoch_ms_from_staging_id(name).unwrap_or_else(|_| {
-                config
-                    .now_ms
-                    .saturating_sub(path_age_ms(&path, config.now_ms).unwrap_or(0))
+                now_ms.saturating_sub(path_age_ms(&path, now_ms).unwrap_or(0))
             });
-            let staging_age = config.now_ms.saturating_sub(created_ms);
-            if staging_age >= expiry_ms
-                && all_files_old_enough(&path, config.now_ms, expiry_ms)
-            {
+            let staging_age = now_ms.saturating_sub(created_ms);
+            if staging_age >= expiry_ms && all_files_old_enough(&path, now_ms, expiry_ms) {
                 match tokio::fs::remove_dir_all(&path).await {
                     Ok(()) => {
                         stats.staging_dirs_removed += 1;
@@ -193,7 +176,12 @@ async fn sweep_staging(
     Ok(())
 }
 
-async fn sweep_trash(trash_dir: &Path, config: &SweepConfig, stats: &mut SweepStats) -> Result<()> {
+async fn sweep_trash(
+    trash_dir: &Path,
+    config: &SweepConfig,
+    now_ms: i64,
+    stats: &mut SweepStats,
+) -> Result<()> {
     let entries = match std::fs::read_dir(trash_dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
@@ -212,11 +200,9 @@ async fn sweep_trash(trash_dir: &Path, config: &SweepConfig, stats: &mut SweepSt
         // would make any not-recently-written object eligible for purge on the
         // very next sweep. Fall back to mtime only if the name is unparseable.
         let deleted_ms = epoch_ms_from_staging_id(name).unwrap_or_else(|_| {
-            config
-                .now_ms
-                .saturating_sub(path_age_ms(&path, config.now_ms).unwrap_or(0))
+            now_ms.saturating_sub(path_age_ms(&path, now_ms).unwrap_or(0))
         });
-        let trash_age = config.now_ms.saturating_sub(deleted_ms);
+        let trash_age = now_ms.saturating_sub(deleted_ms);
         if trash_age < config.trash_expiry_ms {
             continue;
         }
@@ -271,6 +257,21 @@ fn path_age_ms(path: &Path, now: i64) -> Result<i64> {
 mod tests {
     use super::*;
 
+    /// Test convenience: all three maintenance purposes for one bucket at one
+    /// evaluation time. Production drives the three entry points independently.
+    async fn sweep_bucket(
+        store: &LocalObjectStore,
+        bucket: &str,
+        config: &SweepConfig,
+        now_ms: i64,
+    ) -> Result<SweepStats> {
+        Ok(SweepStats {
+            intents_resolved: resolve_intents_bucket(store, bucket, config).await?,
+            staging_dirs_removed: delete_staging_bucket(store, bucket, config, now_ms).await?,
+            trash_dirs_removed: delete_trash_bucket(store, bucket, config, now_ms).await?,
+        })
+    }
+
     #[tokio::test]
     async fn staging_with_recent_files_is_not_swept() {
         let tmp = tempfile::tempdir().unwrap();
@@ -299,8 +300,8 @@ mod tests {
                 staging_expiry_ms: 1_000,
                 multipart_expiry_ms: 1_000,
                 trash_expiry_ms: 1_000,
-                now_ms: 10_000,
             },
+            10_000,
         )
         .await
         .unwrap();
@@ -335,8 +336,8 @@ mod tests {
                 staging_expiry_ms: 1_000,
                 multipart_expiry_ms: 1_000,
                 trash_expiry_ms: 1_000,
-                now_ms: 10_000,
             },
+            10_000,
         )
         .await
         .unwrap();
@@ -371,8 +372,8 @@ mod tests {
                 staging_expiry_ms: 1000,
                 multipart_expiry_ms: 1000,
                 trash_expiry_ms: 0,
-                now_ms: now_ms(),
             },
+            now_ms(),
         )
         .await
         .unwrap();
@@ -400,10 +401,9 @@ mod tests {
             staging_expiry_ms: 1000,
             multipart_expiry_ms: 1000,
             trash_expiry_ms: 1000,
-            now_ms: now_ms(),
         };
 
-        let stats = sweep_bucket(&store, "bucket", &cfg).await.unwrap();
+        let stats = sweep_bucket(&store, "bucket", &cfg, now_ms()).await.unwrap();
         assert_eq!(stats.intents_resolved, 5);
         assert!(index
             .stale_intents(now_ms(), 0, 10)

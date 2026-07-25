@@ -64,31 +64,6 @@ pub fn object_dir_random_suffix() -> String {
         .collect()
 }
 
-/// Returns true if `name` is an object directory name (`V1` followed by 6 uppercase hex,
-/// optionally `_` and 4 uppercase hex).
-pub fn is_object_dir_name(name: &str) -> bool {
-    if !name.starts_with("V1") || name.len() < 8 {
-        return false;
-    }
-    let rest = &name[2..];
-    let (prefix_hex, suffix) = if let Some(idx) = rest.find('_') {
-        (&rest[..idx], Some(&rest[idx + 1..]))
-    } else {
-        (rest, None)
-    };
-    let valid_hex = |s: &str| {
-        s.len() == 6
-            && s.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
-    };
-    let valid_suffix = |s: &str| {
-        s.len() == 4
-            && s.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
-    };
-    valid_hex(prefix_hex) && suffix.map_or(true, valid_suffix)
-}
-
 // ── Shared ────────────────────────────────────────────────────────────────────
 
 pub fn fanout_id(bucket: &str, key: &str) -> String {
@@ -107,21 +82,11 @@ pub fn fanout_id(bucket: &str, key: &str) -> String {
 
 /// Single-level fanout segment: the first 4 hex chars (16 bits → 65,536 slots)
 /// of the key's hash. The current on-disk layout places each object at
-/// `objects/<segment>/<leaf>`. Legacy objects use the 4-level
-/// [`fanout_segments`] layout and coexist untouched — the index records each
+/// `objects/<segment>/<leaf>`. Legacy objects use a 4-level fanout layout
+/// (`objects/aa/bb/cc/dd/…`) and coexist untouched — the index records each
 /// object's real path, so reads never recompute the fanout.
 pub fn fanout_segment(bucket: &str, key: &str) -> String {
     fanout_id(bucket, key)[0..4].to_string()
-}
-
-pub fn fanout_segments(bucket: &str, key: &str) -> [String; 4] {
-    let id = fanout_id(bucket, key);
-    [
-        id[0..2].to_string(),
-        id[2..4].to_string(),
-        id[4..6].to_string(),
-        id[6..8].to_string(),
-    ]
 }
 
 #[cfg(test)]
@@ -180,16 +145,6 @@ mod tests {
     }
 
     #[test]
-    fn is_object_dir_name_accepts_valid_forms() {
-        assert!(is_object_dir_name("V1AB3F7C"));
-        assert!(is_object_dir_name("V1AB3F7C_A1B2"));
-        assert!(!is_object_dir_name("V1ab3f7c")); // lowercase hex
-        assert!(!is_object_dir_name("v1AB3F7C")); // lowercase v
-        assert!(!is_object_dir_name("abcdef"));
-        assert!(!is_object_dir_name("V1AB3F")); // too short (only 4 hex, need 6)
-    }
-
-    #[test]
     fn long_keys_accepted_by_validate_object_key() {
         let key = "x".repeat(1024);
         assert!(validate_object_key(&key).is_ok());
@@ -199,8 +154,8 @@ mod tests {
 
     #[test]
     fn fanout_changes_for_sequential_suffixes() {
-        let a = fanout_segments("bucket", "1722372774777722231");
-        let b = fanout_segments("bucket", "1722372774777722232");
+        let a = fanout_segment("bucket", "1722372774777722231");
+        let b = fanout_segment("bucket", "1722372774777722232");
         assert_ne!(a, b);
     }
 }

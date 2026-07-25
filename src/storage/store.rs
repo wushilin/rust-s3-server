@@ -1,6 +1,6 @@
 //! Core object-storage implementation.
 //!
-//! [`LocalObjectStore`] is the main entry point. The per-bucket SQLite
+//! [`LocalObjectStore`] is the main entry point. The per-bucket RocksDB
 //! catalog is the **source of truth**: a row in `objects` is the object, and
 //! its `blob_dir` column is the only way blobs are located — the filesystem
 //! is never scanned on the request path.
@@ -1903,12 +1903,6 @@ impl LocalObjectStore {
         Ok(started)
     }
 
-    /// Rebuilds the catalog from the self-describing blob tree: a bounded
-    /// walker feeds N meta.json readers feeding one batch writer into a
-    /// temporary database that is atomically swapped in. Per key the
-    /// highest `last_modified_ms` wins; displaced duplicates and invalid
-    /// dirs are trashed on the spot. `trash/` and `staging/` are never
-    /// scanned (that would resurrect deleted objects).
     /// Current rebuild progress per bucket (empty when nothing rebuilds).
     pub fn rebuild_statuses(&self) -> Vec<(String, RebuildProgress)> {
         self.rebuild_progress
@@ -1919,7 +1913,13 @@ impl LocalObjectStore {
             .collect()
     }
 
-    pub async fn rebuild_sqlite(&self, bucket: &str) -> Result<usize> {
+    /// Rebuilds the catalog from the self-describing blob tree: a bounded
+    /// walker feeds N meta.json readers feeding one batch writer into a
+    /// temporary database that is atomically swapped in. Per key the
+    /// highest `last_modified_ms` wins; displaced duplicates and invalid
+    /// dirs are trashed on the spot. `trash/` and `staging/` are never
+    /// scanned (that would resurrect deleted objects).
+    pub async fn rebuild_index(&self, bucket: &str) -> Result<usize> {
         self.rebuild_progress.lock().unwrap().insert(
             bucket.to_string(),
             RebuildProgress {
@@ -1928,12 +1928,12 @@ impl LocalObjectStore {
                 started_at_ms: now_ms(),
             },
         );
-        let result = self.rebuild_sqlite_inner(bucket).await;
+        let result = self.rebuild_index_inner(bucket).await;
         self.rebuild_progress.lock().unwrap().remove(bucket);
         result
     }
 
-    async fn rebuild_sqlite_inner(&self, bucket: &str) -> Result<usize> {
+    async fn rebuild_index_inner(&self, bucket: &str) -> Result<usize> {
         validate_bucket_name(bucket)?;
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::encoding::{fanout_segments, validate_bucket_name};
+use super::encoding::validate_bucket_name;
 use super::errors::Result;
 
 #[derive(Debug, Clone)]
@@ -24,14 +24,6 @@ impl StorageLayout {
 
     pub fn bucket_meta_path(&self, bucket: &str) -> Result<PathBuf> {
         Ok(self.bucket_dir(bucket)?.join("bucket.json"))
-    }
-
-    /// Returns the 4-level fanout leaf directory for (bucket, key).
-    /// Does not include the object directory component — that requires a resolver scan.
-    pub fn fanout_leaf_dir(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        let bucket_dir = self.bucket_dir(bucket)?;
-        let [a, b, c, d] = fanout_segments(bucket, key);
-        Ok(bucket_dir.join("objects").join(a).join(b).join(c).join(d))
     }
 
     pub fn put_staging_dir(&self, bucket: &str, staging_id: &str) -> Result<PathBuf> {
@@ -64,17 +56,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fanout_leaf_dir_has_4_fanout_levels_under_objects() {
+    fn bucket_dir_is_under_buckets_root() {
         let layout = StorageLayout::new("/tmp/root");
-        let leaf = layout.fanout_leaf_dir("bucket", "logs/2026/1").unwrap();
-        let parts: Vec<_> = leaf
-            .iter()
-            .map(|v| v.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(parts[parts.len() - 5], "objects");
-        assert_eq!(parts[parts.len() - 4].len(), 2); // fanout a
-        assert_eq!(parts[parts.len() - 3].len(), 2); // fanout b
-        assert_eq!(parts[parts.len() - 2].len(), 2); // fanout c
-        assert_eq!(parts[parts.len() - 1].len(), 2); // fanout d
+        let dir = layout.bucket_dir("bucket").unwrap();
+        assert_eq!(dir, std::path::Path::new("/tmp/root/buckets/bucket"));
     }
 }

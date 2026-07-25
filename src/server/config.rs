@@ -178,6 +178,21 @@ pub struct SweeperConfig {
     pub reclaim_interval_secs: u64,
 }
 
+impl SweeperConfig {
+    /// The per-pass storage-layer sweep settings derived from this
+    /// (seconds-based) server config. The single place the seconds→millis
+    /// conversion happens; every sweep job uses this.
+    pub fn sweep_pass(&self) -> crate::storage::sweeper::SweepConfig {
+        crate::storage::sweeper::SweepConfig {
+            intent_batch_size: self.intent_batch_size,
+            intent_grace_period_ms: self.intent_grace_period_secs as i64 * 1000,
+            staging_expiry_ms: self.staging_expiry_secs as i64 * 1000,
+            multipart_expiry_ms: self.multipart_upload_expiry_secs as i64 * 1000,
+            trash_expiry_ms: self.trash_expiry_secs as i64 * 1000,
+        }
+    }
+}
+
 impl Default for SweeperConfig {
     fn default() -> Self {
         Self {
@@ -343,21 +358,6 @@ impl AppConfig {
         self.auth.users.iter().find(|u| u.user == username)
     }
 
-    /// First available root key pair (for root presigned-URL generation).
-    pub fn first_root_key(&self) -> Option<(&str, &str)> {
-        self.auth
-            .credentials
-            .first()
-            .map(|c| (c.access_key.as_str(), c.secret_key.as_str()))
-            .or_else(|| {
-                self.auth
-                    .users
-                    .iter()
-                    .flat_map(|u| u.api_keys.iter())
-                    .next()
-                    .map(|k| (k.ak.as_str(), k.secret.as_str()))
-            })
-    }
 }
 
 impl Default for AppConfig {

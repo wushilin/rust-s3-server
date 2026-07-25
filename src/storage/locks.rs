@@ -6,9 +6,9 @@ use std::{
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ObjectLockKey {
-    pub bucket: String,
-    pub object_key: String,
+struct ObjectLockKey {
+    bucket: String,
+    object_key: String,
 }
 
 type LockMap = HashMap<ObjectLockKey, Arc<Mutex<()>>>;
@@ -69,7 +69,7 @@ pub struct ObjectWriteGuard {
     // entry's strong count below.
     _guard: OwnedMutexGuard<()>,
     table: Arc<StdMutex<LockMap>>,
-    pub key: ObjectLockKey,
+    key: ObjectLockKey,
 }
 
 impl Drop for ObjectWriteGuard {

@@ -922,10 +922,6 @@ impl IamStore {
         self.reload().await
     }
 
-    pub fn verify_password_sync(&self, _username: &str, _password: &str) -> bool {
-        false // passwords are only verified via the async path (needs the DB row)
-    }
-
     pub async fn verify_password(&self, username: &str, password: &str) -> Result<bool> {
         let db = self.db.clone();
         let username_owned = username.to_string();

@@ -9,8 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::server::config::SweeperConfig;
 use crate::server::registry::{TaskKind, TaskRegistry};
 use crate::storage::store::LocalObjectStore;
-use crate::storage::sweeper::{resolve_intents_bucket, SweepConfig};
-use crate::storage::time::now_ms;
+use crate::storage::sweeper::resolve_intents_bucket;
 
 pub(crate) const JOB: &str = "resolve_intents";
 
@@ -32,20 +31,13 @@ pub(crate) async fn run_once(
             return 0;
         }
     };
+    let pass = cfg.sweep_pass();
     let mut resolved = 0;
     for (bucket, _) in &buckets {
         // Only process shutdown stops it early — never an operator cancel.
         if cancel.is_cancelled() {
             break;
         }
-        let pass = SweepConfig {
-            intent_batch_size: cfg.intent_batch_size,
-            intent_grace_period_ms: cfg.intent_grace_period_secs as i64 * 1000,
-            staging_expiry_ms: cfg.staging_expiry_secs as i64 * 1000,
-            multipart_expiry_ms: cfg.multipart_upload_expiry_secs as i64 * 1000,
-            trash_expiry_ms: cfg.trash_expiry_secs as i64 * 1000,
-            now_ms: now_ms(),
-        };
         match resolve_intents_bucket(store, bucket, &pass).await {
             Ok(n) => resolved += n,
             Err(crate::storage::errors::StorageError::BucketRebuilding(_)) => {}

@@ -69,7 +69,6 @@ pub(crate) mod rebuild_index;
 /// keeps every handler traceable and able to authorize without re-parsing.
 pub(crate) struct ObjectCtx {
     pub request_id: String,
-    #[allow(dead_code)]
     pub identity: Option<Identity>,
     pub bucket: String,
     pub key: String,
