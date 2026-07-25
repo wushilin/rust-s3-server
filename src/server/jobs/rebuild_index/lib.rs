@@ -32,7 +32,7 @@ pub(crate) fn spawn(store: LocalObjectStore, bucket: String, tasks: Arc<TaskRegi
         log::info!("[{run_id}] {JOB} started bucket={bucket}");
 
         // The 503 gate (`try_begin_rebuild`/`end_rebuild`) is separate from the
-        // task guard. Lower it via a Drop guard so that even if `rebuild_sqlite`
+        // task guard. Lower it via a Drop guard so that even if `rebuild_index`
         // panics (e.g. a poisoned mutex), the bucket is never left permanently
         // stuck returning `BucketRebuilding`.
         struct GateGuard {
@@ -88,7 +88,7 @@ pub(crate) fn spawn(store: LocalObjectStore, bucket: String, tasks: Arc<TaskRegi
         };
         let mut poller = PollerGuard(poller);
 
-        match store.rebuild_sqlite(&bucket).await {
+        match store.rebuild_index(&bucket).await {
             Ok(count) => log::info!("[{run_id}] {JOB} complete bucket={bucket} objects={count}"),
             Err(err) => log::error!("[{run_id}] {JOB} failed bucket={bucket} error={err}"),
         }

@@ -1,21 +1,39 @@
 # rusts3 — S3-compatible single-node S3 server
 
-`rusts3` is a lightweight S3-compatible server written in Rust. It is designed
-for local development, integration tests, CI, and small trusted deployments. It
-is not a drop-in replacement for the complete AWS S3 or MinIO feature set.
+`rusts3` is a lightweight, single-node S3-compatible server written in Rust.
+It has matured into a robust piece of infrastructure: the core AWS S3 API —
+authentication, bucket and object CRUD, listings, multipart, copy, presigning,
+browser POST, and both path-style and virtual-hosted-style addressing — is
+**almost fully compatible with AWS S3**, verified continuously against the
+MinIO Mint suite and real AWS SDKs. It is a strong fit for local development,
+integration tests, CI, and small trusted production deployments. Features S3
+itself deprecates or that only make sense at AWS scale (versioning, ACLs,
+replication, S3 Select — see [Intentional limits](#intentional-limits)) are
+deliberately out of scope.
 
 ## Highlights
 
 - Streaming single-part and multipart uploads and downloads; object bodies are
-  not buffered in memory.
+  never buffered in memory — on the S3 API and in the management console alike.
 - AWS Signature V4 and V2 authentication, including presigned URLs, SigV4
   streaming (`aws-chunked`), and signed browser POST uploads.
-- A built-in management console on a separate port for buckets, objects, IAM
-  users, groups, policies, access keys, share links, and live tasks.
+- **Path-style and virtual-hosted-style addressing**: with a configured public
+  hostname, `https://bucket.s3.example.com/key` and
+  `https://s3.example.com/bucket/key` are equivalent, with adaptive SigV4
+  verification for both shapes.
+- A built-in management console on a separate port: object browser with
+  multi-select and bulk delete (by selection or by prefix), folder upload with
+  drag-and-drop, transparent multipart upload for large files (up to the 5 TiB
+  S3 object ceiling), per-bucket visibility into in-flight multipart uploads
+  with one-click abort, IAM users/groups/policies/access keys, share links,
+  and a live task monitor.
 - AWS-style IAM policy evaluation with explicit deny, wildcard actions and
   resources, prefix/delimiter conditions, user policies, and group policies.
 - Server-side copy, multipart copy, range reads, conditional reads/copies,
   bulk delete, metadata, storage-class headers, and ListObjects v1/v2.
+- IAM backup and restore with a **staged import**: the console previews
+  exactly what a dump will load (per-family counts and sample names — never
+  secrets) before anything is written.
 - RocksDB-primary object indexes with immutable blob directories, write-ahead
   intents, atomic publication, crash recovery, and configurable durability.
 - Automatic index rebuilds, migration from the legacy four-level layout,
@@ -39,6 +57,33 @@ is not a drop-in replacement for the complete AWS S3 or MinIO feature set.
 ### Live tasks
 
 <img width="457" height="175" alt="Live tasks" src="https://github.com/user-attachments/assets/b8adaa59-d218-473d-9d15-d6af9954be63" />
+
+## The two surfaces
+
+rusts3 deliberately exposes two independent HTTP surfaces:
+
+1. **The S3-compatible API** (default port `8002`) speaks the AWS S3 wire
+   protocol: SigV4/SigV2-signed requests, presigned URLs, browser POST
+   uploads, path-style and virtual-hosted-style addressing. Anything that
+   talks to AWS S3 — the AWS CLI and SDKs, `s3cmd`, `mc`, rclone, backup
+   tools — points its endpoint here and authenticates with access keys.
+   Buckets, objects, listings, multipart, copy: it all behaves like S3, and
+   the [supported operations](#supported-s3-operations) table below is the
+   authoritative list.
+
+2. **The Web UI / management console** (default port `8003`) is a
+   full operator interface served by the same binary — no separate frontend
+   to deploy. It authenticates with username/password sessions (not access
+   keys) and covers day-to-day operation: browsing and managing buckets and
+   objects, folder uploads, transparent large-file multipart uploads, bulk
+   deletes, share links, IAM administration (users, groups, policies, access
+   keys), staged IAM backup/restore, live task monitoring with cancellation,
+   and per-bucket controls such as index rebuild and multipart-session
+   cleanup.
+
+The separation means credentials never mix: a leaked console password grants
+no S3 API access and vice versa, and each surface can be firewalled or
+proxied independently.
 
 ## Compatibility snapshot
 
@@ -153,7 +198,7 @@ process crash preserves committed writes in either mode.
 | `auth.enabled` | `false` | Require signatures on the S3 API. Health and metrics endpoints remain public. |
 | `auth.credentials` | `[]` | Legacy unrestricted `{access_key, secret_key}` pairs. |
 | `auth.users` | `[]` | Built-in, unrestricted bootstrap administrators. |
-| `auth.public_hostname` | absent | Public hostname and optional port used to verify proxy-safe signatures and generate console share links. Do not include a scheme. |
+| `auth.public_hostname` | absent | Public hostname and optional port used to verify proxy-safe signatures, generate console share links, and enable virtual-hosted-style addressing (`<bucket>.<public_hostname>`). Do not include a scheme. |
 | `auth.public_scheme` | `http` | `http` or `https`, used for generated share links. |
 
 A built-in administrator can have a console password, any number of S3 API
@@ -225,9 +270,22 @@ The console supports:
 
 - creating/deleting buckets and browsing, uploading, downloading, and deleting
   objects;
+- uploading entire folders (button or drag-and-drop), recreating the folder
+  tree under the current prefix;
+- transparent multipart upload: files over 1 GiB are automatically split into
+  streamed parts (no browser or server memory buffering), up to S3's 5 TiB
+  object limit, with aggregate progress and cancel-with-abort;
+- per-bucket view of in-flight multipart uploads with one-click abort — covers
+  both console uploads and sessions initiated by external S3 clients;
+- multi-select with select-all, bulk delete of the selection (folders delete
+  recursively), and prefix-scoped bulk delete with a typed prefix, warning
+  dialog, and live progress;
 - generating presigned share links (requires `auth.public_hostname`);
 - creating runtime users and groups, resetting passwords, rotating access
   keys, and editing user/group policies;
+- IAM export, and staged IAM import: a read-only preview shows per-family row
+  counts and sample names (secrets are never displayed) before the final
+  confirmation applies anything;
 - bucket statistics and operator-triggered index rebuilds;
 - a WebSocket-powered task monitor for active/recent S3 requests and jobs,
   transfer progress and throughput, with cancellation for safe cancellable
@@ -263,6 +321,65 @@ large files. Low-level multipart operations are also available through
 When a reverse proxy changes the `Host` header, set `auth.public_hostname` to
 the exact hostname (including a nonstandard port) configured in clients. This
 keeps presigned SigV4 verification consistent through the proxy.
+
+### Virtual-hosted-style addressing
+
+Setting `auth.public_hostname` also enables host-style requests: any request
+whose `Host` is `<bucket>.<public_hostname>` is served as an access to that
+bucket, while requests to the bare hostname stay path-style — the same dual
+behavior as AWS S3. SigV4 verification is adaptive: each request is verified
+against exactly the path and host the client signed, in either style. The
+fronting proxy must provide wildcard DNS and TLS for `*.<public_hostname>`
+and preserve the `Host` header.
+
+## Reverse proxy and TLS
+
+rusts3 serves plain HTTP and delegates TLS to a fronting proxy. A production
+setup typically publishes three names:
+
+| Public name | Backend | Purpose |
+|---|---|---|
+| `rusts3.example.com` | `127.0.0.1:8003` | Web UI / management console. |
+| `s3.example.com` | `127.0.0.1:8002` | S3 API, path-style. Set as `auth.public_hostname`. |
+| `*.s3.example.com` | `127.0.0.1:8002` | S3 API, virtual-hosted-style (bucket subdomains). |
+
+Whatever proxy you use, it must (1) **preserve the `Host` header** — both
+SigV4 verification and host-style bucket detection depend on it, (2) stream
+request/response bodies without size limits or buffering (console multipart
+parts are 256 MiB), and (3) pass WebSocket upgrades for the console's
+`/api/tasks/ws` live task monitor.
+
+### Recommended: tlsproxy_rs
+
+[`tlsproxy_rs`](https://github.com/wushilin/tlsproxy_rs) is a hostname-routed
+proxy with **integrated ACME certificate management** — it obtains and renews
+Let's Encrypt certificates automatically via TLS-ALPN-01, issuing per-hostname
+certificates on demand as routes are hit (renewals start 15 days before
+expiry). That makes it a natural fit here: point the three names above at
+their backend ports through its admin console, and certificates for the
+console, the API endpoint, and each bucket subdomain are provisioned and
+rotated without any manual certificate handling. It also provides an
+audited admin UI with configuration revisions and rollback, hot reload, and
+load-balanced backend pools if you later scale reads.
+
+### Alternative: Caddy
+
+[Caddy](https://caddyserver.com/) works equally well; note that the wildcard
+certificate for bucket subdomains requires the DNS-01 challenge (a DNS
+provider plugin):
+
+```caddyfile
+rusts3.example.com {
+    reverse_proxy 127.0.0.1:8003
+}
+s3.example.com, *.s3.example.com {
+    reverse_proxy 127.0.0.1:8002
+}
+```
+
+With either proxy, set `auth.public_hostname: s3.example.com` and
+`auth.public_scheme: https` so presigned links and host-style detection agree
+with the public names.
 
 ## Supported S3 operations
 

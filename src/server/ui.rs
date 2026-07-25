@@ -28,7 +28,7 @@ use super::policy::{
 };
 use crate::storage::errors::StorageError;
 use crate::storage::rawdb;
-use crate::storage::store::LocalObjectStore;
+use crate::storage::store::{CompletePartRequest, LocalObjectStore};
 
 const SESSION_COOKIE: &str = "rusts3_ui_session";
 
@@ -92,11 +92,23 @@ pub fn router(state: UiState) -> Router {
             post(import_iam).layer(DefaultBodyLimit::max(IAM_IMPORT_LIMIT_BYTES)),
         )
         .route(
+            "/api/admin/import/preview",
+            post(preview_import_iam).layer(DefaultBodyLimit::max(IAM_IMPORT_LIMIT_BYTES)),
+        )
+        .route(
             "/api/object",
             get(download_object)
                 .put(upload_object)
                 .delete(delete_object),
         )
+        // Multipart upload for the console: lets the Web UI stream files of any
+        // size in parts instead of one bounded PUT. Bodies stream to staging —
+        // never buffered in memory.
+        .route("/api/multipart/list", get(multipart_list))
+        .route("/api/multipart/create", post(multipart_create))
+        .route("/api/multipart/part", put(multipart_part))
+        .route("/api/multipart/complete", post(multipart_complete))
+        .route("/api/multipart/abort", delete(multipart_abort))
         .route("/api/objects", get(list_objects))
         .route("/api/presign", post(presign))
         .route("/api/tasks", get(list_tasks))
@@ -123,8 +135,9 @@ async fn tasks_page() -> Html<&'static str> {
     Html(include_str!("assets/tasks.html"))
 }
 
-/// Serves the modular front-end assets. The JavaScript is split by concern
-/// (core / tasks / objects / iam / main) and embedded in the binary — no build
+/// Serves the modular front-end assets. The JavaScript is split by feature
+/// (core / tasks / object browser / uploads / users / groups / policy editor /
+/// access keys / export-import / main) and embedded in the binary — no build
 /// step, no bundler, no external requests — then stitched back together by the
 /// browser via ordered `<script src>` tags. Everything here is public client
 /// code (the API endpoints it calls do the authorization).
@@ -132,9 +145,13 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
     let body: &'static str = match file.as_str() {
         "core.js" => include_str!("assets/core.js"),
         "tasks.js" => include_str!("assets/tasks.js"),
-        "objects.js" => include_str!("assets/objects.js"),
-        "iam.js" => include_str!("assets/iam.js"),
-        "backup.js" => include_str!("assets/backup.js"),
+        "object_management.js" => include_str!("assets/object_management.js"),
+        "uploads.js" => include_str!("assets/uploads.js"),
+        "users.js" => include_str!("assets/users.js"),
+        "groups.js" => include_str!("assets/groups.js"),
+        "policy.js" => include_str!("assets/policy.js"),
+        "keys.js" => include_str!("assets/keys.js"),
+        "export_import.js" => include_str!("assets/export_import.js"),
         "main.js" => include_str!("assets/main.js"),
         _ => return error_response(StatusCode::NOT_FOUND, "asset not found"),
     };
@@ -1190,6 +1207,41 @@ async fn import_iam(
     }
 }
 
+/// Stage one of the two-step import: parse the dump and report what it WOULD
+/// load — per-family row counts plus up to 10 sample names — without writing
+/// anything. Sample names come from row keys only; row values (which carry
+/// password hashes and secret keys) are never decoded, so no secret can appear
+/// in the preview. The same framing validation as the real import runs here,
+/// so a truncated or foreign file is rejected before the user confirms.
+async fn preview_import_iam(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    if body.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "empty dump");
+    }
+    match rawdb::preview(body.as_ref()) {
+        Ok(families) => {
+            let total: u64 = families.iter().map(|f| f.rows).sum();
+            Json(json!({
+                "ok": true,
+                "total": total,
+                "families": families.iter().map(|f| json!({
+                    "family": f.cf,
+                    "rows": f.rows,
+                    "samples": f.samples,
+                })).collect::<Vec<_>>(),
+            }))
+            .into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
 #[derive(Deserialize)]
 struct ListObjectsQuery {
     bucket: String,
@@ -1463,6 +1515,265 @@ async fn delete_object(
             audit(&state, &rid.0, &session.username, "delete_object", format!("/{}/{}", q.bucket, q.key));
             Json(json!({"ok": true})).into_response()
         }
+        Err(err) => storage_error(err),
+    }
+}
+
+// ── console multipart upload ─────────────────────────────────────────────────
+// The Web UI's transparent large-file path: create → N streamed parts →
+// complete (or abort). Every endpoint enforces the same s3:PutObject policy as
+// a plain console upload (abort uses s3:AbortMultipartUpload), and part bodies
+// stream straight into multipart staging without ever being buffered in memory.
+
+#[derive(Deserialize)]
+struct MultipartListQuery {
+    bucket: String,
+}
+
+/// Ongoing (initiated, not yet completed or aborted) multipart uploads in a
+/// bucket, for the console's per-bucket "in-flight uploads" view.
+async fn multipart_list(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Query(q): Query<MultipartListQuery>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "MP-LIST",
+        format!("/{}", q.bucket),
+        &[Requirement::bucket("s3:ListBucketMultipartUploads", &q.bucket)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    match state.store.list_multipart_uploads(&q.bucket).await {
+        Ok(uploads) => Json(json!({
+            "uploads": uploads.iter().map(|u| json!({
+                "key": u.object_key,
+                "upload_id": u.upload_id,
+                "initiated_at_ms": u.initiated_at_ms,
+                "content_type": u.content_type,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct MultipartCreateQuery {
+    bucket: String,
+    key: String,
+    #[serde(default)]
+    content_type: Option<String>,
+}
+
+async fn multipart_create(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Query(q): Query<MultipartCreateQuery>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "MP-CREATE",
+        format!("/{}/{}", q.bucket, q.key),
+        &[Requirement::object("s3:PutObject", &q.bucket, &q.key)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    match state
+        .store
+        .initiate_multipart(&q.bucket, &q.key, q.content_type.as_deref(), None)
+        .await
+    {
+        Ok(upload_id) => Json(json!({ "upload_id": upload_id })).into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct MultipartPartQuery {
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u16,
+}
+
+async fn multipart_part(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Query(q): Query<MultipartPartQuery>,
+    body: Body,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "MP-PART",
+        format!("/{}/{} part {}", q.bucket, q.key, q.part_number),
+        &[Requirement::object("s3:PutObject", &q.bucket, &q.key)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let progress = guard.progress();
+    if let Some(total) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        progress.set_total(total);
+    }
+    let cancel = guard.cancel_token();
+    let _active = state.metrics.begin_put();
+    let metrics = state.metrics.clone();
+    let stream = futures::StreamExt::map(body.into_data_stream(), move |result| {
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "upload cancelled by operator",
+            ));
+        }
+        match result {
+            Ok(chunk) => {
+                progress.add_done(chunk.len() as u64);
+                metrics.add_in(chunk.len() as u64);
+                Ok(chunk)
+            }
+            Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
+        }
+    });
+    match state
+        .store
+        .put_multipart_part_stream(
+            &q.bucket,
+            &q.key,
+            &q.upload_id,
+            q.part_number,
+            stream,
+            false,
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(result) => Json(json!({ "etag": result.etag, "size": result.size })).into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct MultipartCompleteBody {
+    bucket: String,
+    key: String,
+    upload_id: String,
+    parts: Vec<MultipartCompletePart>,
+}
+
+#[derive(Deserialize)]
+struct MultipartCompletePart {
+    part_number: u16,
+    etag: String,
+}
+
+async fn multipart_complete(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(req): Json<MultipartCompleteBody>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "MP-COMPLETE",
+        format!("/{}/{}", req.bucket, req.key),
+        &[Requirement::object("s3:PutObject", &req.bucket, &req.key)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let parts: Vec<CompletePartRequest> = req
+        .parts
+        .iter()
+        .map(|p| CompletePartRequest {
+            number: p.part_number,
+            etag: p.etag.clone(),
+        })
+        .collect();
+    match state
+        .store
+        .complete_multipart(&req.bucket, &req.key, &req.upload_id, &parts)
+        .await
+    {
+        Ok(result) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                "upload",
+                format!("/{}/{} (multipart, {} parts)", req.bucket, req.key, parts.len()),
+            );
+            Json(json!({ "etag": result.etag, "size": result.size })).into_response()
+        }
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct MultipartAbortQuery {
+    bucket: String,
+    key: String,
+    upload_id: String,
+}
+
+async fn multipart_abort(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Query(q): Query<MultipartAbortQuery>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "MP-ABORT",
+        format!("/{}/{}", q.bucket, q.key),
+        &[Requirement::object("s3:AbortMultipartUpload", &q.bucket, &q.key)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    match state.store.abort_multipart(&q.bucket, &q.key, &q.upload_id).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(err) => storage_error(err),
     }
 }

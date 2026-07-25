@@ -37,15 +37,13 @@ regex       = "1.9"
 clap        = { version = "4.3", features = ["derive"] }
 multer      = "3"
 tempfile    = "3"
+tower       = { version = "0.4", features = ["util"] }
 
 # Logging
 log     = "0.4"
 log4rs  = { version = "1.2.0", features = ["gzip", "background_rotation"] }
 bcrypt = "0.19.2"
 rpassword = "7.5.4"
-
-[dev-dependencies]
-tower    = { version = "0.4", features = ["util"] }
 
 [[bin]]
 name = "rusts3"

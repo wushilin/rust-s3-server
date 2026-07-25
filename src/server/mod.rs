@@ -49,6 +49,15 @@ use crate::storage::time::parse_http_date_ms;
 
 const MAX_USER_META_BYTES: usize = 2 * 1024;
 
+/// Marks a request that arrived as virtual-hosted-style
+/// (`<bucket>.<public_hostname>`) and was rewritten to path-style. Holds the
+/// path the client actually signed, which SigV4 verification must use instead
+/// of the rewritten routing path.
+#[derive(Debug, Clone)]
+pub(crate) struct HostStyleRewrite {
+    pub original_path: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OperationActor {
     pub username: Option<String>,
@@ -215,7 +224,8 @@ fn router_with_metrics(
     metrics: Arc<TrafficMetrics>,
     tasks: Arc<registry::TaskRegistry>,
 ) -> Router {
-    Router::new()
+    let host_style_config = auth_state.config.clone();
+    let inner = Router::new()
         .route("/minio/health/live", get(health_live))
         .route("/minio/health/ready", get(health_live))
         .route("/minio/v2/metrics/cluster", get(metrics_endpoint))
@@ -240,7 +250,87 @@ fn router_with_metrics(
         ))
         .layer(middleware::from_fn(log_middleware))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
-        .with_state(store)
+        .with_state(store);
+    // `Router::layer` middleware runs only after a route has been matched, so
+    // the host-style URI rewrite must wrap the finished router to influence
+    // routing (and the auth layer's policy path) at all.
+    Router::new().fallback_service(tower::Layer::layer(
+        &middleware::from_fn_with_state(host_style_config, host_style_middleware),
+        inner,
+    ))
+}
+
+/// Virtual-hosted-style addressing: when `auth.public_hostname` is configured
+/// and a request arrives for `<bucket>.<public_hostname>`, the bucket named by
+/// the Host header is folded into the request path (`/key` → `/<bucket>/key`)
+/// so routing and policy evaluation see the one canonical path-style shape.
+/// The bucket-less path the client signed is preserved in a
+/// [`HostStyleRewrite`] extension for SigV4 verification. Requests whose Host
+/// is the bare public hostname (or anything else — IPs, internal names) pass
+/// through unchanged as path-style.
+async fn host_style_middleware(
+    State(config): State<Arc<AppConfig>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some(bucket) = host_style_bucket(&config, &request) {
+        let original_path = request.uri().path().to_string();
+        let query = request
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        let rewritten = format!("/{bucket}{original_path}{query}");
+        let mut parts = request.uri().clone().into_parts();
+        match rewritten.parse::<axum::http::uri::PathAndQuery>() {
+            Ok(pq) => {
+                parts.path_and_query = Some(pq);
+                if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                    request.extensions_mut().insert(HostStyleRewrite { original_path });
+                    *request.uri_mut() = uri;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    next.run(request).await
+}
+
+/// The bucket a virtual-hosted-style request addresses, or `None` for
+/// path-style. Host-style means the Host header (port ignored) is a strict
+/// subdomain of `auth.public_hostname`: `bucket.s3.example.com` for a
+/// configured `s3.example.com`. Health and metrics endpoints keep their
+/// meaning on every host.
+fn host_style_bucket(config: &AppConfig, request: &Request<Body>) -> Option<String> {
+    let domain = strip_host_port(config.auth.public_hostname.as_deref()?).to_ascii_lowercase();
+    if domain.is_empty() {
+        return None;
+    }
+    let path = request.uri().path();
+    if matches!(path, "/minio/health/live" | "/minio/health/ready" | "/minio/prometheus/metrics")
+        || path.starts_with("/minio/v2/metrics/")
+    {
+        return None;
+    }
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| request.uri().host())?;
+    let host = strip_host_port(host).to_ascii_lowercase();
+    let bucket = host.strip_suffix(&domain)?.strip_suffix('.')?;
+    if bucket.is_empty() {
+        return None;
+    }
+    Some(bucket.to_string())
+}
+
+/// `host[:port]` → `host` (bracketed IPv6 literals keep their brackets off).
+fn strip_host_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
 }
 
 /// Registers each request as an active task while its handler runs, so the

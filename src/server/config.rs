@@ -123,6 +123,12 @@ pub struct AuthConfig {
     /// configured public hostname.
     ///
     /// When absent the incoming `Host` header is used (direct-access mode).
+    ///
+    /// Setting this also enables virtual-hosted-style addressing: a request
+    /// whose `Host` is `<bucket>.<public_hostname>` is served as an access to
+    /// that bucket (the bucket is folded into the path before routing), while
+    /// requests to the bare `public_hostname` remain path-style. DNS and TLS
+    /// for `*.<public_hostname>` must be provided by the fronting proxy.
     #[serde(default)]
     pub public_hostname: Option<String>,
     /// URL scheme used for generated public S3 links. SigV4 verification

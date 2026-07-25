@@ -132,16 +132,9 @@ pub fn export<W: Write>(db: &Db, cf_names: &[&str], w: &mut W) -> Result<u64> {
     Ok(rows)
 }
 
-/// Restores a dump into `db`. In [`ImportMode::Merge`] every row is upserted
-/// (`put`) and nothing else changes. In [`ImportMode::Replace`] every family in
-/// `managed_cfs` is erased first, so the result is exactly the dump (rows in the
-/// DB but not in the dump are dropped). The whole restore — erase plus load — is
-/// one atomic write batch. Row order in the dump does not matter: each row
-/// carries its own family and lands independently. Returns a per-family
-/// [`ImportReport`].
-pub fn import<R: Read>(db: &Db, mut r: R, mode: ImportMode, managed_cfs: &[&str]) -> Result<ImportReport> {
-    let mut data = Vec::new();
-    r.read_to_end(&mut data)?;
+/// Validates the fixed framing of a dump (magic header + completeness
+/// trailer) and returns the row-stream body between them.
+fn dump_body(data: &[u8]) -> Result<&[u8]> {
     if data.len() < MAGIC.len() + TRAILER.len() {
         return Err(StorageError::Db("not a rusts3 dump (too short)".into()));
     }
@@ -154,6 +147,71 @@ pub fn import<R: Read>(db: &Db, mut r: R, mode: ImportMode, managed_cfs: &[&str]
             "incomplete dump: end-of-stream marker missing or corrupt (truncated?)".into(),
         ));
     }
+    Ok(&data[MAGIC.len()..body_end])
+}
+
+/// Per-family shape of a dump for a staged import preview: row count plus up
+/// to [`SAMPLE_ROWS`] display names. Names are derived from row **keys** only
+/// — values, which can carry secrets, are never decoded.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PreviewFamily {
+    pub cf: String,
+    pub rows: u64,
+    pub samples: Vec<String>,
+}
+
+pub const SAMPLE_ROWS: usize = 10;
+
+/// Reads a dump and reports what an import would load, without touching any
+/// database: families in first-appearance order, each with its row count and
+/// key-derived sample names. Runs the same framing validation as
+/// [`import`], so a truncated or foreign file is rejected here, before the
+/// user is asked to confirm anything.
+pub fn preview<R: Read>(mut r: R) -> Result<Vec<PreviewFamily>> {
+    let mut data = Vec::new();
+    r.read_to_end(&mut data)?;
+    let mut cursor = dump_body(&data)?;
+    let mut families: Vec<PreviewFamily> = Vec::new();
+    let mut total = 0u64;
+    while !cursor.is_empty() {
+        let row = Row::decode_length_delimited(&mut cursor)
+            .map_err(|e| StorageError::Db(format!("protobuf decode (near row {total}): {e}")))?;
+        total += 1;
+        let family = match families.iter_mut().position(|f| f.cf == row.cf) {
+            Some(i) => &mut families[i],
+            None => {
+                families.push(PreviewFamily {
+                    cf: row.cf.clone(),
+                    ..Default::default()
+                });
+                families.last_mut().unwrap()
+            }
+        };
+        family.rows += 1;
+        if family.samples.len() < SAMPLE_ROWS {
+            // Composite keys (`user_groups` is `user\0group`) render with an
+            // arrow; simple keys pass through unchanged.
+            let display = String::from_utf8_lossy(&row.key)
+                .split('\0')
+                .collect::<Vec<_>>()
+                .join(" → ");
+            family.samples.push(display);
+        }
+    }
+    Ok(families)
+}
+
+/// Restores a dump into `db`. In [`ImportMode::Merge`] every row is upserted
+/// (`put`) and nothing else changes. In [`ImportMode::Replace`] every family in
+/// `managed_cfs` is erased first, so the result is exactly the dump (rows in the
+/// DB but not in the dump are dropped). The whole restore — erase plus load — is
+/// one atomic write batch. Row order in the dump does not matter: each row
+/// carries its own family and lands independently. Returns a per-family
+/// [`ImportReport`].
+pub fn import<R: Read>(db: &Db, mut r: R, mode: ImportMode, managed_cfs: &[&str]) -> Result<ImportReport> {
+    let mut data = Vec::new();
+    r.read_to_end(&mut data)?;
+    let body = dump_body(&data)?;
     let mut batch = WriteBatch::default();
     let mut report = ImportReport {
         mode: mode.label(),
@@ -177,7 +235,7 @@ pub fn import<R: Read>(db: &Db, mut r: R, mode: ImportMode, managed_cfs: &[&str]
         }
     }
 
-    let mut cursor: &[u8] = &data[MAGIC.len()..body_end];
+    let mut cursor: &[u8] = body;
     while !cursor.is_empty() {
         let row = Row::decode_length_delimited(&mut cursor).map_err(|e| {
             StorageError::Db(format!("protobuf decode (near row {}): {e}", report.total))
@@ -193,4 +251,72 @@ pub fn import<R: Read>(db: &Db, mut r: R, mode: ImportMode, managed_cfs: &[&str]
     wo.set_sync(true);
     db.write_opt(batch, &wo)?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-assembles a dump: magic + length-delimited rows + trailer.
+    fn make_dump(rows: &[(&str, &[u8], &[u8])]) -> Vec<u8> {
+        let mut out = Vec::from(MAGIC);
+        for (cf, key, value) in rows {
+            let row = Row {
+                cf: cf.to_string(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+            };
+            let mut buf = Vec::new();
+            row.encode_length_delimited(&mut buf).unwrap();
+            out.extend_from_slice(&buf);
+        }
+        out.extend_from_slice(&TRAILER);
+        out
+    }
+
+    #[test]
+    fn preview_counts_families_and_samples_keys_only() {
+        let mut rows: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+        for i in 0..14 {
+            rows.push((
+                "users".to_string(),
+                format!("user{i}").into_bytes(),
+                br#"{"password_hash":"SUPERSECRET"}"#.to_vec(),
+            ));
+        }
+        rows.push((
+            "user_groups".to_string(),
+            b"jack\0admins".to_vec(),
+            b"{}".to_vec(),
+        ));
+        let borrowed: Vec<(&str, &[u8], &[u8])> = rows
+            .iter()
+            .map(|(cf, k, v)| (cf.as_str(), k.as_slice(), v.as_slice()))
+            .collect();
+        let dump = make_dump(&borrowed);
+
+        let families = preview(dump.as_slice()).unwrap();
+        assert_eq!(families.len(), 2);
+        assert_eq!(families[0].cf, "users");
+        assert_eq!(families[0].rows, 14);
+        assert_eq!(families[0].samples.len(), SAMPLE_ROWS, "samples capped at {SAMPLE_ROWS}");
+        assert_eq!(families[0].samples[0], "user0");
+        assert_eq!(families[1].cf, "user_groups");
+        assert_eq!(families[1].samples, vec!["jack → admins"]);
+        // Secrets live in values; no sample may ever contain one.
+        let all = families
+            .iter()
+            .flat_map(|f| f.samples.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("SUPERSECRET"), "preview must never surface row values");
+    }
+
+    #[test]
+    fn preview_rejects_truncated_dump() {
+        let dump = make_dump(&[("users", b"jack".as_slice(), b"{}".as_slice())]);
+        assert!(preview(&dump[..dump.len() - 1]).is_err(), "missing trailer byte must fail");
+        assert!(preview(&dump[1..]).is_err(), "bad magic must fail");
+    }
 }

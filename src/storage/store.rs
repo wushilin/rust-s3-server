@@ -1869,7 +1869,7 @@ impl LocalObjectStore {
         let bucket = bucket.to_string();
         tokio::spawn(async move {
             log::info!("rebuild task started bucket={bucket}");
-            match store.rebuild_sqlite(&bucket).await {
+            match store.rebuild_index(&bucket).await {
                 Ok(count) => log::info!("rebuild complete bucket={bucket} objects={count}"),
                 Err(err) => log::error!("rebuild failed bucket={bucket} error={err}"),
             }
@@ -3288,7 +3288,7 @@ mod tests {
         let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
         store.index_cache.lock().unwrap().clear();
         let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
-        let count = store.rebuild_sqlite("bucket").await.unwrap();
+        let count = store.rebuild_index("bucket").await.unwrap();
         assert_eq!(count, 3);
         assert_eq!(read_body(&store, "bucket", "a/1").await, b"a/1");
         let page = store.list_objects("bucket", "", None, None, 10).await.unwrap();
@@ -3322,7 +3322,7 @@ mod tests {
 
         store.index_cache.lock().unwrap().clear();
         let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
-        let count = store.rebuild_sqlite("bucket").await.unwrap();
+        let count = store.rebuild_index("bucket").await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(read_body(&store, "bucket", "k").await, b"new");
         assert!(!dup_abs.exists(), "older duplicate must be trashed");

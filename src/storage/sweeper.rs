@@ -24,7 +24,6 @@ use tokio::task::yield_now;
 use super::errors::Result;
 use super::staging::epoch_ms_from_staging_id;
 use super::store::LocalObjectStore;
-use super::time::now_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepConfig {
@@ -256,6 +255,7 @@ fn path_age_ms(path: &Path, now: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::time::now_ms;
 
     /// Test convenience: all three maintenance purposes for one bucket at one
     /// evaluation time. Production drives the three entry points independently.

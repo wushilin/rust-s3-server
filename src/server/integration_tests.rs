@@ -3353,3 +3353,190 @@
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
+
+    // ---------------------------------------------------------------------------
+    // Virtual-hosted-style (host-style) access tests
+    // ---------------------------------------------------------------------------
+
+    /// Sends a SigV4-signed host-style request: the bucket rides in the Host
+    /// header (`<bucket>.<public_hostname>`) and the signed path has no bucket.
+    async fn host_style_signed_request(
+        app: axum::Router,
+        method: &str,
+        host: &str,
+        path: &str,
+        query: &str,
+        body: Body,
+    ) -> axum::response::Response {
+        let datetime = now_datetime();
+        let auth = crate::server::auth::compute_auth_header(
+            method,
+            path,
+            query,
+            host,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+        );
+        let uri = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", host)
+                .header("x-amz-date", &datetime)
+                .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                .header("authorization", auth)
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn host_style_put_get_list_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+        let host = format!("hs-bucket.{TEST_HOST}");
+
+        // Bucket created path-style; the two styles address the same bucket.
+        let res = signed_request(app.clone(), "PUT", "/hs-bucket", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // PUT via host-style: signed path is bucket-less.
+        let res = host_style_signed_request(
+            app.clone(),
+            "PUT",
+            &host,
+            "/hello.txt",
+            "",
+            Body::from("hello host-style"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "host-style PUT must succeed");
+
+        // GET via host-style.
+        let res =
+            host_style_signed_request(app.clone(), "GET", &host, "/hello.txt", "", Body::empty())
+                .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "hello host-style");
+
+        // List via host-style at the domain root.
+        let res = host_style_signed_request(
+            app.clone(),
+            "GET",
+            &host,
+            "/",
+            "list-type=2",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(body.contains("<Key>hello.txt</Key>"), "list must show the object: {body}");
+
+        // Path-style sees the same object.
+        let res = signed_request(
+            app.clone(),
+            "GET",
+            "/hs-bucket/hello.txt",
+            "",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "hello host-style");
+    }
+
+    #[tokio::test]
+    async fn host_style_host_with_port_still_resolves_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+        let host = format!("porty.{TEST_HOST}:8002");
+
+        let res = signed_request(app.clone(), "PUT", "/porty", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = host_style_signed_request(
+            app.clone(),
+            "PUT",
+            &host,
+            "/k.txt",
+            "",
+            Body::from("with port"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res =
+            host_style_signed_request(app.clone(), "GET", &host, "/k.txt", "", Body::empty())
+                .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_text(res).await, "with port");
+    }
+
+    #[tokio::test]
+    async fn host_style_presigned_get_verifies_original_path_and_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+        let host = format!("ps-hs.{TEST_HOST}");
+
+        let res = signed_request(app.clone(), "PUT", "/ps-hs", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = signed_request(
+            app.clone(),
+            "PUT",
+            "/ps-hs/secret.txt",
+            "",
+            Body::from("hs secret"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Presigned for the host-style shape: bucket in host, bucket-less path.
+        let datetime = now_datetime();
+        let qs = crate::server::auth::presign_query(
+            "GET",
+            "/secret.txt",
+            &host,
+            TEST_ACCESS_KEY,
+            TEST_SECRET_KEY,
+            TEST_REGION,
+            &datetime,
+            3600,
+            &[],
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/secret.txt?{qs}"))
+                    .header("host", &host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "host-style presigned GET must verify");
+        assert_eq!(body_text(res).await, "hs secret");
+    }
+
+    #[tokio::test]
+    async fn bare_public_hostname_stays_path_style() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_auth_app(&tmp);
+
+        // GET / on the bare public hostname is ListBuckets, not a bucket access.
+        let res = signed_request(app.clone(), "GET", "/", "", Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_text(res).await;
+        assert!(
+            body.contains("ListAllMyBucketsResult"),
+            "bare host must list buckets: {body}"
+        );
+    }

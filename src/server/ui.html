@@ -181,6 +181,22 @@
   tbody tr:last-child td { border-bottom:0; }
   tbody tr:hover td { background:#fbfcfd; }
   .actions { text-align:right; white-space:nowrap; }
+  .row-check { width:34px; }
+  .row-check input, #selAll { accent-color:var(--accent); cursor:pointer; vertical-align:middle; }
+  .file-pick { border:1.5px dashed var(--line); border-radius:10px; padding:16px; cursor:pointer; transition:border-color .15s, background .15s; }
+  .file-pick:hover, .file-pick.drag { border-color:var(--accent); background:rgba(37,99,235,.04); }
+  .file-pick-row { display:flex; align-items:center; gap:13px; }
+  .file-pick-icon { color:var(--accent); display:flex; }
+  .preview-card { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .preview-head { padding:12px 14px; background:rgba(0,0,0,.02); border-bottom:1px solid var(--line); display:flex; flex-direction:column; gap:2px; }
+  .preview-sec { border-bottom:1px solid var(--line); }
+  .preview-sec:last-of-type { border-bottom:0; }
+  .preview-sec summary { padding:10px 14px; cursor:pointer; font-weight:600; font-size:13px; list-style-position:inside; }
+  .preview-sec summary:hover { background:rgba(0,0,0,.02); }
+  .preview-body { padding:2px 14px 10px 30px; }
+  .preview-line { font-size:12.5px; padding:2.5px 0; font-variant-numeric:tabular-nums; }
+  .preview-actions { display:flex; align-items:center; gap:10px; padding:12px 14px; border-top:1px solid var(--line); background:rgba(0,0,0,.02); }
+  .preview-actions .muted { flex:1; font-size:12px; }
   .row-action { width:30px; height:30px; padding:0; border:0; border-radius:5px; display:inline-grid; place-items:center; background:transparent; color:var(--muted); cursor:pointer; }
   .row-action:hover { background:#edf1f5; color:var(--text); }
   .row-action.danger:hover { background:var(--danger-soft); color:var(--danger); }
@@ -198,8 +214,13 @@
   .bucket-item { width:100%; padding:10px 10px; margin-bottom:3px; display:flex; align-items:center; gap:9px; border:0; border-radius:6px; background:transparent; color:var(--muted); cursor:pointer; text-align:left; }
   .bucket-item:hover { background:#eef2f6; color:var(--text); }
   .bucket-item.active { background:#e9edf2; color:var(--text); font-weight:600; }
-  .bucket-item span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bucket-item span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .bucket-item .icon { color:var(--accent); }
+  .bucket-item .bucket-act { flex:none; opacity:0; }
+  .bucket-item:hover .bucket-act, .bucket-item.active .bucket-act { opacity:1; }
+  .mp-row { display:flex; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--line); }
+  .mp-row:last-child { border-bottom:0; }
+  .mp-row .file-icon { color:var(--accent); }
   .object-area { min-width:0; display:flex; flex-direction:column; background:#fff; }
   .object-head { min-height:62px; padding:10px 15px; display:flex; align-items:center; gap:8px; border-bottom:1px solid var(--line); }
   .crumbs { display:flex; min-width:0; align-items:center; gap:1px; overflow:hidden; }
@@ -412,18 +433,21 @@
             <div class="object-head">
               <div class="crumbs" id="crumbs"></div><span class="spacer"></span>
               <input type="file" id="fileInput" multiple class="hidden" onchange="uploadFiles(this.files)">
+              <input type="file" id="folderInput" webkitdirectory class="hidden" onchange="uploadFiles(this.files)">
               <button class="btn icon-only" data-admin-only id="rebuildBucketBtn" onclick="rebuildBucket()" title="Rebuild this bucket's index"><span data-icon="database"></span></button>
-              <button class="btn danger icon-only" id="deleteBucketBtn" onclick="confirmDeleteBucket()" title="Delete bucket"><span data-icon="trash"></span></button>
+              <button class="btn danger" id="bulkDeleteBtn" onclick="openBulkDelete()" title="Delete every object under a prefix"><span data-icon="trash"></span> Bulk Delete</button>
+              <button class="btn" id="uploadFolderBtn" onclick="$('folderInput').click()" title="Upload a folder and its contents"><span data-icon="folder"></span> Upload folder</button>
               <button class="btn primary" id="uploadBtn" onclick="$('fileInput').click()"><span data-icon="upload"></span> Upload</button>
             </div>
             <div class="toolbar object-toolbar">
               <div class="search"><span data-icon="search"></span><input id="objectSearch" placeholder="Filter objects in this folder" oninput="renderObjects()"><kbd>/</kbd></div>
               <span class="spacer"></span><span class="object-count" id="objectCount"></span>
+              <button class="btn danger small hidden" id="deleteSelectedBtn" onclick="confirmDeleteSelected()"></button>
               <button class="btn icon-only" onclick="loadObjects()" title="Refresh"><span data-icon="refresh"></span></button>
             </div>
             <div class="table-wrap" id="objectTableWrap">
               <table>
-                <thead><tr><th>Name</th><th class="hide-mobile" style="width:120px">Size</th><th class="hide-tablet" style="width:190px">Last modified</th><th style="width:122px"></th></tr></thead>
+                <thead><tr><th class="row-check"><input type="checkbox" id="selAll" onclick="toggleSelectAll(this.checked)" title="Select all loaded items"></th><th>Name</th><th class="hide-mobile" style="width:120px">Size</th><th class="hide-tablet" style="width:190px">Last modified</th><th style="width:122px"></th></tr></thead>
                 <tbody id="objRows"></tbody>
               </table>
               <div id="objectEmpty" class="empty hidden"></div>
@@ -471,12 +495,18 @@
         <div class="panel" style="margin-top:18px">
           <div class="panel-title"><div><h3>Import</h3><p>Restore from a dump produced by Export. The file is fully validated before anything is written, and applied atomically.</p></div></div>
           <div style="padding:20px">
-            <div class="field"><label for="importFile">Dump file</label><input class="input" type="file" id="importFile" accept=".rs3pb,application/octet-stream"></div>
-            <div class="field"><label>Mode</label>
-              <label style="display:flex;gap:9px;align-items:flex-start;font-weight:400;margin-bottom:8px;cursor:pointer"><input type="radio" name="importMode" value="merge" checked style="margin-top:3px"><span><strong>Merge</strong> — upsert rows from the dump; keep anything not present in it.</span></label>
-              <label style="display:flex;gap:9px;align-items:flex-start;font-weight:400;cursor:pointer"><input type="radio" name="importMode" value="replace" style="margin-top:3px"><span><strong>Replace</strong> — erase the IAM database first, then load. An exact restore; removes anything not in the dump.</span></label>
+            <div class="field"><label>Dump file</label>
+              <div class="file-pick" id="importPick" onclick="$('importFile').click()" ondragover="event.preventDefault();this.classList.add('drag')" ondragleave="this.classList.remove('drag')" ondrop="importDropFile(event)">
+                <input type="file" id="importFile" class="hidden" accept=".rs3pb,application/octet-stream" onchange="importFileChosen()">
+                <div class="file-pick-row" id="importPickEmpty"><span class="file-pick-icon" data-icon="upload"></span><div><strong>Choose a dump file</strong><div class="muted" style="font-size:12px">or drag &amp; drop a <code>.rs3pb</code> file here</div></div></div>
+                <div class="file-pick-row hidden" id="importPickInfo"><span class="file-pick-icon" data-icon="database"></span><div style="flex:1;min-width:0"><strong id="importPickName" style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></strong><div class="muted" style="font-size:12px" id="importPickSize"></div></div><button class="row-action" title="Remove file" onclick="event.stopPropagation();clearImportFile()"><span data-icon="x"></span></button></div>
+              </div>
             </div>
-            <button class="btn primary" id="importBtn" onclick="importIam()"><span data-icon="upload"></span> Import</button>
+            <div class="field"><label>Mode</label>
+              <label style="display:flex;gap:9px;align-items:flex-start;font-weight:400;margin-bottom:8px;cursor:pointer"><input type="radio" name="importMode" value="merge" checked style="margin-top:3px" onchange="window.updatePreviewModeNote&&updatePreviewModeNote()"><span><strong>Merge</strong> — upsert rows from the dump; keep anything not present in it.</span></label>
+              <label style="display:flex;gap:9px;align-items:flex-start;font-weight:400;cursor:pointer"><input type="radio" name="importMode" value="replace" style="margin-top:3px" onchange="window.updatePreviewModeNote&&updatePreviewModeNote()"><span><strong>Replace</strong> — erase the IAM database first, then load. An exact restore; removes anything not in the dump.</span></label>
+            </div>
+            <button class="btn primary" id="importBtn" onclick="importIam()"><span data-icon="search"></span> Review &amp; Import</button>
             <div id="importResult" class="hidden" style="margin-top:18px"></div>
           </div>
         </div>
@@ -530,6 +560,35 @@
     </div>
     <div class="dialog-actions"><button type="button" class="btn" id="emptyBucketCancel" onclick="emptyBucketDlg.close()">Cancel</button><button class="btn danger" id="emptyBucketAction" type="submit">Empty and delete</button></div>
   </form>
+</dialog>
+
+<dialog id="mpDlg">
+  <div class="dialog-head"><div><h3>Multipart uploads in <span id="mp_bucket"></span></h3><p>In-flight uploads that were started but not yet completed. Aborting discards the staged parts.</p></div><button class="dialog-close" onclick="mpDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-body"><div id="mpList"></div><div id="mpError" class="inline-error"></div></div>
+  <div class="dialog-actions"><button class="btn" onclick="loadMultipartUploads()"><span data-icon="refresh"></span> Refresh</button><button class="btn primary" onclick="mpDlg.close()">Close</button></div>
+</dialog>
+
+<dialog id="bulkPrefixDlg">
+  <form onsubmit="startBulkPrefixDelete(event)">
+    <div class="dialog-head"><div><h3>Bulk delete by prefix</h3><p id="bulkPrefixSubtitle"></p></div><button type="button" class="dialog-close" onclick="bulkPrefixDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body">
+      <div class="danger-callout">Every object whose key starts with this prefix is permanently deleted, recursively. This action cannot be undone.</div>
+      <div class="field" style="margin-top:17px"><label for="bulkPrefixInput">Prefix</label><input class="input" id="bulkPrefixInput" autocomplete="off" placeholder="folder/subfolder/"></div>
+      <div class="muted" style="font-size:11.5px">Plain string prefix: <code>photos/2024</code> also matches <code>photos/2024-old/…</code> — keep a trailing “/” to target exactly one folder. An empty prefix (the whole bucket) is not allowed.</div>
+      <div id="bulkPrefixError" class="inline-error"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="bulkPrefixDlg.close()">Cancel</button><button class="btn danger" type="submit">Bulk Delete</button></div>
+  </form>
+</dialog>
+
+<dialog id="bulkProgressDlg" oncancel="if(bulkRunning)event.preventDefault()">
+  <div class="dialog-head"><div><h3>Deleting objects</h3><p id="bulkProgressSubtitle"></p></div></div>
+  <div class="dialog-body">
+    <div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px"><span id="bulkProgressStatus">Preparing…</span><strong id="bulkProgressCount"></strong></div>
+    <div class="progress" style="height:7px"><span id="bulkProgressBar"></span></div>
+    <div id="bulkProgressError" class="inline-error"></div>
+  </div>
+  <div class="dialog-actions"><button type="button" class="btn" id="bulkProgressStop" onclick="stopBulkDelete()">Stop</button><button type="button" class="btn hidden" id="bulkProgressClose" onclick="bulkProgressDlg.close()">Close</button></div>
 </dialog>
 
 <dialog id="userDlg">
@@ -587,9 +646,13 @@
 
 <script src="/assets/core.js"></script>
 <script src="/assets/tasks.js"></script>
-<script src="/assets/objects.js"></script>
-<script src="/assets/iam.js"></script>
-<script src="/assets/backup.js"></script>
+<script src="/assets/object_management.js"></script>
+<script src="/assets/uploads.js"></script>
+<script src="/assets/users.js"></script>
+<script src="/assets/groups.js"></script>
+<script src="/assets/policy.js"></script>
+<script src="/assets/keys.js"></script>
+<script src="/assets/export_import.js"></script>
 <script src="/assets/main.js"></script>
 </body>
 </html>

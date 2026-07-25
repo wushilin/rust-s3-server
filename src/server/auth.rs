@@ -793,8 +793,11 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
     // header so verification is proxy-safe (the incoming Host header may have
     // been rewritten by a reverse proxy, but both client and server agree on
     // the configured public hostname).
+    // Host-style requests are detected from the Host header itself, so the
+    // host the client signed is exactly what arrived — never substitute it.
     let signed_headers: Vec<String> = signed_headers_str.split(';').map(str::to_string).collect();
-    let host_override: Option<HeaderMap> =
+    let host_style = request.extensions().get::<super::HostStyleRewrite>().is_some();
+    let host_override: Option<HeaderMap> = if host_style { None } else {
         state.config.auth.public_hostname.as_deref().and_then(|hostname| {
             if signed_headers
                 .iter()
@@ -808,7 +811,8 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
             } else {
                 None
             }
-        });
+        })
+    };
     let headers_for_canon = host_override.as_ref().unwrap_or_else(|| request.headers());
     for signed_header in &signed_headers {
         if signed_header.eq_ignore_ascii_case("host") {
@@ -822,7 +826,7 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
 
     // ── Build canonical request ────────────────────────────────────────────
     let method = request.method().as_str();
-    let uri = canonical_uri(request.uri().path());
+    let uri = canonical_uri(signed_path(request));
     let payload_hash = presigned_payload_hash(request.headers(), &signed_headers);
     let canonical = format!(
         "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\n{signed_hdrs_str}\n{payload_hash}"
@@ -921,13 +925,25 @@ fn percent_decode(s: &str) -> String {
 
 // ─── Canonical request construction ──────────────────────────────────────────
 
+/// The path the client actually signed. Virtual-hosted-style requests carry
+/// the bucket in the Host header and sign a bucket-less path; the rewrite
+/// middleware folds the bucket into the routing path but preserves the
+/// original in a [`super::HostStyleRewrite`] extension for verification.
+fn signed_path(request: &Request<Body>) -> &str {
+    request
+        .extensions()
+        .get::<super::HostStyleRewrite>()
+        .map(|r| r.original_path.as_str())
+        .unwrap_or_else(|| request.uri().path())
+}
+
 fn build_canonical_request(
     request: &Request<Body>,
     signed_headers: &[String],
     payload_hash: &str,
 ) -> String {
     let method = request.method().as_str();
-    let uri = canonical_uri(request.uri().path());
+    let uri = canonical_uri(signed_path(request));
     let query = canonical_query_string(request.uri().query().unwrap_or(""));
     let (canonical_hdrs, signed_hdrs_str) = canonical_headers(request.headers(), signed_headers);
 
