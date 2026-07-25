@@ -55,7 +55,20 @@ async function api(method,url,body) {
   return data;
 }
 function setInlineError(id,message=''){const el=$(id);el.textContent=message;el.classList.toggle('show',!!message);}
-function toast(title,message='',ok=true){const el=document.createElement('div');el.className='toast '+(ok?'ok':'err');el.innerHTML=`<span class="toast-symbol">${icons[ok?'shield':'info']}</span><div><strong>${esc(title)}</strong>${message?`<span>${esc(message)}</span>`:''}</div>`;$('toasts').append(el);setTimeout(()=>el.remove(),4200);}
+function positionToasts(){
+  const stack=$('toasts'),transfers=$('transferCenter');if(!stack||!transfers)return;
+  const base=parseFloat(getComputedStyle(transfers).bottom)||22;
+  const bottom=transfers.classList.contains('hidden')?base:base+transfers.getBoundingClientRect().height+12;
+  stack.style.setProperty('--toast-bottom',bottom+'px');
+}
+function toast(title,message='',ok=true){positionToasts();const el=document.createElement('div');el.className='toast '+(ok?'ok':'err');el.innerHTML=`<span class="toast-symbol">${icons[ok?'shield':'info']}</span><div><strong>${esc(title)}</strong>${message?`<span>${esc(message)}</span>`:''}</div>`;$('toasts').append(el);setTimeout(()=>el.remove(),4200);}
+const transferCenter=$('transferCenter');
+if(transferCenter){
+  new ResizeObserver(positionToasts).observe(transferCenter);
+  new MutationObserver(positionToasts).observe(transferCenter,{attributes:true,attributeFilter:['class']});
+  window.addEventListener('resize',positionToasts);
+  positionToasts();
+}
 function setBusy(button,busy,label){if(!button)return;if(busy){button.dataset.label=button.innerHTML;button.disabled=true;button.textContent=label||'Working…';}else{button.disabled=false;if(button.dataset.label)button.innerHTML=button.dataset.label;hydrateIcons(button);}}
 async function copyText(value){
   // Async Clipboard API only exists in secure contexts (HTTPS or localhost);
