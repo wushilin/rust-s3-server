@@ -42,21 +42,27 @@ deliberately out of scope.
   throughput and task progress; MinIO-compatible health and metrics paths.
 ## Screenshots
 
-### Management console
+### Login Screen
 
 <img width="1728" height="908" alt="Management console" src="https://github.com/user-attachments/assets/1505c045-4664-460d-b910-48ad6c3ce562" />
+
+### Object Browser
+
+<img width="1726" height="900" alt="image" src="https://github.com/user-attachments/assets/f3047bc9-7d65-4022-a8c3-903b20fb6b1f" />
 
 ### IAM and policies
 
 <img width="818" height="621" alt="IAM and policies" src="https://github.com/user-attachments/assets/b9755499-1cd0-415a-85d6-eadcac48f157" />
 
-### Object browser
-
-<img width="1728" height="907" alt="Object browser" src="https://github.com/user-attachments/assets/2c01dd4c-d65b-4a63-b959-c47de7e5a696" />
+### Policy builder
+<img width="762" height="505" alt="image" src="https://github.com/user-attachments/assets/4b667451-3a59-4db6-9027-4023541f9bd6" />
 
 ### Live tasks
 
 <img width="457" height="175" alt="Live tasks" src="https://github.com/user-attachments/assets/b8adaa59-d218-473d-9d15-d6af9954be63" />
+
+### Object scanner
+<img width="1082" height="799" alt="image" src="https://github.com/user-attachments/assets/06745c48-5660-4b3c-aed7-c1d0807ced2e" />
 
 ## The two surfaces
 
