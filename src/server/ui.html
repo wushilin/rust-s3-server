@@ -21,7 +21,7 @@
     <button class="nav-item" data-tab="keys"><span data-icon="key"></span> My Access Keys</button>
     <div class="nav-label" data-admin-only>Maintenance</div>
     <button class="nav-item" data-tab="backup" id="backupTabBtn" data-admin-only><span data-icon="database"></span> Backup &amp; Restore</button>
-    <div class="nav-label" data-admin-only>Performance</div>
+    <div class="nav-label" data-admin-only>Health &amp; Hygiene</div>
     <button class="nav-item" data-tab="perf" id="perfTabBtn" data-admin-only><span data-icon="activity"></span> Storage Scan</button>
     <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span></div></div></div>
   </aside>
@@ -137,7 +137,7 @@
         <div class="content-head">
           <div><h2>Storage Scan</h2><p>Reconcile the catalog against what is actually on disk: per-bucket usage, object health, and anything left unreferenced. The scan is read-only &mdash; every repair is a separate, explicit action.</p></div>
           <span class="spacer"></span>
-          <button class="btn primary" id="scanRunBtn" onclick="openScanWizard()"><span data-icon="activity"></span> Run Performance Scan</button>
+          <button class="btn primary" id="scanRunBtn" onclick="openScanWizard()"><span data-icon="activity"></span> Run Storage Scan</button>
         </div>
 
         <div class="panel hidden" id="scanLivePanel">
@@ -190,7 +190,7 @@
 </dialog>
 
 <dialog id="scanDlg">
-  <div class="dialog-head"><div><h3>Run performance scan</h3><p>The scan walks every object directory in the buckets you pick. It reads metadata and file sizes only &mdash; object contents are never read.</p></div><button type="button" class="dialog-close" onclick="scanDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-head"><div><h3>Run storage scan</h3><p>The scan walks every object directory in the buckets you pick. It reads metadata and file sizes only &mdash; object contents are never read.</p></div><button type="button" class="dialog-close" onclick="scanDlg.close()"><span data-icon="x"></span></button></div>
   <div class="dialog-body">
     <div class="field">
       <label>Buckets to scan</label>

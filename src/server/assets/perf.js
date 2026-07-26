@@ -1,4 +1,4 @@
-// ── performance / storage scan ─────────────────────────────────────────────
+// ── health & hygiene / storage scan ────────────────────────────────────────
 // Admin-only console for the storage health scan: start one over chosen
 // buckets, watch it live over its own WebSocket, read the reports it leaves
 // behind, and drive repairs from them.
