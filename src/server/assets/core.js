@@ -89,12 +89,13 @@ async function copyText(value){
 function showConfirm(title,subtitle,message,action,opts){opts=opts||{};$('confirmTitle').textContent=title;$('confirmSubtitle').textContent=subtitle;$('confirmMessage').textContent=message;const btn=$('confirmAction');const label=opts.confirmLabel||'Delete';btn.textContent=label;btn.classList.toggle('danger',opts.danger!==false);btn.classList.toggle('primary',opts.danger===false);btn.onclick=async()=>{setBusy(btn,true,opts.busyLabel||'Deleting…');try{await action();$('confirmDlg').close();}catch(e){toast('Action failed',e.message,false);}finally{setBusy(btn,false);btn.textContent=label;}};$('confirmDlg').showModal();}
 
 // ── session / app shell ──
-async function boot(){try{me=await api('GET','/api/me');onLoggedIn();}catch{$('loginView').classList.remove('hidden');}}
-async function login(event){event.preventDefault();setInlineError('li_msg');const btn=$('loginBtn');setBusy(btn,true,'Signing in…');try{me=await api('POST','/api/login',{username:$('li_user').value.trim(),password:$('li_pass').value});onLoggedIn();}catch(e){setInlineError('li_msg',e.message);setBusy(btn,false);}}
+// The console is only ever served to an established session — the server picks
+// between the login page and this one before it sends a byte — so boot() has no
+// signed-out branch and the shell never has to be revealed. If the session has
+// gone in the meantime, reloading lands on the login page.
+async function boot(){try{me=await api('GET','/api/me');onLoggedIn();}catch{location.reload();}}
 async function logout(){try{await api('POST','/api/logout');}finally{location.reload();}}
-function togglePassword(){const input=$('li_pass');input.type=input.type==='password'?'text':'password';}
 function onLoggedIn(){
-  $('loginView').classList.add('hidden');$('appView').classList.remove('hidden');
   document.body.classList.toggle('sidebar-collapsed',localStorage.getItem('sidebarCollapsed')==='1');
   $('whoami').textContent=me.username;$('userRole').textContent=me.is_admin?'Administrator':'IAM user';$('avatar').textContent=(me.username[0]||'U').toUpperCase();document.querySelectorAll('[data-admin-only]').forEach(el=>el.classList.toggle('hidden',!me.is_admin));
   showTab('objects');loadBuckets();pingServer();pingTimer=setInterval(pingServer,5000);

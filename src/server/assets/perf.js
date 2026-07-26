@@ -75,8 +75,12 @@ function connectScanWs(){
 function handleScanEvent(env){
   if(env.type==='finished'){
     scanLive=null;renderScanLive();
-    toast('Scan complete',`${env.findings_total} finding${env.findings_total===1?'':'s'}`,env.status==='completed');
-    loadScanHistory();if(env.report_id)openScanReport(env.report_id);
+    toast('Scan complete',`${env.findings_total} finding${env.findings_total===1?'':'s'} — open it from the history below`,env.status==='completed');
+    loadScanHistory();
+    // Deliberately not auto-opening the report: the operator may have moved on,
+    // and a dialog appearing over whatever they are doing is an interruption,
+    // not a feature. The new row at the top of the history has a View button.
+    if(env.report_id&&scanReportId===env.report_id&&$('reportDlg').open)openScanReport(env.report_id);
     return;
   }
   if(env.type==='repair_finished'){

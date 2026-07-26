@@ -140,8 +140,16 @@ pub fn router(state: UiState) -> Router {
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("ui.html"))
+/// The console and the login form are two documents, not one page that hides
+/// half of itself. The server already knows whether there is a session before
+/// it writes a byte, so it serves the right one — a refresh no longer paints
+/// the login screen for as long as `/api/me` takes to answer.
+async fn index(State(state): State<UiState>, headers: HeaderMap) -> Html<&'static str> {
+    if session_of(&state, &headers).is_some() {
+        Html(include_str!("ui.html"))
+    } else {
+        Html(include_str!("login.html"))
+    }
 }
 
 /// The standalone "open in a new tab" task monitor. It reuses the same
@@ -159,6 +167,15 @@ async fn tasks_page() -> Html<&'static str> {
 /// browser via ordered `<script src>` tags. Everything here is public client
 /// code (the API endpoints it calls do the authorization).
 async fn ui_asset(Path(file): Path<String>) -> Response {
+    // The stylesheet is shared by the login page and the console, so it lives
+    // in a file both link rather than inline in one of them.
+    if file == "ui.css" {
+        return (
+            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+            include_str!("assets/ui.css"),
+        )
+            .into_response();
+    }
     let body: &'static str = match file.as_str() {
         "core.js" => include_str!("assets/core.js"),
         "tasks.js" => include_str!("assets/tasks.js"),

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#07111f">
+<title>Sign in · RustS3</title>
+<link rel="stylesheet" href="/assets/ui.css">
+</head>
+<body>
+
+<section id="loginView">
+  <div class="login-panel">
+    <form class="login-box" onsubmit="login(event)">
+      <div class="brand"><span class="brand-mark" data-icon="layers"></span> RustS3</div>
+      <h1>Welcome back</h1>
+      <p class="login-copy">Sign in to manage buckets, objects, users, and access keys.</p>
+      <div class="field">
+        <label for="li_user">Username</label>
+        <input class="input" id="li_user" placeholder="Enter your username" autocomplete="username" autofocus>
+      </div>
+      <div class="field">
+        <label for="li_pass">Password</label>
+        <div class="password-wrap">
+          <input class="input" id="li_pass" type="password" placeholder="Enter your password" autocomplete="current-password">
+          <button class="password-toggle" type="button" onclick="togglePassword()" aria-label="Show password"><span><svg viewBox="0 0 24 24" class="icon"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></span></button>
+        </div>
+      </div>
+      <button class="btn primary" id="loginBtn" type="submit" style="width:100%;margin-top:5px">Sign in</button>
+      <div id="li_msg" class="inline-error"></div>
+      <div class="login-note"><span><svg viewBox="0 0 24 24" class="icon"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg></span><span>Console access uses your username and password. S3 clients authenticate separately with access keys.</span></div>
+    </form>
+  </div>
+  <div class="login-art">
+    <div class="art-content">
+      <div class="art-eyebrow">Object storage, under control</div>
+      <h2>A clear view of every object and every key.</h2>
+      <p>A focused console for managing S3-compatible storage without getting in your way.</p>
+      <div class="art-card">
+        <div class="art-stat"><span><svg viewBox="0 0 24 24" class="icon"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v7c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12v7c0 1.7 4 3 9 3s9-1.3 9-3v-7"/></svg></span><strong>Simple storage</strong><span>Browse every bucket</span></div>
+        <div class="art-stat"><span><svg viewBox="0 0 24 24" class="icon"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg></span><strong>Policy driven</strong><span>Control every user</span></div>
+        <div class="art-stat"><span><svg viewBox="0 0 24 24" class="icon"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/></svg></span><strong>Fast operations</strong><span>Upload and share</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+// Standalone: the login page shares no JavaScript with the console, so signing
+// in never pulls the console's modules in, and the console never has to render
+// a login form it will immediately hide.
+const $ = id => document.getElementById(id);
+function togglePassword(){const input=$('li_pass');input.type=input.type==='password'?'text':'password';}
+function setError(message){const el=$('li_msg');el.textContent=message||'';el.classList.toggle('show',!!message);}
+async function login(event){
+  event.preventDefault();
+  setError('');
+  const btn=$('loginBtn');
+  btn.disabled=true;btn.textContent='Signing in…';
+  try{
+    const resp=await fetch('/api/login',{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({username:$('li_user').value.trim(),password:$('li_pass').value}),
+    });
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Sign in failed');
+    // The server decides which page to serve from the session cookie, so a
+    // plain navigation lands on the console with no flash of anything else.
+    location.href='/';
+  }catch(err){
+    setError(err.message);
+    btn.disabled=false;btn.textContent='Sign in';
+  }
+}
+</script>
+</body>
+</html>
