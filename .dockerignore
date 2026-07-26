@@ -1,4 +1,8 @@
-target/
+# target/ is huge; the image build only needs the one prebuilt binary from it.
+target/*
+!target/release
+target/release/*
+!target/release/rusts3
 .git/
 rusts3-data/
 logs/
