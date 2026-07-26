@@ -145,6 +145,25 @@ impl StatsStore {
         .await
     }
 
+    /// Timestamps of the oldest and newest stored samples, or `None` when the
+    /// store is empty. Used to clamp a requested window to where data actually
+    /// exists, so a wide range doesn't render a mostly-empty chart.
+    pub async fn extent(&self) -> Result<Option<(i64, i64)>> {
+        let db = self.db.clone();
+        blocking(move || {
+            let cf = cf(&db, CF_SAMPLES)?;
+            let mut it = db.raw_iterator_cf(&cf);
+            it.seek_to_first();
+            let Some(first) = it.key().and_then(parse_key) else {
+                return Ok(None);
+            };
+            it.seek_to_last();
+            let last = it.key().and_then(parse_key).unwrap_or(first);
+            Ok(Some((first, last)))
+        })
+        .await
+    }
+
     /// Removes every sample older than `before_ms` in a single ranged delete.
     pub async fn prune(&self, before_ms: i64) -> Result<()> {
         let db = self.db.clone();

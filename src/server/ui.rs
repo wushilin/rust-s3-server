@@ -245,8 +245,29 @@ async fn stats_series(
         _ => return error_response(StatusCode::BAD_REQUEST, "invalid range"),
     };
     let points = query.points.unwrap_or(120).clamp(1, 1000);
-    let end = crate::storage::time::now_ms();
-    let start = end - span_ms;
+    let now = crate::storage::time::now_ms();
+    let mut start = now - span_ms;
+    let mut end = now;
+    // Clamp the requested window to where samples actually exist, so a wide
+    // range (e.g. 7d over 20 minutes of data) plots at full resolution over the
+    // available span instead of a mostly-empty axis. No overlap → leave the
+    // window as-is; the series comes back all-null and the UI shows an empty
+    // state.
+    if let Ok(Some((first, last))) = store.extent().await {
+        let clamped_start = start.max(first);
+        let clamped_end = end.min(last);
+        if clamped_start < clamped_end {
+            start = clamped_start;
+            end = clamped_end;
+        }
+    }
+
+    // Never ask for more buckets than there are samples in the window: bucketing
+    // finer than the sample interval just yields null gaps between lone points.
+    // Cap the count at roughly one bucket per sample so a short window still
+    // draws a continuous line.
+    let sample_ms = (state.config.stats.sample_secs.max(1) * 1000) as i64;
+    let points = (((end - start) / sample_ms) + 1).clamp(1, points as i64) as usize;
 
     let samples = match store.sample_series(start, end, points).await {
         Ok(s) => s,

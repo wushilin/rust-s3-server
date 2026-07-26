@@ -8,12 +8,41 @@
 <link rel="stylesheet" href="/assets/ui.css">
 <link rel="stylesheet" href="/assets/uPlot.min.css">
 <style>
-  /* Fit uPlot into the dark console. */
-  .chart{width:100%}
-  .u-legend{color:#94a3b8;font-size:12px;margin-top:2px}
-  .u-legend .u-marker{margin-right:5px}
-  .chart-grid{display:grid;gap:18px;grid-template-columns:1fr}
-  @media (min-width:1100px){.chart-grid{grid-template-columns:1fr 1fr}}
+  /* ── Runtime Stats dashboard ─────────────────────────────────────────── */
+  /* Range picker + refresh sit in one control group at a shared height so they
+     line up (the generic .input is 40px and .btn.small 31px — the mismatch). */
+  .stats-controls{display:flex;gap:8px;align-items:center}
+  .stats-select{height:34px;border:1px solid var(--line-strong);border-radius:7px;padding:0 30px 0 11px;background:var(--surface);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;
+    appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23647184' stroke-width='2'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;background-size:15px}
+  .stats-select:hover{border-color:#aeb8c5}
+  .stats-select:focus{border-color:var(--accent);box-shadow:var(--focus);outline:none}
+  .stats-controls .btn{min-height:34px}
+
+  .chart-grid{display:grid;gap:16px;grid-template-columns:1fr}
+  @media (min-width:1080px){.chart-grid{grid-template-columns:1fr 1fr}}
+
+  .stat-card{padding:0;overflow:hidden}
+  .stat-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:15px 18px 4px}
+  .stat-card-head h3{font-size:14px;margin:0;color:var(--text)}
+  .stat-card-head p{font-size:11.5px;color:var(--muted);margin:3px 0 0}
+  .stat-now{font-size:21px;font-weight:650;line-height:1.1;color:var(--text);font-variant-numeric:tabular-nums;letter-spacing:-.015em;white-space:nowrap}
+  .stat-now small{font-size:12px;font-weight:600;color:var(--muted);margin-left:2px}
+  .chart{width:100%;padding:2px 12px 10px}
+
+  /* uPlot chrome tuned for the light surface. The library's default legend is a
+     vertical table whose rows reflow as values change width — pin it to a
+     single wrapping row with tabular figures so its height never jumps (#4). */
+  .u-legend{display:flex;flex-wrap:wrap;gap:6px 16px;justify-content:flex-start;
+    min-height:22px;margin:2px 0 0;padding:7px 4px 0;border-top:1px solid var(--line);
+    font-size:11.5px;line-height:1.4}
+  .u-legend .u-series{display:inline-flex;align-items:center;cursor:pointer;padding:0}
+  .u-legend .u-series *{border:none!important}
+  .u-legend .u-marker{width:9px;height:9px;border-radius:3px;margin-right:6px}
+  .u-legend .u-label{color:var(--muted)}
+  .u-legend .u-value{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums;margin-left:6px;text-align:left}
+  .u-legend .u-off{opacity:.35}
+  .u-legend th,.u-legend td{padding:0;font-weight:inherit}
+  .stats-note{padding:22px;color:var(--muted);font-size:13px}
 </style>
 </head>
 <body>
@@ -177,24 +206,27 @@
 
       <section id="tab_stats" class="page hidden">
         <div class="content-head">
-          <div><h2>Runtime Stats</h2><p>Live system &amp; process health, sampled every few seconds. System CPU / disk figures are host-wide; process figures are exact.</p></div>
+          <div><h2>Runtime Stats</h2><p>Live system &amp; process health, sampled every few seconds. System CPU and disk figures are host-wide; process figures are exact.</p></div>
           <span class="spacer"></span>
-          <select class="input" id="statsRange" style="width:auto" onchange="statsSetRange(this.value)">
-            <option value="15m">Last 15 minutes</option>
-            <option value="1h">Last hour</option>
-            <option value="6h">Last 6 hours</option>
-            <option value="24h" selected>Last 24 hours</option>
-            <option value="7d">Last 7 days</option>
-          </select>
-          <button class="btn small" onclick="loadStats()"><span data-icon="refresh"></span> Refresh</button>
+          <div class="stats-controls">
+            <select class="stats-select" id="statsRange" onchange="statsSetRange(this.value)" aria-label="Time range">
+              <option value="15m">Last 15 minutes</option>
+              <option value="1h">Last hour</option>
+              <option value="6h">Last 6 hours</option>
+              <option value="24h" selected>Last 24 hours</option>
+              <option value="7d">Last 7 days</option>
+            </select>
+            <button class="btn" onclick="loadStats()"><span data-icon="refresh"></span> Refresh</button>
+          </div>
         </div>
-        <div id="statsDisabled" class="panel hidden" style="padding:20px"><p class="muted">Runtime stats are disabled in the server configuration (<code>stats.enabled: false</code>).</p></div>
-        <div class="chart-grid">
-          <div class="panel"><div class="panel-title"><div><h3>CPU</h3><p>System vs process, % of total.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartCpu"></div></div></div>
-          <div class="panel"><div class="panel-title"><div><h3>Memory</h3><p>Host used and this process's resident set.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartMem"></div></div></div>
-          <div class="panel"><div class="panel-title"><div><h3>Disk IO</h3><p>Process and host read / write throughput.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartDisk"></div></div></div>
-          <div class="panel"><div class="panel-title"><div><h3>Network (S3)</h3><p>Bytes in / out on the S3 API.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartNet"></div></div></div>
-          <div class="panel"><div class="panel-title"><div><h3>Requests</h3><p>S3 requests per second, all methods.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartQps"></div></div></div>
+        <div id="statsDisabled" class="panel hidden"><p class="stats-note">Runtime stats are disabled in the server configuration (<code>stats.enabled: false</code>).</p></div>
+        <div id="statsEmpty" class="panel hidden"><p class="stats-note">Collecting data… the first samples appear within a few seconds of startup.</p></div>
+        <div class="chart-grid" id="statsGrid">
+          <div class="panel stat-card"><div class="stat-card-head"><div><h3>CPU</h3><p>System vs process, % of total</p></div><div class="stat-now" id="nowCpu"></div></div><div class="chart" id="chartCpu"></div></div>
+          <div class="panel stat-card"><div class="stat-card-head"><div><h3>Memory</h3><p>Host used vs this process's RSS</p></div><div class="stat-now" id="nowMem"></div></div><div class="chart" id="chartMem"></div></div>
+          <div class="panel stat-card"><div class="stat-card-head"><div><h3>Disk IO</h3><p>Process and host read / write</p></div><div class="stat-now" id="nowDisk"></div></div><div class="chart" id="chartDisk"></div></div>
+          <div class="panel stat-card"><div class="stat-card-head"><div><h3>Network (S3)</h3><p>Bytes in / out on the S3 API</p></div><div class="stat-now" id="nowNet"></div></div><div class="chart" id="chartNet"></div></div>
+          <div class="panel stat-card"><div class="stat-card-head"><div><h3>Requests</h3><p>S3 requests per second, all methods</p></div><div class="stat-now" id="nowQps"></div></div><div class="chart" id="chartQps"></div></div>
         </div>
       </section>
     </main>
