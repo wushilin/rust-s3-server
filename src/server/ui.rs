@@ -235,8 +235,9 @@ async fn stats_series(
     let Some(store) = state.stats.clone() else {
         return Json(json!({ "enabled": false })).into_response();
     };
-    let range = query.range.as_deref().unwrap_or("24h");
+    let range = query.range.as_deref().unwrap_or("5m");
     let span_ms: i64 = match range {
+        "5m" => 5 * 60_000,
         "15m" => 15 * 60_000,
         "1h" => 60 * 60_000,
         "6h" => 6 * 60 * 60_000,

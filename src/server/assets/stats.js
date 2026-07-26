@@ -3,7 +3,7 @@
 // Admin-only tab; the /api/stats endpoint enforces that server-side. The server
 // downsamples to <=120 points and clamps the window to where data exists, so
 // this only ever draws a small, dense set — no empty expanses.
-let statsRange='24h', statsCharts=[], statsTimer=null, statsInited=false;
+let statsRange='5m', statsCharts=[], statsTimer=null, statsInited=false;
 
 // Categorical palette (light surface), validated colorblind-safe for adjacent
 // line pairs. Assigned in fixed order, never cycled.
