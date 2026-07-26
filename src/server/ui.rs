@@ -64,6 +64,7 @@ pub fn router(state: UiState) -> Router {
         .route("/", get(index))
         .route("/tasks", get(tasks_page))
         .route("/assets/:file", get(ui_asset))
+        .route("/favicon.ico", get(favicon))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
@@ -170,6 +171,18 @@ async fn tasks_page() -> Html<&'static str> {
 /// step, no bundler, no external requests — then stitched back together by the
 /// browser via ordered `<script src>` tags. Everything here is public client
 /// code (the API endpoints it calls do the authorization).
+/// The console favicon — the brand "layers" mark, embedded in the binary.
+async fn favicon() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/x-icon"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        axum::body::Bytes::from_static(include_bytes!("assets/favicon.ico")),
+    )
+        .into_response()
+}
+
 async fn ui_asset(Path(file): Path<String>) -> Response {
     // The stylesheet is shared by the login page and the console, so it lives
     // in a file both link rather than inline in one of them.
