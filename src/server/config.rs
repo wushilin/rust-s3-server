@@ -244,6 +244,42 @@ fn default_ui_port() -> u16 {
     8003
 }
 
+/// Runtime-stats sampling. The sampler snapshots CPU / memory / disk-IO (from
+/// `/proc`) and S3 throughput every `sample_secs` into a small RocksDB, pruned
+/// to `retention_days`. All optional so an absent `stats:` section just uses
+/// the defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsConfig {
+    #[serde(default = "default_stats_enabled")]
+    pub enabled: bool,
+    /// Sampling period in seconds. Clamped to a minimum of 1 at runtime.
+    #[serde(default = "default_stats_sample_secs")]
+    pub sample_secs: u64,
+    /// How long samples are kept before the retention prune removes them.
+    #[serde(default = "default_stats_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_stats_enabled(),
+            sample_secs: default_stats_sample_secs(),
+            retention_days: default_stats_retention_days(),
+        }
+    }
+}
+
+fn default_stats_enabled() -> bool {
+    true
+}
+fn default_stats_sample_secs() -> u64 {
+    5
+}
+fn default_stats_retention_days() -> u64 {
+    7
+}
+
 /// Root configuration object, deserialised from `config.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -259,6 +295,8 @@ pub struct AppConfig {
     pub sweeper: SweeperConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub stats: StatsConfig,
 }
 
 /// Deserializes a list of strings, dropping entries that were never filled in.
@@ -490,6 +528,7 @@ impl Default for AppConfig {
             auth: AuthConfig::default(),
             sweeper: SweeperConfig::default(),
             ui: UiConfig::default(),
+            stats: StatsConfig::default(),
         }
     }
 }

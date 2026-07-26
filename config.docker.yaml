@@ -69,3 +69,10 @@ ui:
   enabled: {{RUSTS3_UI_ENABLED:true}}
   bind_address: "{{RUSTS3_UI_BIND_ADDRESS:0.0.0.0}}"
   bind_port: {{RUSTS3_UI_PORT:8003}}
+
+stats:
+  # Runtime Stats dashboard: samples CPU/memory/disk-IO and S3 throughput into a
+  # small time-series database, pruned to retention_days.
+  enabled: {{RUSTS3_STATS_ENABLED:true}}
+  sample_secs: {{RUSTS3_STATS_SAMPLE_SECS:5}}
+  retention_days: {{RUSTS3_STATS_RETENTION_DAYS:7}}

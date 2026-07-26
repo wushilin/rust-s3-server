@@ -6,6 +6,15 @@
 <meta name="theme-color" content="#07111f">
 <title>RustS3 Console</title>
 <link rel="stylesheet" href="/assets/ui.css">
+<link rel="stylesheet" href="/assets/uPlot.min.css">
+<style>
+  /* Fit uPlot into the dark console. */
+  .chart{width:100%}
+  .u-legend{color:#94a3b8;font-size:12px;margin-top:2px}
+  .u-legend .u-marker{margin-right:5px}
+  .chart-grid{display:grid;gap:18px;grid-template-columns:1fr}
+  @media (min-width:1100px){.chart-grid{grid-template-columns:1fr 1fr}}
+</style>
 </head>
 <body>
 
@@ -23,6 +32,7 @@
     <button class="nav-item" data-tab="backup" id="backupTabBtn" data-admin-only><span data-icon="database"></span> Backup &amp; Restore</button>
     <div class="nav-label" data-admin-only>Health &amp; Hygiene</div>
     <button class="nav-item" data-tab="perf" id="perfTabBtn" data-admin-only><span data-icon="activity"></span> Storage Scan</button>
+    <button class="nav-item" data-tab="stats" id="statsTabBtn" data-admin-only><span data-icon="zap"></span> Runtime Stats</button>
     <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span></div></div></div>
   </aside>
 
@@ -163,6 +173,29 @@
           <div id="scanHistory"></div>
         </div>
 
+      </section>
+
+      <section id="tab_stats" class="page hidden">
+        <div class="content-head">
+          <div><h2>Runtime Stats</h2><p>Live system &amp; process health, sampled every few seconds. System CPU / disk figures are host-wide; process figures are exact.</p></div>
+          <span class="spacer"></span>
+          <select class="input" id="statsRange" style="width:auto" onchange="statsSetRange(this.value)">
+            <option value="15m">Last 15 minutes</option>
+            <option value="1h">Last hour</option>
+            <option value="6h">Last 6 hours</option>
+            <option value="24h" selected>Last 24 hours</option>
+            <option value="7d">Last 7 days</option>
+          </select>
+          <button class="btn small" onclick="loadStats()"><span data-icon="refresh"></span> Refresh</button>
+        </div>
+        <div id="statsDisabled" class="panel hidden" style="padding:20px"><p class="muted">Runtime stats are disabled in the server configuration (<code>stats.enabled: false</code>).</p></div>
+        <div class="chart-grid">
+          <div class="panel"><div class="panel-title"><div><h3>CPU</h3><p>System vs process, % of total.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartCpu"></div></div></div>
+          <div class="panel"><div class="panel-title"><div><h3>Memory</h3><p>Host used and this process's resident set.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartMem"></div></div></div>
+          <div class="panel"><div class="panel-title"><div><h3>Disk IO</h3><p>Process and host read / write throughput.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartDisk"></div></div></div>
+          <div class="panel"><div class="panel-title"><div><h3>Network (S3)</h3><p>Bytes in / out on the S3 API.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartNet"></div></div></div>
+          <div class="panel"><div class="panel-title"><div><h3>Requests</h3><p>S3 requests per second, all methods.</p></div></div><div style="padding:12px 14px"><div class="chart" id="chartQps"></div></div></div>
+        </div>
       </section>
     </main>
   </div>
@@ -333,6 +366,8 @@
 <script src="/assets/keys.js"></script>
 <script src="/assets/export_import.js"></script>
 <script src="/assets/perf.js"></script>
+<script src="/assets/uPlot.iife.min.js"></script>
+<script src="/assets/stats.js"></script>
 <script src="/assets/main.js"></script>
 </body>
 </html>

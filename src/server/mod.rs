@@ -16,6 +16,8 @@ pub mod policy;
 pub mod range;
 pub mod registry;
 pub mod scan_store;
+pub mod stats_store;
+pub mod sysstat;
 pub mod template;
 pub mod ui;
 pub mod xml;
@@ -191,6 +193,17 @@ impl TrafficMetrics {
             self.bytes_in.load(Ordering::Relaxed),
             self.bytes_out.load(Ordering::Relaxed),
         )
+    }
+
+    /// Total requests seen across every method since start. Used by the runtime
+    /// stats sampler to derive QPS from successive samples.
+    pub(crate) fn request_total_count(&self) -> u64 {
+        self.get_requests.load(Ordering::Relaxed)
+            + self.put_requests.load(Ordering::Relaxed)
+            + self.head_requests.load(Ordering::Relaxed)
+            + self.delete_requests.load(Ordering::Relaxed)
+            + self.post_requests.load(Ordering::Relaxed)
+            + self.other_requests.load(Ordering::Relaxed)
     }
 
     fn snapshot(&self) -> TrafficSnapshot {
@@ -900,6 +913,22 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         let scans = jobs::perf_scan::ScanService::new(
             scan_store::ScanStore::open(FsPath::new(&config.root)).await?,
         );
+        // Runtime stats: its own time-series database and a 5s sampler feeding
+        // it. Disabled by config means no store is opened and no sampler runs;
+        // the UI endpoint then reports the feature as off.
+        let stats = if config.app_config.stats.enabled {
+            let stats_db = stats_store::StatsStore::open(FsPath::new(&config.root)).await?;
+            sysstat::spawn_sampler(
+                stats_db.clone(),
+                metrics.clone(),
+                config.app_config.stats.clone(),
+                shutdown.clone(),
+            );
+            Some(stats_db)
+        } else {
+            log::info!("runtime stats disabled by config");
+            None
+        };
         let ui_state = ui::UiState {
             store: store.clone(),
             iam,
@@ -907,6 +936,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             metrics: metrics.clone(),
             tasks: tasks.clone(),
             scans,
+            stats,
         };
         let ui_bind = format!(
             "{}:{}",

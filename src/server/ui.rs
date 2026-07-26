@@ -46,6 +46,8 @@ pub struct UiState {
     pub(crate) tasks: Arc<super::registry::TaskRegistry>,
     /// Storage health scans: their history, and the live-progress channel.
     pub(crate) scans: Arc<super::jobs::perf_scan::ScanService>,
+    /// Runtime stats time-series. `None` when the feature is disabled by config.
+    pub(crate) stats: Option<super::stats_store::StatsStore>,
 }
 
 /// A resolved UI session. Managed admin membership is resolved on every
@@ -131,6 +133,8 @@ pub fn router(state: UiState) -> Router {
         )
         .route("/api/perf/scans/:id/findings", get(list_scan_findings))
         .route("/api/perf/scans/:id/repair", post(repair_findings))
+        // Runtime stats (admin only): a single read-only, downsampled series.
+        .route("/api/stats/series", get(stats_series))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
         // Outermost: give every UI request a correlation id (echoed back as
         // `x-amz-request-id`) and an access-log line — the same tracing/audit
@@ -176,6 +180,14 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
         )
             .into_response();
     }
+    // Vendored uPlot stylesheet for the Runtime Stats charts.
+    if file == "uPlot.min.css" {
+        return (
+            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+            include_str!("assets/uPlot.min.css"),
+        )
+            .into_response();
+    }
     let body: &'static str = match file.as_str() {
         "core.js" => include_str!("assets/core.js"),
         "tasks.js" => include_str!("assets/tasks.js"),
@@ -187,6 +199,9 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
         "keys.js" => include_str!("assets/keys.js"),
         "export_import.js" => include_str!("assets/export_import.js"),
         "perf.js" => include_str!("assets/perf.js"),
+        // Vendored charting library (single IIFE build) + the stats tab logic.
+        "uPlot.iife.min.js" => include_str!("assets/uPlot.iife.min.js"),
+        "stats.js" => include_str!("assets/stats.js"),
         "main.js" => include_str!("assets/main.js"),
         _ => return error_response(StatusCode::NOT_FOUND, "asset not found"),
     };
@@ -195,6 +210,100 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
         body,
     )
         .into_response()
+}
+
+// ── runtime stats ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    range: Option<String>,
+    points: Option<usize>,
+}
+
+/// Runtime-stats series for a time range, downsampled server-side to at most
+/// `points` (default 120) aligned buckets. **Admin only, strictly read-only.**
+/// The `range` is whitelisted and `points` clamped so a crafted request can
+/// never force an unbounded scan or payload.
+async fn stats_series(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
+) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    let Some(store) = state.stats.clone() else {
+        return Json(json!({ "enabled": false })).into_response();
+    };
+    let range = query.range.as_deref().unwrap_or("24h");
+    let span_ms: i64 = match range {
+        "15m" => 15 * 60_000,
+        "1h" => 60 * 60_000,
+        "6h" => 6 * 60 * 60_000,
+        "24h" => 24 * 60 * 60_000,
+        "7d" => 7 * 24 * 60 * 60_000,
+        _ => return error_response(StatusCode::BAD_REQUEST, "invalid range"),
+    };
+    let points = query.points.unwrap_or(120).clamp(1, 1000);
+    let end = crate::storage::time::now_ms();
+    let start = end - span_ms;
+
+    let samples = match store.sample_series(start, end, points).await {
+        Ok(s) => s,
+        Err(err) => return storage_error(err),
+    };
+
+    // Columnar, µPlot-friendly: `data[0]` is the time axis (unix seconds), each
+    // subsequent array aligns index-for-index; empty buckets are null (gaps).
+    let span = (end - start).max(1) as i128;
+    let time: Vec<Value> = (0..points)
+        .map(|i| {
+            let bucket_start = start as i128 + span * i as i128 / points as i128;
+            json!((bucket_start as f64) / 1000.0)
+        })
+        .collect();
+    macro_rules! col {
+        ($f:ident) => {
+            samples
+                .iter()
+                .map(|s| match s {
+                    Some(v) => json!(v.$f),
+                    None => Value::Null,
+                })
+                .collect::<Vec<Value>>()
+        };
+    }
+    let data = json!([
+        time,
+        col!(cpu_sys),
+        col!(cpu_proc),
+        col!(mem_used),
+        col!(mem_total),
+        col!(mem_proc_rss),
+        col!(disk_proc_r),
+        col!(disk_proc_w),
+        col!(disk_sys_r),
+        col!(disk_sys_w),
+        col!(net_in),
+        col!(net_out),
+        col!(qps),
+    ]);
+    let mut response = Json(json!({
+        "enabled": true,
+        "range": range,
+        "sample_secs": state.config.stats.sample_secs,
+        "labels": [
+            "time", "cpu_sys", "cpu_proc", "mem_used", "mem_total", "mem_proc_rss",
+            "disk_proc_r", "disk_proc_w", "disk_sys_r", "disk_sys_w", "net_in", "net_out", "qps"
+        ],
+        "data": data,
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static cache-control value"),
+    );
+    response
 }
 
 // ── request tracing ──────────────────────────────────────────────────────────

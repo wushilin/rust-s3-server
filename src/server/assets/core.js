@@ -105,12 +105,12 @@ function onLoggedIn(){
 }
 function toggleSidebar(){const c=document.body.classList.toggle('sidebar-collapsed');localStorage.setItem('sidebarCollapsed',c?'1':'0');}
 function toggleProfile(){$('profilePopover').classList.toggle('hidden');}
-const pageMeta={objects:['Object Browser','Manage buckets and objects'],users:['IAM Users','Manage users and policies'],groups:['IAM Groups','Reuse policies and assign administrative access'],keys:['My Access Keys','Manage your application credentials'],backup:['Backup & Restore','Export and import the global IAM database'],perf:['Storage Scan','Audit disk usage and object health, and repair what it finds']};
+const pageMeta={objects:['Object Browser','Manage buckets and objects'],users:['IAM Users','Manage users and policies'],groups:['IAM Groups','Reuse policies and assign administrative access'],keys:['My Access Keys','Manage your application credentials'],backup:['Backup & Restore','Export and import the global IAM database'],perf:['Storage Scan','Audit disk usage and object health, and repair what it finds'],stats:['Runtime Stats','System & process health over time']};
 function showTab(tab){
-  if((tab==='users'||tab==='groups'||tab==='backup'||tab==='perf')&&!me?.is_admin)return;
+  if((tab==='users'||tab==='groups'||tab==='backup'||tab==='perf'||tab==='stats')&&!me?.is_admin)return;
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
-  ['objects','users','groups','keys','backup','perf'].forEach(t=>$('tab_'+t).classList.toggle('hidden',t!==tab));
+  ['objects','users','groups','keys','backup','perf','stats'].forEach(t=>$('tab_'+t).classList.toggle('hidden',t!==tab));
   $('pageTitle').textContent=pageMeta[tab][0];$('pageSubtitle').textContent=pageMeta[tab][1];closeDetails();
-  if(tab==='users')loadUsers();if(tab==='groups')loadGroups();if(tab==='keys')loadMyKeys();if(tab==='backup')resetBackupPanel();if(tab==='perf')initPerf();
+  if(tab==='users')loadUsers();if(tab==='groups')loadGroups();if(tab==='keys')loadMyKeys();if(tab==='backup')resetBackupPanel();if(tab==='perf')initPerf();if(tab==='stats')initStats();
 }
 async function pingServer(){try{const resp=await fetch('/api/ping',{cache:'no-store'});const data=await resp.json().catch(()=>({}));if(!resp.ok){if(resp.status===401&&me)location.reload();throw new Error('ping failed');}$('serverState').classList.remove('offline');$('serverStateText').textContent='Server connected';$('serverVersion').textContent='RustS3 v'+data.version;}catch{$('serverState').classList.add('offline');$('serverStateText').textContent='Connection interrupted';}}
