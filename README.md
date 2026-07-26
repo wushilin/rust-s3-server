@@ -183,6 +183,39 @@ single field can be overridden with `-e` — there is no separate list of
 environment bindings to keep in step with the config schema, because the config
 file *is* the list.
 
+That short form is one *provider* — `env` — with its name left implicit. The
+general shape is `{{provider<sep>param<sep>param…}}`, where the character
+immediately after the provider name is the separator, so a value containing
+colons can choose something else:
+
+```text
+{{RUSTS3_PORT:8002}}            shorthand: env lookup with a default
+{{env:RUSTS3_PORT:8002}}        the same thing, said explicitly
+{{env|DSN|postgres://h:5432}}   separator '|', so the colons are data
+{{upper:env:RUSTS3_REGION}}     transforms compose with lookups
+{{lower$env$RUSTS3_ADMIN_USER}} any single character works as the separator
+```
+
+The first segment is taken as a provider only if it *both* matches
+`[A-Za-z_]+` — letters and underscores, no digits — and names a registered
+provider. Failing either test, the placeholder falls back to the `env`
+shorthand. So `{{a:b}}` is `$a` defaulting to `b` unless `a` is a registered
+provider, and a name like `RUSTS3_PORT` cannot be read as a call at all,
+because the digit disqualifies it before the registry is consulted.
+
+Everything after the first separator is the last parameter, so in `{{a:b:c:d}}`
+the default is `b:c:d`.
+
+Providers today are `env`, `upper` and `lower`. Parameters beyond what a
+provider uses are accepted and ignored, so the calling convention can grow
+without breaking existing files. Adding a provider — a secret store, a file
+reader, an instance-metadata lookup — means implementing `Resolver` and
+registering it; a resolver is handed the whole call, including the registry, so
+it can resolve nested calls the way `upper` does above.
+
+If you genuinely have an environment variable named after a provider, name the
+provider explicitly to disambiguate: `{{env:ENV}}` reads `$ENV`.
+
 `{{NAME}}` without a default is **required**: if it is unset the server refuses
 to start and names the variable. Delete the defaults from the `auth` entries in
 `config.docker.yaml` if you would rather the container fail than come up with
