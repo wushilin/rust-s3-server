@@ -149,11 +149,100 @@ rusts3 validate [-c FILE]              Validate configuration and exit
 rusts3 genpassword [--cost N]          Generate a bcrypt console password
 rusts3 verifypassword [HASH]           Verify a bcrypt console password
 rusts3 init                            Write a config.yaml with every option at its default
+rusts3 healthcheck [-c FILE]           Probe a running server; exit non-zero if unhealthy
 ```
 
 Running `rusts3` without a subcommand remains supported: it uses built-in
 defaults, or the file supplied with the legacy `-c` option. Only one process
 may own a data directory; rusts3 enforces this with `<base_dir>/.rusts3.lock`.
+
+## Containers
+
+```bash
+docker build -t rusts3:latest .
+docker run -d --name rusts3 \
+  -p 8002:8002 -p 8003:8003 \
+  -v rusts3-data:/data \
+  -e RUSTS3_ADMIN_PASSWORD=change-me \
+  -e RUSTS3_ACCESS_KEY=myaccesskey -e RUSTS3_SECRET_KEY=mysecretkey \
+  rusts3:latest
+```
+
+The image ships `config.docker.yaml` at `/etc/rusts3/config.yaml`, in which
+every value is a placeholder:
+
+```yaml
+server:
+  bind_port: {{RUSTS3_PORT:8002}}
+  base_dir: "{{RUSTS3_DATA_DIR:/data}}"
+```
+
+`{{NAME:default}}` expands to `$NAME` when it is set and non-empty, and to
+`default` otherwise. So the image runs with no configuration at all, and any
+single field can be overridden with `-e` — there is no separate list of
+environment bindings to keep in step with the config schema, because the config
+file *is* the list.
+
+`{{NAME}}` without a default is **required**: if it is unset the server refuses
+to start and names the variable. Delete the defaults from the `auth` entries in
+`config.docker.yaml` if you would rather the container fail than come up with
+known credentials.
+
+Substitution is textual and happens before the YAML is parsed, so quote a
+placeholder whose value might contain spaces or YAML punctuation — as the
+shipped file does.
+
+To go further than individual overrides, mount your own file over
+`/etc/rusts3/config.yaml`; placeholders in it are expanded the same way.
+
+### Storage
+
+`/data` holds everything durable: buckets, the IAM database, scan history and
+logs. A named volume is the simplest thing that works — the runtime creates it
+with the ownership the image expects.
+
+A **host directory** needs one extra thought, because the image runs as a
+non-root user (uid 10001). Either give that uid ownership of the directory:
+
+```bash
+sudo chown -R 10001:10001 /srv/rusts3
+docker run -d -v /srv/rusts3:/data ... rusts3:latest
+```
+
+or run the container as a user that already owns it:
+
+```bash
+docker run -d -v /srv/rusts3:/data --user "$(id -u):$(id -g)" ... rusts3:latest
+```
+
+Getting this wrong is not mysterious — the server names the directory and the
+uid it was running as, and tells you both remedies.
+
+### Health and shutdown
+
+`HEALTHCHECK` runs `rusts3 healthcheck`, which reads the same config the server
+did (so it probes whatever port is actually configured) and requests the
+unauthenticated `/minio/health/live`. It needs no `curl` in the image. Podman
+ignores `HEALTHCHECK` unless the image is built with `--format docker`.
+
+The server handles `SIGTERM` as well as `SIGINT`, which is what makes
+`docker stop` clean rather than a ten-second wait followed by `SIGKILL` — in a
+container the entrypoint is PID 1, and PID 1 does not get default signal
+handling from the kernel. In-flight connections are given a few seconds to
+drain and then the process exits regardless, so a client holding a keep-alive
+socket cannot delay a stop.
+
+### Testing an image
+
+`docker-test.sh` starts the image and drives it with the AWS CLI: credentials
+and ports from the environment, bucket lifecycle, single and multipart
+round-trips compared byte for byte, ranged reads, server-side copy, prefix and
+delimiter listing, presigned download, a restart to prove the volume is
+durable, and deletion. It works with docker or podman.
+
+```bash
+./docker-test.sh
+```
 
 ## Configuration
 
