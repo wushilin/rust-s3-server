@@ -18,6 +18,8 @@ pub(crate) mod delete_staging;
 pub(crate) mod delete_trash;
 #[path = "migrate_layout/lib.rs"]
 pub(crate) mod migrate_layout;
+#[path = "perf_scan/lib.rs"]
+pub(crate) mod perf_scan;
 #[path = "reclaim/lib.rs"]
 pub(crate) mod reclaim;
 #[path = "rebuild_index/lib.rs"]

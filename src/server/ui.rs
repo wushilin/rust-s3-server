@@ -15,7 +15,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::auth::presign_query;
 use super::config::AppConfig;
@@ -44,6 +44,8 @@ pub struct UiState {
     pub config: Arc<AppConfig>,
     pub(crate) metrics: Arc<TrafficMetrics>,
     pub(crate) tasks: Arc<super::registry::TaskRegistry>,
+    /// Storage health scans: their history, and the live-progress channel.
+    pub(crate) scans: Arc<super::jobs::perf_scan::ScanService>,
 }
 
 /// A resolved UI session. Managed admin membership is resolved on every
@@ -114,6 +116,18 @@ pub fn router(state: UiState) -> Router {
         .route("/api/tasks", get(list_tasks))
         .route("/api/tasks/ws", get(tasks_ws))
         .route("/api/tasks/:id/cancel", post(cancel_task))
+        // Storage health scan (admin only). The scan itself is a registry
+        // verb; these routes start it, stream its progress, and serve the
+        // reports it leaves behind.
+        .route("/api/perf/scan", get(scan_state).post(start_scan))
+        .route("/api/perf/scan/ws", get(scan_ws))
+        .route("/api/perf/scans", get(list_scan_reports))
+        .route(
+            "/api/perf/scans/:id",
+            get(get_scan_report).delete(delete_scan_report),
+        )
+        .route("/api/perf/scans/:id/findings", get(list_scan_findings))
+        .route("/api/perf/scans/:id/repair", post(repair_findings))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
         // Outermost: give every UI request a correlation id (echoed back as
         // `x-amz-request-id`) and an access-log line — the same tracing/audit
@@ -152,6 +166,7 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
         "policy.js" => include_str!("assets/policy.js"),
         "keys.js" => include_str!("assets/keys.js"),
         "export_import.js" => include_str!("assets/export_import.js"),
+        "perf.js" => include_str!("assets/perf.js"),
         "main.js" => include_str!("assets/main.js"),
         _ => return error_response(StatusCode::NOT_FOUND, "asset not found"),
     };
@@ -171,7 +186,13 @@ fn is_audit_noise(path: &str) -> bool {
     path.starts_with("/assets/")
         || matches!(
             path,
-            "/" | "/tasks" | "/api/ping" | "/api/me" | "/api/tasks" | "/api/tasks/ws"
+            "/" | "/tasks"
+                | "/api/ping"
+                | "/api/me"
+                | "/api/tasks"
+                | "/api/tasks/ws"
+                | "/api/perf/scan"
+                | "/api/perf/scan/ws"
         )
 }
 
@@ -1930,6 +1951,389 @@ async fn cancel_task(
             error_response(StatusCode::NOT_FOUND, "Task not found or already finished")
         }
     }
+}
+
+// ── storage health scan ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StartScanRequest {
+    /// Buckets to scan, chosen in the console's wizard. Empty means all.
+    #[serde(default)]
+    buckets: Vec<String>,
+}
+
+/// Starts a scan. Admin-only and deliberately exclusive: a scan walks every
+/// object dir in the selected buckets, so a second concurrent run would just
+/// compete for the same disks.
+async fn start_scan(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(req): Json<StartScanRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    // Resolve the selection against reality, so a stale console can't ask for a
+    // bucket that no longer exists.
+    let existing: Vec<String> = match state.store.list_buckets().await {
+        Ok(buckets) => buckets.into_iter().map(|(name, _)| name).collect(),
+        Err(err) => return storage_error(err),
+    };
+    let buckets: Vec<String> = if req.buckets.is_empty() {
+        existing
+    } else {
+        let selected: Vec<String> = req
+            .buckets
+            .iter()
+            .filter(|name| existing.contains(name))
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            return error_response(StatusCode::BAD_REQUEST, "no such bucket");
+        }
+        selected
+    };
+    if buckets.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "there are no buckets to scan");
+    }
+
+    match super::jobs::perf_scan::spawn(
+        state.store.clone(),
+        state.scans.clone(),
+        state.tasks.clone(),
+        buckets.clone(),
+        session.username.clone(),
+    ) {
+        Some(report_id) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                "storage_scan",
+                format!("{} bucket(s)", buckets.len()),
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "report_id": report_id, "buckets": buckets })),
+            )
+                .into_response()
+        }
+        None => error_response(
+            StatusCode::CONFLICT,
+            "a storage scan or repair is already running",
+        ),
+    }
+}
+
+/// Live state without a WebSocket — the console's fallback, and a plain way to
+/// ask "is anything running right now".
+async fn scan_state(State(state): State<UiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    Json(state.scans.snapshot()).into_response()
+}
+
+/// Progress stream for the Performance page. Its own channel, separate from
+/// `/api/tasks/ws`: that one carries one status string per task, this carries
+/// the structured per-phase counters the scan page renders.
+async fn scan_ws(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if require_root(&state, &headers).is_err() {
+        return error_response(StatusCode::UNAUTHORIZED, "admin only");
+    }
+    ws.on_upgrade(move |socket| scan_socket(socket, state))
+}
+
+async fn scan_socket(mut socket: WebSocket, state: UiState) {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut events = state.scans.subscribe();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    // Connect mid-scan and you see progress immediately, not at the next tick.
+    if socket
+        .send(Message::Text(state.scans.snapshot().to_string()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if socket.send(Message::Text(state.scans.snapshot().to_string())).await.is_err() { break; }
+            }
+            recv = events.recv() => {
+                match recv {
+                    Err(RecvError::Closed) => break,
+                    Ok(event) => {
+                        if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+                    }
+                    // Fell behind the publisher — resync from current state.
+                    Err(RecvError::Lagged(_)) => {
+                        if socket.send(Message::Text(state.scans.snapshot().to_string())).await.is_err() { break; }
+                    }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(_)) => {}   // the client has nothing to say
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ScanListQuery {
+    #[serde(default = "default_scan_history")]
+    limit: usize,
+}
+
+fn default_scan_history() -> usize {
+    25
+}
+
+async fn list_scan_reports(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Query(query): Query<ScanListQuery>,
+) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    match state.scans.store().list_reports(query.limit.clamp(1, 200)).await {
+        Ok(reports) => Json(json!({
+            "now_ms": crate::storage::time::now_ms(),
+            "running": state.scans.busy(),
+            "reports": reports.iter().map(scan_report_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
+async fn get_scan_report(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    let report = match state.scans.store().get_report(&id).await {
+        Ok(Some(report)) => report,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "no such scan report"),
+        Err(err) => return storage_error(err),
+    };
+    // Findings live in their own family; the per-state tally is what tells the
+    // operator how much of an old report is still outstanding.
+    let states = state
+        .scans
+        .store()
+        .state_counts(&id)
+        .await
+        .unwrap_or_default();
+    let mut body = scan_report_json(&report);
+    body["buckets"] = serde_json::to_value(&report.buckets).unwrap_or(Value::Null);
+    body["finding_states"] = json!(states);
+    body["now_ms"] = json!(crate::storage::time::now_ms());
+    Json(body).into_response()
+}
+
+async fn delete_scan_report(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    match state.scans.store().delete_report(&id).await {
+        Ok(true) => {
+            audit(&state, &rid.0, &session.username, "delete_scan_report", &id);
+            Json(json!({ "ok": true })).into_response()
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "no such scan report"),
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct FindingsQuery {
+    #[serde(default)]
+    kind: Option<String>,
+    /// Opaque cursor: the previous page's `next`.
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default = "default_findings_page")]
+    limit: usize,
+}
+
+fn default_findings_page() -> usize {
+    100
+}
+
+async fn list_scan_findings(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<FindingsQuery>,
+) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    let kind = query.kind.as_deref().filter(|v| !v.is_empty());
+    match state
+        .scans
+        .store()
+        .list_findings(&id, kind, query.after.as_deref(), query.limit.clamp(1, 500))
+        .await
+    {
+        Ok((findings, next)) => Json(json!({
+            "findings": findings.iter().map(finding_json).collect::<Vec<_>>(),
+            "next": next,
+        }))
+        .into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct RepairRequest {
+    items: Vec<RepairItem>,
+}
+
+#[derive(Deserialize)]
+struct RepairItem {
+    /// The finding's storage key, as returned by the findings listing.
+    key: String,
+    action: String,
+}
+
+/// Applies repairs to findings of one report. The storage layer re-verifies
+/// each one under the per-key lock before acting, so driving an old report is
+/// safe: anything that no longer holds is recorded as stale, untouched.
+async fn repair_findings(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+    Json(req): Json<RepairRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if req.items.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "no findings selected");
+    }
+    if state.scans.store().get_report(&id).await.ok().flatten().is_none() {
+        return error_response(StatusCode::NOT_FOUND, "no such scan report");
+    }
+    let mut items = Vec::with_capacity(req.items.len());
+    for item in &req.items {
+        let Some(action) = parse_repair_action(&item.action) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown repair action {}", item.action),
+            );
+        };
+        // A key from another report would let one report's repair silently act
+        // on another's findings.
+        if !item.key.starts_with(&format!("{id}\u{1f}")) {
+            return error_response(StatusCode::BAD_REQUEST, "finding does not belong to this report");
+        }
+        items.push((item.key.clone(), action));
+    }
+
+    match super::jobs::perf_scan::spawn_repair(
+        state.store.clone(),
+        state.scans.clone(),
+        state.tasks.clone(),
+        id.clone(),
+        items,
+    ) {
+        Some(task_id) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                "repair_findings",
+                format!("{} finding(s) of {id}", req.items.len()),
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "task_id": task_id, "items": req.items.len() })),
+            )
+                .into_response()
+        }
+        None => error_response(
+            StatusCode::CONFLICT,
+            "a storage scan or repair is already running",
+        ),
+    }
+}
+
+fn parse_repair_action(value: &str) -> Option<crate::storage::scan::RepairAction> {
+    use crate::storage::scan::RepairAction;
+    match value {
+        "trash_blob" => Some(RepairAction::TrashBlob),
+        "delete_row" => Some(RepairAction::DeleteRow),
+        "quarantine" => Some(RepairAction::Quarantine),
+        "resync_row" => Some(RepairAction::ResyncRow),
+        "reclaim_empty_dirs" => Some(RepairAction::ReclaimEmptyDirs),
+        _ => None,
+    }
+}
+
+/// Report summary as the console consumes it. Totals are pre-computed here so
+/// the page doesn't re-derive them from the per-bucket array.
+fn scan_report_json(report: &super::scan_store::ScanReport) -> Value {
+    json!({
+        "id": report.id,
+        "started_at_ms": report.started_at_ms,
+        "finished_at_ms": report.finished_at_ms,
+        "status": report.status,
+        "actor": report.actor,
+        "buckets_scanned": report.buckets.len(),
+        "requested_buckets": report.requested_buckets,
+        "objects": report.objects(),
+        "logical_bytes": report.logical_bytes(),
+        "disk_bytes": report.disk_bytes(),
+        "findings": report.findings,
+        "findings_total": report.findings_total,
+        "error": report.error,
+    })
+}
+
+/// A finding plus the repairs it allows — the UI never hard-codes which action
+/// belongs to which kind; the storage layer is the single source of that truth.
+fn finding_json(stored: &super::scan_store::StoredFinding) -> Value {
+    let finding = &stored.finding;
+    json!({
+        "key": stored.key,
+        "id": finding.id,
+        "bucket": finding.bucket,
+        "kind": finding.kind,
+        "object_key": finding.object_key,
+        "blob_dir": finding.blob_dir,
+        "detail": finding.detail,
+        "bytes": finding.bytes,
+        "count": finding.count,
+        "state": finding.state,
+        "outcome": finding.outcome,
+        "repaired_at_ms": finding.repaired_at_ms,
+        "data": finding.data,
+        "actions": finding.kind.actions().iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+    })
 }
 
 // ── presigned URL generation (share) ─────────────────────────────────────────

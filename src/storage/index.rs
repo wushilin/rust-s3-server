@@ -505,6 +505,43 @@ impl ObjectIndex {
         .await
     }
 
+    /// Rewrites a row's attributes from the blob's `meta.json` — the health
+    /// scan's drift repair. `meta.json` is what `read_object` actually serves,
+    /// so when the two disagree it is the row that is wrong. The `expected`
+    /// blob-dir guard makes it a no-op if the row moved under us (a concurrent
+    /// overwrite), so a stale finding can never clobber a newer version.
+    /// Returns whether a row was updated. Called under the per-key write lock.
+    pub async fn update_object_attrs(
+        &self,
+        key: &str,
+        expected_blob_dir: &str,
+        size: u64,
+        etag: &str,
+        last_modified_ms: i64,
+    ) -> Result<bool> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let key = key.to_string();
+        let expected = expected_blob_dir.to_string();
+        let etag = etag.to_string();
+        run_blocking(move || {
+            let objects = cf(&db, CF_OBJECTS)?;
+            let Some(value) = db.get_cf(&objects, key.as_bytes())? else {
+                return Ok(false);
+            };
+            let mut record = decode_object(key.as_bytes(), &value)?;
+            if record.blob_dir != expected {
+                return Ok(false);
+            }
+            record.size = size;
+            record.etag = etag;
+            record.last_modified_ms = last_modified_ms;
+            db.put_cf_opt(&objects, key.as_bytes(), encode_object(&record), &write_opts(durability))?;
+            Ok(true)
+        })
+        .await
+    }
+
     /// Up to `limit` keys still on the legacy 4-level fanout layout
     /// (`objects/xx/xx/xx/xx/…`). Empty once migration is complete. Only
     /// consulted after the cheap root-dir check finds legacy structure, so it

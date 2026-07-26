@@ -208,6 +208,23 @@ impl LocalObjectStore {
         self.shutdown.clone()
     }
 
+    /// Takes the per-key write lock. Exposed for the health-scan repair path
+    /// (`super::scan`), which mutates rows and blob dirs and must serialise
+    /// against publish/delete of the same key exactly as the write path does.
+    pub(crate) async fn lock_object_key(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> super::locks::ObjectWriteGuard {
+        self.locks.lock(bucket, key).await
+    }
+
+    /// Drops a key's cached `meta.json` parse. Anything that changes a row out
+    /// of band must call this so reads don't serve the stale parse.
+    pub(crate) fn forget_cached_meta(&self, bucket: &str, key: &str) {
+        self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+    }
+
     pub fn layout(&self) -> &StorageLayout {
         &self.layout
     }

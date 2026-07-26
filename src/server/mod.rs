@@ -15,6 +15,7 @@ pub(crate) mod pipeline;
 pub mod policy;
 pub mod range;
 pub mod registry;
+pub mod scan_store;
 pub mod ui;
 pub mod xml;
 
@@ -863,12 +864,19 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     // Management UI on its own port: web logins (user/password) only —
     // completely separate from the access-key-authenticated S3 API.
     if config.app_config.ui.enabled {
+        // Storage-scan history lives in its own database, deliberately not a
+        // family of admin.rocksdb: IAM is exported/imported as one unit and
+        // scan reports have no business travelling with it.
+        let scans = jobs::perf_scan::ScanService::new(
+            scan_store::ScanStore::open(FsPath::new(&config.root)).await?,
+        );
         let ui_state = ui::UiState {
             store: store.clone(),
             iam,
             config: config.app_config.clone(),
             metrics: metrics.clone(),
             tasks: tasks.clone(),
+            scans,
         };
         let ui_bind = format!(
             "{}:{}",

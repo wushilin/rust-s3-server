@@ -50,12 +50,49 @@ function renderTasksData(data){
   taskBytes={in:data.bytes_in,out:data.bytes_out,at:data.now_ms};
   const now=data.now_ms;const seen={};for(const t of active)seen[t.id]=now;taskSeen=seen;
   if($('tasksPopover').classList.contains('hidden'))return;
-  $('tasksActive').innerHTML=active.map(t=>taskRowHtml(t,now,false)).join('');
+  syncActiveRows(active,now);
   const completedNow=new Set();for(const t of tasks)if(t.completed){completedNow.add(t.id);showCompleted(t,now);}
   for(const id of [...dismissedTasks])if(!completedNow.has(id))dismissedTasks.delete(id);
   updateTasksEmpty(active.length);
 }
-function taskRowHtml(t,now,done){const up=fmtDur(now-t.started_at_ms);const status=t.status||'';const cancel=(!done&&t.cancellable)?`<button class="task-cancel" title="Cancel task" onclick="cancelTask('${esc(t.id)}')"><span class="stop"></span></button>`:'<span class="task-cancel-spacer"></span>';const bar=done?'':(t.total>0?`<div class="task-bar"><span style="width:${Math.min(100,Math.round(t.done/t.total*100))}%"></span></div>`:(t.kind==='job'?`<div class="task-bar indet"><span></span></div>`:''));const glyph=icons[done?'check':opIcon(t.op,t.kind)]||icons.activity;return `<div class="task-row${done?' done':''}"><span class="task-op ${done?'done':esc(t.kind)}" title="${esc(t.op)}">${glyph}</span><div class="task-main"><span class="task-target" title="${esc(t.target)}">${esc(t.target)}</span><span class="task-status" title="${esc(status)}">${esc(status)}</span>${bar}</div><span class="task-up" title="running for ${esc(up)}">${esc(up)}</span>${cancel}</div>`;}
+function taskRowHtml(t,now,done){const up=fmtDur(now-t.started_at_ms);const status=t.status||'';const cancel=(!done&&t.cancellable)?`<button class="task-cancel" title="Cancel task" onclick="cancelTask('${esc(t.id)}')"><span class="stop"></span></button>`:'<span class="task-cancel-spacer"></span>';const bar=done?'':(t.total>0?`<div class="task-bar"><span style="width:${Math.min(100,Math.round(t.done/t.total*100))}%"></span></div>`:(t.kind==='job'?`<div class="task-bar indet"><span></span></div>`:''));const glyph=icons[done?'check':opIcon(t.op,t.kind)]||icons.activity;return `<div class="task-row${done?' done':''}" data-task-id="${esc(t.id)}" data-sig="${esc(taskRowSig(t,done))}"><span class="task-op ${done?'done':esc(t.kind)}" title="${esc(t.op)}">${glyph}</span><div class="task-main"><span class="task-target" title="${esc(t.target)}">${esc(t.target)}</span><span class="task-status" title="${esc(status)}">${esc(status)}</span>${bar}</div><span class="task-up" title="running for ${esc(up)}">${esc(up)}</span>${cancel}</div>`;}
+
+// Everything about a row that can't be patched in place — if any of it changes
+// the row is rebuilt, otherwise the existing node is kept.
+function taskRowSig(t,done){const bar=done?'':(t.total>0?'p':(t.kind==='job'?'i':''));return [done?'d':'a',bar,(!done&&t.cancellable)?'c':'',done?'check':opIcon(t.op,t.kind),t.kind||'',t.op||''].join('|');}
+
+// Reconcile the active list node-by-node instead of rewriting innerHTML. The
+// server pushes a snapshot at least once a second; blowing the rows away that
+// often meant a hovered row was replaced before the browser ever got round to
+// showing its title tooltip, so the truncated target/status appeared to have no
+// mouseover label at all. Reusing the nodes keeps the hover (and any text
+// selection) alive between snapshots.
+function syncActiveRows(active,now){
+  const host=$('tasksActive');const existing=new Map();
+  for(const el of [...host.children])existing.set(el.dataset.taskId,el);
+  let prev=null;
+  for(const t of active){
+    let row=existing.get(t.id);
+    if(row&&row.dataset.sig!==taskRowSig(t,false)){row.remove();existing.delete(t.id);row=null;}
+    if(row){updateTaskRow(row,t,now);existing.delete(t.id);}
+    else{const wrap=document.createElement('div');wrap.innerHTML=taskRowHtml(t,now,false);row=wrap.firstElementChild;}
+    const want=prev?prev.nextSibling:host.firstChild;
+    if(row!==want)host.insertBefore(row,want);
+    prev=row;
+  }
+  for(const el of existing.values())el.remove();
+}
+// Only touch the DOM when a value actually changed — reassigning title while
+// the pointer sits on the element restarts the tooltip delay in some browsers.
+function setTaskLabel(el,text){if(el&&el.textContent!==text){el.textContent=text;el.title=text;}}
+function updateTaskRow(row,t,now){
+  setTaskLabel(row.querySelector('.task-target'),t.target||'');
+  setTaskLabel(row.querySelector('.task-status'),t.status||'');
+  const up=fmtDur(now-t.started_at_ms),upEl=row.querySelector('.task-up');
+  if(upEl&&upEl.textContent!==up){upEl.textContent=up;upEl.title='running for '+up;}
+  const fill=row.querySelector('.task-bar:not(.indet) > span');
+  if(fill&&t.total>0){const w=Math.min(100,Math.round(t.done/t.total*100))+'%';if(fill.style.width!==w)fill.style.width=w;}
+}
 function showCompleted(t,now){if(dismissedTasks.has(t.id))return;dismissedTasks.add(t.id);const wrap=document.createElement('div');wrap.innerHTML=taskRowHtml(t,now,true);const row=wrap.firstElementChild;$('tasksDone').append(row);setTimeout(()=>{row.classList.add('vanish');row.addEventListener('transitionend',()=>{row.remove();updateTasksEmpty($('tasksActive').children.length);},{once:true});setTimeout(()=>{if(row.isConnected){row.remove();updateTasksEmpty($('tasksActive').children.length);}},500);},COMPLETED_LINGER);}
 function updateTasksEmpty(activeCount){$('tasksEmpty').classList.toggle('hidden',activeCount>0||$('tasksDone').children.length>0);}
 async function cancelTask(id){try{const r=await api('POST','/api/tasks/'+encodeURIComponent(id)+'/cancel');toast('Cancelling',`${r.cancelled} task${r.cancelled===1?'':'s'} signalled`);}catch(e){toast('Cannot cancel',e.message,false);}}

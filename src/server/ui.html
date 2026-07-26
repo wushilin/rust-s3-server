@@ -256,6 +256,47 @@
   .transfer-row .progress { margin-top:7px; }
   .transfer-row .progress > span { margin:0; height:100%; }
 
+  /* Storage scan */
+  .scan-bar { height:6px; border-radius:3px; background:var(--line); overflow:hidden; }
+  .scan-bar > span { display:block; height:100%; width:0; background:var(--accent); border-radius:3px; transition:width .3s ease; }
+  .scan-bar.indet > span { width:32%; animation:scanindet 1.2s ease-in-out infinite; }
+  @keyframes scanindet { 0%{margin-left:-32%} 100%{margin-left:100%} }
+  .scan-summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:1px; background:var(--line); border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+  #scanStats.scan-summary { border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .scan-stat { background:var(--surface); padding:12px 15px; display:flex; flex-direction:column; gap:3px; }
+  .scan-stat span { color:var(--muted); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .scan-stat strong { font-size:15px; font-variant-numeric:tabular-nums; }
+  .scan-stat.warn strong { color:var(--accent); }
+  .scan-row { cursor:pointer; }
+  .scan-row:hover { background:var(--surface-soft); }
+  .scan-badge { display:inline-flex; align-items:center; padding:1px 7px; border-radius:99px; background:#edf1f5; color:var(--muted); font-size:10.5px; font-weight:700; letter-spacing:.02em; text-transform:uppercase; }
+  .scan-badge.warn { background:var(--accent-soft); color:var(--accent); }
+  .scan-badge.repaired { background:var(--success-soft); color:var(--success); }
+  .scan-badge.stale { background:#edf1f5; color:var(--muted); }
+  .scan-badge.failed, .scan-badge.cancelled { background:var(--danger-soft); color:var(--danger); }
+  .scan-kind .scan-chevron { transition:transform .15s ease; color:var(--muted); }
+  .scan-kind.open .scan-chevron { transform:rotate(180deg); }
+  .scan-findings-head { display:flex; align-items:center; gap:9px; padding:11px 19px; border-bottom:1px solid var(--line); background:var(--surface-soft); }
+  .scan-check { display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); cursor:pointer; }
+  .scan-check input { width:15px; height:15px; accent-color:var(--accent); }
+  .scan-finding-list { max-height:520px; overflow-y:auto; }
+  .scan-finding { display:flex; align-items:flex-start; gap:11px; padding:11px 19px; border-bottom:1px solid var(--line); }
+  .scan-finding:last-child { border-bottom:0; }
+  .scan-finding[data-state="repaired"] { opacity:.7; }
+  .scan-finding-target { font-size:12.5px; font-weight:600; word-break:break-all; }
+  .scan-finding-target code { font-weight:600; }
+  .scan-finding-size { flex:none; font-size:11.5px; color:var(--muted); font-variant-numeric:tabular-nums; padding-top:2px; }
+  .scan-finding-actions { flex:none; display:flex; align-items:center; gap:7px; }
+  .scan-action { height:31px; font-size:12px; width:auto; min-width:170px; padding:0 8px; }
+  .scan-outcome { margin-top:5px; font-size:11.5px; color:var(--success); }
+  .scan-finding[data-state="failed"] .scan-outcome { color:var(--danger); }
+  .scan-finding[data-state="stale"] .scan-outcome { color:var(--muted); }
+  .scan-more { padding:12px 19px; text-align:center; }
+  .scan-bucket-list { padding:4px; }
+  .scan-bucket { display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:6px; cursor:pointer; font-size:13px; }
+  .scan-bucket:hover { background:var(--surface-soft); }
+  .scan-bucket input { width:16px; height:16px; accent-color:var(--accent); }
+
   /* Content pages */
   .content-head { display:flex; align-items:flex-start; gap:15px; margin-bottom:22px; }
   .content-head h2 { margin:0; font-size:23px; letter-spacing:-.025em; }
@@ -402,6 +443,8 @@
     <button class="nav-item" data-tab="keys"><span data-icon="key"></span> My Access Keys</button>
     <div class="nav-label" data-admin-only>Maintenance</div>
     <button class="nav-item" data-tab="backup" id="backupTabBtn" data-admin-only><span data-icon="database"></span> Backup &amp; Restore</button>
+    <div class="nav-label" data-admin-only>Performance</div>
+    <button class="nav-item" data-tab="perf" id="perfTabBtn" data-admin-only><span data-icon="activity"></span> Storage Scan</button>
     <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span></div></div></div>
   </aside>
 
@@ -511,6 +554,37 @@
           </div>
         </div>
       </section>
+
+      <section id="tab_perf" class="page hidden">
+        <div class="content-head">
+          <div><h2>Storage Scan</h2><p>Reconcile the catalog against what is actually on disk: per-bucket usage, object health, and anything left unreferenced. The scan is read-only &mdash; every repair is a separate, explicit action.</p></div>
+          <span class="spacer"></span>
+          <button class="btn primary" id="scanRunBtn" onclick="openScanWizard()"><span data-icon="activity"></span> Run Performance Scan</button>
+        </div>
+
+        <div class="panel hidden" id="scanLivePanel">
+          <div class="panel-title">
+            <div><h3 id="scanLiveTitle">Storage scan running</h3><p id="scanLiveSub"></p></div>
+            <span class="spacer"></span>
+            <button class="btn danger small" id="scanCancelBtn" onclick="cancelScan()">Cancel</button>
+          </div>
+          <div style="padding:17px 19px">
+            <div class="scan-bar" id="scanBar"><span id="scanBarFill"></span></div>
+            <div class="scan-summary" id="scanStats" style="margin-top:15px"></div>
+          </div>
+        </div>
+
+        <div class="panel" id="scanHistoryPanel" style="margin-top:18px">
+          <div class="panel-title">
+            <div><h3>Scan history</h3><p>Reports are kept until you delete them. Findings stay actionable &mdash; each repair re-checks the world before it acts.</p></div>
+            <span class="spacer"></span>
+            <button class="btn small" onclick="loadScanHistory()"><span data-icon="refresh"></span> Refresh</button>
+          </div>
+          <div id="scanHistory"></div>
+        </div>
+
+        <div id="scanReport" class="hidden" style="margin-top:18px"></div>
+      </section>
     </main>
   </div>
 </div>
@@ -526,6 +600,23 @@
   <dl id="detailList"></dl>
   <div class="details-actions"><a class="btn primary" id="detailDownload"><span data-icon="download"></span> Download</a><button class="btn" onclick="openShareFromDetails()"><span data-icon="share"></span> Share</button></div>
 </aside>
+
+<dialog id="scanDlg">
+  <div class="dialog-head"><div><h3>Run performance scan</h3><p>The scan walks every object directory in the buckets you pick. It reads metadata and file sizes only &mdash; object contents are never read.</p></div><button type="button" class="dialog-close" onclick="scanDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-body">
+    <div class="field">
+      <label>Buckets to scan</label>
+      <div class="scan-bucket-list check-list" id="scanBucketList"></div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <button type="button" class="btn small" onclick="toggleAllScanBuckets(true)">Select all</button>
+        <button type="button" class="btn small" onclick="toggleAllScanBuckets(false)">Select none</button>
+      </div>
+    </div>
+    <span class="muted" style="font-size:11.5px">The scan yields between every directory it reads, so the server keeps serving while it runs. It is cancellable at any point, from here or from the task panel.</span>
+    <div id="scanDlgError" class="inline-error"></div>
+  </div>
+  <div class="dialog-actions"><button type="button" class="btn" onclick="scanDlg.close()">Cancel</button><button class="btn primary" id="scanStartBtn" onclick="startScan()">Start scan</button></div>
+</dialog>
 
 <dialog id="bucketDlg">
   <form onsubmit="createBucket(event)">
@@ -653,6 +744,7 @@
 <script src="/assets/policy.js"></script>
 <script src="/assets/keys.js"></script>
 <script src="/assets/export_import.js"></script>
+<script src="/assets/perf.js"></script>
 <script src="/assets/main.js"></script>
 </body>
 </html>
