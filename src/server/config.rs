@@ -261,6 +261,35 @@ pub struct AppConfig {
     pub ui: UiConfig,
 }
 
+/// Deserializes a list of strings, dropping entries that were never filled in.
+///
+/// For any future list field that a container config templates one slot per
+/// line, e.g.
+///
+/// ```yaml
+/// whitelist:
+///   - "{{RUSTS3_ALLOW_1:}}"
+///   - "{{RUSTS3_ALLOW_2:}}"
+/// ```
+///
+/// With neither variable set this must produce an empty list, not a list of
+/// two empty strings — and it must not fail to parse, which is what a bare
+/// (unquoted) unfilled slot would otherwise do, since YAML reads it as `null`.
+/// Both cases are handled here: `null` and blank entries are skipped.
+///
+/// Use it as `#[serde(default, deserialize_with = "list_of_filled_strings")]`.
+pub fn list_of_filled_strings<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<Option<String>> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect())
+}
+
 impl AppConfig {
     /// Reads a config file, expanding `{{ENV_VAR:default}}` placeholders from
     /// the environment first. That is what lets one image be configured by
@@ -286,21 +315,80 @@ impl AppConfig {
         serde_yaml::to_string(self)
     }
 
-    /// Folds empty optional strings to `None`.
+    /// Folds unfilled values away, so a templated config can be *flat*.
     ///
-    /// An environment-driven config has no way to say "omit this key": an unset
-    /// `{{RUSTS3_PUBLIC_HOSTNAME:}}` expands to the empty string. Normalising
-    /// here means every consumer downstream sees exactly what it would have
-    /// seen had the key been absent, rather than each of the three places that
-    /// read it having to special-case an empty host.
+    /// Placeholder expansion cannot express "if this then not that": a
+    /// container config has to list every slot it might use and leave the
+    /// unused ones to expand to nothing. Which means an unfilled slot must be
+    /// indistinguishable from an absent one — otherwise the shape of the file
+    /// would have to change with the deployment, which is the thing templating
+    /// exists to avoid.
+    ///
+    /// So:
+    ///
+    /// * an empty optional string becomes `None`, as if the key were absent;
+    /// * a list entry that was never filled in is dropped rather than becoming
+    ///   a real, empty entry.
+    ///
+    /// The second is not merely tidiness. `verify_builtin_password` compares
+    /// the configured password to the candidate, so a user left with an empty
+    /// password would *authenticate against an empty password*. An empty access
+    /// key or secret is the same class of problem. A half-filled credential is
+    /// never usable and never safe, so it is discarded.
+    ///
+    /// Anything dropped is reported on stderr: silently discarding
+    /// configuration is its own kind of trap.
     fn normalize(&mut self) {
+        fn blank(value: &str) -> bool {
+            value.trim().is_empty()
+        }
         fn blank_to_none(value: &mut Option<String>) {
-            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            if value.as_deref().is_some_and(blank) {
                 *value = None;
             }
         }
+        let mut dropped: Vec<String> = Vec::new();
+
         blank_to_none(&mut self.auth.public_hostname);
         blank_to_none(&mut self.ui.bind_address);
+
+        for user in &mut self.auth.users {
+            // An empty password is not "no password" to the verifier — it is a
+            // password that the empty string matches. Treat it as absent, which
+            // means "this user cannot log into the console".
+            blank_to_none(&mut user.password);
+            let before = user.api_keys.len();
+            user.api_keys
+                .retain(|key| !blank(&key.ak) && !blank(&key.secret));
+            for _ in user.api_keys.len()..before {
+                dropped.push(format!("an unfilled api_key of user {:?}", user.user));
+            }
+        }
+
+        let before = self.auth.users.len();
+        self.auth.users.retain(|user| !blank(&user.user));
+        for _ in self.auth.users.len()..before {
+            dropped.push("an unfilled auth.users entry".to_string());
+        }
+
+        let before = self.auth.credentials.len();
+        self.auth
+            .credentials
+            .retain(|credential| !blank(&credential.access_key) && !blank(&credential.secret_key));
+        for _ in self.auth.credentials.len()..before {
+            dropped.push("an unfilled auth.credentials entry".to_string());
+        }
+
+        if !dropped.is_empty() {
+            // Logging is not initialised yet at config-load time, so this goes
+            // straight to stderr — which is where a container's output lands.
+            eprintln!(
+                "config: ignoring {} unfilled entr{} ({})",
+                dropped.len(),
+                if dropped.len() == 1 { "y" } else { "ies" },
+                dropped.join(", ")
+            );
+        }
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
@@ -520,6 +608,105 @@ mod tests {
             err.to_string().contains("T_UNSET_REQUIRED"),
             "the error must name the variable: {err}"
         );
+    }
+
+    /// A templated config is flat: it lists every slot it might use, and the
+    /// unused ones expand to nothing. Those must vanish, not become entries.
+    #[test]
+    fn unfilled_list_slots_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "auth:\n  enabled: true\n  users:\n\
+             \x20   - user: \"{{T_USER_1:admin}}\"\n      password: \"{{T_PASS_1:secret}}\"\n\
+             \x20     api_keys:\n\
+             \x20       - ak: \"{{T_AK_1:key1}}\"\n          secret: \"{{T_SK_1:sec1}}\"\n\
+             \x20       - ak: \"{{T_AK_2:}}\"\n          secret: \"{{T_SK_2:}}\"\n\
+             \x20   - user: \"{{T_USER_2:}}\"\n      password: \"{{T_PASS_2:}}\"\n",
+        )
+        .unwrap();
+        let config = AppConfig::from_file(path.to_str().unwrap()).unwrap();
+
+        // The filled user survives with its one filled key; the empty slots are
+        // gone entirely.
+        assert_eq!(config.auth.users.len(), 1, "{:?}", config.auth.users);
+        assert_eq!(config.auth.users[0].user, "admin");
+        assert_eq!(config.auth.users[0].api_keys.len(), 1);
+        assert_eq!(config.auth.users[0].api_keys[0].ak, "key1");
+    }
+
+    /// The one that actually matters: an unfilled password must not become a
+    /// password that the empty string authenticates against.
+    #[test]
+    fn an_unfilled_password_becomes_no_password_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "auth:\n  enabled: true\n  users:\n    - user: \"admin\"\n      password: \"{{T_PW:}}\"\n",
+        )
+        .unwrap();
+        let config = AppConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.auth.users.len(), 1);
+        assert_eq!(
+            config.auth.users[0].password, None,
+            "an empty password must read as absent, or the empty string logs in"
+        );
+    }
+
+    /// A half-filled credential is never usable and never safe.
+    #[test]
+    fn a_credential_missing_either_half_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "auth:\n  enabled: true\n  credentials:\n\
+             \x20   - access_key: \"AK1\"\n      secret_key: \"SK1\"\n\
+             \x20   - access_key: \"AK2\"\n      secret_key: \"{{T_SK:}}\"\n\
+             \x20   - access_key: \"{{T_AK:}}\"\n      secret_key: \"SK3\"\n",
+        )
+        .unwrap();
+        let config = AppConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.auth.credentials.len(), 1);
+        assert_eq!(config.auth.credentials[0].access_key, "AK1");
+    }
+
+    /// A discriminated shape: every branch is present, the unused ones blank.
+    #[test]
+    fn unused_branches_of_a_flat_config_are_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "server:\n  bind_address: \"{{T_ADDR:0.0.0.0}}\"\n  bind_port: {{T_PORT:8002}}\n\
+             auth:\n  enabled: true\n  public_hostname: \"{{T_HOST:}}\"\n\
+             ui:\n  bind_address: \"{{T_UI:}}\"\n",
+        )
+        .unwrap();
+        let config = AppConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.auth.public_hostname, None);
+        assert_eq!(config.ui.bind_address, None);
+        assert_eq!(config.server.bind_port, 8002);
+    }
+
+    #[test]
+    fn a_templated_string_list_drops_unfilled_and_null_slots() {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            #[serde(default, deserialize_with = "list_of_filled_strings")]
+            whitelist: Vec<String>,
+        }
+        // Two filled, one blank, one bare (which YAML reads as null).
+        let yaml = "whitelist:\n  - \"10.0.0.1\"\n  - \"\"\n  - \n  - \"10.0.0.2\"\n";
+        let holder: Holder = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(holder.whitelist, vec!["10.0.0.1", "10.0.0.2"]);
+
+        // …and a list where nothing was filled in is simply empty.
+        let yaml = "whitelist:\n  - \"\"\n  - \n";
+        let holder: Holder = serde_yaml::from_str(yaml).unwrap();
+        assert!(holder.whitelist.is_empty());
     }
 
     #[test]

@@ -228,6 +228,48 @@ shipped file does.
 To go further than individual overrides, mount your own file over
 `/etc/rusts3/config.yaml`; placeholders in it are expanded the same way.
 
+### Unfilled slots
+
+Templating cannot express "if this, then not that", so a container config is
+*flat*: it lists every slot a deployment might use and lets the unused ones
+expand to nothing. An unfilled slot is therefore treated as an absent one.
+
+```yaml
+auth:
+  users:
+    - user: "{{RUSTS3_ADMIN_USER:admin}}"
+      password: "{{RUSTS3_ADMIN_PASSWORD:changeme}}"
+      api_keys:
+        - ak: "{{RUSTS3_ACCESS_KEY:rusts3admin}}"
+          secret: "{{RUSTS3_SECRET_KEY:rusts3admin}}"
+        - ak: "{{RUSTS3_ACCESS_KEY_2:}}"      # unset → the whole entry is dropped
+          secret: "{{RUSTS3_SECRET_KEY_2:}}"
+    - user: "{{RUSTS3_USER_2:}}"              # unset → this user does not exist
+      password: "{{RUSTS3_PASSWORD_2:}}"
+```
+
+**Empty is the marker**, rather than a reserved word like `none` or `ignore`.
+An unset variable already produces empty, so there is no convention to
+remember and no escaping rule for the day someone genuinely wants a value of
+`none`; and empty can never be a valid username, access key or secret, so
+nothing legitimate is ever discarded by accident.
+
+The rule applies to optional scalars too — an empty `public_hostname` reads as
+"not configured" rather than as an invalid hostname. Anything dropped is named
+on stderr at startup, because silently discarding configuration is its own kind
+of trap:
+
+```text
+config: ignoring 3 unfilled entries (an unfilled api_key of user "admin",
+an unfilled auth.users entry, an unfilled auth.users entry)
+```
+
+One case is a safety fix rather than a convenience. A built-in user's password
+is compared against the candidate, so a user left with an *empty* password
+would authenticate against the empty string. An unfilled password is therefore
+turned into no password at all, which means that user simply cannot log in. A
+credential missing either half is discarded for the same reason.
+
 ### Storage
 
 `/data` holds everything durable: buckets, the IAM database, scan history and
