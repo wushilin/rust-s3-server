@@ -20,20 +20,43 @@ function statsFmt(kind){
 function lastVal(arr){ for(let i=arr.length-1;i>=0;i--) if(arr[i]!=null) return arr[i]; return null; }
 
 // Builds one uPlot chart into `el`. `defs` maps each line to a column index in
-// the server's columnar response (data[idx]).
+// the server's columnar response (data[idx]). We render our OWN legend (a fixed
+// grid) instead of uPlot's table, so nothing shifts on hover and label/value
+// stay aligned.
 function statsChart(el,defs,kind){
   const fmt=statsFmt(kind);
   const single=defs.length===1;
+
+  // Custom legend: one fixed-height row per series, updated live from the hook.
+  const legend=document.createElement('div');
+  legend.className='slegend';
+  const valEls=defs.map((d,i)=>{
+    const row=document.createElement('div');
+    row.className='slegend-item';
+    row.innerHTML='<span class="slegend-dot" style="background:'+STATS_COLORS[i%STATS_COLORS.length]
+      +'"></span><span class="slegend-label"></span><span class="slegend-val"></span>';
+    row.querySelector('.slegend-label').textContent=d.label;
+    legend.appendChild(row);
+    return row.querySelector('.slegend-val');
+  });
+
+  const setLegend=(idx)=>{
+    for(let i=0;i<defs.length;i++){
+      const col=u.data[i+1]; // data[0] is the x axis; series i → column i+1
+      const v=idx!=null?col[idx]:lastVal(col);
+      valEls[i].textContent=fmt(v);
+    }
+  };
+
   const opts={
     width: el.clientWidth||520, height:152,
     padding:[12,14,2,6],
+    legend:{show:false},
     cursor:{points:{size:6,width:2},focus:{prox:28}},
     scales:{x:{time:true}, y:{range:(u,dmin,dmax)=>[0,(dmax==null||dmax<=0)?1:dmax*1.2]}},
     series:[{},...defs.map((d,i)=>({
-      label:d.label,
       stroke:STATS_COLORS[i%STATS_COLORS.length],
       width:2, points:{show:false}, spanGaps:false,
-      value:(u,v)=>fmt(v),
       ...(single?{fill:'rgba(42,120,214,.09)'}:{}),
     }))],
     axes:[
@@ -42,9 +65,11 @@ function statsChart(el,defs,kind){
       {stroke:STATS_AXIS, grid:{stroke:STATS_GRID,width:1}, ticks:{show:false},
        font:'11px system-ui,sans-serif', size:54, values:(u,vals)=>vals.map(fmt)},
     ],
+    hooks:{setCursor:[u=>setLegend(u.cursor.idx)]},
   };
   const u=new uPlot(opts,[[],...defs.map(()=>[])],el);
-  return {u,defs,el,kind};
+  el.appendChild(legend);
+  return {u,defs,el,kind,setLegend};
 }
 
 function initStats(){
@@ -95,6 +120,7 @@ async function loadStats(){
     if(!hasData)return;
     statsCharts.forEach(c=>{
       c.c.u.setData([d[0],...c.c.defs.map(def=>d[def.idx])]);
+      c.c.setLegend(null); // refresh legend to latest (cursor hook only fires on hover)
       const latest=c.c.defs.map(def=>lastVal(d[def.idx]));
       const el=$(c.now); if(el)el.textContent=c.head(latest);
     });

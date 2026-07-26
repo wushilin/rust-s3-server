@@ -32,23 +32,16 @@
   /* uPlot chrome tuned for the light surface. The library's default legend is a
      vertical table whose rows reflow as values change width — pin it to a
      single wrapping row with tabular figures so its height never jumps (#4). */
-  /* Each series occupies a FIXED-WIDTH slot with the value right-aligned inside
-     it, so the live value changing width as the cursor moves never shifts its
-     neighbours (the "floating" jitter). align-items:center baselines the
-     marker, label and value together. */
-  .u-legend{display:flex;flex-wrap:wrap;gap:5px 18px;justify-content:flex-start;
-    min-height:22px;margin:2px 0 0;padding:7px 4px 0;border-top:1px solid var(--line);
-    font-size:11.5px;line-height:1.5}
-  .u-legend .u-series{display:inline-flex;align-items:center;box-sizing:border-box;
-    width:158px;cursor:pointer;padding:0}
-  .u-legend .u-series *{border:none!important}
-  .u-legend .u-marker{flex:none;width:9px;height:9px;border-radius:3px;margin-right:6px}
-  .u-legend .u-label{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .u-legend .u-value{margin-left:auto;padding-left:8px;color:var(--text);font-weight:600;
-    font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
-  .u-legend .u-off{opacity:.35}
-  .u-legend th,.u-legend td{padding:0;font-weight:inherit}
-  .u-legend .u-series th{display:inline-flex;align-items:center;min-width:0}
+  /* uPlot's built-in legend is disabled (legend.show=false); this custom one is
+     a fixed 2-column grid of equal-height rows, so values changing under the
+     cursor never shift anything and the label/value always line up. */
+  .slegend{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px 22px;
+    margin-top:6px;padding:8px 2px 0;border-top:1px solid var(--line);font-size:11.5px}
+  .slegend-item{display:flex;align-items:center;min-width:0;height:21px}
+  .slegend-dot{flex:none;width:9px;height:9px;border-radius:3px;margin-right:7px}
+  .slegend-label{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .slegend-val{margin-left:auto;padding-left:8px;color:var(--text);font-weight:600;
+    font-variant-numeric:tabular-nums;white-space:nowrap}
   .stats-note{padding:22px;color:var(--muted);font-size:13px}
 </style>
 </head>
