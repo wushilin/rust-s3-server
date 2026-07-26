@@ -76,6 +76,10 @@
   .nav-item { width:calc(100% - 20px); margin:2px 10px; height:42px; padding:0 12px; border:0; border-radius:6px; background:transparent; color:var(--nav-text); display:flex; align-items:center; gap:12px; cursor:pointer; text-align:left; transition:.14s ease; }
   .nav-item:hover { color:#e9eef5; background:var(--nav-hover); }
   .nav-item.active { color:var(--nav-active); background:#1b293a; box-shadow:inset 3px 0 var(--accent); }
+  .nav-link { text-decoration:none; font-size:inherit; }
+  .nav-ext { margin-left:auto; display:inline-flex; opacity:.55; }
+  .nav-ext .icon { width:14px; height:14px; }
+  body.sidebar-collapsed .nav-ext { display:none; }
   .sidebar-foot { margin-top:auto; padding:14px 10px 16px; border-top:1px solid rgba(255,255,255,.07); }
   .server-state { display:flex; align-items:flex-start; gap:9px; padding:10px 12px; color:#8594a8; font-size:12px; }
   .server-state .state-dot { margin-top:4px; flex:0 0 auto; }
