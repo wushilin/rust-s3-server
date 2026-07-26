@@ -75,11 +75,26 @@ use super::metadata::ObjectMeta;
 use super::store::{move_object_dir_to_trash, LocalObjectStore};
 use super::time::now_ms;
 
-/// Blob dirs and index rows younger than this are never reported. A publish
-/// that is mid-flight right now looks exactly like an orphan; one minute is far
-/// longer than the window between a rename into the live tree and the row
-/// commit that follows it.
-pub const SCAN_GRACE_MS: i64 = 60_000;
+/// Blob dirs and index rows touched within this window are not judged.
+///
+/// This is the *last* line of defence against calling an in-flight publish an
+/// orphan, not the first. The real protection is the exact index lookup every
+/// candidate gets in the verification pass: a publish that commits its row at
+/// any point before that lookup resolves to "not a finding" on its own. And
+/// even a report that slips through is not dangerous — the repair path re-checks
+/// under the per-key lock and refuses to trash a dir the index points at.
+///
+/// So this only has to cover a publish stalling between the rename into the
+/// live tree and the row commit that immediately follows it — one write, which
+/// even on slow storage is orders of magnitude below ten seconds. A longer
+/// window buys nothing and costs a lot: it silently hides real findings from
+/// the scan an operator just ran, which is exactly when they are looking.
+///
+/// Note also what mtime can and cannot tell us: a blob dir's mtime is when it
+/// was *staged*, not when it was published, so a large upload can be renamed
+/// into place with an mtime many minutes old. Freshness was never a reliable
+/// signal here — which is another reason not to lean on it.
+pub const SCAN_GRACE_MS: i64 = 10_000;
 
 /// Index rows read per batch during the sweeps. Bounds peak memory and gives a
 /// natural yield point.
@@ -87,6 +102,11 @@ const INDEX_BATCH: i64 = 1_000;
 
 /// Cap on the stale-intent count sampled for the hygiene summary.
 const STALE_INTENT_SAMPLE: i64 = 10_000;
+
+/// How many empty-directory paths are listed on the aggregated finding. The
+/// count is always exact; this only bounds the list an operator reads (and the
+/// size of the stored payload) when a bucket has thousands of them.
+const MAX_LISTED_EMPTY_DIRS: usize = 500;
 
 // ── findings ────────────────────────────────────────────────────────────────
 
@@ -327,6 +347,12 @@ pub struct BucketReport {
     /// Part files stat'ed.
     pub parts_checked: u64,
     pub empty_fanout_dirs: u64,
+    /// Blob dirs that looked like a finding but were modified inside
+    /// [`SCAN_GRACE_MS`] and so were not judged. Reported so "0 findings" is
+    /// never quietly hiding "…and one thing I declined to look at": the
+    /// operator sees it and can rescan in a moment.
+    #[serde(default)]
+    pub deferred_recent: u64,
     /// Hygiene counters — the background jobs already fix these on their own
     /// schedule; they are reported because they explain disk usage.
     pub legacy_layout_dirs: u64,
@@ -508,6 +534,10 @@ impl LocalObjectStore {
         // Candidates are the *mismatches* only — a healthy bucket accumulates
         // none, and a broken one is bounded by how broken it is, not by size.
         let mut candidates: Vec<Candidate> = Vec::new();
+        // Which directories are empty, not just how many — a count alone leaves
+        // the operator with nothing to look at. Bounded: the count stays exact
+        // when the list is capped.
+        let mut empty_fanout_paths: Vec<String> = Vec::new();
         // (dir, depth) — depth 1 is a fanout dir directly under objects/.
         let mut stack: Vec<(PathBuf, usize)> = vec![(objects_dir.clone(), 0)];
         while let Some((dir, depth)) = stack.pop() {
@@ -542,14 +572,25 @@ impl LocalObjectStore {
                     // migration job cleans as it vacates them.
                     if depth == 1 && subdirs.is_empty() {
                         report.empty_fanout_dirs += 1;
+                        if empty_fanout_paths.len() < MAX_LISTED_EMPTY_DIRS {
+                            if let Some(rel) = rel_of(&bucket_dir, &dir) {
+                                empty_fanout_paths.push(rel);
+                            }
+                        }
                     }
                     for sub in subdirs {
                         stack.push((sub, depth + 1));
                     }
-                } else if subdirs.is_empty() {
+                } else if subdirs.is_empty() && depth > 0 {
                     // Files but no meta.json: cannot be a valid publish, since
                     // blobs are staged complete before the rename. There is no
                     // object key to be had here — only the path.
+                    //
+                    // `depth > 0` matters: `objects/` itself is a container, and
+                    // a loose file dropped in it (with no buckets' worth of
+                    // fanout dirs beside it) would otherwise make the *root*
+                    // look like one unreadable blob dir — whose repair would
+                    // trash the entire object tree. The root is never a blob.
                     let bytes: u64 = files.iter().map(|(_, size)| size).sum();
                     report.objects_bytes += bytes;
                     report.blob_dirs += 1;
@@ -560,7 +601,9 @@ impl LocalObjectStore {
                         // operator gets both halves of the fix (trash the
                         // bytes, delete the row).
                         let referenced = rows.contains_key(&hash64(&rel));
-                        if !is_recent(&dir, started).await {
+                        if is_recent(&dir, started).await {
+                            report.deferred_recent += 1;
+                        } else {
                             emit(
                                 sink,
                                 &mut report,
@@ -589,6 +632,11 @@ impl LocalObjectStore {
                         }
                     }
                 } else {
+                    // A container that also holds loose files (including the
+                    // `objects/` root). The files are not ours, but their bytes
+                    // are really on the disk, so count them rather than letting
+                    // the usage figure quietly understate the truth.
+                    report.objects_bytes += files.iter().map(|(_, size)| size).sum::<u64>();
                     for sub in subdirs {
                         stack.push((sub, depth + 1));
                     }
@@ -621,7 +669,9 @@ impl LocalObjectStore {
                     if let Some(fingerprint) = row_fingerprint {
                         rows.insert(hash64(&rel), fingerprint);
                     }
-                    if !is_recent(&dir, started).await {
+                    if is_recent(&dir, started).await {
+                        report.deferred_recent += 1;
+                    } else {
                         emit(
                             sink,
                             &mut report,
@@ -715,19 +765,19 @@ impl LocalObjectStore {
                     meta_etag: meta.etag.clone(),
                     meta_last_modified_ms: meta.last_modified_ms,
                 }),
-                None => {
-                    if !is_recent(&dir, started).await {
-                        candidates.push(Candidate {
-                            rel,
-                            object_key: meta.object_key.clone(),
-                            bytes,
-                            unreferenced: true,
-                            meta_size: meta.size,
-                            meta_etag: meta.etag.clone(),
-                            meta_last_modified_ms: meta.last_modified_ms,
-                        });
-                    }
-                }
+                // Freshness is deliberately *not* judged here — it is checked
+                // in the verification pass, as late as possible and after the
+                // exact index lookup, so a dir that has been sitting unclaimed
+                // for seconds is reported rather than silently held back.
+                None => candidates.push(Candidate {
+                    rel,
+                    object_key: meta.object_key.clone(),
+                    bytes,
+                    unreferenced: true,
+                    meta_size: meta.size,
+                    meta_etag: meta.etag.clone(),
+                    meta_last_modified_ms: meta.last_modified_ms,
+                }),
             }
             yield_now().await;
         }
@@ -787,6 +837,18 @@ impl LocalObjectStore {
                 }),
             };
             if let Some(finding) = finding {
+                // Last check, at the latest possible moment: a dir written in
+                // the last few seconds is a publish that may still be
+                // committing. Everything older is fair game.
+                if matches!(
+                    finding.kind,
+                    FindingKind::OrphanBlob | FindingKind::SupersededBlob
+                ) && is_recent(&bucket_dir.join(&candidate.rel), now_ms()).await
+                {
+                    report.deferred_recent += 1;
+                    yield_now().await;
+                    continue;
+                }
                 emit(sink, &mut report, progress, finding).await?;
             }
             yield_now().await;
@@ -810,7 +872,10 @@ impl LocalObjectStore {
                 if !rows.contains_key(&hash64(&row.blob_dir)) {
                     continue;
                 }
-                // A row written after the walk passed its dir is not missing.
+                // A row committed after the walk had already passed its dir was
+                // never going to be seen; that is not a missing blob. (The
+                // filesystem check below is the real proof — this just avoids
+                // the stat for the obvious case.)
                 if started - row.last_modified_ms < SCAN_GRACE_MS {
                     continue;
                 }
@@ -878,7 +943,12 @@ impl LocalObjectStore {
                 ),
                 0,
             )
-            .with("dirs", report.empty_fanout_dirs);
+            .with("dirs", report.empty_fanout_dirs)
+            .with("paths", empty_fanout_paths.clone())
+            .with(
+                "paths_truncated",
+                report.empty_fanout_dirs > empty_fanout_paths.len() as u64,
+            );
             finding.count = report.empty_fanout_dirs;
             emit(sink, &mut report, progress, finding).await?;
         }
@@ -918,13 +988,28 @@ impl LocalObjectStore {
         if action == RepairAction::ReclaimEmptyDirs {
             let cancel = CancellationToken::new();
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // The pass is `remove_dir` per fanout dir, which by definition only
+            // succeeds on an empty one — a dir that has since been published
+            // into fails harmlessly and is skipped. So "nothing was removed"
+            // means the finding no longer holds: the directories filled up or
+            // someone else already cleaned them.
             let removed = self
                 .reclaim_empty_dirs_pass(bucket, &cancel, &counter)
                 .await?;
-            return Ok((
-                FindingState::Repaired,
-                format!("reclaimed {removed} empty director{}", if removed == 1 { "y" } else { "ies" }),
-            ));
+            return Ok(if removed == 0 {
+                (
+                    FindingState::Stale,
+                    "no empty directories remain — nothing to reclaim".to_string(),
+                )
+            } else {
+                (
+                    FindingState::Repaired,
+                    format!(
+                        "reclaimed {removed} empty director{}",
+                        if removed == 1 { "y" } else { "ies" }
+                    ),
+                )
+            });
         }
 
         // A dir with no readable meta.json has no object key, so there is
@@ -1482,12 +1567,54 @@ mod tests {
         let result = scan(&store, "bkt").await;
         assert_eq!(result.report.empty_fanout_dirs, 2);
         assert_eq!(kinds(&result), vec![FindingKind::EmptyFanout]);
+        // The operator must be able to see *which* directories, not just how
+        // many — a bare count is not something you can go and look at.
+        let paths = result.findings[0].data["paths"].as_array().unwrap();
+        let mut listed: Vec<&str> = paths.iter().map(|p| p.as_str().unwrap()).collect();
+        listed.sort();
+        assert_eq!(listed, vec!["objects/AAAA", "objects/BBBB"]);
+        assert_eq!(result.findings[0].data["paths_truncated"], false);
 
-        let (state, message) = store
-            .repair_finding(&result.findings[0], RepairAction::ReclaimEmptyDirs)
-            .await;
+        let finding = only(&result, FindingKind::EmptyFanout).clone();
+        let (state, message) = store.repair_finding(&finding, RepairAction::ReclaimEmptyDirs).await;
         assert_eq!(state, FindingState::Repaired, "{message}");
         assert!(!tmp.path().join("buckets/bkt/objects/AAAA").exists());
+        assert!(store.read_object("bkt", "a.txt").await.is_ok());
+
+        // Running it again finds nothing left to do — that is the finding
+        // having gone stale, not a repair.
+        let (state, message) = store.repair_finding(&finding, RepairAction::ReclaimEmptyDirs).await;
+        assert_eq!(state, FindingState::Stale, "{message}");
+        assert!(message.contains("no empty directories remain"));
+    }
+
+    /// The `objects/` root is a container, never a blob dir. A loose file in it
+    /// must not make the whole tree look like one unreadable object — the
+    /// repair for that would trash every object in the bucket.
+    #[tokio::test]
+    async fn a_loose_file_in_the_objects_root_never_condemns_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bkt").await.unwrap();
+        let objects = tmp.path().join("buckets/bkt/objects");
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::write(objects.join("stray.txt"), b"not ours").unwrap();
+        age(&objects.join("stray.txt"));
+        age(&objects);
+
+        let result = scan(&store, "bkt").await;
+        assert!(
+            !result.findings.iter().any(|f| f.blob_dir.as_deref() == Some("objects")),
+            "the objects root must never be reported as a blob dir: {:?}",
+            result.findings
+        );
+        // Its bytes are still counted, so usage doesn't understate the disk.
+        assert_eq!(result.report.objects_bytes, 8);
+
+        // And the same holds once real objects exist alongside it.
+        store.put_object("bkt", "a.txt", b"hello", None, None, false).await.unwrap();
+        let result = scan(&store, "bkt").await;
+        assert!(!result.findings.iter().any(|f| f.blob_dir.as_deref() == Some("objects")));
         assert!(store.read_object("bkt", "a.txt").await.is_ok());
     }
 
@@ -1610,6 +1737,38 @@ mod tests {
         }
         // …and the row is still there, untouched.
         assert!(store.index("bkt").await.unwrap().get("a.txt").await.unwrap().is_some());
+    }
+
+    /// The freshness guard is checked at verification time, after the exact
+    /// index lookup — a dir written moments ago may be a publish still
+    /// committing its row, so it waits for the next scan.
+    #[tokio::test]
+    async fn a_brand_new_unreferenced_dir_waits_for_the_next_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bkt").await.unwrap();
+        store.put_object("bkt", "a.txt", b"hello", None, None, false).await.unwrap();
+        let row = store.index("bkt").await.unwrap().get("a.txt").await.unwrap().unwrap();
+        let live = tmp.path().join("buckets/bkt").join(&row.blob_dir);
+
+        let fresh = tmp.path().join("buckets/bkt/objects/ZZZZ/V1JUSTNOW");
+        std::fs::create_dir_all(&fresh).unwrap();
+        for name in ["meta.json", "part.1"] {
+            std::fs::copy(live.join(name), fresh.join(name)).unwrap();
+        }
+        // Left with a current mtime: indistinguishable from a publish that has
+        // renamed into the live tree but not yet committed its row.
+        let result = scan(&store, "bkt").await;
+        assert!(result.findings.is_empty(), "{:?}", result.findings);
+        // …but the operator is told something was held back, so a clean report
+        // is never quietly incomplete.
+        assert_eq!(result.report.deferred_recent, 1);
+
+        // Once it has sat there past the window, it is reported — as a
+        // superseded copy, because the row for that key points elsewhere.
+        age(&fresh);
+        let result = scan(&store, "bkt").await;
+        assert_eq!(kinds(&result), vec![FindingKind::SupersededBlob]);
     }
 
     #[tokio::test]

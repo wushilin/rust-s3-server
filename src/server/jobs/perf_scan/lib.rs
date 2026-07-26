@@ -118,6 +118,16 @@ impl ScanService {
         self.live.lock().unwrap().as_ref().map(|r| r.kind.to_string())
     }
 
+    /// The report a run is currently writing into, if any — so a bulk history
+    /// delete can leave it alone.
+    pub fn running_report_id(&self) -> Option<String> {
+        self.live.lock().unwrap().as_ref().map(|r| r.report_id.clone())
+    }
+
+    /// Claims the single run slot. Returns false if a scan or repair already
+    /// holds it — scans must never overlap: two walks of the same trees compete
+    /// for the same disks, and two runs writing findings into two reports of
+    /// the same bucket is a muddle nobody can read.
     fn begin(&self, run: LiveRun) -> bool {
         let mut live = self.live.lock().unwrap();
         if live.is_some() {
@@ -134,6 +144,17 @@ impl ScanService {
     fn publish(&self, value: Value) {
         // A send with no subscribers is not an error — nobody is watching.
         let _ = self.hub.send(value);
+    }
+}
+
+/// Releases the single run slot when dropped — on success, on error, and on
+/// panic. Without this, a panicking run would leave the service permanently
+/// "busy" and every later scan would be refused until a restart.
+struct LiveGuard(Arc<ScanService>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.end();
     }
 }
 
@@ -168,6 +189,9 @@ pub(crate) fn spawn(
 
     let returned = report_id.clone();
     tokio::spawn(async move {
+        // Frees the run slot however this task ends — the guarantee that scans
+        // never overlap is only as good as the release path.
+        let _live = LiveGuard(Arc::clone(&service));
         // The task guard makes the scan visible and cancellable in the console's
         // task list; dropping it deregisters even on panic.
         let guard = tasks.register(
@@ -293,7 +317,6 @@ pub(crate) fn spawn(
             report.buckets.len()
         );
 
-        service.end();
         service.publish(json!({
             "type": "finished",
             "report_id": report_id,
@@ -331,6 +354,7 @@ pub(crate) fn spawn_repair(
 
     let returned = task_id.clone();
     tokio::spawn(async move {
+        let _live = LiveGuard(Arc::clone(&service));
         let guard = tasks.register(
             &task_id,
             TaskKind::Job,
@@ -387,7 +411,6 @@ pub(crate) fn spawn_repair(
             "[{task_id}] {REPAIR_JOB} finished report={report_id} repaired={} stale={} failed={}",
             counts.0, counts.1, counts.2
         );
-        service.end();
         service.publish(json!({
             "type": "repair_finished",
             "report_id": report_id,
@@ -503,6 +526,30 @@ mod tests {
         service.end();
         assert!(service.busy().is_none());
         assert!(service.begin(run("repair")));
+    }
+
+    /// The slot must be released however a run ends. A panicking scan that
+    /// left it claimed would refuse every later scan until a restart.
+    #[tokio::test]
+    async fn the_run_slot_is_released_even_when_a_run_panics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = ScanService::new(ScanStore::open(tmp.path()).await.unwrap());
+        assert!(service.begin(LiveRun {
+            kind: "scan",
+            report_id: "r".into(),
+            task_id: "t".into(),
+            started_at_ms: 0,
+            progress: Arc::new(ScanProgress::default()),
+            repaired: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total: 0,
+        }));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _live = LiveGuard(Arc::clone(&service));
+            panic!("the scan blew up");
+        }));
+        assert!(result.is_err());
+        assert!(service.busy().is_none(), "the slot must be free again");
     }
 
     #[tokio::test]

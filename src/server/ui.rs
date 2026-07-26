@@ -121,7 +121,10 @@ pub fn router(state: UiState) -> Router {
         // reports it leaves behind.
         .route("/api/perf/scan", get(scan_state).post(start_scan))
         .route("/api/perf/scan/ws", get(scan_ws))
-        .route("/api/perf/scans", get(list_scan_reports))
+        .route(
+            "/api/perf/scans",
+            get(list_scan_reports).delete(delete_scan_reports),
+        )
         .route(
             "/api/perf/scans/:id",
             get(get_scan_report).delete(delete_scan_report),
@@ -2167,6 +2170,58 @@ async fn delete_scan_report(
 }
 
 #[derive(Deserialize)]
+struct DeleteReportsRequest {
+    #[serde(default)]
+    ids: Vec<String>,
+    /// Clear the whole history. The report of a scan that is still running is
+    /// always kept — it is about to be written to.
+    #[serde(default)]
+    all: bool,
+}
+
+/// Deletes several reports at once. Scan history accumulates one row per run,
+/// so clearing it should not be one click (or one request) per report.
+async fn delete_scan_reports(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(req): Json<DeleteReportsRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let mut ids = if req.all {
+        match state.scans.store().all_report_ids().await {
+            Ok(ids) => ids,
+            Err(err) => return storage_error(err),
+        }
+    } else {
+        req.ids.clone()
+    };
+    if ids.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "no reports selected");
+    }
+    // Never delete the report a running scan is still filling in.
+    if let Some(running) = state.scans.running_report_id() {
+        ids.retain(|id| id != &running);
+    }
+    match state.scans.store().delete_reports(ids).await {
+        Ok(deleted) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                "delete_scan_reports",
+                format!("{deleted} report(s)"),
+            );
+            Json(json!({ "deleted": deleted })).into_response()
+        }
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
 struct FindingsQuery {
     #[serde(default)]
     kind: Option<String>,
@@ -2181,6 +2236,26 @@ fn default_findings_page() -> usize {
     100
 }
 
+/// Finding keys embed an ASCII unit separator, which is legal in a URL only
+/// once percent-encoded — a browser's `URLSearchParams` does that, a hand-rolled
+/// `curl "...?after=$NEXT"` does not, and the failure is silent. So the cursor
+/// handed to clients is base64url instead: opaque, and safe to paste anywhere.
+fn encode_cursor(key: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    URL_SAFE_NO_PAD.encode(key.as_bytes())
+}
+
+/// Accepts an encoded cursor, and still accepts a raw key so an older client
+/// (or a hand-written request) keeps working.
+fn decode_cursor(value: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| value.to_string())
+}
+
 async fn list_scan_findings(
     State(state): State<UiState>,
     headers: HeaderMap,
@@ -2191,15 +2266,20 @@ async fn list_scan_findings(
         return resp;
     }
     let kind = query.kind.as_deref().filter(|v| !v.is_empty());
+    let after = query
+        .after
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(decode_cursor);
     match state
         .scans
         .store()
-        .list_findings(&id, kind, query.after.as_deref(), query.limit.clamp(1, 500))
+        .list_findings(&id, kind, after.as_deref(), query.limit.clamp(1, 500))
         .await
     {
         Ok((findings, next)) => Json(json!({
             "findings": findings.iter().map(finding_json).collect::<Vec<_>>(),
-            "next": next,
+            "next": next.as_deref().map(encode_cursor),
         }))
         .into_response(),
         Err(err) => storage_error(err),
@@ -2310,6 +2390,7 @@ fn scan_report_json(report: &super::scan_store::ScanReport) -> Value {
         "disk_bytes": report.disk_bytes(),
         "findings": report.findings,
         "findings_total": report.findings_total,
+        "deferred_recent": report.deferred_recent(),
         "error": report.error,
     })
 }
@@ -2441,6 +2522,30 @@ fn verify_builtin_password(configured: &str, candidate: &str) -> bool {
         return bcrypt::verify(candidate, configured).unwrap_or(false);
     }
     constant_time_eq(configured, candidate)
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{decode_cursor, encode_cursor};
+
+    #[test]
+    fn cursor_round_trips_a_key_containing_control_bytes() {
+        // The real shape: report id, kind, anchor and id joined by 0x1f.
+        let key = "1785036091761-b12662\u{1f}orphan_blob\u{1f}objects/aa1f/V1ORPH223_0223\u{1f}2a086913";
+        let encoded = encode_cursor(key);
+        assert!(
+            encoded.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "cursor must be safe to drop straight into a URL: {encoded}"
+        );
+        assert_eq!(decode_cursor(&encoded), key);
+    }
+
+    #[test]
+    fn a_raw_key_is_still_accepted_as_a_cursor() {
+        // Anything already holding an old-style cursor keeps working.
+        let key = "report\u{1f}kind\u{1f}anchor\u{1f}id";
+        assert_eq!(decode_cursor(key), key);
+    }
 }
 
 #[cfg(test)]

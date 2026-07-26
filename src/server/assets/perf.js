@@ -31,7 +31,17 @@ const actionLabels={
   resync_row:'Resync row from meta.json',
   reclaim_empty_dirs:'Reclaim empty directories',
 };
+// A repaired finding stays in its report rather than vanishing — the report is
+// a record of what was found *and* what was done about it. These are how each
+// outcome reads once that has happened.
+const stateLabels={repaired:'Repaired',stale:'No longer applicable',failed:'Repair failed'};
 const kindOrder=['corrupt_object','missing_blob','unreadable_blob','orphan_blob','superseded_blob','index_drift','empty_fanout'];
+// Not everything the scan reports is damage. Empty directories are pure
+// housekeeping — nothing is at risk and nothing is unreadable — so they are
+// styled as routine rather than alarming, and kept out of the problem count.
+const housekeepingKinds=new Set(['empty_fanout']);
+const isProblem=kind=>!housekeepingKinds.has(kind);
+const countProblems=counts=>Object.entries(counts||{}).filter(([k])=>isProblem(k)).reduce((sum,[,n])=>sum+n,0);
 
 // How many findings one "repair all" click may sweep up. Repairs are real
 // filesystem work; an unbounded click on a million findings is not a thing an
@@ -72,7 +82,7 @@ function handleScanEvent(env){
   if(env.type==='repair_finished'){
     scanLive=null;renderScanLive();
     toast('Repairs finished',`${env.repaired} repaired · ${env.stale} no longer applicable · ${env.failed} failed`,env.failed===0);
-    if(scanReportId)openScanReport(scanReportId);
+    if(scanReportId&&$('reportDlg').open)openScanReport(scanReportId);
     return;
   }
   scanLive=env.type==='idle'?null:env;
@@ -159,29 +169,61 @@ async function loadScanHistory(){
       host.innerHTML=`<div class="empty" style="padding:44px 20px"><div class="empty-icon">${icons.activity}</div><h3>No scans yet</h3><p>A scan walks every object directory to reconcile the catalog against what is actually on disk. Run one to see disk usage per bucket and anything that needs attention.</p></div>`;
       return;
     }
-    host.innerHTML=`<table><thead><tr><th>When</th><th>Buckets</th><th>Objects</th><th>Logical</th><th>On disk</th><th>Findings</th><th></th></tr></thead><tbody>${reports.map(scanRowHtml).join('')}</tbody></table>`;
+    host.innerHTML=`<table><thead><tr><th style="width:34px"><input type="checkbox" onclick="event.stopPropagation()" onchange="toggleAllReports(this.checked)"></th><th>When</th><th>Buckets</th><th>Objects</th><th>Logical</th><th>On disk</th><th>Findings</th><th></th></tr></thead><tbody>${reports.map(scanRowHtml).join('')}</tbody></table>`;
   }catch(e){host.innerHTML=`<div class="muted" style="padding:18px">${esc(e.message)}</div>`;}
 }
 function scanRowHtml(report){
   const status=report.status;
   const badge=status==='completed'?'':`<span class="scan-badge ${esc(status)}">${esc(status)}</span> `;
-  const findings=report.findings_total
-    ? `<span class="scan-badge warn">${report.findings_total.toLocaleString()}</span>`
-    : `<span class="muted">clean</span>`;
+  const problems=countProblems(report.findings);
+  const tidy=(report.findings_total||0)-problems;
+  const findings=problems
+    ? `<span class="scan-badge warn">${problems.toLocaleString()}</span>`
+    : tidy
+      ? `<span class="scan-badge tidy">${tidy.toLocaleString()} to tidy</span>`
+      : `<span class="muted">clean</span>`;
+  // The row stays clickable for anyone who tries it, but the View button is
+  // what makes opening a report discoverable — a bare clickable row tells
+  // nobody it can be clicked.
   return `<tr class="scan-row" onclick="openScanReport('${esc(report.id)}')">
-    <td><strong>${esc(fmtTime(report.started_at_ms))}</strong><div class="muted" style="font-size:11.5px">${badge}${esc(fmtAgo(report.started_at_ms))}${report.actor?' · by '+esc(report.actor):''}</div></td>
+    <td onclick="event.stopPropagation()"><input type="checkbox" class="scan-report-pick" value="${esc(report.id)}"></td>
+    <td><strong class="scan-when">${esc(fmtTime(report.started_at_ms))}</strong><div class="muted" style="font-size:11.5px">${badge}${esc(fmtAgo(report.started_at_ms))}${report.actor?' · by '+esc(report.actor):''}</div></td>
     <td>${report.buckets_scanned}</td>
     <td>${(report.objects||0).toLocaleString()}</td>
     <td>${esc(fmtSize(report.logical_bytes||0))}</td>
     <td>${esc(fmtSize(report.disk_bytes||0))}</td>
     <td>${findings}</td>
-    <td style="text-align:right"><button class="row-action danger" title="Delete this report" onclick="event.stopPropagation();confirmDeleteScan('${esc(report.id)}')">${icons.trash}</button></td>
+    <td style="text-align:right;white-space:nowrap">
+      <button class="btn small" onclick="event.stopPropagation();openScanReport('${esc(report.id)}')">View</button>
+      <button class="row-action danger" title="Delete this report" onclick="event.stopPropagation();confirmDeleteScan('${esc(report.id)}')">${icons.trash}</button>
+    </td>
   </tr>`;
+}
+function toggleAllReports(on){document.querySelectorAll('.scan-report-pick').forEach(cb=>{cb.checked=on;});}
+function deleteSelectedReports(){
+  const ids=[...document.querySelectorAll('.scan-report-pick:checked')].map(cb=>cb.value);
+  if(!ids.length){toast('Nothing selected','Tick the reports you want to delete',false);return;}
+  showConfirm(`Delete ${ids.length} report${ids.length===1?'':'s'}`,'Scan history',
+    'The scans themselves changed nothing, so deleting their reports is safe — any repair already applied stays applied.',
+    async()=>{
+      const r=await api('DELETE','/api/perf/scans',{ids});
+      if(ids.includes(scanReportId)){scanReportId=null;$('reportDlg').close();}
+      toast('Reports deleted',`${r.deleted} removed`);loadScanHistory();
+    });
+}
+function deleteAllReports(){
+  showConfirm('Delete the entire scan history','All reports',
+    'Every report and all of its findings are removed. A scan that is still running keeps its report. Repairs already applied stay applied.',
+    async()=>{
+      const r=await api('DELETE','/api/perf/scans',{all:true});
+      scanReportId=null;$('reportDlg').close();
+      toast('History cleared',`${r.deleted} report${r.deleted===1?'':'s'} removed`);loadScanHistory();
+    });
 }
 function confirmDeleteScan(id){
   showConfirm('Delete scan report','This removes the report and all of its findings.','The scan itself changed nothing, so deleting the report is safe — you can always run another.',async()=>{
     await api('DELETE','/api/perf/scans/'+enc(id));
-    if(scanReportId===id){scanReportId=null;$('scanReport').classList.add('hidden');}
+    if(scanReportId===id){scanReportId=null;$('reportDlg').close();}
     toast('Report deleted','');loadScanHistory();
   });
 }
@@ -189,10 +231,21 @@ function confirmDeleteScan(id){
 // ── one report ──
 async function openScanReport(id){
   scanReportId=id;
-  const host=$('scanReport');host.classList.remove('hidden');
+  // Which categories have already been fetched is per-report state. Not
+  // clearing it meant a kind opened in an earlier report short-circuited its
+  // load here, leaving the section expanded but empty — no rows, no buttons.
+  scanKindOpen={};
+  const host=$('scanReportBody');
   host.innerHTML='<div class="panel"><div class="muted" style="padding:20px">Loading report…</div></div>';
+  $('reportDlgTitle').textContent='Scan report';
+  $('reportDlgSub').textContent='';
+  if(!$('reportDlg').open)$('reportDlg').showModal();
   try{
     const report=await api('GET','/api/perf/scans/'+enc(id));
+    $('reportDlgTitle').textContent=`Scan of ${fmtTime(report.started_at_ms)}`;
+    $('reportDlgSub').textContent=`${fmtAgo(report.started_at_ms)} · ${report.buckets_scanned} bucket${report.buckets_scanned===1?'':'s'}`
+      +`${report.finished_at_ms?' · took '+fmtDur(report.finished_at_ms-report.started_at_ms):''}`
+      +`${report.actor?' · by '+report.actor:''}`;
     host.innerHTML=reportHtml(report);
     hydrateIcons(host);
     // Auto-open the first non-empty category: the point of the page is the
@@ -204,6 +257,13 @@ async function openScanReport(id){
 function reportHtml(report){
   const states=report.finding_states||{};
   const outstanding=states.open||0;
+  const deferred=report.deferred_recent||0;
+  const problems=countProblems(report.findings);
+  const housekeeping=(report.findings_total||0)-problems;
+  // A dir written moments before the scan looked at it may be a publish that
+  // has not committed its row yet, so it is not judged. Say so plainly —
+  // otherwise "no findings" reads as "nothing to find".
+  const deferredNote=deferred?`<div class="scan-note">${deferred} director${deferred===1?'y was':'ies were'} modified moments before the scan reached ${deferred===1?'it':'them'}, so ${deferred===1?'it was':'they were'} not judged — a directory being published right now is indistinguishable from one left behind. Run the scan again in a few seconds to include ${deferred===1?'it':'them'}.</div>`:'';
   const buckets=(report.buckets||[]).map(b=>`<tr>
     <td><strong>${esc(b.bucket)}</strong>${b.error?`<div class="scan-badge failed">${esc(b.error)}</div>`:''}</td>
     <td>${(b.objects_indexed||0).toLocaleString()}</td>
@@ -218,31 +278,33 @@ function reportHtml(report){
   const kinds=kindOrder.filter(kind=>(report.findings||{})[kind]).map(kind=>findingSectionHtml(kind,report.findings[kind])).join('');
   return `<div class="panel">
     <div class="panel-title">
-      <div><h3>Scan of ${esc(fmtTime(report.started_at_ms))}</h3>
-      <p>${esc(fmtAgo(report.started_at_ms))} · ${report.buckets_scanned} bucket${report.buckets_scanned===1?'':'s'} · ${report.finished_at_ms?'took '+esc(fmtDur(report.finished_at_ms-report.started_at_ms)):'in progress'}${report.error?' · '+esc(report.error):''}</p></div>
-      <span class="spacer"></span>
-      <button class="btn small" onclick="$('scanReport').classList.add('hidden')"><span data-icon="x"></span> Close</button>
+      <div><h3>Summary</h3><p>${report.error?esc(report.error):'What the scan measured across every bucket it covered.'}</p></div>
     </div>
     <div class="scan-summary">
       ${statTile('Objects',(report.objects||0).toLocaleString())}
       ${statTile('Logical size',fmtSize(report.logical_bytes||0))}
       ${statTile('On disk',fmtSize(report.disk_bytes||0))}
-      ${statTile('Findings',(report.findings_total||0).toLocaleString(),(report.findings_total||0)>0)}
-      ${statTile('Still open',outstanding.toLocaleString(),outstanding>0)}
+      ${statTile('Problems',problems.toLocaleString(),problems>0)}
+      ${housekeeping?statTile('To tidy up',housekeeping.toLocaleString()):''}
+      ${statTile('Still open',outstanding.toLocaleString(),problems>0&&outstanding>0)}
       ${statTile('Repaired',(states.repaired||0).toLocaleString())}
+      ${deferred?statTile('Not yet judged',deferred.toLocaleString(),true):''}
     </div>
+    ${deferredNote}
     <div style="overflow-x:auto"><table>
       <thead><tr><th>Bucket</th><th>Objects</th><th>Logical</th><th>Objects dir</th><th>Trash</th><th>Staging</th><th>Index</th><th>Empty dirs</th><th>Stale intents</th></tr></thead>
       <tbody>${buckets}</tbody>
     </table></div>
   </div>
-  ${kinds||`<div class="panel" style="margin-top:16px"><div class="empty" style="padding:40px 20px"><div class="empty-icon">${icons.check}</div><h3>Nothing wrong found</h3><p>Every index row matched a blob directory on disk, every part was present and the right size, and no directory was left unreferenced.</p></div></div>`}`;
+  ${problems?'':`<div class="panel" style="margin-top:16px"><div class="empty" style="padding:40px 20px"><div class="empty-icon">${icons.check}</div><h3>Nothing wrong found</h3><p>Every index row matched a blob directory on disk, every part was present and the right size, and no directory was left unreferenced.${housekeeping?` There ${housekeeping===1?'is':'are'} ${housekeeping} routine tidy-up item${housekeeping===1?'':'s'} below — no data is at risk.`:''}${deferred?` ${deferred} recently-written director${deferred===1?'y was':'ies were'} skipped as too new to judge — rescan shortly to cover ${deferred===1?'it':'them'}.`:''}</p></div></div>`}
+  ${kinds}`;
 }
 function findingSectionHtml(kind,count){
   const [title,blurb]=findingMeta[kind]||[kind,''];
+  const badge=isProblem(kind)?'warn':'tidy';
   return `<div class="panel scan-kind" style="margin-top:16px" id="kind_${esc(kind)}">
     <div class="panel-title" onclick="toggleFindings('${esc(kind)}')" style="cursor:pointer">
-      <div><h3>${esc(title)} <span class="scan-badge warn">${count.toLocaleString()}</span></h3><p>${esc(blurb)}</p></div>
+      <div><h3>${esc(title)} <span class="scan-badge ${badge}">${count.toLocaleString()}</span></h3><p>${esc(blurb)}</p></div>
       <span class="spacer"></span>
       <span class="scan-chevron" data-icon="chevron-down"></span>
     </div>
@@ -273,15 +335,21 @@ async function loadFindings(kind,after,accumulated){
 function findingsHtml(kind,findings,next){
   const rows=findings.map(f=>findingRowHtml(kind,f)).join('');
   const actions=(findings[0]?.actions)||[];
-  const recommended=actions[0];
   const openCount=findings.filter(f=>f.state==='open').length;
-  const bulk=recommended&&openCount>1
-    ? `<button class="btn small primary" onclick="repairAll('${esc(kind)}','${esc(recommended)}')">${esc(actionLabels[recommended]||recommended)} — all open</button>`
+  // Whole-section repair: the operator picks the action once and it is applied
+  // to every open finding of this kind — not just the ones on screen, since
+  // repairAll pages through the server. Offered for every kind, because "there
+  // are 4,000 of these" is exactly when clicking each one is not an option.
+  const bulk=actions.length&&openCount
+    ? `<select class="input small scan-action" id="bulk_${esc(kind)}" title="Action to apply to every open finding in this category">
+         ${actions.map((a,i)=>`<option value="${esc(a)}">${esc(actionLabels[a]||a)}${i===0?' (recommended)':''}</option>`).join('')}
+       </select>
+       <button class="btn small primary" onclick="repairAll('${esc(kind)}')">Apply to all open</button>`
     : '';
   return `<div class="scan-findings-head">
       <label class="scan-check"><input type="checkbox" onchange="toggleAllFindings('${esc(kind)}',this.checked)"> Select all on this page</label>
-      <span class="spacer"></span>
       <button class="btn small" onclick="repairSelected('${esc(kind)}')">Repair selected</button>
+      <span class="spacer"></span>
       ${bulk}
     </div>
     <div class="scan-finding-list">${rows}</div>
@@ -291,17 +359,24 @@ function findingRowHtml(kind,f){
   const state=f.state||'open';
   const target=f.object_key?`<code>${esc(f.object_key)}</code>`:(f.blob_dir?`<code>${esc(f.blob_dir)}</code>`:'<span class="muted">—</span>');
   const where=f.object_key&&f.blob_dir?`<div class="muted" style="font-size:11px">${esc(f.blob_dir)}</div>`:'';
+  // Aggregated findings (empty directories) name no single path, so list the
+  // directories they stand for — otherwise there is nothing to go and inspect.
+  const paths=Array.isArray(f.data?.paths)?f.data.paths:null;
+  const pathList=paths&&paths.length
+    ? `<div class="scan-paths">${paths.map(p=>`<code>${esc(p)}</code>`).join('')}${f.data.paths_truncated?`<span class="muted">…and ${(f.count-paths.length).toLocaleString()} more</span>`:''}</div>`
+    : '';
   const options=(f.actions||[]).map((a,i)=>`<option value="${esc(a)}">${esc(actionLabels[a]||a)}${i===0?' (recommended)':''}</option>`).join('');
   const controls=state==='open'
     ? `<select class="input small scan-action" data-key="${esc(f.key)}">${options}</select>
        <button class="btn small" onclick="repairOne('${esc(kind)}','${esc(f.key)}',this)">Repair</button>`
-    : `<span class="scan-badge ${esc(state)}">${esc(state)}</span>`;
+    : `<span class="scan-badge ${esc(state)}">${state==='repaired'?icons.check:''}${esc(stateLabels[state]||state)}</span>`;
   return `<div class="scan-finding" data-key="${esc(f.key)}" data-state="${esc(state)}">
     <label class="scan-check">${state==='open'?`<input type="checkbox" class="scan-pick" value="${esc(f.key)}">`:'<span style="width:14px;display:inline-block"></span>'}</label>
     <div style="flex:1;min-width:0">
       <div class="scan-finding-target">${esc(f.bucket)} · ${target}</div>${where}
       <div class="muted" style="font-size:11.5px">${esc(f.detail)}</div>
-      ${f.outcome?`<div class="scan-outcome">${esc(f.outcome)}</div>`:''}
+      ${pathList}
+      ${f.outcome?`<div class="scan-outcome">${esc(f.outcome)}${f.repaired_at_ms?` · ${esc(fmtAgo(f.repaired_at_ms))}`:''}</div>`:''}
     </div>
     <div class="scan-finding-size">${f.bytes?esc(fmtSize(f.bytes)):''}</div>
     <div class="scan-finding-actions">${controls}</div>
@@ -344,7 +419,10 @@ function repairSelected(kind){
 }
 // Sweeps every *open* finding of one kind — paging through the server rather
 // than trusting whatever happens to be rendered.
-async function repairAll(kind,action){
+async function repairAll(kind){
+  const select=$('bulk_'+kind);
+  const action=select?select.value:null;
+  if(!action)return;
   const items=[];let after=null;
   try{
     while(items.length<REPAIR_ALL_CAP){

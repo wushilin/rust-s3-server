@@ -140,6 +140,13 @@ impl ScanReport {
     pub fn objects(&self) -> u64 {
         self.buckets.iter().map(|b| b.objects_indexed).sum()
     }
+
+    /// Blob dirs the scan declined to judge because they were written moments
+    /// before it looked. Surfaced so a clean report is never mistaken for a
+    /// complete one.
+    pub fn deferred_recent(&self) -> u64 {
+        self.buckets.iter().map(|b| b.deferred_recent).sum()
+    }
 }
 
 /// A finding plus the storage key it lives under — the key is the cursor for
@@ -321,6 +328,51 @@ impl ScanStore {
             batch.delete_range_cf(&findings, &from, &to);
             db.write_opt(batch, &write_opts())?;
             Ok(existed)
+        })
+        .await
+    }
+
+    /// Every report id, oldest first. Used by "delete all", which needs the
+    /// ids rather than the (much larger) summaries.
+    pub async fn all_report_ids(&self) -> Result<Vec<String>> {
+        let db = self.db.clone();
+        blocking(move || {
+            let reports = cf(&db, CF_REPORTS)?;
+            let mut out = Vec::new();
+            for item in db.iterator_cf(&reports, IteratorMode::Start) {
+                let (key, _) = item?;
+                out.push(String::from_utf8_lossy(&key).into_owned());
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Deletes several reports and all their findings in one write batch —
+    /// clearing a long history should not be one round trip per report.
+    /// Returns how many of the ids actually existed.
+    pub async fn delete_reports(&self, ids: Vec<String>) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let db = self.db.clone();
+        blocking(move || {
+            let reports = cf(&db, CF_REPORTS)?;
+            let findings = cf(&db, CF_FINDINGS)?;
+            let mut batch = WriteBatch::default();
+            let mut deleted = 0;
+            for id in &ids {
+                if db.get_cf(&reports, id.as_bytes())?.is_some() {
+                    deleted += 1;
+                }
+                batch.delete_cf(&reports, id.as_bytes());
+                let from = finding_prefix(id, None);
+                let mut to = from.clone();
+                *to.last_mut().expect("prefix is never empty") += 1;
+                batch.delete_range_cf(&findings, &from, &to);
+            }
+            db.write_opt(batch, &write_opts())?;
+            Ok(deleted)
         })
         .await
     }
@@ -518,6 +570,40 @@ mod tests {
         // Siblings are untouched.
         let (findings, _) = store.list_findings(&ids[0], None, None, 10).await.unwrap();
         assert_eq!(findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_removes_reports_and_their_findings() {
+        let (_tmp, store) = store().await;
+        let mut ids = Vec::new();
+        for n in 0..4 {
+            let id = format!("{:013}-{n}", 1_700_000_000_000i64 + n);
+            store
+                .put_report(&ScanReport::new(id.clone(), "admin".into(), vec!["bkt".into()]))
+                .await
+                .unwrap();
+            store
+                .append_findings(&id, vec![finding("bkt", FindingKind::OrphanBlob, "objects/A/1")])
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        // Unknown ids are tolerated and simply don't count.
+        let mut requested = vec![ids[0].clone(), ids[1].clone()];
+        requested.push("nosuchreport".to_string());
+        assert_eq!(store.delete_reports(requested).await.unwrap(), 2);
+        assert_eq!(store.list_reports(10).await.unwrap().len(), 2);
+        let (gone, _) = store.list_findings(&ids[0], None, None, 10).await.unwrap();
+        assert!(gone.is_empty(), "findings must go with their report");
+        let (kept, _) = store.list_findings(&ids[3], None, None, 10).await.unwrap();
+        assert_eq!(kept.len(), 1, "other reports are untouched");
+
+        // …and clearing everything.
+        let all = store.all_report_ids().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(store.delete_reports(all).await.unwrap(), 2);
+        assert!(store.list_reports(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
