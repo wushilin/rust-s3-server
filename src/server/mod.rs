@@ -1713,6 +1713,12 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             response
         }
+        StorageError::PreconditionFailed { .. } => s3_error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold",
+            resource,
+        ),
         _ => s3_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalError",

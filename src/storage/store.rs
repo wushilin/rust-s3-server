@@ -102,6 +102,45 @@ pub struct PutResult {
     pub last_modified_ms: i64,
 }
 
+/// A conditional-write precondition, evaluated against the object currently at
+/// the key under the per-key lock so the check and the write are atomic.
+///
+/// These mirror the S3 `PutObject` preconditions the `object_store` crate emits
+/// for `PutMode::Create` and `PutMode::Update` — the primitive Delta Lake and
+/// Iceberg build conflict-free commits on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    /// `If-None-Match: *` — the write succeeds only if no object exists.
+    IfNoneMatchStar,
+    /// `If-Match: "<etag>"` — the write succeeds only if the current object's
+    /// ETag matches (compared ignoring surrounding quotes, weak prefix, case).
+    IfMatch(String),
+}
+
+impl Precondition {
+    /// Is the precondition satisfied given the ETag currently at the key
+    /// (`None` when the key is empty)?
+    fn is_met(&self, current_etag: Option<&str>) -> bool {
+        match self {
+            Precondition::IfNoneMatchStar => current_etag.is_none(),
+            Precondition::IfMatch(want) => current_etag.is_some_and(|have| etag_eq(have, want)),
+        }
+    }
+}
+
+/// Compares two ETags for equality, ignoring surrounding quotes, an optional
+/// weak `W/` prefix, and ASCII case. rusts3 stores a bare MD5 hex; a client's
+/// `If-Match` header carries the quoted form it received in the ETag response.
+fn etag_eq(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
 /// Live progress of a bucket index rebuild, for status displays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildProgress {
@@ -411,7 +450,7 @@ impl LocalObjectStore {
         let staging_id = self
             .stage_put(bucket, key, payload, content_type, content_encoding)
             .await?;
-        self.commit_staged_put(bucket, key, &staging_id).await
+        self.commit_staged_put(bucket, key, &staging_id, None).await
     }
 
     pub async fn put_object_stream<S, E>(
@@ -440,6 +479,7 @@ impl LocalObjectStore {
             aws_chunked,
             expected_sha256,
             None,
+            None,
         )
         .await
     }
@@ -457,6 +497,7 @@ impl LocalObjectStore {
         aws_chunked: bool,
         expected_sha256: Option<&str>,
         expected_decoded_len: Option<u64>,
+        precondition: Option<Precondition>,
     ) -> Result<PutResult>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -489,7 +530,8 @@ impl LocalObjectStore {
             )
             .await?
         };
-        self.commit_staged_put(bucket, key, &staging_id).await
+        self.commit_staged_put(bucket, key, &staging_id, precondition)
+            .await
     }
 
     pub async fn stage_put(
@@ -718,6 +760,7 @@ impl LocalObjectStore {
         bucket: &str,
         key: &str,
         staging_id: &str,
+        precondition: Option<Precondition>,
     ) -> Result<PutResult> {
         validate_staging_id(staging_id)?;
         let staging_dir = self.layout.put_staging_dir(bucket, staging_id)?;
@@ -759,11 +802,13 @@ impl LocalObjectStore {
         let publish_dir =
             prepare_single_publish_dir(&staging_dir, &staged_part, &object_meta).await?;
 
+        // Remove staging on every path — a rejected precondition must not leak
+        // the staged blob.
         let result = self
-            .publish_prepared_dir(bucket, key, &publish_dir, object_meta)
-            .await?;
+            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, precondition)
+            .await;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        Ok(result)
+        result
     }
 
     /// The shared commit section for PUT / CopyObject / CompleteMultipart:
@@ -776,6 +821,7 @@ impl LocalObjectStore {
         key: &str,
         publish_dir: &Path,
         mut object_meta: ObjectMeta,
+        precondition: Option<Precondition>,
     ) -> Result<PutResult> {
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if self.durability == Durability::Full {
@@ -792,6 +838,22 @@ impl LocalObjectStore {
         let _guard = self.locks.lock(bucket, key).await;
 
         let old = index.get(key).await?;
+
+        // Conditional write: evaluate the precondition against the object
+        // currently at the key, atomically under the lock we already hold, so
+        // the check and the publish cannot race. On failure, abandon the intent
+        // and the staged blob and report 412.
+        if let Some(precondition) = &precondition {
+            if !precondition.is_met(old.as_ref().map(|o| o.etag.as_str())) {
+                let _ = index.delete_intent(intent_id).await;
+                let _ = tokio::fs::remove_dir_all(publish_dir).await;
+                return Err(StorageError::PreconditionFailed {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        }
+
         // Monotonic per-key clamp: newer-wins adjudication (rebuild, DR)
         // requires timestamps to order versions even across clock steps.
         let last_modified_ms = old
@@ -1559,8 +1621,10 @@ impl LocalObjectStore {
         };
         let publish_dir = prepare_multipart_publish_dir(&staging_dir, &parts, &object_meta).await?;
 
+        // Multipart completion is unconditional (object_store never sends a
+        // precondition with it).
         let result = self
-            .publish_prepared_dir(bucket, key, &publish_dir, object_meta)
+            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, None)
             .await?;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(result)
@@ -1625,7 +1689,7 @@ impl LocalObjectStore {
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         drop(_source_guard);
-        self.commit_staged_put(dst_bucket, dst_key, &staging_id)
+        self.commit_staged_put(dst_bucket, dst_key, &staging_id, None)
             .await
     }
 

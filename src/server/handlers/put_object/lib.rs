@@ -6,7 +6,28 @@ use axum::response::Response;
 
 use crate::server as srv;
 use crate::server::handlers::ObjectCtx;
-use crate::storage::store::LocalObjectStore;
+use crate::storage::store::{LocalObjectStore, Precondition};
+
+/// Parses the conditional-write preconditions S3 (and the `object_store` crate)
+/// place on `PutObject`. `If-None-Match: *` means create-only; `If-Match:
+/// "<etag>"` means overwrite-only-if-unchanged. If-None-Match takes precedence
+/// when both are present.
+fn parse_precondition(headers: &axum::http::HeaderMap) -> Option<Precondition> {
+    if let Some(v) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+        if v.trim() == "*" {
+            return Some(Precondition::IfNoneMatchStar);
+        }
+    }
+    if let Some(v) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        // A specific ETag ("<etag>"); `*` (any existing object) is not what
+        // object_store emits, so it is left unconditional here.
+        if !v.is_empty() && v != "*" {
+            return Some(Precondition::IfMatch(v.to_string()));
+        }
+    }
+    None
+}
 
 pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) -> Response {
     let resource = ctx.resource();
@@ -41,6 +62,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
     } else {
         None
     };
+    let precondition = parse_precondition(&ctx.headers);
     match store
         .put_object_stream_with_metadata(
             &ctx.bucket,
@@ -54,6 +76,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             aws_chunked,
             expected_sha256.as_deref(),
             expected_decoded_len,
+            precondition,
         )
         .await
     {
@@ -102,5 +125,90 @@ mod tests {
         let store = LocalObjectStore::new(tmp.path());
         let resp = handle(store, ctx("nope", "k"), Body::from("x")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn ctx_with(bucket: &str, key: &str, name: header::HeaderName, value: &str) -> ObjectCtx {
+        let mut c = ctx(bucket, key);
+        c.headers.insert(name, value.parse().unwrap());
+        c
+    }
+
+    #[tokio::test]
+    async fn if_none_match_star_creates_only_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("condbkt").await.unwrap();
+
+        // First conditional create succeeds against an empty key.
+        let resp = handle(
+            store.clone(),
+            ctx_with("condbkt", "k", header::IF_NONE_MATCH, "*"),
+            Body::from("one"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A second create with If-None-Match: * is rejected — the object exists.
+        let resp = handle(
+            store.clone(),
+            ctx_with("condbkt", "k", header::IF_NONE_MATCH, "*"),
+            Body::from("second write"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+
+        // …and the original content is untouched.
+        let read = store.read_object("condbkt", "k").await.unwrap();
+        assert_eq!(read.meta.size, 3);
+    }
+
+    #[tokio::test]
+    async fn if_match_requires_matching_etag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("condbkt").await.unwrap();
+
+        let resp = handle(store.clone(), ctx("condbkt", "k"), Body::from("orig")).await;
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Correct ETag → the update goes through.
+        let resp = handle(
+            store.clone(),
+            ctx_with("condbkt", "k", header::IF_MATCH, &etag),
+            Body::from("updated!"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(store.read_object("condbkt", "k").await.unwrap().meta.size, 8);
+
+        // Stale ETag → rejected.
+        let resp = handle(
+            store.clone(),
+            ctx_with("condbkt", "k", header::IF_MATCH, "\"deadbeefdeadbeefdeadbeefdeadbeef\""),
+            Body::from("no"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(store.read_object("condbkt", "k").await.unwrap().meta.size, 8);
+    }
+
+    #[tokio::test]
+    async fn if_match_on_absent_object_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("condbkt").await.unwrap();
+        let resp = handle(
+            store,
+            ctx_with("condbkt", "ghost", header::IF_MATCH, "\"anything\""),
+            Body::from("x"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
     }
 }

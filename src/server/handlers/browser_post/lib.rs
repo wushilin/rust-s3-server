@@ -139,7 +139,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
         Ok(v) => v,
         Err(err) => return srv::storage_error_response(err, &format!("/{bucket}/{key}")),
     };
-    let mut response = match store.commit_staged_put(&bucket, &key, &staging_id).await {
+    let mut response = match store.commit_staged_put(&bucket, &key, &staging_id, None).await {
         Ok(result) => {
             let location = format!("/{bucket}/{key}");
             srv::with_measure(

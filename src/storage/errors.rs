@@ -22,6 +22,9 @@ pub enum StorageError {
     BucketRebuilding(String),
     /// The on-disk index schema is not current; a rebuild is required.
     IndexOutdated(String),
+    /// A conditional write's precondition (If-None-Match / If-Match) was not
+    /// met against the object currently at the key. Maps to HTTP 412.
+    PreconditionFailed { bucket: String, key: String },
 }
 
 impl fmt::Display for StorageError {
@@ -56,6 +59,9 @@ impl fmt::Display for StorageError {
                 write!(f, "bucket index rebuild in progress: {v}")
             }
             StorageError::IndexOutdated(v) => write!(f, "index schema outdated: {v}"),
+            StorageError::PreconditionFailed { bucket, key } => {
+                write!(f, "precondition failed for {bucket}/{key}")
+            }
         }
     }
 }

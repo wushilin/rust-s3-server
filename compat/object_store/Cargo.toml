@@ -1,0 +1,21 @@
+# Compatibility test harness: drives the `object_store` crate's S3 client
+# against a running rusts3 to prove the operations real apps rely on comply.
+#
+# A standalone workspace (the empty [workspace] table below decouples it from
+# the parent crate), so `object_store` and its transitive deps never enter the
+# main server's dependency graph. Run it with ./run.sh.
+[package]
+name = "rusts3-object-store-compat"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+object_store = { version = "0.14", features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+bytes = "1"
+futures = "0.3"
