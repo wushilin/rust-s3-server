@@ -10,11 +10,15 @@ let statsRange='24h', statsCharts=[], statsTimer=null, statsInited=false;
 const STATS_COLORS=['#2a78d6','#eb6834','#1baf7a','#eda100'];
 const STATS_AXIS='#647184', STATS_GRID='rgba(100,113,132,.13)';
 
-// Value formatters by unit. Reuses fmtSize from core.js for bytes / byte-rates.
+// Byte formatter that ROUNDS the sub-1024 case — fmtSize (core.js) leaves it as
+// a raw number, which for a fractional rate prints "856.3328…B".
+function fmtBytesStat(n){ n=+n||0; return n<1024 ? Math.round(n)+' B' : fmtSize(n); }
+
+// Value formatters by unit.
 function statsFmt(kind){
   if(kind==='pct')  return v=>v==null?'':(v<10?v.toFixed(1):v.toFixed(0))+'%';
-  if(kind==='bps')  return v=>v==null?'':fmtSize(v)+'/s';
-  if(kind==='bytes')return v=>v==null?'':fmtSize(v);
+  if(kind==='bps')  return v=>v==null?'':fmtBytesStat(v)+'/s';
+  if(kind==='bytes')return v=>v==null?'':fmtBytesStat(v);
   return v=>v==null?'':(v>=10?Math.round(v):v.toFixed(1)); // qps / count
 }
 function lastVal(arr){ for(let i=arr.length-1;i>=0;i--) if(arr[i]!=null) return arr[i]; return null; }
@@ -49,8 +53,8 @@ function statsChart(el,defs,kind){
   };
 
   const opts={
-    width: el.clientWidth||520, height:152,
-    padding:[12,14,2,6],
+    width: el.clientWidth||520, height:168,
+    padding:[12,14,4,6],
     legend:{show:false},
     cursor:{points:{size:6,width:2},focus:{prox:28}},
     scales:{x:{time:true}, y:{range:(u,dmin,dmax)=>[0,(dmax==null||dmax<=0)?1:dmax*1.2]}},
@@ -60,8 +64,9 @@ function statsChart(el,defs,kind){
       ...(single?{fill:'rgba(42,120,214,.09)'}:{}),
     }))],
     axes:[
+      // Taller x-axis so uPlot's two-tier time+date labels aren't clipped.
       {stroke:STATS_AXIS, grid:{stroke:STATS_GRID,width:1}, ticks:{stroke:STATS_GRID,width:1,size:4},
-       font:'11px system-ui,sans-serif', size:28},
+       font:'11px system-ui,sans-serif', size:42},
       {stroke:STATS_AXIS, grid:{stroke:STATS_GRID,width:1}, ticks:{show:false},
        font:'11px system-ui,sans-serif', size:54, values:(u,vals)=>vals.map(fmt)},
     ],
@@ -81,11 +86,11 @@ function initStats(){
       {c:statsChart($('chartCpu'), [{label:'System',idx:1},{label:'Process',idx:2}], 'pct'),
        now:'nowCpu', head:v=>statsFmt('pct')(v[0])},
       {c:statsChart($('chartMem'), [{label:'Used',idx:3},{label:'Process RSS',idx:5}], 'bytes'),
-       now:'nowMem', head:v=>v[0]==null?'—':fmtSize(v[0])},
+       now:'nowMem', head:v=>v[0]==null?'—':fmtBytesStat(v[0])},
       {c:statsChart($('chartDisk'),[{label:'Proc read',idx:6},{label:'Proc write',idx:7},{label:'Sys read',idx:8},{label:'Sys write',idx:9}], 'bps'),
-       now:'nowDisk', head:v=>fmtSize((v[2]||0)+(v[3]||0))+B},
+       now:'nowDisk', head:v=>fmtBytesStat((v[2]||0)+(v[3]||0))+B},
       {c:statsChart($('chartNet'), [{label:'In',idx:10},{label:'Out',idx:11}], 'bps'),
-       now:'nowNet', head:v=>fmtSize((v[0]||0)+(v[1]||0))+B},
+       now:'nowNet', head:v=>fmtBytesStat((v[0]||0)+(v[1]||0))+B},
       {c:statsChart($('chartQps'), [{label:'Requests',idx:12}], 'qps'),
        now:'nowQps', head:v=>statsFmt('qps')(v[0]||0)+B},
     ];
@@ -101,7 +106,7 @@ function initStats(){
 
 function statsResize(){
   if(!statsInited||$('tab_stats').classList.contains('hidden'))return;
-  statsCharts.forEach(c=>c.c.u.setSize({width:c.c.el.clientWidth||520,height:152}));
+  statsCharts.forEach(c=>c.c.u.setSize({width:c.c.el.clientWidth||520,height:168}));
 }
 
 function statsSetRange(v){statsRange=v;loadStats();}

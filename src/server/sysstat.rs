@@ -60,6 +60,30 @@ pub struct Sample {
     pub qps: Option<f64>,
 }
 
+impl Sample {
+    /// Field count, and the column order shared by [`to_cols`](Self::to_cols),
+    /// [`from_cols`](Self::from_cols), and the API's columnar response.
+    pub(crate) const COLS: usize = 12;
+
+    /// The metrics as a positional array, so the store can aggregate buckets
+    /// generically instead of naming all twelve fields.
+    pub(crate) fn to_cols(&self) -> [Option<f64>; Self::COLS] {
+        [
+            self.cpu_sys, self.cpu_proc, self.mem_used, self.mem_total, self.mem_proc_rss,
+            self.disk_proc_r, self.disk_proc_w, self.disk_sys_r, self.disk_sys_w,
+            self.net_in, self.net_out, self.qps,
+        ]
+    }
+
+    pub(crate) fn from_cols(c: [Option<f64>; Self::COLS]) -> Self {
+        Self {
+            cpu_sys: c[0], cpu_proc: c[1], mem_used: c[2], mem_total: c[3], mem_proc_rss: c[4],
+            disk_proc_r: c[5], disk_proc_w: c[6], disk_sys_r: c[7], disk_sys_w: c[8],
+            net_in: c[9], net_out: c[10], qps: c[11],
+        }
+    }
+}
+
 /// Raw monotonic counters read each tick; a [`Sample`] is the diff of two.
 #[derive(Debug, Clone)]
 struct Raw {

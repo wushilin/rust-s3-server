@@ -16,7 +16,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions,
+    ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode, MultiThreaded, Options,
+    WriteBatch, WriteOptions,
 };
 
 use super::sysstat::Sample;
@@ -100,12 +101,13 @@ impl StatsStore {
         .await
     }
 
-    /// Downsamples `[start_ms, end_ms)` into exactly `buckets` slots, aligned to
-    /// even time boundaries. Each slot is the first sample at or after the
-    /// bucket's start (one seek), or `None` if the bucket has no sample — which
-    /// the UI renders as a gap. This bounds the work at ~`buckets` seeks and the
-    /// response at `buckets` points regardless of how many samples the range
-    /// actually holds.
+    /// Downsamples `[start_ms, end_ms)` into exactly `buckets` slots by taking
+    /// the **mean of every sample** that falls in each bucket (per field,
+    /// ignoring nulls), or `None` for an empty bucket — which the UI draws as a
+    /// gap. Averaging (rather than picking one representative sample) is what
+    /// makes a rate like requests/sec or throughput read as the bucket's true
+    /// average over a wide range, instead of one arbitrary 5-second snapshot.
+    /// Costs one forward pass over the window's samples.
     pub async fn sample_series(
         &self,
         start_ms: i64,
@@ -117,29 +119,47 @@ impl StatsStore {
             let cf = cf(&db, CF_SAMPLES)?;
             let buckets = buckets.max(1);
             let span = (end_ms - start_ms).max(1) as i128;
-            let mut it = db.raw_iterator_cf(&cf);
-            let mut out = Vec::with_capacity(buckets);
-            for i in 0..buckets {
-                let bucket_start = start_ms as i128 + span * i as i128 / buckets as i128;
-                let bucket_end = start_ms as i128 + span * (i as i128 + 1) / buckets as i128;
-                it.seek(key_for(bucket_start as i64).as_bytes());
-                let slot = if it.valid() {
-                    match (it.key(), it.value()) {
-                        (Some(k), Some(v)) => match parse_key(k) {
-                            // The seek lands on the first key ≥ bucket_start; use
-                            // it only if it also falls before the bucket's end.
-                            Some(ts) if (ts as i128) < bucket_end => {
-                                serde_json::from_slice::<Sample>(v).ok()
-                            }
-                            _ => None,
-                        },
-                        _ => None,
+            let mut sums = vec![[0f64; Sample::COLS]; buckets];
+            let mut counts = vec![[0u32; Sample::COLS]; buckets];
+
+            let start_key = key_for(start_ms);
+            for item in
+                db.iterator_cf(&cf, IteratorMode::From(start_key.as_bytes(), Direction::Forward))
+            {
+                let (k, v) = item?;
+                let Some(ts) = parse_key(&k) else { continue };
+                if ts >= end_ms {
+                    break;
+                }
+                if ts < start_ms {
+                    continue;
+                }
+                let bi = (((ts - start_ms) as i128 * buckets as i128) / span) as usize;
+                let bi = bi.min(buckets - 1);
+                if let Ok(sample) = serde_json::from_slice::<Sample>(&v) {
+                    for (j, col) in sample.to_cols().into_iter().enumerate() {
+                        if let Some(x) = col {
+                            sums[bi][j] += x;
+                            counts[bi][j] += 1;
+                        }
                     }
-                } else {
-                    None
-                };
-                out.push(slot);
+                }
             }
+
+            let out = (0..buckets)
+                .map(|bi| {
+                    if counts[bi].iter().all(|&c| c == 0) {
+                        return None;
+                    }
+                    let mut cols = [None; Sample::COLS];
+                    for j in 0..Sample::COLS {
+                        if counts[bi][j] > 0 {
+                            cols[j] = Some(sums[bi][j] / counts[bi][j] as f64);
+                        }
+                    }
+                    Some(Sample::from_cols(cols))
+                })
+                .collect();
             Ok(out)
         })
         .await
@@ -217,6 +237,18 @@ mod tests {
         assert_eq!(series[1], None);
         assert_eq!(series[2].as_ref().unwrap().cpu_sys, Some(200.0));
         assert_eq!(series[3], None);
+    }
+
+    #[tokio::test]
+    async fn downsample_averages_samples_within_a_bucket() {
+        let (_tmp, store) = store().await;
+        // Three samples collapse into one bucket → the value is their mean, not
+        // one arbitrary snapshot.
+        store.put(0, &sample(10.0)).await.unwrap();
+        store.put(3, &sample(20.0)).await.unwrap();
+        store.put(6, &sample(60.0)).await.unwrap();
+        let series = store.sample_series(0, 10, 1).await.unwrap();
+        assert_eq!(series[0].as_ref().unwrap().cpu_sys, Some(30.0));
     }
 
     #[tokio::test]
