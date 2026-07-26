@@ -14,21 +14,33 @@ set -euo pipefail
 IMAGE="${IMAGE:-docker.io/wushilin/rusts3:latest}"
 NAME="${NAME:-rusts3}"
 
-# Durable state (buckets, IAM db, logs) lives on this named volume at /data.
-VOLUME="${VOLUME:-rusts3-data}"
+# Durable state (buckets, IAM db, logs) lives in this host folder, mounted at
+# /data. It is created below if missing.
+DATA_DIR="${DATA_DIR:-./data}"
 
-# Host ports to publish: S3 API and management UI.
+# Ports the server binds on the host (host networking, so these are the actual
+# host ports): S3 API and management UI.
 S3_PORT="${S3_PORT:-8002}"
 UI_PORT="${UI_PORT:-8003}"
+
+# Create the data folder on the host before mounting it.
+mkdir -p "${DATA_DIR}"
 
 # Replace any existing container of the same name.
 podman rm -f "${NAME}" >/dev/null 2>&1 || true
 
+# --network host shares the host's network namespace directly: no pasta, no
+# slirp4netns, and no root required (only ports < 1024 would need privilege).
+# The server binds straight onto the host at RUSTS3_PORT / RUSTS3_UI_PORT, so
+# there are no -p mappings — those are ignored with host networking.
+# The :Z,U mount options relabel the folder for SELinux and chown it to the
+# container's rusts3 user (uid 10001) so the server can write to it.
 podman run -d \
     --name "${NAME}" \
-    -p "${S3_PORT}:8002" \
-    -p "${UI_PORT}:8003" \
-    -v "${VOLUME}:/data" \
+    --network host \
+    -v "${DATA_DIR}:/data:Z,U" \
+    -e RUSTS3_PORT="${S3_PORT}" \
+    -e RUSTS3_UI_PORT="${UI_PORT}" \
     -e RUSTS3_ADMIN_USER="admin" \
     -e RUSTS3_ADMIN_PASSWORD="change-me-please" \
     -e RUSTS3_ACCESS_KEY="my-access-key" \
