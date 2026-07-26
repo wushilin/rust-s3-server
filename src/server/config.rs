@@ -262,9 +262,16 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Reads a config file, expanding `{{ENV_VAR:default}}` placeholders from
+    /// the environment first. That is what lets one image be configured by
+    /// `-e RUSTS3_PORT=9000` without maintaining a parallel set of env-var
+    /// bindings for every field — the file stays the single description of
+    /// what is configurable.
     pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
-        let config: Self = serde_yaml::from_str(&text)?;
+        let text = super::template::expand(&text)?;
+        let mut config: Self = serde_yaml::from_str(&text)?;
+        config.normalize();
         config.validate().map_err(|message| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
         })?;
@@ -279,6 +286,23 @@ impl AppConfig {
         serde_yaml::to_string(self)
     }
 
+    /// Folds empty optional strings to `None`.
+    ///
+    /// An environment-driven config has no way to say "omit this key": an unset
+    /// `{{RUSTS3_PUBLIC_HOSTNAME:}}` expands to the empty string. Normalising
+    /// here means every consumer downstream sees exactly what it would have
+    /// seen had the key been absent, rather than each of the three places that
+    /// read it having to special-case an empty host.
+    fn normalize(&mut self) {
+        fn blank_to_none(value: &mut Option<String>) {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                *value = None;
+            }
+        }
+        blank_to_none(&mut self.auth.public_hostname);
+        blank_to_none(&mut self.ui.bind_address);
+    }
+
     pub fn validate(&self) -> std::result::Result<(), String> {
         format!("{}:{}", self.server.bind_address, self.server.bind_port)
             .parse::<std::net::SocketAddr>()
@@ -288,8 +312,11 @@ impl AppConfig {
                 .parse::<std::net::SocketAddr>()
                 .map_err(|err| format!("invalid ui bind address: {err}"))?;
         }
-        if let Some(host) = self.auth.public_hostname.as_deref() {
-            if host.is_empty() || host.contains("://") || host.contains('/') {
+        // An empty value means "not configured": a container config expands an
+        // unset {{RUSTS3_PUBLIC_HOSTNAME:}} to the empty string, and that has
+        // to be indistinguishable from omitting the key.
+        if let Some(host) = self.auth.public_hostname.as_deref().filter(|v| !v.is_empty()) {
+            if host.contains("://") || host.contains('/') {
                 return Err(
                     "auth.public_hostname must contain only a hostname and optional port"
                         .to_string(),
@@ -452,6 +479,48 @@ fn default_trash_expiry_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a container gets when RUSTS3_PUBLIC_HOSTNAME is not supplied:
+    /// the placeholder expands to "", which must read as "not configured".
+    #[test]
+    fn an_empty_templated_optional_is_treated_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "server:\n  bind_address: \"0.0.0.0\"\n  bind_port: {{T_PORT:8002}}\n\
+             auth:\n  enabled: true\n  public_hostname: \"{{T_HOST:}}\"\n\
+             ui:\n  bind_address: \"{{T_UI_ADDR:}}\"\n",
+        )
+        .unwrap();
+        let config = AppConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.server.bind_port, 8002);
+        assert_eq!(config.auth.public_hostname, None, "empty host must read as unset");
+        assert_eq!(config.ui.bind_address, None);
+    }
+
+    #[test]
+    fn a_templated_config_takes_values_from_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "server:\n  bind_port: {{T_PORT_SET:8002}}\n").unwrap();
+        std::env::set_var("T_PORT_SET", "9123");
+        let config = AppConfig::from_file(path.to_str().unwrap()).unwrap();
+        std::env::remove_var("T_PORT_SET");
+        assert_eq!(config.server.bind_port, 9123);
+    }
+
+    #[test]
+    fn a_placeholder_with_no_default_and_no_variable_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "server:\n  bind_port: {{T_UNSET_REQUIRED}}\n").unwrap();
+        let err = AppConfig::from_file(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("T_UNSET_REQUIRED"),
+            "the error must name the variable: {err}"
+        );
+    }
 
     #[test]
     fn bandwidth_report_defaults_to_enabled() {

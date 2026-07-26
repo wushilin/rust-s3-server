@@ -1,0 +1,71 @@
+# rusts3 configuration for container runtimes.
+#
+# Every value is a {{RUSTS3_NAME:default}} placeholder: the server expands them
+# from the environment when it loads this file, falling back to the default
+# shown. So the image runs with no configuration at all, and any single field
+# can be overridden with -e without templating the file yourself.
+#
+#   podman run -d --name rusts3 \
+#     -p 8002:8002 -p 8003:8003 \
+#     -v rusts3-data:/data \
+#     -e RUSTS3_ADMIN_PASSWORD=... \
+#     -e RUSTS3_ACCESS_KEY=... -e RUSTS3_SECRET_KEY=... \
+#     rusts3:latest
+#
+# A placeholder with no default (there are none here by default) makes startup
+# fail naming the variable, rather than silently running with an empty value.
+# If you want to *force* credentials to be supplied, drop the defaults from the
+# four auth entries below.
+server:
+  bind_address: "{{RUSTS3_BIND_ADDRESS:0.0.0.0}}"
+  bind_port: {{RUSTS3_PORT:8002}}
+  # Mount a volume here — this is the entire durable state of the server.
+  base_dir: "{{RUSTS3_DATA_DIR:/data}}"
+
+storage:
+  meta_cache_capacity: {{RUSTS3_META_CACHE_CAPACITY:200000}}
+  # "full" fsyncs blobs and the WAL before acknowledging a write. "relaxed" is
+  # faster but can lose the last acked writes on power loss.
+  durability: "{{RUSTS3_DURABILITY:full}}"
+  # 0 = one reader per core.
+  rebuild_reader_threads: {{RUSTS3_REBUILD_READER_THREADS:0}}
+  rebuild_queue_bound: {{RUSTS3_REBUILD_QUEUE_BOUND:1000}}
+  rebuild_batch_size: {{RUSTS3_REBUILD_BATCH_SIZE:1000}}
+
+logging:
+  # Relative paths resolve under base_dir, so logs land on the mounted volume.
+  dir: "{{RUSTS3_LOG_DIR:logs}}"
+  level: "{{RUSTS3_LOG_LEVEL:info}}"
+  enable_bandwidth_report: {{RUSTS3_BANDWIDTH_REPORT:true}}
+  rotation_size_mb: {{RUSTS3_LOG_ROTATION_MB:100}}
+  keep_files: {{RUSTS3_LOG_KEEP_FILES:5}}
+  compress: {{RUSTS3_LOG_COMPRESS:true}}
+
+auth:
+  # Leaving this false publishes the S3 API with no authentication at all.
+  enabled: {{RUSTS3_AUTH_ENABLED:true}}
+  users:
+    - user: "{{RUSTS3_ADMIN_USER:admin}}"
+      # CHANGE THIS. It is the console login and the S3 secret below is its key.
+      password: "{{RUSTS3_ADMIN_PASSWORD:rusts3admin}}"
+      api_keys:
+        - ak: "{{RUSTS3_ACCESS_KEY:rusts3admin}}"
+          secret: "{{RUSTS3_SECRET_KEY:rusts3admin}}"
+  # Set these to serve virtual-hosted-style requests (bucket.host/key).
+  public_hostname: "{{RUSTS3_PUBLIC_HOSTNAME:}}"
+  public_scheme: "{{RUSTS3_PUBLIC_SCHEME:http}}"
+
+sweeper:
+  interval_secs: {{RUSTS3_SWEEP_INTERVAL_SECS:300}}
+  intent_batch_size: {{RUSTS3_INTENT_BATCH_SIZE:100}}
+  intent_grace_period_secs: {{RUSTS3_INTENT_GRACE_SECS:3600}}
+  staging_expiry_secs: {{RUSTS3_STAGING_EXPIRY_SECS:86400}}
+  # 0 disables multipart cleanup entirely, matching S3's keep-forever default.
+  multipart_upload_expiry_secs: {{RUSTS3_MULTIPART_EXPIRY_SECS:2592000}}
+  trash_expiry_secs: {{RUSTS3_TRASH_EXPIRY_SECS:86400}}
+  reclaim_interval_secs: {{RUSTS3_RECLAIM_INTERVAL_SECS:300}}
+
+ui:
+  enabled: {{RUSTS3_UI_ENABLED:true}}
+  bind_address: "{{RUSTS3_UI_BIND_ADDRESS:0.0.0.0}}"
+  bind_port: {{RUSTS3_UI_PORT:8003}}

@@ -32,6 +32,19 @@ enum Command {
         #[arg(short = 'c', long, value_name = "FILE", default_value = "config.yaml")]
         config: String,
     },
+    /// Probe a running server's health endpoint and exit non-zero if it is
+    /// not answering. Used as the container HEALTHCHECK, so the image needs no
+    /// curl or wget — and it reads the same config the server did, so it
+    /// always probes the port that is actually in use.
+    #[command(name = "healthcheck")]
+    HealthCheck {
+        /// Path to config.yaml.
+        #[arg(short = 'c', long, value_name = "FILE", default_value = "config.yaml")]
+        config: String,
+        /// Seconds to wait for the connection and the reply.
+        #[arg(long, default_value_t = 3)]
+        timeout: u64,
+    },
     /// Generate a bcrypt hash for a built-in console password.
     #[command(name = "genpassword")]
     GenPassword {
@@ -75,6 +88,51 @@ const CONFIG_HEADER: &str = "\
 # Note: auth.enabled defaults to false, which leaves the S3 API fully open.
 ";
 
+/// Minimal HTTP/1.1 GET of the unauthenticated liveness endpoint. Deliberately
+/// hand-rolled over `TcpStream`: a health check must not need an async runtime,
+/// a TLS stack, or anything installed in the image alongside the binary.
+fn health_probe(port: u16, timeout_secs: u64) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+    // Always loopback: the configured bind address may be 0.0.0.0, which is not
+    // a valid destination, and a health check is by definition local.
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream =
+        TcpStream::connect_timeout(&address, timeout).map_err(|err| format!("connect: {err}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|err| format!("timeout setup: {err}"))?;
+    stream
+        .write_all(b"GET /minio/health/live HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .map_err(|err| format!("write: {err}"))?;
+
+    let mut response = Vec::new();
+    // The status line is all that matters; cap the read so a chatty or wedged
+    // server cannot hang the check.
+    let mut buffer = [0u8; 512];
+    while response.len() < 4096 {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buffer[..n]),
+            Err(err) => return Err(format!("read: {err}")),
+        }
+        if response.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&response);
+    let status = head.lines().next().unwrap_or_default();
+    if status.contains(" 200") {
+        Ok(())
+    } else {
+        Err(format!("unexpected status line: {status:?}"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -110,6 +168,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 eprintln!("password does not match");
                 std::process::exit(1);
+            }
+        }
+        Some(Command::HealthCheck { config, timeout }) => {
+            let config = AppConfig::from_file(&config)?;
+            match health_probe(config.server.bind_port, timeout) {
+                Ok(()) => {
+                    println!("ok");
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("unhealthy: {err}");
+                    std::process::exit(1);
+                }
             }
         }
         Some(Command::Validate { config }) => {

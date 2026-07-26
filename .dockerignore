@@ -1,0 +1,5 @@
+target/
+.git/
+rusts3-data/
+logs/
+*.log

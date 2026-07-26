@@ -16,6 +16,7 @@ pub mod policy;
 pub mod range;
 pub mod registry;
 pub mod scan_store;
+pub mod template;
 pub mod ui;
 pub mod xml;
 
@@ -699,12 +700,34 @@ async fn traffic_metrics_middleware(
 /// start if another process holds it. The returned handle must stay alive
 /// for the process lifetime — dropping it releases the lock.
 fn acquire_process_lock(root: &FsPath) -> Result<std::fs::File, Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(root)?;
+    // Name the directory in any failure here. This is the first thing that
+    // touches the data root, so it is where a container with a wrongly-owned
+    // volume fails — and a bare "Permission denied (os error 13)" tells the
+    // operator nothing about which path or whose uid is the problem.
+    let explain = |action: &str, err: std::io::Error| -> Box<dyn std::error::Error> {
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            format!(
+                "cannot {action} the data directory {} as uid {}: {err}. \
+                 If this is a mounted volume, give that uid ownership of it \
+                 (chown -R {}:{} <host path>) or run the container with a \
+                 matching --user.",
+                root.display(),
+                unsafe { libc::geteuid() },
+                unsafe { libc::geteuid() },
+                unsafe { libc::getegid() },
+            )
+            .into()
+        } else {
+            format!("cannot {action} the data directory {}: {err}", root.display()).into()
+        }
+    };
+    std::fs::create_dir_all(root).map_err(|err| explain("create", err))?;
     let lock_path = root.join(".rusts3.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(&lock_path)?;
+        .open(&lock_path)
+        .map_err(|err| explain("write to", err))?;
     let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         return Err(format!(
@@ -773,12 +796,19 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         Err(err) => log::warn!("startup intent drain failed to list buckets error={err}"),
     }
 
-    // Cancel all background tasks on SIGINT / Ctrl-C.
+    // Cancel all background tasks on SIGINT or SIGTERM.
+    //
+    // SIGTERM matters more than it looks: it is what `docker stop`,
+    // `systemctl stop` and Kubernetes send. In a container the entrypoint is
+    // PID 1, and the kernel does not apply *default* signal dispositions to
+    // PID 1 — so a SIGTERM with no explicit handler is silently discarded and
+    // the runtime kills the process ten seconds later instead. Handling it here
+    // is what makes a container stop cleanly rather than always being SIGKILLed.
     let shutdown_sig = shutdown.clone();
     tokio::spawn(async move {
         log::info!("shutdown signal watcher task started");
-        tokio::signal::ctrl_c().await.ok();
-        log::info!("SIGINT received — shutting down");
+        let reason = wait_for_shutdown_signal().await;
+        log::info!("{reason} received — shutting down");
         shutdown_sig.cancel();
         log::info!("shutdown signal watcher task completed");
     });
@@ -903,11 +933,62 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
 
     let app = router_with_metrics(store, auth_state, metrics, tasks);
     let listener = tokio::net::TcpListener::bind(config.address).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await?;
+    let drain = shutdown.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown.cancelled_owned());
+
+    // Graceful shutdown waits for in-flight connections, and an idle keep-alive
+    // connection is indistinguishable from a busy one — so a single client
+    // holding a socket open could keep the process alive indefinitely. Bound
+    // it: a container runtime gives us ten seconds before SIGKILL, so we take
+    // rather less than that and then go. Nothing is lost by leaving early —
+    // writes are committed before they are acknowledged.
+    tokio::select! {
+        result = server => result?,
+        _ = drain_deadline(drain) => {
+            log::warn!(
+                "connections still open {}s after the shutdown signal — exiting anyway",
+                SHUTDOWN_DRAIN_GRACE.as_secs()
+            );
+        }
+    }
     log::info!("rusts3-v2 shutdown complete");
     Ok(())
+}
+
+/// How long to let in-flight connections drain after a shutdown signal before
+/// exiting regardless. Comfortably inside the ten seconds a container runtime
+/// allows between SIGTERM and SIGKILL.
+const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolves once shutdown has been signalled *and* the drain grace has elapsed.
+async fn drain_deadline(shutdown: tokio_util::sync::CancellationToken) {
+    shutdown.cancelled().await;
+    tokio::time::sleep(SHUTDOWN_DRAIN_GRACE).await;
+}
+
+/// Resolves on the first shutdown signal, naming it for the log.
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(err) => {
+                log::warn!("cannot listen for SIGTERM ({err}); SIGINT only");
+                tokio::signal::ctrl_c().await.ok();
+                return "SIGINT";
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        "SIGINT"
+    }
 }
 
 /// Spawns one scheduler loop per maintenance job. Each loop runs its job on an
