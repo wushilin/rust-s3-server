@@ -7,3 +7,4 @@ test-data/
 deploy.sh
 logs/
 rusts3-data/
+*.local.*
