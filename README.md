@@ -208,6 +208,8 @@ HMAC key.
 | `ui.enabled` | `true` | Enable the management console. |
 | `ui.bind_address` | S3 bind address | Optional separate console listen address. |
 | `ui.bind_port` | `8003` | Console listen port. |
+| `ui.public_hostname` | absent | Public console hostname and optional port; its exact origin is allowed to PUT through the S3 CORS layer. Required for direct console uploads. |
+| `ui.public_scheme` | `http` | Console origin scheme (`http` or `https`). |
 
 ### Storage
 

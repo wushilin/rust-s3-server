@@ -240,6 +240,7 @@ fn router_with_metrics(
     tasks: Arc<registry::TaskRegistry>,
 ) -> Router {
     let host_style_config = auth_state.config.clone();
+    let cors_config = auth_state.config.clone();
     let inner = Router::new()
         .route("/minio/health/live", get(health_live))
         .route("/minio/health/ready", get(health_live))
@@ -264,6 +265,10 @@ fn router_with_metrics(
             traffic_metrics_middleware,
         ))
         .layer(middleware::from_fn(log_middleware))
+        // Presigned browser uploads originate on the separate management-UI
+        // port. Handle their credential-free preflight and expose the S3 ETag
+        // needed by multipart clients.
+        .layer(middleware::from_fn_with_state(cors_config, s3_cors_middleware))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
         .with_state(store);
     // `Router::layer` middleware runs only after a route has been matched, so
@@ -273,6 +278,55 @@ fn router_with_metrics(
         &middleware::from_fn_with_state(host_style_config, host_style_middleware),
         inner,
     ))
+}
+
+async fn s3_cors_middleware(
+    State(config): State<Arc<AppConfig>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let configured_origin = config.ui.public_hostname.as_deref().map(|host| {
+        format!("{}://{host}", config.ui.public_scheme.as_str())
+    });
+    let allowed_origin = origin
+        .as_deref()
+        .filter(|origin| configured_origin.as_deref() == Some(*origin));
+    if request.method() == axum::http::Method::OPTIONS {
+        let Some(origin) = allowed_origin else {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .expect("static CORS denial is valid");
+        };
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("access-control-allow-origin", origin)
+            .header("access-control-allow-methods", "PUT, OPTIONS")
+            .header("access-control-allow-headers", "content-type")
+            .header("access-control-max-age", "3600")
+            .header("vary", "Origin")
+            .body(Body::empty())
+            .expect("static CORS response is valid");
+    }
+    let mut response = next.run(request).await;
+    if let Some(origin) = allowed_origin {
+        if let Ok(value) = HeaderValue::from_str(origin) {
+            response.headers_mut().insert("access-control-allow-origin", value);
+            response.headers_mut().insert(
+                "access-control-expose-headers",
+                HeaderValue::from_static("etag, x-amz-request-id"),
+            );
+            response
+                .headers_mut()
+                .append("vary", HeaderValue::from_static("Origin"));
+        }
+    }
+    response
 }
 
 /// Virtual-hosted-style addressing: when `auth.public_hostname` is configured

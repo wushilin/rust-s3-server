@@ -2862,6 +2862,56 @@
         )
     }
 
+    fn make_cors_app(tmp: &tempfile::TempDir) -> axum::Router {
+        let mut config = super::config::AppConfig::default();
+        config.ui.public_hostname = Some("console.example.test".to_string());
+        config.ui.public_scheme = super::config::PublicScheme::Https;
+        router(
+            LocalObjectStore::new(tmp.path()),
+            std::sync::Arc::new(config),
+        )
+    }
+
+    #[tokio::test]
+    async fn s3_cors_preflight_allows_only_the_configured_console_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_cors_app(&tmp);
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/bucket/key")
+                    .header("origin", "https://console.example.test")
+                    .header("access-control-request-method", "PUT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            allowed.headers()["access-control-allow-origin"],
+            "https://console.example.test"
+        );
+        assert_eq!(allowed.headers()["access-control-allow-methods"], "PUT, OPTIONS");
+
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/bucket/key")
+                    .header("origin", "https://attacker.example")
+                    .header("access-control-request-method", "PUT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(!denied.headers().contains_key("access-control-allow-origin"));
+    }
+
     fn now_datetime() -> String {
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
     }

@@ -103,15 +103,16 @@ pub fn router(state: UiState) -> Router {
         .route(
             "/api/object",
             get(download_object)
-                .put(upload_object)
                 .delete(delete_object),
         )
-        // Multipart upload for the console: lets the Web UI stream files of any
-        // size in parts instead of one bounded PUT. Bodies stream to staging —
-        // never buffered in memory.
+        // Upload control plane for the console. File bytes never cross the UI
+        // listener: the browser PUTs them to short-lived, RSWEB-signed standard
+        // S3 URLs, while these session-authenticated endpoints retain policy
+        // checks and multipart create/complete/abort orchestration.
+        .route("/api/upload/presign", post(upload_presign))
         .route("/api/multipart/list", get(multipart_list))
         .route("/api/multipart/create", post(multipart_create))
-        .route("/api/multipart/part", put(multipart_part))
+        .route("/api/multipart/part-url", post(multipart_part_url))
         .route("/api/multipart/complete", post(multipart_complete))
         .route("/api/multipart/abort", delete(multipart_abort))
         .route("/api/objects", get(list_objects))
@@ -137,12 +138,52 @@ pub fn router(state: UiState) -> Router {
         // Runtime stats (admin only): a single read-only, downsampled series.
         .route("/api/stats/series", get(stats_series))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.config.clone(),
+            ui_csrf_middleware,
+        ))
         // Outermost: give every UI request a correlation id (echoed back as
         // `x-amz-request-id`) and an access-log line — the same tracing/audit
         // path the S3 API gets from `log_middleware`. So console actions,
         // upload included, are traceable and auditable, not second-class.
         .layer(middleware::from_fn_with_state(state.clone(), ui_log_middleware))
         .with_state(state)
+}
+
+/// SameSite=Strict is the primary cookie-side CSRF defense. This adds an
+/// independent request-side check for modern browsers: cross-site unsafe
+/// requests are rejected, and an Origin header must match the configured
+/// public console origin when one is set. Requests without browser fetch
+/// metadata remain usable by non-browser administration clients.
+async fn ui_csrf_middleware(
+    State(config): State<Arc<AppConfig>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let unsafe_method = !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    if unsafe_method {
+        let cross_site = request
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            == Some("cross-site");
+        let configured_origin = config.ui.public_hostname.as_deref().map(|host| {
+            format!("{}://{host}", config.ui.public_scheme.as_str())
+        });
+        let wrong_origin = request
+            .headers()
+            .get("origin")
+            .and_then(|value| value.to_str().ok())
+            .zip(configured_origin.as_deref())
+            .is_some_and(|(actual, expected)| actual != expected);
+        if cross_site || wrong_origin {
+            return error_response(StatusCode::FORBIDDEN, "cross-site request rejected");
+        }
+    }
+    next.run(request).await
 }
 
 /// The console and the login form are two documents, not one page that hides
@@ -1595,12 +1636,20 @@ async fn download_object(
     }
 }
 
-async fn upload_object(
+#[derive(Deserialize)]
+struct UploadPresignRequest {
+    bucket: String,
+    key: String,
+}
+
+/// Authorize a console upload and mint a bearer URL for the byte-heavy S3 PUT.
+/// The hidden web key remains server-side; its principal is re-authorized by
+/// the normal S3 middleware when the browser uses the URL.
+async fn upload_presign(
     State(state): State<UiState>,
     headers: HeaderMap,
-    Query(q): Query<ObjectQuery>,
     Extension(rid): Extension<super::RequestId>,
-    body: Body,
+    Json(req): Json<UploadPresignRequest>,
 ) -> Response {
     let session = match require_session(&state, &headers) {
         Ok(s) => s,
@@ -1610,68 +1659,15 @@ async fn upload_object(
         &state,
         &session,
         &rid.0,
-        "UPLOAD",
-        format!("/{}/{}", q.bucket, q.key),
-        &[Requirement::object("s3:PutObject", &q.bucket, &q.key)],
+        "UPLOAD-SIGN",
+        format!("/{}/{}", req.bucket, req.key),
+        &[Requirement::object("s3:PutObject", &req.bucket, &req.key)],
     ) {
         Ok(g) => g,
         Err(resp) => return resp,
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    // The task guard (from the pipeline above) is held across the write; a
-    // cancel errors the stream mid-transfer (staging reclaimed by the sweeper)
-    // but cannot interrupt the atomic commit once the body is fully read.
-    let progress = guard.progress();
-    if let Some(total) = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        progress.set_total(total);
-    }
-    let cancel = guard.cancel_token();
-    let _active = state.metrics.begin_put();
-    // Feed the shared byte counter so console traffic shows in the throughput
-    // stats too (one relaxed atomic add per chunk — no allocation).
-    let metrics = state.metrics.clone();
-    let stream = futures::StreamExt::map(body.into_data_stream(), move |result| {
-        if cancel.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "upload cancelled by operator",
-            ));
-        }
-        match result {
-            Ok(chunk) => {
-                progress.add_done(chunk.len() as u64);
-                metrics.add_in(chunk.len() as u64);
-                Ok(chunk)
-            }
-            Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
-        }
-    });
-    match state
-        .store
-        .put_object_stream(
-            &q.bucket,
-            &q.key,
-            stream,
-            content_type.as_deref(),
-            None,
-            false,
-            None,
-        )
-        .await
-    {
-        Ok(result) => {
-            audit(&state, &rid.0, &session.username, "upload", format!("/{}/{}", q.bucket, q.key));
-            Json(json!({ "etag": result.etag, "size": result.size })).into_response()
-        }
-        Err(err) => storage_error(err),
-    }
+    drop(guard);
+    presigned_upload_response(&state, &session, &rid.0, &req.bucket, &req.key, &[]).await
 }
 
 async fn delete_object(
@@ -1799,12 +1795,11 @@ struct MultipartPartQuery {
     part_number: u16,
 }
 
-async fn multipart_part(
+async fn multipart_part_url(
     State(state): State<UiState>,
     headers: HeaderMap,
     Extension(rid): Extension<super::RequestId>,
     Query(q): Query<MultipartPartQuery>,
-    body: Body,
 ) -> Response {
     let session = match require_session(&state, &headers) {
         Ok(s) => s,
@@ -1814,57 +1809,87 @@ async fn multipart_part(
         &state,
         &session,
         &rid.0,
-        "MP-PART",
+        "MP-PART-SIGN",
         format!("/{}/{} part {}", q.bucket, q.key, q.part_number),
         &[Requirement::object("s3:PutObject", &q.bucket, &q.key)],
     ) {
         Ok(g) => g,
         Err(resp) => return resp,
     };
-    let progress = guard.progress();
-    if let Some(total) = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        progress.set_total(total);
-    }
-    let cancel = guard.cancel_token();
-    let _active = state.metrics.begin_put();
-    let metrics = state.metrics.clone();
-    let stream = futures::StreamExt::map(body.into_data_stream(), move |result| {
-        if cancel.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "upload cancelled by operator",
-            ));
-        }
-        match result {
-            Ok(chunk) => {
-                progress.add_done(chunk.len() as u64);
-                metrics.add_in(chunk.len() as u64);
-                Ok(chunk)
-            }
-            Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
-        }
-    });
-    match state
-        .store
-        .put_multipart_part_stream(
-            &q.bucket,
-            &q.key,
-            &q.upload_id,
-            q.part_number,
-            stream,
-            false,
-            None,
-            None,
-        )
+    drop(guard);
+    let part_number = q.part_number.to_string();
+    presigned_upload_response(
+        &state,
+        &session,
+        &rid.0,
+        &q.bucket,
+        &q.key,
+        &[("partNumber", part_number.as_str()), ("uploadId", q.upload_id.as_str())],
+    )
+    .await
+}
+
+/// Build a path-style presigned S3 PUT URL using the caller's hidden console
+/// key. URLs are minted just in time and expire after six hours; multipart
+/// clients request one immediately before starting each part.
+async fn presigned_upload_response(
+    state: &UiState,
+    session: &UiSession,
+    request_id: &str,
+    bucket: &str,
+    key: &str,
+    extra_query: &[(&str, &str)],
+) -> Response {
+    let Some(host) = state.config.auth.public_hostname.as_deref() else {
+        return error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "set auth.public_hostname in the config to enable direct console uploads",
+        );
+    };
+    let (access_key, secret_key) = match state
+        .iam
+        .web_key_for(&session.username, session.is_builtin)
         .await
     {
-        Ok(result) => Json(json!({ "etag": result.etag, "size": result.size })).into_response(),
-        Err(err) => storage_error(err),
-    }
+        Ok(pair) => pair,
+        Err(err) => return storage_error(err),
+    };
+    let encoded_key = key
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let path = format!("/{bucket}/{encoded_key}");
+    let datetime = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let expires_secs = 6 * 60 * 60;
+    let query = presign_query(
+        "PUT",
+        &path,
+        host,
+        &access_key,
+        &secret_key,
+        "us-east-1",
+        &datetime,
+        expires_secs,
+        extra_query,
+    );
+    let base_url = format!(
+        "{}://{}",
+        state.config.auth.public_scheme.as_str(),
+        host.trim_end_matches('/'),
+    );
+    audit(
+        state,
+        request_id,
+        &session.username,
+        "upload_presign",
+        format!("/{bucket}/{key}"),
+    );
+    Json(json!({
+        "url": format!("{base_url}{path}?{query}"),
+        "expires_secs": expires_secs,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1872,13 +1897,6 @@ struct MultipartCompleteBody {
     bucket: String,
     key: String,
     upload_id: String,
-    parts: Vec<MultipartCompletePart>,
-}
-
-#[derive(Deserialize)]
-struct MultipartCompletePart {
-    part_number: u16,
-    etag: String,
 }
 
 async fn multipart_complete(
@@ -1902,14 +1920,20 @@ async fn multipart_complete(
         Ok(g) => g,
         Err(resp) => return resp,
     };
-    let parts: Vec<CompletePartRequest> = req
-        .parts
-        .iter()
-        .map(|p| CompletePartRequest {
-            number: p.part_number,
-            etag: p.etag.clone(),
-        })
-        .collect();
+    // The store's ListParts result is authoritative. Do not trust a browser-
+    // supplied ETag manifest when the server can construct it itself.
+    let parts: Vec<CompletePartRequest> = match state
+        .store
+        .list_parts(&req.bucket, &req.key, &req.upload_id)
+        .await
+    {
+        Ok(parts) if !parts.is_empty() => parts
+            .into_iter()
+            .map(|p| CompletePartRequest { number: p.number, etag: p.etag })
+            .collect(),
+        Ok(_) => return error_response(StatusCode::BAD_REQUEST, "multipart upload has no parts"),
+        Err(err) => return storage_error(err),
+    };
     match state
         .store
         .complete_multipart(&req.bucket, &req.key, &req.upload_id, &parts)

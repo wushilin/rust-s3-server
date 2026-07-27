@@ -225,6 +225,12 @@ pub struct UiConfig {
     pub bind_address: Option<String>,
     #[serde(default = "default_ui_port")]
     pub bind_port: u16,
+    /// Public console hostname (and optional port), used as the sole allowed
+    /// browser origin for presigned uploads to the separate S3 endpoint.
+    #[serde(default)]
+    pub public_hostname: Option<String>,
+    #[serde(default)]
+    pub public_scheme: PublicScheme,
 }
 
 impl Default for UiConfig {
@@ -233,6 +239,8 @@ impl Default for UiConfig {
             enabled: default_ui_enabled(),
             bind_address: None,
             bind_port: default_ui_port(),
+            public_hostname: None,
+            public_scheme: PublicScheme::default(),
         }
     }
 }
@@ -389,6 +397,7 @@ impl AppConfig {
 
         blank_to_none(&mut self.auth.public_hostname);
         blank_to_none(&mut self.ui.bind_address);
+        blank_to_none(&mut self.ui.public_hostname);
 
         for user in &mut self.auth.users {
             // An empty password is not "no password" to the verifier — it is a
@@ -445,6 +454,14 @@ impl AppConfig {
             if host.contains("://") || host.contains('/') {
                 return Err(
                     "auth.public_hostname must contain only a hostname and optional port"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(host) = self.ui.public_hostname.as_deref().filter(|v| !v.is_empty()) {
+            if host.contains("://") || host.contains('/') {
+                return Err(
+                    "ui.public_hostname must contain only a hostname and optional port"
                         .to_string(),
                 );
             }

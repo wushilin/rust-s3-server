@@ -30,7 +30,7 @@ let uploadTaskId=0,uploadTasks=[],activeUploadCount=0,uploadReloadTimer=null;
 function uploadFiles(fileList){const items=[...fileList].map(item=>item instanceof File?{file:item,rel:item.webkitRelativePath||item.name}:item);if(!items.length||!bucket)return;const accepted=items.filter(({file,rel})=>{if(file.size<=MAX_UI_UPLOAD_BYTES)return true;toast('File is too large',`${rel} exceeds the 5 TiB S3 object limit.`,false);return false;});const targetBucket=bucket,targetPrefix=prefix;for(const {file,rel} of accepted)uploadTasks.push({id:++uploadTaskId,file,bucket:targetBucket,key:targetPrefix+rel,status:'queued',progress:0,xhr:null,error:''});$('fileInput').value='';$('folderInput').value='';renderTransfers();processUploadQueue();}
 function processUploadQueue(){while(activeUploadCount<3){const task=uploadTasks.find(t=>t.status==='queued');if(!task)break;task.status='uploading';activeUploadCount++;renderTransfers();runUpload(task).then(()=>{task.status='complete';task.progress=100;scheduleUploadRefresh(task);}).catch(e=>{if(task.status!=='cancelled'){task.status='error';task.error=e.message;}}).finally(()=>{task.xhr=null;activeUploadCount--;renderTransfers();processUploadQueue();});}}
 function runUpload(task){return task.file.size>MP_THRESHOLD?runMultipartUpload(task):runSinglePut(task);}
-function runSinglePut(task){return new Promise((resolve,reject)=>{const xhr=task.xhr=new XMLHttpRequest();xhr.open('PUT',`/api/object?bucket=${encodeURIComponent(task.bucket)}&key=${encodeURIComponent(task.key)}`);xhr.setRequestHeader('content-type',task.file.type||'application/octet-stream');xhr.upload.onprogress=e=>{if(e.lengthComputable){task.progress=e.loaded/e.total*100;renderTransfers();}};xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)resolve();else{let message=xhr.statusText;try{message=JSON.parse(xhr.responseText).error||message;}catch{}reject(new Error(message||'Upload failed'));}};xhr.onerror=()=>reject(new Error('Network error during upload'));xhr.onabort=()=>reject(new Error('Upload cancelled'));xhr.send(task.file);});}
+async function runSinglePut(task){const signed=await api('POST','/api/upload/presign',{bucket:task.bucket,key:task.key});if(task.status==='cancelled')throw new Error('Upload cancelled');return sendSignedPut(task,signed.url,task.file,0,task.file.size);}
 // Multipart: parts go up sequentially (cancel aborts the in-flight part's XHR,
 // which surfaces here and triggers a server-side abort to free staged parts).
 async function runMultipartUpload(task){
@@ -39,33 +39,36 @@ async function runMultipartUpload(task){
   const uploadId=created.upload_id;
   try{
     const size=task.file.size,partSize=Math.max(MP_PART_SIZE,Math.ceil(size/10000));
-    const parts=[];
+    task.completedParts=0;task.totalParts=Math.ceil(size/partSize);
     for(let number=1,offset=0;offset<size;number++,offset+=partSize){
       if(task.status==='cancelled')throw new Error('Upload cancelled');
       const blob=task.file.slice(offset,Math.min(offset+partSize,size));
-      const data=await sendPart(task,q,uploadId,number,blob,offset,size);
-      parts.push({part_number:number,etag:data.etag});
+      const signed=await api('POST',`/api/multipart/part-url?${q}&upload_id=${encodeURIComponent(uploadId)}&part_number=${number}`);
+      if(task.status==='cancelled')throw new Error('Upload cancelled');
+      await sendSignedPut(task,signed.url,blob,offset,size);
+      task.completedParts=number;
     }
-    await api('POST','/api/multipart/complete',{bucket:task.bucket,key:task.key,upload_id:uploadId,parts});
+    await api('POST','/api/multipart/complete',{bucket:task.bucket,key:task.key,upload_id:uploadId});
   }catch(e){
     api('DELETE',`/api/multipart/abort?${q}&upload_id=${encodeURIComponent(uploadId)}`).catch(()=>{});
     throw e;
   }
 }
-function sendPart(task,q,uploadId,number,blob,sentSoFar,total){
+function sendSignedPut(task,url,blob,sentSoFar,total){
   return new Promise((resolve,reject)=>{
     const xhr=task.xhr=new XMLHttpRequest();
-    xhr.open('PUT',`/api/multipart/part?${q}&upload_id=${encodeURIComponent(uploadId)}&part_number=${number}`);
-    xhr.setRequestHeader('content-type','application/octet-stream');
+    xhr.open('PUT',url);
+    xhr.setRequestHeader('content-type',blob.type||'application/octet-stream');
     xhr.upload.onprogress=e=>{if(e.lengthComputable){task.progress=(sentSoFar+e.loaded)/total*100;renderTransfers();}};
-    xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){try{resolve(JSON.parse(xhr.responseText));}catch{reject(new Error('Malformed part response'));}}else{let message=xhr.statusText;try{message=JSON.parse(xhr.responseText).error||message;}catch{}reject(new Error(message||'Part upload failed'));}};
+    xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)resolve(xhr.getResponseHeader('etag'));else reject(new Error(s3UploadError(xhr)));};
     xhr.onerror=()=>reject(new Error('Network error during upload'));
     xhr.onabort=()=>reject(new Error('Upload cancelled'));
     xhr.send(blob);
   });
 }
+function s3UploadError(xhr){if(xhr.responseText){const match=xhr.responseText.match(/<Message>([^<]+)<\/Message>/);if(match)return match[1];}return xhr.statusText||'Upload failed';}
 function cancelUpload(id){const task=uploadTasks.find(t=>t.id===id);if(!task||!['queued','uploading'].includes(task.status))return;task.status='cancelled';task.error='';if(task.xhr)task.xhr.abort();renderTransfers();processUploadQueue();}
 function cancelUploadsForBucket(name){uploadTasks.filter(t=>t.bucket===name&&['queued','uploading'].includes(t.status)).forEach(t=>cancelUpload(t.id));}
 function clearTransfers(){uploadTasks=uploadTasks.filter(t=>['queued','uploading'].includes(t.status));renderTransfers();}
 function scheduleUploadRefresh(task){if(task.bucket!==bucket||!task.key.startsWith(prefix))return;clearTimeout(uploadReloadTimer);uploadReloadTimer=setTimeout(()=>loadObjects(),350);}
-function renderTransfers(){const center=$('transferCenter');center.classList.toggle('hidden',!uploadTasks.length);if(!uploadTasks.length)return;const pending=uploadTasks.filter(t=>['queued','uploading'].includes(t.status)).length;$('transferCount').textContent=pending?`${pending} active`:`${uploadTasks.length} finished`;$('clearTransfersBtn').disabled=uploadTasks.every(t=>['queued','uploading'].includes(t.status));$('transferList').innerHTML=uploadTasks.map(task=>{const status=task.status==='uploading'?Math.round(task.progress)+'%':task.status==='queued'?'Waiting':task.status==='complete'?'Complete':task.status==='cancelled'?'Cancelled':'Failed';const stateClass=task.status==='complete'?'ok':['error','cancelled'].includes(task.status)?'err':'';return `<div class="transfer-row"><div class="transfer-name"><strong title="${esc(task.file.name)}">${esc(task.file.name)}</strong><span title="${esc(task.bucket+'/'+task.key)}">${esc(task.bucket+'/'+task.key)} · ${fmtSize(task.file.size)}${task.error?' · '+esc(task.error):''}</span>${task.status==='uploading'?`<div class="progress"><span style="width:${task.progress}%"></span></div>`:''}</div><div class="transfer-state ${stateClass}">${status}</div>${['queued','uploading'].includes(task.status)?`<button class="row-action danger" title="Cancel upload" onclick="cancelUpload(${task.id})">${icons.x}</button>`:'<span></span>'}</div>`;}).join('');}
+function renderTransfers(){const center=$('transferCenter');center.classList.toggle('hidden',!uploadTasks.length);if(!uploadTasks.length)return;const pending=uploadTasks.filter(t=>['queued','uploading'].includes(t.status)).length;$('transferCount').textContent=pending?`${pending} active`:`${uploadTasks.length} finished`;$('clearTransfersBtn').disabled=uploadTasks.every(t=>['queued','uploading'].includes(t.status));$('transferList').innerHTML=uploadTasks.map(task=>{const partStatus=task.totalParts?` · ${task.completedParts||0} of ${task.totalParts} parts`:'';const status=task.status==='uploading'?Math.round(task.progress)+'%'+partStatus:task.status==='queued'?'Waiting':task.status==='complete'?'Complete':task.status==='cancelled'?'Cancelled':'Failed';const stateClass=task.status==='complete'?'ok':['error','cancelled'].includes(task.status)?'err':'';return `<div class="transfer-row"><div class="transfer-name"><strong title="${esc(task.file.name)}">${esc(task.file.name)}</strong><span title="${esc(task.bucket+'/'+task.key)}">${esc(task.bucket+'/'+task.key)} · ${fmtSize(task.file.size)}${task.error?' · '+esc(task.error):''}</span>${task.status==='uploading'?`<div class="progress"><span style="width:${task.progress}%"></span></div>`:''}</div><div class="transfer-state ${stateClass}">${status}</div>${['queued','uploading'].includes(task.status)?`<button class="row-action danger" title="Cancel upload" onclick="cancelUpload(${task.id})">${icons.x}</button>`:'<span></span>'}</div>`;}).join('');}

@@ -164,3 +164,8 @@ ui:
 
   # Console TCP port.  (default 8003)
   bind_port: 18001
+
+  # Public console origin. Required for browser-to-S3 presigned uploads; this
+  # exact origin alone receives S3 CORS permission.
+  public_hostname: "192.168.44.172:18001"
+  public_scheme: http
