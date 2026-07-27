@@ -369,7 +369,7 @@ password to bootstrap administration. The console supports:
 
 - creating/deleting buckets; browsing, uploading, downloading, deleting objects;
 - folder upload (button or drag-and-drop), recreating the tree under the current prefix;
-- transparent multipart: files over 1 GiB are split into streamed parts (no
+- transparent multipart: files over 256 MiB are split into streamed parts (no
   browser or server buffering) up to 5 TiB, with progress and cancel-with-abort;
 - per-bucket view of in-flight multipart uploads with one-click abort — covering
   both console uploads and sessions started by external S3 clients;

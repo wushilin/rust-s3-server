@@ -667,9 +667,15 @@ fn operation_and_target(
     }
     let target = path;
     match *method {
-        Method::PUT if is_copy && query.contains_key("partNumber") => ("COPY_PART", target),
+        Method::PUT if is_copy && query.contains_key("partNumber") => (
+            "COPY_PART",
+            format!("{target} (part {})", query["partNumber"]),
+        ),
         Method::PUT if is_copy => ("COPY", target),
-        Method::PUT if query.contains_key("partNumber") => ("UPLOAD_PART", target),
+        Method::PUT if query.contains_key("partNumber") => (
+            "UPLOAD_PART",
+            format!("{target} (part {})", query["partNumber"]),
+        ),
         Method::PUT => ("UPLOAD", target),
         Method::GET if query.contains_key("uploadId") => ("LIST_PARTS", target),
         Method::GET => ("DOWNLOAD", target),

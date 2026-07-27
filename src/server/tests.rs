@@ -77,6 +77,12 @@
             operation_and_target(&Method::DELETE, &uri, false),
             ("DELETE", "/bucket/object.txt".to_string())
         );
+        let part: axum::http::Uri =
+            "/bucket/object.txt?partNumber=7&uploadId=upload-1".parse().unwrap();
+        assert_eq!(
+            operation_and_target(&Method::PUT, &part, false),
+            ("UPLOAD_PART", "/bucket/object.txt (part 7)".to_string())
+        );
         let list: axum::http::Uri = "/bucket?list-type=2&prefix=objects%2F".parse().unwrap();
         assert_eq!(
             operation_and_target(&Method::GET, &list, false),
