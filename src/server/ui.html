@@ -289,10 +289,16 @@
   <div class="dialog-head"><div><h3>Bucket settings — <span id="bucketSettingsName"></span></h3><p>Configure browser origins allowed to access this bucket.</p></div><button type="button" class="dialog-close" onclick="bucketSettingsDlg.close()"><span data-icon="x"></span></button></div>
   <div class="dialog-body">
     <div class="field"><label>Console origin (implicitly allowed)</label><input class="input" id="bucketConsoleOrigin" readonly></div>
-    <div class="field"><label for="bucketCorsJson">CORS rules (JSON)</label><textarea class="input code-area" id="bucketCorsJson" rows="15" spellcheck="false"></textarea><span class="muted" style="font-size:11.5px">Each rule uses allowed_origins, allowed_methods, allowed_headers, expose_headers, and optional max_age_seconds. The console rule is applied automatically and is not saved here.</span></div>
+    <div class="field"><label for="bucketCorsJson">CORS rules (JSON) <button type="button" class="btn small" onclick="openCorsSample()">View sample</button></label><textarea class="input code-area" id="bucketCorsJson" rows="15" spellcheck="false"></textarea><span class="muted" style="font-size:11.5px">Each rule uses allowed_origins, allowed_methods, allowed_headers, expose_headers, and optional max_age_seconds. The faded example is not saved unless you paste or type it. The console rule is applied automatically.</span></div>
     <div id="bucketSettingsError" class="inline-error"></div>
   </div>
   <div class="dialog-actions"><button type="button" class="btn" onclick="bucketSettingsDlg.close()">Cancel</button><button type="button" class="btn primary" onclick="saveBucketSettings()">Save settings</button></div>
+</dialog>
+
+<dialog id="corsSampleDlg">
+  <div class="dialog-head"><div><h3>Sample CORS rule</h3><p>Allow a browser application to upload and read objects.</p></div><button type="button" class="dialog-close" onclick="corsSampleDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-body"><textarea class="input code-area" id="corsSampleJson" rows="17" readonly></textarea></div>
+  <div class="dialog-actions"><button type="button" class="btn" onclick="corsSampleDlg.close()">Close</button><button type="button" class="btn primary" onclick="copyCorsSample()"><span data-icon="copy"></span> Copy sample</button></div>
 </dialog>
 
 <dialog id="groupDlg">

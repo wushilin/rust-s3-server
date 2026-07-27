@@ -1364,8 +1364,22 @@ async fn set_bucket_cors(
         Err(response) => return response,
     };
     if req.rules.len() > 100 || req.rules.iter().any(|rule| {
+        let invalid_strings = rule
+            .allowed_origins
+            .iter()
+            .chain(&rule.allowed_methods)
+            .chain(&rule.allowed_headers)
+            .chain(&rule.expose_headers)
+            .any(|value| value.trim().is_empty() || value.contains(['\r', '\n']));
+        let invalid_wildcards = rule
+            .allowed_origins
+            .iter()
+            .chain(&rule.allowed_headers)
+            .any(|value| value.matches('*').count() > 1);
         rule.allowed_origins.is_empty()
             || rule.allowed_methods.is_empty()
+            || invalid_strings
+            || invalid_wildcards
             || rule.allowed_methods.iter().any(|method| {
                 !matches!(method.to_ascii_uppercase().as_str(), "GET" | "PUT" | "POST" | "DELETE" | "HEAD")
             })
