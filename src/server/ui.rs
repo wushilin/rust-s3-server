@@ -28,6 +28,7 @@ use super::policy::{
 };
 use crate::storage::errors::StorageError;
 use crate::storage::rawdb;
+use crate::storage::metadata::CorsRule;
 use crate::storage::store::{CompletePartRequest, LocalObjectStore};
 
 const SESSION_COOKIE: &str = "rusts3_ui_session";
@@ -87,6 +88,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/:name", delete(delete_bucket))
         .route("/api/buckets/:name/stats", get(bucket_stats))
         .route("/api/buckets/:name/rebuild", post(rebuild_bucket))
+        .route("/api/buckets/:name/cors", get(get_bucket_cors).put(set_bucket_cors))
         .route("/api/admin/export", get(export_iam))
         // Import buffers and fully validates the dump before an atomic apply, so
         // the body is held in memory. The global IAM database is small by nature
@@ -1298,6 +1300,83 @@ async fn bucket_stats(
     };
     match state.store.object_count(&name).await {
         Ok(objects) => Json(json!({"objects": objects})).into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
+async fn get_bucket_cors(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "GET_BUCKET_CORS",
+        format!("/{name}"),
+        &[Requirement::bucket("s3:GetBucketCORS", &name)],
+    ) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
+    match state.store.bucket_meta(&name).await {
+        Ok(meta) => {
+            let console_origin = state.config.ui.public_hostname.as_deref().map(|host| {
+                format!("{}://{host}", state.config.ui.public_scheme.as_str())
+            });
+            Json(json!({ "rules": meta.cors, "console_origin": console_origin })).into_response()
+        }
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetBucketCorsRequest {
+    rules: Vec<CorsRule>,
+}
+
+async fn set_bucket_cors(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+    Json(req): Json<SetBucketCorsRequest>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "PUT_BUCKET_CORS",
+        format!("/{name}"),
+        &[Requirement::bucket("s3:PutBucketCORS", &name)],
+    ) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
+    if req.rules.len() > 100 || req.rules.iter().any(|rule| {
+        rule.allowed_origins.is_empty()
+            || rule.allowed_methods.is_empty()
+            || rule.allowed_methods.iter().any(|method| {
+                !matches!(method.to_ascii_uppercase().as_str(), "GET" | "PUT" | "POST" | "DELETE" | "HEAD")
+            })
+    }) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid CORS rules");
+    }
+    match state.store.set_bucket_cors(&name, req.rules).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "set_bucket_cors", format!("/{name}"));
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(err) => storage_error(err),
     }
 }

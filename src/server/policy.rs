@@ -616,6 +616,10 @@ pub fn requirements_for_request(
 
     let reqs = match (method, &decoded_key) {
         // ── bucket level ──
+        ("GET", None) if has("cors") => vec![Requirement::bucket("s3:GetBucketCORS", bucket)],
+        ("PUT" | "DELETE", None) if has("cors") => {
+            vec![Requirement::bucket("s3:PutBucketCORS", bucket)]
+        }
         ("PUT", None) => vec![Requirement::bucket("s3:CreateBucket", bucket)],
         ("DELETE", None) => vec![Requirement::bucket("s3:DeleteBucket", bucket)],
         ("HEAD", None) => vec![Requirement::bucket("s3:ListBucket", bucket)],

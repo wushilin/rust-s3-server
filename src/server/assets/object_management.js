@@ -18,8 +18,8 @@ function saveFilter(){if(bucket)filterMemory[locationKey()]=$('objectSearch').va
 function restoreFilter(){$('objectSearch').value=bucket?(filterMemory[locationKey()]||''):'';}
 function selectBucket(i){saveFilter();bucket=buckets[i].name;prefix='';restoreFilter();objectItems=[];renderBuckets();loadObjects();}
 function renderCrumbs(){
-  if(!bucket){$('crumbs').innerHTML='<span class="muted">Create a bucket to get started</span>';$('uploadBtn').disabled=true;$('uploadFolderBtn').disabled=true;$('rebuildBucketBtn').disabled=true;$('bulkDeleteBtn').disabled=true;return;}
-  $('uploadBtn').disabled=false;$('uploadFolderBtn').disabled=false;$('rebuildBucketBtn').disabled=false;$('bulkDeleteBtn').disabled=false;const parts=prefix.split('/').filter(Boolean);let acc='';let html=`<button class="crumb-btn ${parts.length?'':'current'}" onclick="goPrefix('')">${esc(bucket)}</button>`;parts.forEach((part,i)=>{acc+=part+'/';html+=`<span class="crumb-sep">${icons['chevron-right']}</span><button class="crumb-btn ${i===parts.length-1?'current':''}" onclick="goPrefix(decodeURIComponent('${enc(acc)}'))">${esc(part)}</button>`;});$('crumbs').innerHTML=html;
+  if(!bucket){$('crumbs').innerHTML='<span class="muted">Create a bucket to get started</span>';$('uploadBtn').disabled=true;$('uploadFolderBtn').disabled=true;$('bucketSettingsBtn').disabled=true;$('rebuildBucketBtn').disabled=true;$('bulkDeleteBtn').disabled=true;return;}
+  $('uploadBtn').disabled=false;$('uploadFolderBtn').disabled=false;$('bucketSettingsBtn').disabled=false;$('rebuildBucketBtn').disabled=false;$('bulkDeleteBtn').disabled=false;const parts=prefix.split('/').filter(Boolean);let acc='';let html=`<button class="crumb-btn ${parts.length?'':'current'}" onclick="goPrefix('')">${esc(bucket)}</button>`;parts.forEach((part,i)=>{acc+=part+'/';html+=`<span class="crumb-sep">${icons['chevron-right']}</span><button class="crumb-btn ${i===parts.length-1?'current':''}" onclick="goPrefix(decodeURIComponent('${enc(acc)}'))">${esc(part)}</button>`;});$('crumbs').innerHTML=html;
 }
 function goPrefix(value){saveFilter();prefix=value;restoreFilter();closeDetails();loadObjects();}
 async function loadObjects(more=false){
@@ -37,6 +37,9 @@ function renderObjects(){
 function objectUrl(key){return `/api/object?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(key)}`;}
 function openBucketDialog(){$('newBucketName').value='';setInlineError('bucketError');$('bucketDlg').showModal();setTimeout(()=>$('newBucketName').focus(),50);}
 async function createBucket(event){event.preventDefault();const name=$('newBucketName').value.trim();if(!name){setInlineError('bucketError','Enter a bucket name.');return;}try{await api('POST','/api/buckets',{name});$('bucketDlg').close();toast('Bucket created',name);await loadBuckets();const index=buckets.findIndex(b=>b.name===name);if(index>=0)selectBucket(index);}catch(e){setInlineError('bucketError',e.message);}}
+let bucketSettingsTarget=null;
+async function openBucketSettings(){if(!bucket)return;bucketSettingsTarget=bucket;$('bucketSettingsName').textContent=bucket;setInlineError('bucketSettingsError');try{const data=await api('GET','/api/buckets/'+encodeURIComponent(bucket)+'/cors');$('bucketConsoleOrigin').value=data.console_origin||'Not configured';$('bucketCorsJson').value=JSON.stringify(data.rules||[],null,2);$('bucketSettingsDlg').showModal();}catch(e){toast('Could not load bucket settings',e.message,false);}}
+async function saveBucketSettings(){let rules;try{rules=JSON.parse($('bucketCorsJson').value||'[]');if(!Array.isArray(rules))throw new Error('CORS rules must be a JSON array.');}catch(e){setInlineError('bucketSettingsError',e.message);return;}try{await api('PUT','/api/buckets/'+encodeURIComponent(bucketSettingsTarget)+'/cors',{rules});$('bucketSettingsDlg').close();toast('Bucket settings saved',bucketSettingsTarget);}catch(e){setInlineError('bucketSettingsError',e.message);}}
 let deletingBucket=null,deletingObjectCount=0;
 function rebuildBucket(){
   if(!bucket)return;const target=bucket;

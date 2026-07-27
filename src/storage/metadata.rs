@@ -82,6 +82,24 @@ pub struct BucketMeta {
     /// On-disk storage layout version. Current unreleased format is "v1".
     #[serde(default)]
     pub storage_version: String,
+    /// User-managed bucket CORS rules. The management console's own origin is
+    /// an implicit server rule and is deliberately not persisted here.
+    #[serde(default)]
+    pub cors: Vec<CorsRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CorsRule {
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub allowed_methods: Vec<String>,
+    #[serde(default)]
+    pub allowed_headers: Vec<String>,
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    #[serde(default)]
+    pub max_age_seconds: Option<u32>,
 }
 
 pub fn content_type_or_default(value: Option<&str>) -> String {

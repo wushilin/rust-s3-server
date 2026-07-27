@@ -374,7 +374,7 @@ pub fn delete_objects_xml(results: &[DeleteObjectResult], quiet: bool) -> String
     )
 }
 
-fn escape_xml(value: &str) -> String {
+pub(crate) fn escape_xml(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         // Characters illegal in XML 1.0 (control chars other than tab/LF/CR) are

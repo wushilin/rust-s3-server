@@ -2894,7 +2894,7 @@
             allowed.headers()["access-control-allow-origin"],
             "https://console.example.test"
         );
-        assert_eq!(allowed.headers()["access-control-allow-methods"], "PUT, OPTIONS");
+        assert_eq!(allowed.headers()["access-control-allow-methods"], "PUT");
 
         let denied = app
             .oneshot(
@@ -2910,6 +2910,64 @@
             .unwrap();
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
         assert!(!denied.headers().contains_key("access-control-allow-origin"));
+    }
+
+    #[tokio::test]
+    async fn bucket_cors_round_trips_and_drives_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        let create = app
+            .clone()
+            .oneshot(Request::builder().method("PUT").uri("/cors-bucket").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let document = r#"<CORSConfiguration><CORSRule><AllowedOrigin>https://app.example.test</AllowedOrigin><AllowedMethod>PUT</AllowedMethod><AllowedHeader>content-type</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>600</MaxAgeSeconds></CORSRule></CORSConfiguration>"#;
+        let put = app
+            .clone()
+            .oneshot(Request::builder().method("PUT").uri("/cors-bucket?cors").body(Body::from(document)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let get = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri("/cors-bucket?cors").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let xml = body_text(get).await;
+        assert!(xml.contains("<AllowedOrigin>https://app.example.test</AllowedOrigin>"));
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/cors-bucket/object")
+                    .header("origin", "https://app.example.test")
+                    .header("access-control-request-method", "PUT")
+                    .header("access-control-request-headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(preflight.headers()["access-control-max-age"], "600");
+
+        let delete = app
+            .clone()
+            .oneshot(Request::builder().method("DELETE").uri("/cors-bucket?cors").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+        let missing = app
+            .oneshot(Request::builder().method("GET").uri("/cors-bucket?cors").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     fn now_datetime() -> String {

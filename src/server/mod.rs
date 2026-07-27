@@ -240,7 +240,10 @@ fn router_with_metrics(
     tasks: Arc<registry::TaskRegistry>,
 ) -> Router {
     let host_style_config = auth_state.config.clone();
-    let cors_config = auth_state.config.clone();
+    let cors_state = CorsMiddlewareState {
+        config: auth_state.config.clone(),
+        store: store.clone(),
+    };
     let inner = Router::new()
         .route("/minio/health/live", get(health_live))
         .route("/minio/health/ready", get(health_live))
@@ -268,7 +271,7 @@ fn router_with_metrics(
         // Presigned browser uploads originate on the separate management-UI
         // port. Handle their credential-free preflight and expose the S3 ETag
         // needed by multipart clients.
-        .layer(middleware::from_fn_with_state(cors_config, s3_cors_middleware))
+        .layer(middleware::from_fn_with_state(cors_state, s3_cors_middleware))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
         .with_state(store);
     // `Router::layer` middleware runs only after a route has been matched, so
@@ -280,8 +283,73 @@ fn router_with_metrics(
     ))
 }
 
+#[derive(Clone)]
+struct CorsMiddlewareState {
+    config: Arc<AppConfig>,
+    store: LocalObjectStore,
+}
+
+struct CorsDecision {
+    expose_headers: String,
+    max_age_seconds: u32,
+}
+
+fn cors_pattern_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let Some((before, after)) = pattern.split_once('*') else {
+        return pattern == value;
+    };
+    value.starts_with(before) && value.ends_with(after)
+}
+
+fn cors_rule_decision(
+    config: &AppConfig,
+    rules: &[crate::storage::metadata::CorsRule],
+    origin: &str,
+    method: &str,
+    requested_headers: &[String],
+) -> Option<CorsDecision> {
+    let console_origin = config
+        .ui
+        .public_hostname
+        .as_deref()
+        .map(|host| format!("{}://{host}", config.ui.public_scheme.as_str()));
+    if console_origin.as_deref() == Some(origin)
+        && method == "PUT"
+        && requested_headers
+            .iter()
+            .all(|header| header.eq_ignore_ascii_case("content-type"))
+    {
+        return Some(CorsDecision {
+            expose_headers: "etag, x-amz-request-id".to_string(),
+            max_age_seconds: 3600,
+        });
+    }
+    rules.iter().find_map(|rule| {
+        let origin_allowed = rule
+            .allowed_origins
+            .iter()
+            .any(|pattern| cors_pattern_matches(pattern, origin));
+        let method_allowed = rule
+            .allowed_methods
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(method));
+        let headers_allowed = requested_headers.iter().all(|header| {
+            rule.allowed_headers.iter().any(|allowed| {
+                cors_pattern_matches(&allowed.to_ascii_lowercase(), &header.to_ascii_lowercase())
+            })
+        });
+        (origin_allowed && method_allowed && headers_allowed).then(|| CorsDecision {
+            expose_headers: rule.expose_headers.join(", "),
+            max_age_seconds: rule.max_age_seconds.unwrap_or(0),
+        })
+    })
+}
+
 async fn s3_cors_middleware(
-    State(config): State<Arc<AppConfig>>,
+    State(state): State<CorsMiddlewareState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -290,14 +358,54 @@ async fn s3_cors_middleware(
         .get("origin")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let configured_origin = config.ui.public_hostname.as_deref().map(|host| {
-        format!("{}://{host}", config.ui.public_scheme.as_str())
+    let bucket = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .filter(|bucket| !bucket.is_empty());
+    let rules = match bucket {
+        Some(bucket) => state
+            .store
+            .bucket_meta(bucket)
+            .await
+            .map(|meta| meta.cors)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let requested_method = if request.method() == axum::http::Method::OPTIONS {
+        request
+            .headers()
+            .get("access-control-request-method")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+    } else {
+        request.method().as_str()
+    };
+    let requested_headers = request
+        .headers()
+        .get("access-control-request-headers")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(|header| header.trim().to_string())
+                .filter(|header| !header.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let decision = origin.as_deref().and_then(|origin| {
+        cors_rule_decision(
+            &state.config,
+            &rules,
+            origin,
+            requested_method,
+            &requested_headers,
+        )
     });
-    let allowed_origin = origin
-        .as_deref()
-        .filter(|origin| configured_origin.as_deref() == Some(*origin));
     if request.method() == axum::http::Method::OPTIONS {
-        let Some(origin) = allowed_origin else {
+        let (Some(origin), Some(decision)) = (origin.as_deref(), decision.as_ref()) else {
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Body::empty())
@@ -306,21 +414,22 @@ async fn s3_cors_middleware(
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("access-control-allow-origin", origin)
-            .header("access-control-allow-methods", "PUT, OPTIONS")
-            .header("access-control-allow-headers", "content-type")
-            .header("access-control-max-age", "3600")
+            .header("access-control-allow-methods", requested_method)
+            .header("access-control-allow-headers", requested_headers.join(", "))
+            .header("access-control-max-age", decision.max_age_seconds)
             .header("vary", "Origin")
             .body(Body::empty())
             .expect("static CORS response is valid");
     }
     let mut response = next.run(request).await;
-    if let Some(origin) = allowed_origin {
+    if let (Some(origin), Some(decision)) = (origin.as_deref(), decision.as_ref()) {
         if let Ok(value) = HeaderValue::from_str(origin) {
             response.headers_mut().insert("access-control-allow-origin", value);
-            response.headers_mut().insert(
-                "access-control-expose-headers",
-                HeaderValue::from_static("etag, x-amz-request-id"),
-            );
+            if let Ok(value) = HeaderValue::from_str(&decision.expose_headers) {
+                response
+                    .headers_mut()
+                    .insert("access-control-expose-headers", value);
+            }
             response
                 .headers_mut()
                 .append("vary", HeaderValue::from_static("Origin"));
@@ -1267,6 +1376,9 @@ async fn bucket_route(
     );
     match method {
         Method::HEAD => handlers::head_bucket::handle(store, ctx, body).await,
+        Method::GET if ctx.query.contains_key("cors") => get_bucket_cors_s3(store, ctx).await,
+        Method::PUT if ctx.query.contains_key("cors") => put_bucket_cors_s3(store, ctx, body).await,
+        Method::DELETE if ctx.query.contains_key("cors") => delete_bucket_cors_s3(store, ctx).await,
         Method::PUT => handlers::create_bucket::handle(store, ctx, body).await,
         Method::DELETE => handlers::delete_bucket::handle(store, ctx, body).await,
         Method::GET if ctx.query.contains_key("location") => {
@@ -1306,6 +1418,92 @@ async fn bucket_route(
             "The specified method is not allowed",
             &ctx.bucket,
         ),
+    }
+}
+
+async fn get_bucket_cors_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    match store.bucket_meta(&ctx.bucket).await {
+        Ok(meta) if meta.cors.is_empty() => s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchCORSConfiguration",
+            "The CORS configuration does not exist",
+            &ctx.resource(),
+        ),
+        Ok(meta) => {
+            let rules = meta.cors.iter().map(|rule| {
+                let origins = rule.allowed_origins.iter().map(|v| format!("<AllowedOrigin>{}</AllowedOrigin>", xml::escape_xml(v))).collect::<String>();
+                let methods = rule.allowed_methods.iter().map(|v| format!("<AllowedMethod>{}</AllowedMethod>", xml::escape_xml(v))).collect::<String>();
+                let headers = rule.allowed_headers.iter().map(|v| format!("<AllowedHeader>{}</AllowedHeader>", xml::escape_xml(v))).collect::<String>();
+                let expose = rule.expose_headers.iter().map(|v| format!("<ExposeHeader>{}</ExposeHeader>", xml::escape_xml(v))).collect::<String>();
+                let max_age = rule.max_age_seconds.map(|v| format!("<MaxAgeSeconds>{v}</MaxAgeSeconds>")).unwrap_or_default();
+                format!("<CORSRule>{origins}{methods}{headers}{expose}{max_age}</CORSRule>")
+            }).collect::<String>();
+            xml_response(StatusCode::OK, format!(r#"<?xml version="1.0" encoding="UTF-8"?><CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{rules}</CORSConfiguration>"#))
+        }
+        Err(err) => storage_error_response(err, &ctx.resource()),
+    }
+}
+
+fn cors_xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let pattern = format!(r#"(?s)<{tag}>\s*(.*?)\s*</{tag}>"#);
+    Regex::new(&pattern)
+        .unwrap()
+        .captures_iter(xml)
+        .filter_map(|capture| capture.get(1).map(|value| unescape_xml(value.as_str())))
+        .collect()
+}
+
+async fn put_bucket_cors_s3(
+    store: LocalObjectStore,
+    ctx: handlers::BucketCtx,
+    body: Body,
+) -> Response {
+    let bytes = match axum::body::to_bytes(body, 256 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return s3_error(StatusCode::BAD_REQUEST, "MalformedXML", "Invalid CORS document", &ctx.resource()),
+    };
+    let xml_body = String::from_utf8_lossy(&bytes);
+    let rule_re = Regex::new(r#"(?s)<CORSRule>(.*?)</CORSRule>"#).unwrap();
+    let mut rules = Vec::new();
+    for capture in rule_re.captures_iter(&xml_body) {
+        let body = capture.get(1).map(|value| value.as_str()).unwrap_or("");
+        let origins = cors_xml_values(body, "AllowedOrigin");
+        let methods = cors_xml_values(body, "AllowedMethod");
+        let valid_methods = methods.iter().all(|method| {
+            matches!(
+                method.to_ascii_uppercase().as_str(),
+                "GET" | "PUT" | "POST" | "DELETE" | "HEAD"
+            )
+        });
+        let valid_patterns = origins
+            .iter()
+            .chain(cors_xml_values(body, "AllowedHeader").iter())
+            .all(|value| value.matches('*').count() <= 1);
+        if origins.is_empty() || methods.is_empty() || !valid_methods || !valid_patterns {
+            return s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", "Invalid CORS rule", &ctx.resource());
+        }
+        let allowed_headers = cors_xml_values(body, "AllowedHeader");
+        rules.push(crate::storage::metadata::CorsRule {
+            allowed_origins: origins,
+            allowed_methods: methods,
+            allowed_headers,
+            expose_headers: cors_xml_values(body, "ExposeHeader"),
+            max_age_seconds: cors_xml_values(body, "MaxAgeSeconds").first().and_then(|value| value.parse().ok()),
+        });
+    }
+    if rules.is_empty() || rules.len() > 100 {
+        return s3_error(StatusCode::BAD_REQUEST, "MalformedXML", "CORSConfiguration must contain 1 to 100 rules", &ctx.resource());
+    }
+    match store.set_bucket_cors(&ctx.bucket, rules).await {
+        Ok(()) => empty_response(StatusCode::OK),
+        Err(err) => storage_error_response(err, &ctx.resource()),
+    }
+}
+
+async fn delete_bucket_cors_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    match store.set_bucket_cors(&ctx.bucket, Vec::new()).await {
+        Ok(()) => empty_response(StatusCode::NO_CONTENT),
+        Err(err) => storage_error_response(err, &ctx.resource()),
     }
 }
 

@@ -98,6 +98,7 @@
               <div class="crumbs" id="crumbs"></div><span class="spacer"></span>
               <input type="file" id="fileInput" multiple class="hidden" onchange="uploadFiles(this.files)">
               <input type="file" id="folderInput" webkitdirectory class="hidden" onchange="uploadFiles(this.files)">
+              <button class="btn icon-only" id="bucketSettingsBtn" onclick="openBucketSettings()" title="Bucket settings"><span data-icon="shield"></span></button>
               <button class="btn icon-only" data-admin-only id="rebuildBucketBtn" onclick="rebuildBucket()" title="Rebuild this bucket's index"><span data-icon="database"></span></button>
               <button class="btn danger" id="bulkDeleteBtn" onclick="openBulkDelete()" title="Delete every object under a prefix"><span data-icon="trash"></span> Bulk Delete</button>
               <button class="btn" id="uploadFolderBtn" onclick="$('folderInput').click()" title="Upload a folder and its contents"><span data-icon="folder"></span> Upload folder</button>
@@ -282,6 +283,16 @@
     <div class="dialog-body"><div class="field"><label for="newBucketName">Bucket name</label><input class="input" id="newBucketName" placeholder="e.g. product-images" autocomplete="off"><span class="muted" style="font-size:11.5px">Use 3–63 lowercase letters, numbers, periods, or hyphens.</span></div><div id="bucketError" class="inline-error"></div></div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="bucketDlg.close()">Cancel</button><button class="btn primary" type="submit">Create bucket</button></div>
   </form>
+</dialog>
+
+<dialog id="bucketSettingsDlg">
+  <div class="dialog-head"><div><h3>Bucket settings — <span id="bucketSettingsName"></span></h3><p>Configure browser origins allowed to access this bucket.</p></div><button type="button" class="dialog-close" onclick="bucketSettingsDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-body">
+    <div class="field"><label>Console origin (implicitly allowed)</label><input class="input" id="bucketConsoleOrigin" readonly></div>
+    <div class="field"><label for="bucketCorsJson">CORS rules (JSON)</label><textarea class="input code-area" id="bucketCorsJson" rows="15" spellcheck="false"></textarea><span class="muted" style="font-size:11.5px">Each rule uses allowed_origins, allowed_methods, allowed_headers, expose_headers, and optional max_age_seconds. The console rule is applied automatically and is not saved here.</span></div>
+    <div id="bucketSettingsError" class="inline-error"></div>
+  </div>
+  <div class="dialog-actions"><button type="button" class="btn" onclick="bucketSettingsDlg.close()">Cancel</button><button type="button" class="btn primary" onclick="saveBucketSettings()">Save settings</button></div>
 </dialog>
 
 <dialog id="groupDlg">

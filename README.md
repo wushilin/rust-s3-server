@@ -144,7 +144,7 @@ for filtering, port overrides, and running against an existing server.
 Not implemented:
 
 - bucket versioning and delete markers;
-- bucket policies via the S3 API (use console IAM policies instead), ACLs, CORS,
+- bucket policies via the S3 API (use console IAM policies instead), ACLs,
   websites, lifecycle rules, tagging;
 - object lock, retention/legal hold, replication, notifications, S3 Select;
 - server-side encryption and storage-tier behavior (storage class is metadata only);
@@ -368,6 +368,7 @@ Open `http://127.0.0.1:8003`. Configure at least one `auth.users` entry with a
 password to bootstrap administration. The console supports:
 
 - creating/deleting buckets; browsing, uploading, downloading, deleting objects;
+- per-bucket CORS settings, with the configured console origin implicitly allowed;
 - folder upload (button or drag-and-drop), recreating the tree under the current prefix;
 - transparent multipart: files over 256 MiB are split into streamed parts (no
   browser or server buffering) up to 5 TiB, with progress and cancel-with-abort;
@@ -413,6 +414,7 @@ request/byte totals and rates are in the periodic logs and the console task view
 | `GET` | `/{bucket}` | ListObjects v1/v2 with prefix, delimiter, marker/continuation token, encoding, and pagination. |
 | `GET` | `/{bucket}?location` | Get bucket location. |
 | `GET` | `/{bucket}?uploads` | List multipart uploads. |
+| `GET/PUT/DELETE` | `/{bucket}?cors` | Read, replace, or remove bucket CORS rules. |
 | `GET` | `/{bucket}?versions` | Compatibility listing of retained current/retired snapshots; not S3 versioning. |
 | `POST` | `/{bucket}?delete` | Multi-object delete, including quiet mode. |
 | `POST` | `/{bucket}?rebuildIndex` | Start an index rebuild (`202`; `409` if already running). |

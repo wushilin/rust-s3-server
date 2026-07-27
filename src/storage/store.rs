@@ -45,13 +45,15 @@ use super::layout::StorageLayout;
 use super::locks::ObjectLockTable;
 use super::metadata::{
     content_encoding_or_none, content_language_or_none, content_type_or_default,
-    storage_class_or_default, unquote_etag, BucketMeta, ObjectMeta, ObjectStorageKind, PartMeta,
+    storage_class_or_default, unquote_etag, BucketMeta, CorsRule, ObjectMeta, ObjectStorageKind, PartMeta,
     PutMeta, UploadMeta,
 };
 use super::staging::{new_staging_id, validate_staging_id};
 use super::time::now_ms;
 
 const CACHE_SHARDS: usize = 64;
+const BUCKET_META_CACHE_CAPACITY: usize = 1024;
+const BUCKET_META_CACHE_SHARDS: usize = 16;
 const INDEX_CACHE_WARN_THRESHOLD: usize = 500;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 const REBUILD_PROGRESS_EVERY: usize = 1000;
@@ -76,6 +78,7 @@ pub struct LocalObjectStore {
     /// flight per bucket and the rest await it.
     index_open_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     meta_cache: Arc<BoundedLruCache<ObjectCacheKey, CachedObjectMeta>>,
+    bucket_meta_cache: Arc<BoundedLruCache<String, BucketMeta>>,
     /// Buckets currently undergoing a blocking index rebuild; every request
     /// against them fails with [`StorageError::BucketRebuilding`] (503).
     rebuilding: Arc<Mutex<HashSet<String>>>,
@@ -234,6 +237,10 @@ impl LocalObjectStore {
                 config.meta_cache_capacity.max(1),
                 CACHE_SHARDS,
             )),
+            bucket_meta_cache: Arc::new(BoundedLruCache::new(
+                BUCKET_META_CACHE_CAPACITY,
+                BUCKET_META_CACHE_SHARDS,
+            )),
             rebuilding: Arc::new(Mutex::new(HashSet::new())),
             rebuild_progress: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
@@ -297,8 +304,10 @@ impl LocalObjectStore {
             let meta = BucketMeta {
                 created_at_ms: now_ms(),
                 storage_version: "v2".to_string(),
+                cors: Vec::new(),
             };
             write_json_atomic(&bucket_meta_path, &meta).await?;
+            self.bucket_meta_cache.insert(bucket.to_string(), meta);
             if self.durability == Durability::Full {
                 // `bucket_exists` gates every object operation on this marker.
                 // Make it (and the directory entry created for it) durable
@@ -318,6 +327,38 @@ impl LocalObjectStore {
             .ok()
             .map(|p| p.exists())
             .unwrap_or(false)
+    }
+
+    pub async fn bucket_meta(&self, bucket: &str) -> Result<BucketMeta> {
+        validate_bucket_name(bucket)?;
+        if let Some(meta) = self.bucket_meta_cache.get(&bucket.to_string()) {
+            return Ok(meta);
+        }
+        if !self.bucket_exists(bucket).await {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let meta: BucketMeta = read_json(&self.layout.bucket_meta_path(bucket)?).await?;
+        self.bucket_meta_cache
+            .insert(bucket.to_string(), meta.clone());
+        Ok(meta)
+    }
+
+    pub async fn set_bucket_cors(&self, bucket: &str, cors: Vec<CorsRule>) -> Result<()> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        meta.cors = cors;
+        write_json_atomic(&path, &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&path).await?;
+            fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
+        }
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        Ok(())
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<(String, BucketMeta)>> {
@@ -358,6 +399,7 @@ impl LocalObjectStore {
             ));
         }
         let removed = self.index_cache.lock().unwrap().remove(bucket);
+        self.bucket_meta_cache.remove(&bucket.to_string());
         if let Some(index) = removed {
             index.close().await;
         }
