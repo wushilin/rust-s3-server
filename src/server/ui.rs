@@ -1195,17 +1195,25 @@ async fn list_buckets(
     };
     match state.store.list_buckets().await {
         Ok(buckets) => {
-            let visible: Vec<_> = buckets
-                .into_iter()
-                .filter(|(name, _)| {
-                    authorize(
-                        &state,
-                        &session,
-                        &[Requirement::bucket("s3:ListBucket", name)],
-                    )
-                })
-                .map(|(name, meta)| json!({ "name": name, "created_at_ms": meta.created_at_ms }))
-                .collect();
+            let mut visible = Vec::new();
+            for (name, meta) in buckets {
+                if !authorize(
+                    &state,
+                    &session,
+                    &[Requirement::bucket("s3:ListBucket", &name)],
+                ) {
+                    continue;
+                }
+                // The rail badges the in-flight multipart count next to each
+                // bucket, so it rides along with the listing rather than
+                // costing the console one request per bucket.
+                let multipart_uploads = state.store.count_multipart_uploads(&name).await;
+                visible.push(json!({
+                    "name": name,
+                    "created_at_ms": meta.created_at_ms,
+                    "multipart_uploads": multipart_uploads,
+                }));
+            }
             Json(json!({ "buckets": visible })).into_response()
         }
         Err(err) => storage_error(err),

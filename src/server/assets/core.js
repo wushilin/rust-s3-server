@@ -98,7 +98,7 @@ async function logout(){try{await api('POST','/api/logout');}finally{location.re
 function onLoggedIn(){
   document.body.classList.toggle('sidebar-collapsed',localStorage.getItem('sidebarCollapsed')==='1');
   $('whoami').textContent=me.username;$('userRole').textContent=me.is_admin?'Administrator':'IAM user';$('avatar').textContent=(me.username[0]||'U').toUpperCase();document.querySelectorAll('[data-admin-only]').forEach(el=>el.classList.toggle('hidden',!me.is_admin));
-  showTab('objects');loadBuckets();pingServer();pingTimer=setInterval(pingServer,5000);
+  showTab('objects');loadBuckets();startBucketBadgePolling();pingServer();pingTimer=setInterval(pingServer,5000);
   // Active-task panel: admins only (the backend enforces this too). Live over a
   // WebSocket; falls back to polling if the socket can't be established.
   if(me.is_admin){refreshTasks();connectTasksWs();}

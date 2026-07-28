@@ -217,6 +217,11 @@
   .bucket-item .icon { color:var(--accent); }
   .bucket-item .bucket-act { flex:none; opacity:0; }
   .bucket-item:hover .bucket-act, .bucket-item.active .bucket-act { opacity:1; }
+  /* Count stamped on the multipart icon. Absolutely positioned so it leaves the
+     button's grid flow untouched — the icon stays centred. A non-zero count
+     overrides the hover-only opacity above, so it is legible at rest. */
+  .bucket-item .bucket-act.has-mp { opacity:1; position:relative; color:var(--accent); }
+  .mp-count { position:absolute; top:-1px; right:-1px; min-width:15px; height:15px; padding:0 4px; display:grid; place-items:center; border-radius:99px; background:var(--accent); color:#fff; font-size:9.5px; font-weight:700; line-height:1; }
   .mp-row { display:flex; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--line); }
   .mp-row:last-child { border-bottom:0; }
   .mp-row .file-icon { color:var(--accent); }
@@ -240,16 +245,16 @@
   .load-more { padding:13px; text-align:center; border-top:1px solid var(--line); }
   .progress { height:5px; flex:1; overflow:hidden; background:#e1e6ec; border-radius:99px; }
   .progress > span { display:block; width:0; height:100%; background:var(--accent); border-radius:inherit; transition:width .15s; }
-  .transfer-center { position:fixed; right:22px; bottom:22px; z-index:60; width:min(460px,calc(100vw - 30px)); overflow:hidden; background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:0 18px 50px rgba(15,23,42,.2); }
+  .transfer-center { position:fixed; right:22px; bottom:22px; z-index:60; width:min(529px,calc(100vw - 30px)); overflow:hidden; background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:0 18px 50px rgba(15,23,42,.2); }
   .transfer-head { height:48px; padding:0 13px 0 16px; display:flex; align-items:center; gap:9px; border-bottom:1px solid var(--line); }
   .transfer-head strong { font-size:13px; }
   .transfer-list { max-height:300px; overflow:auto; }
-  .transfer-row { display:grid; grid-template-columns:minmax(0,1fr) 78px 32px; gap:12px; align-items:center; min-height:64px; padding:9px 11px 9px 15px; border-bottom:1px solid var(--line); }
+  .transfer-row { display:grid; grid-template-columns:minmax(0,1fr) auto 32px; gap:12px; align-items:center; min-height:64px; padding:9px 11px 9px 15px; border-bottom:1px solid var(--line); }
   .transfer-row:last-child { border-bottom:0; }
   .transfer-name { min-width:0; }
   .transfer-name strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; }
   .transfer-name > span { display:block; margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:10.5px; }
-  .transfer-state { text-align:right; color:var(--muted); font-size:11px; }
+  .transfer-state { text-align:right; white-space:nowrap; color:var(--muted); font-size:11px; }
   .transfer-state.ok { color:var(--success); }
   .transfer-state.err { color:var(--danger); }
   .transfer-row .progress { margin-top:7px; }

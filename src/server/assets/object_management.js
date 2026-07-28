@@ -9,7 +9,12 @@ async function loadBuckets(preserve=false){
   try{const data=await api('GET','/api/buckets');buckets=data.buckets||[];if(!preserve||!buckets.some(b=>b.name===bucket))bucket=buckets[0]?.name||null;renderBuckets();if(bucket){prefix=preserve?prefix:'';await loadObjects();}else{objectItems=[];renderCrumbs();renderObjects();}}catch(e){toast('Could not load buckets',e.message,false);}
 }
 function renderBuckets(){
-  $('bucketList').innerHTML=buckets.length?buckets.map((b,i)=>`<div class="bucket-item ${b.name===bucket?'active':''}" onclick="selectBucket(${i})" title="${esc(b.name)}">${icons.database}<span>${esc(b.name)}</span><button class="row-action bucket-act" title="Ongoing multipart uploads" onclick="event.stopPropagation();openMultipartDialog(decodeURIComponent('${enc(b.name)}'))">${icons.layers}</button><button class="row-action danger bucket-act" title="Delete bucket “${esc(b.name)}”" onclick="event.stopPropagation();confirmDeleteBucket(decodeURIComponent('${enc(b.name)}'))">${icons.trash}</button></div>`).join(''):`<div style="padding:20px 10px;text-align:center;color:var(--muted);font-size:12px">No buckets yet</div>`;
+  // The multipart icon is normally hover-only, like the other row actions. A
+  // non-zero count pins it visible and stamps the count on its corner: a bucket
+  // holding staged parts should announce itself at rest, since nothing else in
+  // the rail hints that disk is being held.
+  const mpCount=b=>{const n=b.multipart_uploads||0;return n?`<span class="mp-count">${n>99?'99+':n}</span>`:'';};
+  $('bucketList').innerHTML=buckets.length?buckets.map((b,i)=>`<div class="bucket-item ${b.name===bucket?'active':''}" onclick="selectBucket(${i})" title="${esc(b.name)}">${icons.database}<span>${esc(b.name)}</span><button class="row-action bucket-act ${b.multipart_uploads?'has-mp':''}" title="${b.multipart_uploads?`${b.multipart_uploads} multipart upload${b.multipart_uploads===1?'':'s'} in flight`:'Ongoing multipart uploads'}" onclick="event.stopPropagation();openMultipartDialog(decodeURIComponent('${enc(b.name)}'))">${icons.layers}${mpCount(b)}</button><button class="row-action danger bucket-act" title="Delete bucket “${esc(b.name)}”" onclick="event.stopPropagation();confirmDeleteBucket(decodeURIComponent('${enc(b.name)}'))">${icons.trash}</button></div>`).join(''):`<div style="padding:20px 10px;text-align:center;color:var(--muted);font-size:12px">No buckets yet</div>`;
 }
 // Per-folder filter memory: leaving a folder saves its filter, arriving at one
 // restores it (empty = a fresh folder resets the filter).
@@ -78,11 +83,27 @@ async function loadMultipartUploads(){
   try{
     const data=await api('GET','/api/multipart/list?bucket='+encodeURIComponent(mpBucket));const uploads=data.uploads||[];
     $('mpList').innerHTML=uploads.length?uploads.map(u=>`<div class="mp-row"><span class="file-icon">${icons.layers}</span><div style="flex:1;min-width:0"><strong style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(u.key)}">${esc(u.key)}</strong><div class="muted" style="font-size:11.5px">Started ${fmtTime(u.initiated_at_ms)} · id <code>${esc(u.upload_id)}</code></div></div><button class="row-action danger" title="Abort upload" onclick="confirmAbortMultipart(decodeURIComponent('${enc(u.key)}'),decodeURIComponent('${enc(u.upload_id)}'))">${icons.x}</button></div>`).join(''):`<div class="empty" style="padding:26px 10px"><div class="empty-icon">${icons.layers}</div><h3>No multipart uploads in flight</h3><p>Large console uploads and S3 multipart sessions appear here until they complete or abort.</p></div>`;
+    setBucketMultipartCount(mpBucket,uploads.length);
   }catch(e){setInlineError('mpError',e.message);$('mpList').innerHTML='';}
 }
+// Badge upkeep. The dialog and the upload queue know a bucket's count first
+// hand, so they set it directly; the poll is the catch-all for uploads started
+// by S3 clients outside this console. It re-renders only on a real change, so a
+// rail that isn't moving costs nothing but the request.
+function setBucketMultipartCount(name,count){const target=buckets.find(b=>b.name===name);if(!target||(target.multipart_uploads||0)===count)return;target.multipart_uploads=count;renderBuckets();}
+async function refreshBucketBadges(){
+  if(!buckets.length)return;
+  try{
+    const data=await api('GET','/api/buckets');const counts=new Map((data.buckets||[]).map(b=>[b.name,b.multipart_uploads||0]));
+    let changed=false;buckets.forEach(b=>{const n=counts.get(b.name)||0;if((b.multipart_uploads||0)!==n){b.multipart_uploads=n;changed=true;}});
+    if(changed)renderBuckets();
+  }catch{}
+}
+let bucketBadgeTimer=null;
+function startBucketBadgePolling(){if(bucketBadgeTimer)return;bucketBadgeTimer=setInterval(()=>{if(document.hidden||$('tab_objects').classList.contains('hidden'))return;refreshBucketBadges();},20000);}
 function confirmAbortMultipart(key,uploadId){
   const target=mpBucket;
-  showConfirm('Abort multipart upload?',key,'All parts staged for this upload will be discarded. A client still uploading will fail its next part.',async()=>{await api('DELETE',`/api/multipart/abort?bucket=${encodeURIComponent(target)}&key=${encodeURIComponent(key)}&upload_id=${encodeURIComponent(uploadId)}`);toast('Upload aborted',key);await loadMultipartUploads();},{confirmLabel:'Abort upload',busyLabel:'Aborting…'});
+  showConfirm('Abort multipart upload?',key,'All parts staged for this upload will be discarded. A client still uploading will fail its next part.',async()=>{await api('DELETE',`/api/multipart/abort?bucket=${encodeURIComponent(target)}&key=${encodeURIComponent(key)}&upload_id=${encodeURIComponent(uploadId)}`);toast('Upload aborted',key);await loadMultipartUploads();await refreshBucketBadges();},{confirmLabel:'Abort upload',busyLabel:'Aborting…'});
 }
 
 // ── bulk delete ───────────────────────────────────────────────────────────

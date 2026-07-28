@@ -1786,6 +1786,29 @@ impl LocalObjectStore {
         Ok(uploads)
     }
 
+    /// How many in-flight multipart uploads `bucket` holds. Same set as
+    /// [`list_multipart_uploads`](Self::list_multipart_uploads), but it only
+    /// stats each `upload.json` instead of reading and parsing it — the console
+    /// asks for this per bucket on every rail refresh, so it stays metadata-only.
+    /// An unreadable bucket counts as zero rather than erroring: this feeds a
+    /// badge, and a missing staging dir simply means nothing is in flight.
+    pub async fn count_multipart_uploads(&self, bucket: &str) -> usize {
+        let Ok(bucket_dir) = self.layout.bucket_dir(bucket) else {
+            return 0;
+        };
+        let staging_dir = bucket_dir.join("staging").join("multipart");
+        let Ok(mut entries) = tokio::fs::read_dir(&staging_dir).await else {
+            return 0;
+        };
+        let mut count = 0;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if tokio::fs::metadata(entry.path().join("upload.json")).await.is_ok() {
+                count += 1;
+            }
+        }
+        count
+    }
+
     pub async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
         self.validate_upload(bucket, key, upload_id).await?;
         let _guard = self.locks.lock(bucket, key).await;

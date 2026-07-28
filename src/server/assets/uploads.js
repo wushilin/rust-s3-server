@@ -28,7 +28,7 @@ let uploadTaskId=0,uploadTasks=[],activeUploadCount=0,uploadReloadTimer=null;
 // webkitRelativePath) or `{file, rel}` pairs from a folder drop; `rel` becomes
 // the key suffix, so folder uploads recreate their tree under the current prefix.
 function uploadFiles(fileList){const items=[...fileList].map(item=>item instanceof File?{file:item,rel:item.webkitRelativePath||item.name}:item);if(!items.length||!bucket)return;const accepted=items.filter(({file,rel})=>{if(file.size<=MAX_UI_UPLOAD_BYTES)return true;toast('File is too large',`${rel} exceeds the 5 TiB S3 object limit.`,false);return false;});const targetBucket=bucket,targetPrefix=prefix;for(const {file,rel} of accepted)uploadTasks.push({id:++uploadTaskId,file,bucket:targetBucket,key:targetPrefix+rel,status:'queued',progress:0,xhr:null,error:''});$('fileInput').value='';$('folderInput').value='';renderTransfers();processUploadQueue();}
-function processUploadQueue(){while(activeUploadCount<3){const task=uploadTasks.find(t=>t.status==='queued');if(!task)break;task.status='uploading';activeUploadCount++;renderTransfers();runUpload(task).then(()=>{task.status='complete';task.progress=100;scheduleUploadRefresh(task);}).catch(e=>{if(task.status!=='cancelled'){task.status='error';task.error=e.message;}}).finally(()=>{task.xhr=null;activeUploadCount--;renderTransfers();processUploadQueue();});}}
+function processUploadQueue(){while(activeUploadCount<3){const task=uploadTasks.find(t=>t.status==='queued');if(!task)break;task.status='uploading';activeUploadCount++;renderTransfers();runUpload(task).then(()=>{task.status='complete';task.progress=100;scheduleUploadRefresh(task);}).catch(e=>{if(task.status!=='cancelled'){task.status='error';task.error=e.message;}}).finally(()=>{task.xhr=null;activeUploadCount--;renderTransfers();if(task.totalParts)refreshBucketBadges();processUploadQueue();});}}
 function runUpload(task){return task.file.size>MP_THRESHOLD?runMultipartUpload(task):runSinglePut(task);}
 async function runSinglePut(task){const signed=await api('POST','/api/upload/presign',{bucket:task.bucket,key:task.key});if(task.status==='cancelled')throw new Error('Upload cancelled');return sendSignedPut(task,signed.url,task.file,0,task.file.size);}
 // Multipart: parts go up sequentially (cancel aborts the in-flight part's XHR,
@@ -37,6 +37,7 @@ async function runMultipartUpload(task){
   const q=`bucket=${encodeURIComponent(task.bucket)}&key=${encodeURIComponent(task.key)}`;
   const created=await api('POST',`/api/multipart/create?${q}&content_type=${encodeURIComponent(task.file.type||'application/octet-stream')}`);
   const uploadId=created.upload_id;
+  refreshBucketBadges();   // staging exists from here on — let the rail say so
   try{
     const size=task.file.size,partSize=Math.max(MP_PART_SIZE,Math.ceil(size/10000));
     task.completedParts=0;task.totalParts=Math.ceil(size/partSize);
