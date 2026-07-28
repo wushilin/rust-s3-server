@@ -107,6 +107,7 @@ pub fn router(state: UiState) -> Router {
             get(download_object)
                 .delete(delete_object),
         )
+        .route("/api/folders", post(create_folder))
         // Upload control plane for the console. File bytes never cross the UI
         // listener: the browser PUTs them to short-lived, RSWEB-signed standard
         // S3 URLs, while these session-authenticated endpoints retain policy
@@ -1580,6 +1581,77 @@ struct ListObjectsQuery {
     recursive: bool,
 }
 
+#[derive(Deserialize)]
+struct CreateFolderRequest {
+    bucket: String,
+    #[serde(default)]
+    prefix: String,
+    name: String,
+}
+
+/// Applies the console's folder-name convenience rules. This does not create a
+/// new storage entity: the returned key is PUT as an ordinary zero-byte S3
+/// object. The console rejects embedded empty path components because they are
+/// awkward to navigate; the S3 API itself continues to accept them.
+fn folder_object_key(prefix: &str, name: &str) -> std::result::Result<String, &'static str> {
+    let name = name.trim();
+    if name.starts_with('/') {
+        return Err("Folder names cannot start with /.");
+    }
+    let name = name.trim_end_matches('/');
+    if name.is_empty() {
+        return Err("Enter a folder name.");
+    }
+    if name.contains("//") {
+        return Err("Folder names cannot contain consecutive slashes.");
+    }
+    Ok(format!("{prefix}{name}/"))
+}
+
+async fn create_folder(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(req): Json<CreateFolderRequest>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let key = match folder_object_key(&req.prefix, &req.name) {
+        Ok(key) => key,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "CREATE_FOLDER",
+        format!("/{}/{}", req.bucket, key),
+        &[Requirement::object("s3:PutObject", &req.bucket, &key)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    match state
+        .store
+        .put_object(&req.bucket, &key, &[], None, None, false)
+        .await
+    {
+        Ok(_) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                "create_folder",
+                format!("/{}/{}", req.bucket, key),
+            );
+            Json(json!({"ok": true, "key": key})).into_response()
+        }
+        Err(err) => storage_error(err),
+    }
+}
+
 async fn list_objects(
     State(state): State<UiState>,
     headers: HeaderMap,
@@ -2845,5 +2917,28 @@ mod password_tests {
         assert!(!verify_builtin_password(&hash, "wrong"));
         assert!(verify_builtin_password("legacy-cleartext", "legacy-cleartext"));
         assert!(!verify_builtin_password("legacy-cleartext", "wrong"));
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::folder_object_key;
+
+    #[test]
+    fn folder_key_normalizes_trailing_slashes() {
+        assert_eq!(folder_object_key("", "a/b////").unwrap(), "a/b/");
+        assert_eq!(folder_object_key("parent/", "child/").unwrap(), "parent/child/");
+    }
+
+    #[test]
+    fn folder_key_rejects_leading_slashes_and_empty_names() {
+        assert!(folder_object_key("", "/a/b").is_err());
+        assert!(folder_object_key("", "////").is_err());
+        assert!(folder_object_key("", "   ").is_err());
+    }
+
+    #[test]
+    fn folder_key_rejects_embedded_double_slashes() {
+        assert!(folder_object_key("", "a////b").is_err());
     }
 }

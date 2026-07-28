@@ -101,6 +101,7 @@
               <button class="btn icon-only" id="bucketSettingsBtn" onclick="openBucketSettings()" title="Bucket settings"><span data-icon="shield"></span></button>
               <button class="btn icon-only" data-admin-only id="rebuildBucketBtn" onclick="rebuildBucket()" title="Rebuild this bucket's index"><span data-icon="database"></span></button>
               <button class="btn danger" id="bulkDeleteBtn" onclick="openBulkDelete()" title="Delete every object under a prefix"><span data-icon="trash"></span> Bulk Delete</button>
+              <button class="btn" id="createFolderBtn" onclick="openFolderDialog()" title="Create an empty folder"><span data-icon="plus"></span> New folder</button>
               <button class="btn" id="uploadFolderBtn" onclick="$('folderInput').click()" title="Upload a folder and its contents"><span data-icon="folder"></span> Upload folder</button>
               <button class="btn primary" id="uploadBtn" onclick="$('fileInput').click()"><span data-icon="upload"></span> Upload</button>
             </div>
@@ -344,6 +345,18 @@
       <div id="bulkPrefixError" class="inline-error"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="bulkPrefixDlg.close()">Cancel</button><button class="btn danger" type="submit">Bulk Delete</button></div>
+  </form>
+</dialog>
+
+<dialog id="folderDlg">
+  <form onsubmit="createFolder(event)">
+    <div class="dialog-head"><div><h3>Create folder</h3><p id="folderSubtitle"></p></div><button type="button" class="dialog-close" onclick="folderDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body">
+      <div class="field"><label for="folderName">Folder name</label><input class="input" id="folderName" autocomplete="off" placeholder="e.g. photos/2026"></div>
+      <div class="muted" style="font-size:11.5px">Trailing slashes are normalized; consecutive slashes are not allowed here. A folder is a regular zero-byte S3 object whose key ends in <code>/</code>.</div>
+      <div id="folderError" class="inline-error"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="folderDlg.close()">Cancel</button><button class="btn primary" id="folderAction" type="submit">Create folder</button></div>
   </form>
 </dialog>
 
