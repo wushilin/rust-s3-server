@@ -152,6 +152,11 @@ resolve_zig() {
 # spelling outright — it reads the `unknown` vendor field as the OS and fails
 # with "UnknownOperatingSystem". Dropping it and forcing zig's own triple both
 # fixes the build and makes the x86_64 output impossible to override.
+#
+# They also drop -Wl,-O<n>: rustc hands the linker -Wl,-O1 on release builds and
+# zig's lld answers "ignoring deprecated linker optimization setting '1'" on
+# stderr, which rustc's linker_messages lint then reports as a build warning.
+# The setting is ignored either way, so the only thing lost is the noise.
 make_zig_shims() {
     local dir="$CACHE_DIR/zig-shim-${ZIG_TARGET}"
     mkdir -p "$dir"
@@ -164,6 +169,7 @@ while (( \$# )); do
     case "\$1" in
         --target=*|-target=*) shift ;;
         --target|-target)     if (( \$# >= 2 )); then shift 2; else shift; fi ;;
+        -Wl,-O[0-9]*)         shift ;;
         *)                    args+=("\$1"); shift ;;
     esac
 done
