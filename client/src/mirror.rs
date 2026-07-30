@@ -247,6 +247,9 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         Some(spec) => crate::attr::parse_attrs(spec)?,
         None => BTreeMap::new(),
     };
+    if args.preserve && !cfg!(unix) {
+        return Err(anyhow!("--preserve is not supported on this platform"));
+    }
 
     let source = resolve_side(&args.source).await?;
     let target = resolve_side(&args.target).await?;
@@ -364,6 +367,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 args.disable_multipart,
                 parallel,
                 attrs,
+                args.preserve,
             )
             .await;
             match result {
@@ -487,6 +491,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
 /// user-facing aliased-path display strings for the caller's
 /// `MirrorMessage`. This module (like `transfer::upload_file`/
 /// `download_key_to_path`) intentionally prints nothing itself.
+#[allow(clippy::too_many_arguments)]
 async fn copy_entry(
     source: &Side,
     target: &Side,
@@ -495,6 +500,7 @@ async fn copy_entry(
     disable_multipart: bool,
     parallel: usize,
     attrs: &BTreeMap<String, String>,
+    preserve: bool,
 ) -> Result<(String, String)> {
     match (source, target) {
         (
@@ -517,6 +523,7 @@ async fn copy_entry(
                 None,
                 attrs,
                 false,
+                preserve,
             )
             .await?;
             Ok((src.display().to_string(), target_url))
@@ -534,7 +541,7 @@ async fn copy_entry(
             let key = s3_key(prefix, &entry.rel);
             let output = dst_root.join(&entry.rel);
             crate::transfer::download_key_to_path(
-                client, bucket, &key, &output, part_size, parallel,
+                client, bucket, &key, &output, part_size, parallel, preserve,
             )
             .await?;
             Ok((
@@ -575,6 +582,7 @@ async fn copy_entry(
                 part_size,
                 disable_multipart,
                 parallel,
+                preserve,
             )
             .await?;
             Ok((

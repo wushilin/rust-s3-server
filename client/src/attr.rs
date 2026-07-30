@@ -120,6 +120,121 @@ pub(crate) fn parse_attrs(s: &str) -> Result<BTreeMap<String, String>> {
     Ok(map)
 }
 
+/// Filesystem-attribute preservation for `--preserve`/`-a`
+/// (`pkg/disk/stat_linux.go`, `client-fs.go:preserveAttributes`, [SEM] §2).
+///
+/// Encoded as a `/`-separated list of `key:value` pairs, sorted
+/// alphabetically by field name: `atime:<sec>#<nsec>/gid:<gid>/mode:<st_mode
+/// int>/mtime:<sec>#<nsec>/uid:<uid>`. mc also writes `gname`/`uname` when
+/// `/etc/passwd`/`/etc/group` lookups succeed, and omits them on lookup
+/// failure; rs3 omits them unconditionally, which is read-compatible with
+/// mc-written values since `parseAttribute` treats missing fields as simply
+/// absent.
+#[cfg(unix)]
+pub(crate) fn encode_fs_attrs(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "atime:{}#{}/gid:{}/mode:{}/mtime:{}#{}/uid:{}",
+        meta.atime(),
+        meta.atime_nsec(),
+        meta.gid(),
+        meta.mode(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.uid(),
+    )
+}
+
+/// Parses a Go `strconv.ParseUint(val, 0, 32)`-style base-auto-detected
+/// unsigned integer (mc's `preserveAttributes` parses `mode` this way):
+/// `0x`/`0X` hex, `0o`/`0O` octal, `0b`/`0B` binary, a bare leading `0`
+/// old-style octal, otherwise decimal.
+#[cfg(unix)]
+fn parse_uint_auto(s: &str) -> Option<u32> {
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(rest, 16).ok()
+    } else if let Some(rest) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+        u32::from_str_radix(rest, 8).ok()
+    } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        u32::from_str_radix(rest, 2).ok()
+    } else if s.len() > 1 && s.starts_with('0') {
+        u32::from_str_radix(&s[1..], 8).ok()
+    } else {
+        s.parse::<u32>().ok()
+    }
+}
+
+/// Parses a `<sec>` or `<sec>#<nsec>` timestamp field (`cmd/utils.go:
+/// parseAtimeMtime`) into a [`std::time::SystemTime`].
+#[cfg(unix)]
+fn parse_sec_nsec(v: &str) -> Option<std::time::SystemTime> {
+    let (sec, nsec) = match v.split_once('#') {
+        Some((s, n)) => (s.parse::<i64>().ok()?, n.parse::<u32>().ok()?),
+        None => (v.parse::<i64>().ok()?, 0),
+    };
+    let base = std::time::SystemTime::UNIX_EPOCH;
+    if sec >= 0 {
+        base.checked_add(std::time::Duration::new(sec as u64, nsec))
+    } else {
+        base.checked_sub(std::time::Duration::new((-sec) as u64, 0))
+            .and_then(|t| t.checked_add(std::time::Duration::new(0, nsec)))
+    }
+}
+
+/// Applies a `--preserve`-encoded attribute string to `path`: mode via
+/// chmod, uid/gid via chown, atime/mtime via `File::set_times`. Every field
+/// is independently best-effort -- a malformed value, an absent field, or a
+/// permission failure on the underlying syscall is skipped rather than
+/// failing the whole call, matching mc's `preserveAttributes` (mode/uid/gid
+/// default to "leave unchanged" on parse failure, and mc's own
+/// `probe.Error` from these calls is logged, not fatal, at the call site).
+#[cfg(unix)]
+pub(crate) fn apply_fs_attrs(path: &std::path::Path, encoded: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+    for part in encoded.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once(':') {
+            Some((k, v)) => {
+                fields.insert(k, v);
+            }
+            None => {
+                fields.insert(part, "");
+            }
+        }
+    }
+
+    if let Some(mode) = fields.get("mode").and_then(|v| parse_uint_auto(v)) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
+    }
+
+    let atime = fields.get("atime").and_then(|v| parse_sec_nsec(v));
+    let mtime = fields.get("mtime").and_then(|v| parse_sec_nsec(v));
+    if atime.is_some() || mtime.is_some() {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+            let mut times = std::fs::FileTimes::new();
+            if let Some(t) = atime {
+                times = times.set_accessed(t);
+            }
+            if let Some(t) = mtime {
+                times = times.set_modified(t);
+            }
+            let _ = file.set_times(times);
+        }
+    }
+
+    let uid = fields.get("uid").and_then(|v| v.parse::<u32>().ok());
+    let gid = fields.get("gid").and_then(|v| v.parse::<u32>().ok());
+    if uid.is_some() || gid.is_some() {
+        let _ = std::os::unix::fs::chown(path, uid, gid);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +300,60 @@ mod tests {
     fn extra_equals_in_value_is_literal() {
         let m = parse_attrs("a=b=c=d").unwrap();
         assert_eq!(m["A"], "b=c=d");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encode_fs_attrs_contains_mode_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let encoded = encode_fs_attrs(&meta);
+        assert!(encoded.contains("mode:"), "encoded: {encoded}");
+        assert!(encoded.contains("mtime:"), "encoded: {encoded}");
+        assert!(encoded.contains("atime:"), "encoded: {encoded}");
+        assert!(encoded.contains("uid:"), "encoded: {encoded}");
+        assert!(encoded.contains("gid:"), "encoded: {encoded}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_fs_attrs_roundtrips_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let encoded = encode_fs_attrs(&src_meta);
+
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&dst, b"world").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        apply_fs_attrs(&dst, &encoded).unwrap();
+
+        let dst_meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(dst_meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_fs_attrs_parses_octal_and_hex_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&dst, b"world").unwrap();
+
+        apply_fs_attrs(&dst, "mode:0640").unwrap();
+        let dst_meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(dst_meta.permissions().mode() & 0o777, 0o640);
+
+        apply_fs_attrs(&dst, "mode:0x1A4").unwrap(); // 0x1A4 == 0644
+        let dst_meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(dst_meta.permissions().mode() & 0o777, 0o644);
     }
 }

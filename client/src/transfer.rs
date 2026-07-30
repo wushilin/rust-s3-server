@@ -135,7 +135,12 @@ pub(crate) async fn upload_file(
     storage_class: Option<&str>,
     metadata: &BTreeMap<String, String>,
     if_not_exists: bool,
+    preserve: bool,
 ) -> Result<UploadOutcome> {
+    #[cfg(not(unix))]
+    if preserve {
+        return Err(anyhow!("--preserve is not supported on this platform"));
+    }
     let parsed = parse_s3_url(target)?;
     let bucket = parsed
         .bucket
@@ -153,6 +158,16 @@ pub(crate) async fn upload_file(
     let file_meta = fs::metadata(source)
         .await
         .with_context(|| format!("stat {}", source.display()))?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut metadata = metadata.clone();
+    #[cfg(unix)]
+    if preserve {
+        metadata.insert(
+            "Mc-Attrs".to_string(),
+            crate::attr::encode_fs_attrs(&file_meta),
+        );
+    }
+    let metadata = &metadata;
     let (client, _) = client_for_alias(&parsed.alias).await?;
     if disable_multipart || file_meta.len() <= part_size {
         let mut req = client
@@ -401,8 +416,13 @@ pub(crate) async fn transfer_object_between_s3(
     part_size: u64,
     disable_multipart: bool,
     parallel: usize,
+    preserve: bool,
 ) -> Result<()> {
     if same_endpoint(source_alias, target_alias) {
+        // Same-endpoint copies go through server-side CopyObject, whose
+        // default `x-amz-metadata-directive: COPY` already carries the
+        // source object's user metadata (including any `Mc-Attrs`) onto the
+        // target -- nothing extra to do here for `--preserve` ([SEM] §2).
         let single_limit = part_size.min(MAX_SINGLE_COPY);
         if disable_multipart || size <= single_limit {
             target_client
@@ -426,6 +446,17 @@ pub(crate) async fn transfer_object_between_s3(
             .await?;
         }
         return Ok(());
+    }
+    // The streaming cross-endpoint path below has no equivalent of
+    // CopyObject's metadata-directive carry-over -- it would need source
+    // metadata fetched and threaded through both the single-shot PUT and
+    // the multipart create-upload call. Out of scope for now; hard-error
+    // rather than silently drop `--preserve` (matches the existing
+    // cross-endpoint `--attr` rejection in `main.rs`/`mirror.rs`).
+    if preserve {
+        return Err(anyhow!(
+            "--preserve for cross-endpoint S3-to-S3 copies is not implemented yet"
+        ));
     }
     if std::env::var("RS3_DEBUG_COPY").is_ok() {
         eprintln!("rs3: falling back to streaming copy");
@@ -565,6 +596,68 @@ mod tests {
             "bkt/dir/obj%20name%2Bx.bin"
         );
     }
+
+    fn dummy_client(endpoint: &str) -> Client {
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "k", "s", None, None, "test",
+            ))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build();
+        Client::from_conf(cfg)
+    }
+
+    fn dummy_alias(url: &str) -> crate::config::Alias {
+        crate::config::Alias {
+            url: url.to_string(),
+            access_key: "k".to_string(),
+            secret_key: "s".to_string(),
+            api: "s3v4".to_string(),
+            path: "auto".to_string(),
+            region: None,
+        }
+    }
+
+    // [SEM] §2: same-endpoint S3-to-S3 copies preserve metadata for free via
+    // server-side CopyObject's default COPY directive, but the streaming
+    // cross-endpoint fallback has no equivalent carry-over, so `--preserve`
+    // is hard-rejected there rather than silently dropped. This must be
+    // checked before any network I/O -- both aliases here point at
+    // unreachable endpoints, so a hang/timeout would mean the check ran too
+    // late (or not at all).
+    #[test]
+    fn preserve_is_rejected_for_cross_endpoint_s3_to_s3_before_any_io() {
+        let source_client = dummy_client("http://127.0.0.1:1");
+        let source_alias = dummy_alias("http://127.0.0.1:1");
+        let target_client = dummy_client("http://127.0.0.1:2");
+        let target_alias = dummy_alias("http://127.0.0.1:2");
+        let result = futures::executor::block_on(transfer_object_between_s3(
+            &source_client,
+            &source_alias,
+            "bkt",
+            "key",
+            &target_client,
+            &target_alias,
+            "bkt",
+            "key",
+            1,
+            5 * 1024 * 1024,
+            false,
+            1,
+            true,
+        ));
+        assert!(
+            result.is_err(),
+            "cross-endpoint --preserve must be rejected"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("not implemented"),
+            "error should say the feature is unimplemented"
+        );
+    }
 }
 
 /// Downloads `bucket/key` to `output`, returning the transferred size so
@@ -577,7 +670,12 @@ pub(crate) async fn download_key_to_path(
     output: &Path,
     part_size: u64,
     parallel: usize,
+    preserve: bool,
 ) -> Result<u64> {
+    #[cfg(not(unix))]
+    if preserve {
+        return Err(anyhow!("--preserve is not supported on this platform"));
+    }
     let head = client
         .head_object()
         .bucket(bucket)
@@ -600,6 +698,21 @@ pub(crate) async fn download_key_to_path(
     match result {
         Ok(()) => {
             fs::rename(&tmp, output).await?;
+            #[cfg(unix)]
+            if preserve {
+                if let Some(encoded) = head
+                    .metadata()
+                    .and_then(|m| m.iter().find(|(k, _)| k.eq_ignore_ascii_case("mc-attrs")))
+                    .map(|(_, v)| v)
+                {
+                    if let Err(err) = crate::attr::apply_fs_attrs(output, encoded) {
+                        eprintln!(
+                            "rs3: warning: could not preserve attributes for `{}`: {err:#}",
+                            output.display()
+                        );
+                    }
+                }
+            }
             Ok(size)
         }
         Err(err) => {
@@ -674,6 +787,7 @@ pub(crate) async fn download_object(
     part_size: u64,
     parallel: usize,
     session: &crate::messages::TransferSession,
+    preserve: bool,
 ) -> Result<()> {
     let parsed = parse_s3_url(source)?;
     let bucket = parsed
@@ -688,7 +802,10 @@ pub(crate) async fn download_object(
         Some(path) => path,
         None => PathBuf::from(key.rsplit('/').next().unwrap_or(&key)),
     };
-    let size = download_key_to_path(&client, &bucket, &key, &output, part_size, parallel).await?;
+    let size = download_key_to_path(
+        &client, &bucket, &key, &output, part_size, parallel, preserve,
+    )
+    .await?;
     session.add_total(size);
     let (total_count, total_size) = session.totals();
     let msg = crate::messages::CopyMessage {

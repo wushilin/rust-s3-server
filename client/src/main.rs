@@ -226,6 +226,12 @@ struct PutArgs {
     attr: Option<String>,
     #[arg(long, help = "upload only if the object does not already exist")]
     if_not_exists: bool,
+    #[arg(
+        short = 'a',
+        long,
+        help = "preserve filesystem attributes (mode, ownership, timestamps)"
+    )]
+    preserve: bool,
     #[arg(required = true)]
     source: PathBuf,
     #[arg(required = true)]
@@ -250,6 +256,12 @@ struct CpArgs {
     storage_class: Option<String>,
     #[arg(long, help = "add custom metadata for the object")]
     attr: Option<String>,
+    #[arg(
+        short = 'a',
+        long,
+        help = "preserve filesystem attributes (mode, ownership, timestamps)"
+    )]
+    preserve: bool,
     #[arg(required = true)]
     paths: Vec<String>,
 }
@@ -278,6 +290,12 @@ pub(crate) struct MirrorArgs {
     pub(crate) newer_than: Option<String>,
     #[arg(long, help = "add custom metadata for the object")]
     pub(crate) attr: Option<String>,
+    #[arg(
+        short = 'a',
+        long,
+        help = "preserve filesystem attributes (mode, ownership, timestamps)"
+    )]
+    pub(crate) preserve: bool,
     pub(crate) source: String,
     pub(crate) target: String,
 }
@@ -916,6 +934,9 @@ async fn abort_incomplete_uploads(client: &Client, bucket: &str) -> Result<()> {
 }
 
 async fn put(args: PutArgs) -> Result<()> {
+    if args.preserve && !cfg!(unix) {
+        return Err(anyhow!("--preserve is not supported on this platform"));
+    }
     let part_size = parse_size(&args.part_size)?;
     let metadata = match args.attr.as_deref() {
         Some(spec) => attr::parse_attrs(spec)?,
@@ -931,6 +952,7 @@ async fn put(args: PutArgs) -> Result<()> {
         args.storage_class.as_deref(),
         &metadata,
         args.if_not_exists,
+        args.preserve,
     )
     .await?;
     session.add_total(outcome.size);
@@ -951,6 +973,9 @@ async fn cp(args: CpArgs) -> Result<()> {
     timefilter::validate_time_filters(args.older_than.as_deref(), args.newer_than.as_deref())?;
     if args.paths.len() < 2 {
         return Err(anyhow!("cp requires SOURCE [SOURCE...] TARGET"));
+    }
+    if args.preserve && !cfg!(unix) {
+        return Err(anyhow!("--preserve is not supported on this platform"));
     }
     let part_size = parse_size(&args.part_size)?;
     let attrs = match args.attr.as_deref() {
@@ -975,6 +1000,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                     args.older_than.as_deref(),
                     args.newer_than.as_deref(),
                     &attrs,
+                    args.preserve,
                 )
                 .await?;
                 used_session = true;
@@ -1012,6 +1038,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                         part_size,
                         args.parallel,
                         &session,
+                        args.preserve,
                     )
                     .await?;
                 }
@@ -1045,6 +1072,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                         args.storage_class.as_deref(),
                         &attrs,
                         false,
+                        args.preserve,
                     )
                     .await?;
                     session.add_total(outcome.size);
@@ -1061,6 +1089,11 @@ async fn cp(args: CpArgs) -> Result<()> {
                 used_session = true;
             }
         } else {
+            if args.preserve {
+                return Err(anyhow!(
+                    "cp --preserve for local-to-local copies is not implemented yet"
+                ));
+            }
             copy_local_path(
                 Path::new(source),
                 Path::new(&target),
@@ -1094,6 +1127,7 @@ async fn cp_recursive(source: &str, target: &str, args: &CpArgs) -> Result<()> {
         older_than: args.older_than.clone(),
         newer_than: args.newer_than.clone(),
         attr: args.attr.clone(),
+        preserve: args.preserve,
         source: source.to_string(),
         target: target.to_string(),
     };
@@ -1115,6 +1149,7 @@ async fn copy_s3_object_to_s3(
     older_than: Option<&str>,
     newer_than: Option<&str>,
     attrs: &BTreeMap<String, String>,
+    preserve: bool,
 ) -> Result<()> {
     if !attrs.is_empty() {
         return Err(anyhow!("--attr for S3-to-S3 copies is not implemented yet"));
@@ -1171,6 +1206,7 @@ async fn copy_s3_object_to_s3(
         part_size,
         disable_multipart,
         parallel,
+        preserve,
     )
     .await?;
     session.add_total(size);
@@ -1277,7 +1313,17 @@ async fn get(args: GetArgs) -> Result<()> {
         return Err(anyhow!("get --version-id is not implemented yet"));
     }
     let session = TransferSession::new("get");
-    download_object(&args.source, args.target, DEFAULT_PART_SIZE, 4, &session).await?;
+    // GetArgs has no `--preserve` flag ([SEM] §2 lists it on cp/mirror/put
+    // only), so `get` never preserves filesystem attributes.
+    download_object(
+        &args.source,
+        args.target,
+        DEFAULT_PART_SIZE,
+        4,
+        &session,
+        false,
+    )
+    .await?;
     session.finish();
     Ok(())
 }

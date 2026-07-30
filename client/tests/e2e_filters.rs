@@ -279,3 +279,122 @@ fn cp_attr_s3_to_s3_is_rejected() {
         "cp --attr between two S3 objects should be rejected"
     );
 }
+
+// `--preserve`/`-a` round-trips filesystem attributes (mode, timestamps)
+// through `X-Amz-Meta-Mc-Attrs`: upload encodes the source file's stat into
+// the header, download parses it back out and applies it to the new local
+// file ([SEM] §2). rusts3 persists arbitrary user metadata, so this is
+// fully e2e-verifiable against the real test server, unlike the
+// if-not-exists multipart case above.
+#[cfg(unix)]
+#[test]
+fn cp_preserve_roundtrips_mode_and_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/preserve1"]);
+    let src = server.dir.path().join("src.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let src_mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+
+    server.rs3_ok(&[
+        "cp",
+        "--preserve",
+        src.to_str().unwrap(),
+        "test/preserve1/src.txt",
+    ]);
+
+    let dst = server.dir.path().join("dst.txt");
+    server.rs3_ok(&[
+        "cp",
+        "--preserve",
+        "test/preserve1/src.txt",
+        dst.to_str().unwrap(),
+    ]);
+
+    let dst_meta = std::fs::metadata(&dst).unwrap();
+    assert_eq!(
+        dst_meta.permissions().mode() & 0o777,
+        0o600,
+        "mode should round-trip through --preserve"
+    );
+    let dst_mtime = dst_meta.modified().unwrap();
+    let src_secs = src_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let dst_secs = dst_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(
+        src_secs, dst_secs,
+        "mtime should round-trip through --preserve (to the second)"
+    );
+}
+
+// Without `--preserve`, cp/put never touch the target's mode/mtime -- a
+// plain cp of a chmod'd file must not leak fs attrs onto the new local
+// file.
+#[cfg(unix)]
+#[test]
+fn cp_without_preserve_does_not_apply_attrs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/preserve2"]);
+    let src = server.dir.path().join("src.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    server.rs3_ok(&["cp", src.to_str().unwrap(), "test/preserve2/src.txt"]);
+
+    let dst = server.dir.path().join("dst.txt");
+    // Pre-create with a different mode; a non-preserving cp should not
+    // touch it since it never even sees an `Mc-Attrs` header to apply.
+    std::fs::write(&dst, b"placeholder").unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+    server.rs3_ok(&["cp", "test/preserve2/src.txt", dst.to_str().unwrap()]);
+
+    let dst_meta = std::fs::metadata(&dst).unwrap();
+    assert_eq!(
+        dst_meta.permissions().mode() & 0o777,
+        0o644,
+        "cp without --preserve must not apply the source's mode"
+    );
+}
+
+// The streaming cross-endpoint S3-to-S3 path can't cheaply carry source
+// metadata onto the target PUT the way same-endpoint CopyObject's COPY
+// directive does for free, so `--preserve` hard-errors there rather than
+// silently dropping it -- mirrors `cp_attr_s3_to_s3_is_rejected` above,
+// which does the same for `--attr`.
+#[test]
+fn cp_preserve_s3_to_s3_same_endpoint_succeeds() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/preserve3"]);
+    let src = server.dir.path().join("a.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&[
+        "put",
+        "--preserve",
+        src.to_str().unwrap(),
+        "test/preserve3/a.txt",
+    ]);
+    // Same-endpoint S3->S3 copy: server-side CopyObject's default COPY
+    // metadata directive carries `Mc-Attrs` over with zero extra code, so
+    // this must succeed (unlike the cross-endpoint streaming path).
+    server.rs3_ok(&[
+        "cp",
+        "--preserve",
+        "test/preserve3/a.txt",
+        "test/preserve3/b.txt",
+    ]);
+    let out = server.rs3_ok(&["stat", "--json", "test/preserve3/b.txt"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(
+        v["metadata"]["mc-attrs"].is_string(),
+        "Mc-Attrs should have been carried over by server-side copy: {out}"
+    );
+}
