@@ -157,14 +157,16 @@ impl McMessage for RmMessage {
 
 /// `stat` message for a single object. mc's `Type` field is a fixed
 /// `"file"` for the object-stat path (not the object's MIME content-type);
-/// `content_type`, if present, is folded into the `Metadata` block under a
-/// `Content-Type` key, matching real `mc stat` output.
+/// `content_type`/`cache_control`, if present, are folded into the
+/// `Metadata` block under `Content-Type`/`Cache-Control` keys, matching real
+/// `mc stat` output.
 pub(crate) struct StatMessage {
     pub key: String,
     pub date: DateTime<Utc>,
     pub size: u64,
     pub etag: String,
     pub content_type: Option<String>,
+    pub cache_control: Option<String>,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -174,6 +176,10 @@ impl StatMessage {
         if let Some(ct) = &self.content_type {
             m.entry("Content-Type".to_string())
                 .or_insert_with(|| ct.clone());
+        }
+        if let Some(cc) = &self.cache_control {
+            m.entry("Cache-Control".to_string())
+                .or_insert_with(|| cc.clone());
         }
         m
     }
@@ -548,6 +554,7 @@ mod tests {
             size: 12,
             etag: "etag123".into(),
             content_type: Some("text/plain".into()),
+            cache_control: None,
             metadata: BTreeMap::new(),
         };
         let v = msg.json();
@@ -571,6 +578,7 @@ mod tests {
             size: 0,
             etag: String::new(),
             content_type: None,
+            cache_control: None,
             metadata: BTreeMap::new(),
         };
         assert!(msg.json().get("metadata").is_none());

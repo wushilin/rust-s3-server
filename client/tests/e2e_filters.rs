@@ -188,3 +188,94 @@ fn mirror_remove_does_not_delete_age_excluded_but_still_present_source() {
     );
     server.rs3_ok(&["stat", "test/flt7/p/keep.txt"]);
 }
+
+// --attr threads a system header (Content-Type, routed onto PutObject's own
+// field) and a user-metadata key (X-Amz-Meta-Color, routed through
+// `.metadata()`, prefix stripped since the SDK re-adds it on the wire) in
+// the same quoted `key=value;key=value` spec ([SEM] §2). rusts3's put
+// handler only persists Content-Type/Content-Encoding/Content-Language plus
+// user metadata (see `extract_user_meta` in `src/server/mod.rs`) -- it drops
+// Cache-Control/Content-Disposition/Expires entirely, so this asserts
+// against the two headers the real e2e server actually round-trips rather
+// than the full system-header set the client itself supports.
+#[test]
+fn put_attr_sets_system_header_and_user_metadata() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/attr1"]);
+    let src = server.dir.path().join("a.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&[
+        "put",
+        "--attr",
+        "Content-Type=text/x-custom;X-Amz-Meta-Color=red",
+        src.to_str().unwrap(),
+        "test/attr1/a.txt",
+    ]);
+    let out = server.rs3_ok(&["stat", "--json", "test/attr1/a.txt"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["metadata"]["Content-Type"], "text/x-custom");
+    // rusts3 lowercases user-metadata keys on the wire (`extract_user_meta`),
+    // so the SDK's HeadObject response -- and thus rs3's own stat output --
+    // reports it back as `color`, not the canonical `Color` the --attr spec
+    // parsed to.
+    assert_eq!(v["metadata"]["color"], "red");
+}
+
+#[test]
+fn put_if_not_exists_rejects_second_write_to_same_key() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/attr2"]);
+    let src = server.dir.path().join("a.txt");
+    std::fs::write(&src, b"first").unwrap();
+    server.rs3_ok(&[
+        "put",
+        "--if-not-exists",
+        src.to_str().unwrap(),
+        "test/attr2/a.txt",
+    ]);
+    let second = server.rs3(&[
+        "put",
+        "--if-not-exists",
+        src.to_str().unwrap(),
+        "test/attr2/a.txt",
+    ]);
+    assert!(
+        !second.status.success(),
+        "second --if-not-exists put should fail once the key exists"
+    );
+    // The original object must survive the rejected second write.
+    server.rs3_ok(&["stat", "test/attr2/a.txt"]);
+}
+
+// NOTE: there is no multipart counterpart to
+// `put_if_not_exists_rejects_second_write_to_same_key` here. The client
+// wires `if_not_exists` onto CompleteMultipartUpload's `If-None-Match: *`
+// per [SEM] §2 (not CreateMultipartUpload), but rusts3's
+// `complete_multipart` handler doesn't implement conditional-write
+// preconditions at all (unlike its `put_object` handler, which does) --
+// see `src/server/handlers/complete_multipart/lib.rs`. That path is
+// implemented per spec but isn't e2e-verifiable against this test server.
+
+// cp/mirror only support --attr for uploads (local -> S3); a same- or
+// cross-endpoint S3 -> S3 copy path would need metadata_directive=REPLACE
+// threaded through several copy code paths, which is out of scope here, so
+// it hard-errors instead of silently ignoring the flag.
+#[test]
+fn cp_attr_s3_to_s3_is_rejected() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/attr4"]);
+    let src = server.dir.path().join("a.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/attr4/a.txt"]);
+    let out = server.rs3(&[
+        "cp",
+        "--attr",
+        "X-Amz-Meta-Color=red",
+        "test/attr4/a.txt",
+        "test/attr4/b.txt",
+    ]);
+    assert!(
+        !out.status.success(),
+        "cp --attr between two S3 objects should be rejected"
+    );
+}

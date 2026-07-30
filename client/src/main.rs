@@ -1,3 +1,4 @@
+mod attr;
 mod config;
 mod list;
 mod messages;
@@ -221,6 +222,10 @@ struct PutArgs {
     disable_multipart: bool,
     #[arg(long = "storage-class", visible_alias = "sc")]
     storage_class: Option<String>,
+    #[arg(long, help = "add custom metadata for the object")]
+    attr: Option<String>,
+    #[arg(long, help = "upload only if the object does not already exist")]
+    if_not_exists: bool,
     #[arg(required = true)]
     source: PathBuf,
     #[arg(required = true)]
@@ -243,6 +248,8 @@ struct CpArgs {
     disable_multipart: bool,
     #[arg(long = "storage-class", visible_alias = "sc")]
     storage_class: Option<String>,
+    #[arg(long, help = "add custom metadata for the object")]
+    attr: Option<String>,
     #[arg(required = true)]
     paths: Vec<String>,
 }
@@ -269,6 +276,8 @@ pub(crate) struct MirrorArgs {
     pub(crate) older_than: Option<String>,
     #[arg(long)]
     pub(crate) newer_than: Option<String>,
+    #[arg(long, help = "add custom metadata for the object")]
+    pub(crate) attr: Option<String>,
     pub(crate) source: String,
     pub(crate) target: String,
 }
@@ -908,6 +917,10 @@ async fn abort_incomplete_uploads(client: &Client, bucket: &str) -> Result<()> {
 
 async fn put(args: PutArgs) -> Result<()> {
     let part_size = parse_size(&args.part_size)?;
+    let metadata = match args.attr.as_deref() {
+        Some(spec) => attr::parse_attrs(spec)?,
+        None => BTreeMap::new(),
+    };
     let session = TransferSession::new("put");
     let outcome = upload_file(
         &args.source,
@@ -916,6 +929,8 @@ async fn put(args: PutArgs) -> Result<()> {
         args.parallel,
         args.disable_multipart,
         args.storage_class.as_deref(),
+        &metadata,
+        args.if_not_exists,
     )
     .await?;
     session.add_total(outcome.size);
@@ -938,6 +953,10 @@ async fn cp(args: CpArgs) -> Result<()> {
         return Err(anyhow!("cp requires SOURCE [SOURCE...] TARGET"));
     }
     let part_size = parse_size(&args.part_size)?;
+    let attrs = match args.attr.as_deref() {
+        Some(spec) => attr::parse_attrs(spec)?,
+        None => BTreeMap::new(),
+    };
     let target = args.paths.last().unwrap().clone();
     let session = TransferSession::new("cp");
     let mut used_session = false;
@@ -955,6 +974,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                     &session,
                     args.older_than.as_deref(),
                     args.newer_than.as_deref(),
+                    &attrs,
                 )
                 .await?;
                 used_session = true;
@@ -1023,6 +1043,8 @@ async fn cp(args: CpArgs) -> Result<()> {
                         args.parallel,
                         args.disable_multipart,
                         args.storage_class.as_deref(),
+                        &attrs,
+                        false,
                     )
                     .await?;
                     session.add_total(outcome.size);
@@ -1071,6 +1093,7 @@ async fn cp_recursive(source: &str, target: &str, args: &CpArgs) -> Result<()> {
         disable_multipart: args.disable_multipart,
         older_than: args.older_than.clone(),
         newer_than: args.newer_than.clone(),
+        attr: args.attr.clone(),
         source: source.to_string(),
         target: target.to_string(),
     };
@@ -1091,7 +1114,11 @@ async fn copy_s3_object_to_s3(
     session: &TransferSession,
     older_than: Option<&str>,
     newer_than: Option<&str>,
+    attrs: &BTreeMap<String, String>,
 ) -> Result<()> {
+    if !attrs.is_empty() {
+        return Err(anyhow!("--attr for S3-to-S3 copies is not implemented yet"));
+    }
     let source_url = parse_s3_url(source)?;
     let source_bucket = source_url
         .bucket
@@ -1484,6 +1511,7 @@ async fn stat(args: StatArgs) -> Result<()> {
             size: resp.content_length().unwrap_or_default() as u64,
             etag: strip_etag_quotes(resp.e_tag().unwrap_or_default()),
             content_type: resp.content_type().map(str::to_string),
+            cache_control: resp.cache_control().map(str::to_string),
             metadata,
         });
     }

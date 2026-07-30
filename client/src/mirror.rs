@@ -243,12 +243,19 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     let part_size = crate::urls::parse_size(&args.part_size)?;
     let parallel = args.parallel.max(1);
     let dry_run = args.dry_run || args.fake;
+    let attrs = match args.attr.as_deref() {
+        Some(spec) => crate::attr::parse_attrs(spec)?,
+        None => BTreeMap::new(),
+    };
 
     let source = resolve_side(&args.source).await?;
     let target = resolve_side(&args.target).await?;
 
     if matches!((&source, &target), (Side::Local(_), Side::Local(_))) {
         return Err(anyhow!("mirror between two local paths is not supported"));
+    }
+    if !attrs.is_empty() && matches!((&source, &target), (Side::S3 { .. }, Side::S3 { .. })) {
+        return Err(anyhow!("--attr for S3-to-S3 copies is not implemented yet"));
     }
 
     let source_entries = match &source {
@@ -347,6 +354,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         let source = &source;
         let target = &target;
         let session = &session;
+        let attrs = &attrs;
         async move {
             let result = copy_entry(
                 source,
@@ -355,6 +363,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 part_size,
                 args.disable_multipart,
                 parallel,
+                attrs,
             )
             .await;
             match result {
@@ -485,6 +494,7 @@ async fn copy_entry(
     part_size: u64,
     disable_multipart: bool,
     parallel: usize,
+    attrs: &BTreeMap<String, String>,
 ) -> Result<(String, String)> {
     match (source, target) {
         (
@@ -505,6 +515,8 @@ async fn copy_entry(
                 parallel,
                 disable_multipart,
                 None,
+                attrs,
+                false,
             )
             .await?;
             Ok((src.display().to_string(), target_url))

@@ -1,11 +1,15 @@
+use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder;
+use aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::Length;
+use aws_smithy_types::date_time::Format as DateTimeFormat;
 use futures::stream::{self, StreamExt};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::fs;
@@ -13,6 +17,80 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 
 use crate::config::client_for_alias;
 use crate::urls::parse_s3_url;
+
+/// A handful of PutObject/CreateMultipartUpload builder methods that
+/// `apply_attrs` needs on both request types -- the aws-sdk-s3 generated
+/// builders don't share a trait, so this one is hand-rolled just for the
+/// system-header/`.metadata()` fields `--attr` can touch ([SEM] §2).
+trait AttrTarget: Sized {
+    fn attr_cache_control(self, v: String) -> Self;
+    fn attr_content_type(self, v: String) -> Self;
+    fn attr_content_encoding(self, v: String) -> Self;
+    fn attr_content_disposition(self, v: String) -> Self;
+    fn attr_content_language(self, v: String) -> Self;
+    fn attr_expires(self, v: aws_smithy_types::DateTime) -> Self;
+    fn attr_metadata(self, k: String, v: String) -> Self;
+}
+
+macro_rules! impl_attr_target {
+    ($ty:ty) => {
+        impl AttrTarget for $ty {
+            fn attr_cache_control(self, v: String) -> Self {
+                self.cache_control(v)
+            }
+            fn attr_content_type(self, v: String) -> Self {
+                self.content_type(v)
+            }
+            fn attr_content_encoding(self, v: String) -> Self {
+                self.content_encoding(v)
+            }
+            fn attr_content_disposition(self, v: String) -> Self {
+                self.content_disposition(v)
+            }
+            fn attr_content_language(self, v: String) -> Self {
+                self.content_language(v)
+            }
+            fn attr_expires(self, v: aws_smithy_types::DateTime) -> Self {
+                self.expires(v)
+            }
+            fn attr_metadata(self, k: String, v: String) -> Self {
+                self.metadata(k, v)
+            }
+        }
+    };
+}
+
+impl_attr_target!(PutObjectFluentBuilder);
+impl_attr_target!(CreateMultipartUploadFluentBuilder);
+
+/// Routes a parsed `--attr` map onto a PutObject/CreateMultipartUpload
+/// builder: keys that (case-insensitively) match a known S3 system header
+/// set the corresponding builder field, everything else becomes user
+/// metadata via `.metadata()` with a leading `X-Amz-Meta-` stripped (the SDK
+/// re-adds the wire prefix) -- no auto-prefixing is applied to keys that
+/// aren't already spelled that way ([SEM] §2).
+fn apply_attrs<T: AttrTarget>(mut req: T, metadata: &BTreeMap<String, String>) -> Result<T> {
+    for (k, v) in metadata {
+        let lower = k.to_ascii_lowercase();
+        req = match lower.as_str() {
+            "cache-control" => req.attr_cache_control(v.clone()),
+            "content-type" => req.attr_content_type(v.clone()),
+            "content-encoding" => req.attr_content_encoding(v.clone()),
+            "content-disposition" => req.attr_content_disposition(v.clone()),
+            "content-language" => req.attr_content_language(v.clone()),
+            "expires" => {
+                let dt = aws_smithy_types::DateTime::from_str(v, DateTimeFormat::HttpDate)
+                    .map_err(|err| anyhow!("invalid Expires value `{v}`: {err}"))?;
+                req.attr_expires(dt)
+            }
+            _ if lower.starts_with("x-amz-meta-") => {
+                req.attr_metadata(k["X-Amz-Meta-".len()..].to_string(), v.clone())
+            }
+            _ => req.attr_metadata(k.clone(), v.clone()),
+        };
+    }
+    Ok(req)
+}
 
 const COPY_SOURCE_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
@@ -47,6 +125,7 @@ pub(crate) struct UploadedPart {
     etag: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_file(
     source: &Path,
     target: &str,
@@ -54,6 +133,8 @@ pub(crate) async fn upload_file(
     parallel: usize,
     disable_multipart: bool,
     storage_class: Option<&str>,
+    metadata: &BTreeMap<String, String>,
+    if_not_exists: bool,
 ) -> Result<UploadOutcome> {
     let parsed = parse_s3_url(target)?;
     let bucket = parsed
@@ -69,11 +150,11 @@ pub(crate) async fn upload_file(
         Some(k) => k,
         None => source_name.to_string(),
     };
-    let metadata = fs::metadata(source)
+    let file_meta = fs::metadata(source)
         .await
         .with_context(|| format!("stat {}", source.display()))?;
     let (client, _) = client_for_alias(&parsed.alias).await?;
-    if disable_multipart || metadata.len() <= part_size {
+    if disable_multipart || file_meta.len() <= part_size {
         let mut req = client
             .put_object()
             .bucket(&bucket)
@@ -82,6 +163,10 @@ pub(crate) async fn upload_file(
         if let Some(sc) = storage_class {
             req = req.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
         }
+        req = apply_attrs(req, metadata)?;
+        if if_not_exists {
+            req = req.if_none_match("*");
+        }
         req.send().await?;
     } else {
         multipart_upload(
@@ -89,19 +174,22 @@ pub(crate) async fn upload_file(
             source,
             &bucket,
             &key,
-            metadata.len(),
+            file_meta.len(),
             part_size,
             parallel.max(1),
             storage_class,
+            metadata,
+            if_not_exists,
         )
         .await?;
     }
     Ok(UploadOutcome {
         target: format!("{}/{bucket}/{key}", parsed.alias),
-        size: metadata.len(),
+        size: file_meta.len(),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn multipart_upload(
     client: &Client,
     source: &Path,
@@ -111,6 +199,8 @@ pub(crate) async fn multipart_upload(
     part_size: u64,
     parallel: usize,
     storage_class: Option<&str>,
+    metadata: &BTreeMap<String, String>,
+    if_not_exists: bool,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
@@ -119,6 +209,7 @@ pub(crate) async fn multipart_upload(
     if let Some(sc) = storage_class {
         create = create.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
     }
+    create = apply_attrs(create, metadata)?;
     let created = create.send().await?;
     let upload_id = created
         .upload_id()
@@ -180,7 +271,7 @@ pub(crate) async fn multipart_upload(
                 .build()
         })
         .collect::<Vec<_>>();
-    client
+    let mut complete = client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(key)
@@ -189,9 +280,11 @@ pub(crate) async fn multipart_upload(
             CompletedMultipartUpload::builder()
                 .set_parts(Some(completed))
                 .build(),
-        )
-        .send()
-        .await?;
+        );
+    if if_not_exists {
+        complete = complete.if_none_match("*");
+    }
+    complete.send().await?;
     Ok(())
 }
 
