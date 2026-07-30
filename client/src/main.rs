@@ -3,6 +3,7 @@ mod list;
 mod messages;
 mod mirror;
 mod output;
+mod timefilter;
 mod transfer;
 mod urls;
 
@@ -264,6 +265,10 @@ pub(crate) struct MirrorArgs {
     pub(crate) watch: bool,
     #[arg(long)]
     pub(crate) disable_multipart: bool,
+    #[arg(long)]
+    pub(crate) older_than: Option<String>,
+    #[arg(long)]
+    pub(crate) newer_than: Option<String>,
     pub(crate) source: String,
     pub(crate) target: String,
 }
@@ -297,6 +302,10 @@ struct RmArgs {
     version_id: Option<String>,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long)]
+    older_than: Option<String>,
+    #[arg(long)]
+    newer_than: Option<String>,
     targets: Vec<String>,
 }
 
@@ -835,7 +844,7 @@ async fn rb(args: RbArgs) -> Result<()> {
 async fn remove_bucket(client: &Client, alias: &str, bucket: &str, force: bool) -> Result<()> {
     if force {
         abort_incomplete_uploads(client, bucket).await?;
-        remove_prefix(client, alias, bucket, "", false).await?;
+        remove_prefix(client, alias, bucket, "", false, None, None).await?;
     }
     client
         .delete_bucket()
@@ -924,12 +933,7 @@ async fn put(args: PutArgs) -> Result<()> {
 }
 
 async fn cp(args: CpArgs) -> Result<()> {
-    if args.older_than.is_some() {
-        return Err(anyhow!("cp --older-than is not implemented yet"));
-    }
-    if args.newer_than.is_some() {
-        return Err(anyhow!("cp --newer-than is not implemented yet"));
-    }
+    timefilter::validate_time_filters(args.older_than.as_deref(), args.newer_than.as_deref())?;
     if args.paths.len() < 2 {
         return Err(anyhow!("cp requires SOURCE [SOURCE...] TARGET"));
     }
@@ -949,6 +953,8 @@ async fn cp(args: CpArgs) -> Result<()> {
                     args.disable_multipart,
                     args.parallel,
                     &session,
+                    args.older_than.as_deref(),
+                    args.newer_than.as_deref(),
                 )
                 .await?;
                 used_session = true;
@@ -957,14 +963,38 @@ async fn cp(args: CpArgs) -> Result<()> {
             if args.recursive {
                 cp_recursive(source, &target, &args).await?;
             } else {
-                download_object(
-                    source,
-                    Some(PathBuf::from(&target)),
-                    part_size,
-                    args.parallel,
-                    &session,
-                )
-                .await?;
+                let parsed = parse_s3_url(source)?;
+                let bucket = parsed
+                    .bucket
+                    .clone()
+                    .ok_or_else(|| anyhow!("bucket is required in source `{source}`"))?;
+                let key = parsed
+                    .key
+                    .clone()
+                    .ok_or_else(|| anyhow!("object key is required in source `{source}`"))?;
+                let (head_client, _) = client_for_alias(&parsed.alias).await?;
+                let head = head_client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
+                let object_time = head.last_modified().map(smithy_to_chrono);
+                if timefilter::passes_filters(
+                    object_time,
+                    args.older_than.as_deref(),
+                    args.newer_than.as_deref(),
+                )? {
+                    download_object(
+                        source,
+                        Some(PathBuf::from(&target)),
+                        part_size,
+                        args.parallel,
+                        &session,
+                    )
+                    .await?;
+                }
                 used_session = true;
             }
         } else if !is_s3_url(source) && is_s3_url(&target) {
@@ -977,25 +1007,35 @@ async fn cp(args: CpArgs) -> Result<()> {
                 }
                 cp_recursive(source, &target, &args).await?;
             } else {
-                let outcome = upload_file(
-                    source_path,
-                    &target,
-                    part_size,
-                    args.parallel,
-                    args.disable_multipart,
-                    args.storage_class.as_deref(),
-                )
-                .await?;
-                session.add_total(outcome.size);
-                let (total_count, total_size) = session.totals();
-                let msg = CopyMessage {
-                    source: source_path.display().to_string(),
-                    target: outcome.target,
-                    size: outcome.size,
-                    total_count,
-                    total_size,
-                };
-                session.object_done(&msg, outcome.size);
+                let metadata = fs::metadata(source_path)
+                    .await
+                    .with_context(|| format!("stat {}", source_path.display()))?;
+                let object_time = metadata.modified().ok().map(DateTime::<Utc>::from);
+                if timefilter::passes_filters(
+                    object_time,
+                    args.older_than.as_deref(),
+                    args.newer_than.as_deref(),
+                )? {
+                    let outcome = upload_file(
+                        source_path,
+                        &target,
+                        part_size,
+                        args.parallel,
+                        args.disable_multipart,
+                        args.storage_class.as_deref(),
+                    )
+                    .await?;
+                    session.add_total(outcome.size);
+                    let (total_count, total_size) = session.totals();
+                    let msg = CopyMessage {
+                        source: source_path.display().to_string(),
+                        target: outcome.target,
+                        size: outcome.size,
+                        total_count,
+                        total_size,
+                    };
+                    session.object_done(&msg, outcome.size);
+                }
                 used_session = true;
             }
         } else {
@@ -1004,6 +1044,8 @@ async fn cp(args: CpArgs) -> Result<()> {
                 Path::new(&target),
                 args.recursive,
                 &session,
+                args.older_than.as_deref(),
+                args.newer_than.as_deref(),
             )
             .await?;
             used_session = true;
@@ -1027,6 +1069,8 @@ async fn cp_recursive(source: &str, target: &str, args: &CpArgs) -> Result<()> {
         fake: false,
         watch: false,
         disable_multipart: args.disable_multipart,
+        older_than: args.older_than.clone(),
+        newer_than: args.newer_than.clone(),
         source: source.to_string(),
         target: target.to_string(),
     };
@@ -1037,6 +1081,7 @@ async fn mirror(args: MirrorArgs) -> Result<()> {
     mirror::run_mirror(&args).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn copy_s3_object_to_s3(
     source: &str,
     target: &str,
@@ -1044,6 +1089,8 @@ async fn copy_s3_object_to_s3(
     disable_multipart: bool,
     parallel: usize,
     session: &TransferSession,
+    older_than: Option<&str>,
+    newer_than: Option<&str>,
 ) -> Result<()> {
     let source_url = parse_s3_url(source)?;
     let source_bucket = source_url
@@ -1080,6 +1127,10 @@ async fn copy_s3_object_to_s3(
         .send()
         .await?;
     let size = head.content_length().unwrap_or_default() as u64;
+    let object_time = head.last_modified().map(smithy_to_chrono);
+    if !timefilter::passes_filters(object_time, older_than, newer_than)? {
+        return Ok(());
+    }
     transfer_object_between_s3(
         &source_client,
         &source_alias,
@@ -1113,6 +1164,8 @@ async fn copy_local_path(
     target: &Path,
     recursive: bool,
     session: &TransferSession,
+    older_than: Option<&str>,
+    newer_than: Option<&str>,
 ) -> Result<()> {
     let metadata = fs::metadata(source)
         .await
@@ -1133,6 +1186,10 @@ async fn copy_local_path(
                 if metadata.is_dir() {
                     dirs.push_back(path);
                 } else if metadata.is_file() {
+                    let object_time = metadata.modified().ok().map(DateTime::<Utc>::from);
+                    if !timefilter::passes_filters(object_time, older_than, newer_than)? {
+                        continue;
+                    }
                     let rel = path.strip_prefix(source)?;
                     let output = target.join(rel);
                     if let Some(parent) = output.parent() {
@@ -1154,6 +1211,10 @@ async fn copy_local_path(
             }
         }
     } else {
+        let object_time = metadata.modified().ok().map(DateTime::<Utc>::from);
+        if !timefilter::passes_filters(object_time, older_than, newer_than)? {
+            return Ok(());
+        }
         let output = if target.is_dir() {
             target.join(
                 source
@@ -1223,6 +1284,7 @@ async fn rm(args: RmArgs) -> Result<()> {
     if args.versions || args.version_id.is_some() {
         return Err(anyhow!("rm --versions/--version-id is not implemented yet"));
     }
+    timefilter::validate_time_filters(args.older_than.as_deref(), args.newer_than.as_deref())?;
     if args.recursive && !args.force && !args.dry_run {
         return Err(anyhow!(
             "removal with --recursive requires --force (or use --dry-run)"
@@ -1249,10 +1311,21 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
     let (client, _) = client_for_alias(&parsed.alias).await?;
     if args.recursive {
         let prefix = parsed.key.unwrap_or_default();
-        let removed = remove_prefix(&client, &parsed.alias, &bucket, &prefix, args.dry_run).await?;
+        let removed = remove_prefix(
+            &client,
+            &parsed.alias,
+            &bucket,
+            &prefix,
+            args.dry_run,
+            args.older_than.as_deref(),
+            args.newer_than.as_deref(),
+        )
+        .await?;
         // Human-only informational line -- not an RmMessage (nothing was
         // actually removed), so it must not corrupt a --json stream; a
-        // zero-match `rm -r` under --json legitimately emits nothing.
+        // zero-match `rm -r` under --json legitimately emits nothing. Also
+        // covers a filtered-to-zero `--older-than`/`--newer-than` match --
+        // that's success too, just with nothing left to report.
         if removed == 0 && !out().json {
             println!("Nothing to remove under `{target}`.");
         }
@@ -1262,13 +1335,21 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
             .key
             .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
         // DeleteObject succeeds for missing keys; stat first for an mc-like error.
-        client
+        let head = client
             .head_object()
             .bucket(&bucket)
             .key(&key)
             .send()
             .await
             .map_err(|_| anyhow!("object does not exist"))?;
+        let object_time = head.last_modified().map(smithy_to_chrono);
+        if !timefilter::passes_filters(
+            object_time,
+            args.older_than.as_deref(),
+            args.newer_than.as_deref(),
+        )? {
+            return Ok(());
+        }
         if args.dry_run {
             print_msg(&RmMessage {
                 key: target.to_string(),
@@ -1292,12 +1373,15 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn remove_prefix(
     client: &Client,
     alias: &str,
     bucket: &str,
     prefix: &str,
     dry_run: bool,
+    older_than: Option<&str>,
+    newer_than: Option<&str>,
 ) -> Result<u64> {
     use aws_sdk_s3::types::{Delete, ObjectIdentifier};
     // S3 prefix matching is a raw string match, so a listing prefix of `p`
@@ -1316,6 +1400,15 @@ async fn remove_prefix(
     while let Some(mut page) = pager.next_page().await? {
         if !boundary_safe {
             page.retain(|obj| obj.key == prefix || obj.key.starts_with(&descendant_prefix));
+        }
+        if older_than.is_some() || newer_than.is_some() {
+            let mut kept = Vec::with_capacity(page.len());
+            for obj in page {
+                if timefilter::passes_filters(obj.modified, older_than, newer_than)? {
+                    kept.push(obj);
+                }
+            }
+            page = kept;
         }
         if page.is_empty() {
             continue;

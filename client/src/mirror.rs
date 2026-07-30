@@ -234,6 +234,12 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     if args.watch {
         return Err(anyhow!("mirror --watch is not implemented yet"));
     }
+    // Validate filter grammar up front, so a bad spec is fatal before any
+    // listing/transfer/delete work starts (matches cp/rm).
+    crate::timefilter::validate_time_filters(
+        args.older_than.as_deref(),
+        args.newer_than.as_deref(),
+    )?;
     let part_size = crate::urls::parse_size(&args.part_size)?;
     let parallel = args.parallel.max(1);
     let dry_run = args.dry_run || args.fake;
@@ -261,6 +267,24 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
             prefix,
             ..
         } => collect_s3_entries(client, bucket, prefix).await?,
+    };
+    // [SEM] §1: `--older-than`/`--newer-than` apply to source content only
+    // (mc's `SourceContent.Time`, `cmd/mirror-main.go:832-838`), before the
+    // diff planner runs -- never to the target listing or to deletes.
+    let source_entries: Vec<Entry> = if args.older_than.is_some() || args.newer_than.is_some() {
+        let mut kept = Vec::with_capacity(source_entries.len());
+        for entry in source_entries {
+            if crate::timefilter::passes_filters(
+                entry.modified,
+                args.older_than.as_deref(),
+                args.newer_than.as_deref(),
+            )? {
+                kept.push(entry);
+            }
+        }
+        kept
+    } else {
+        source_entries
     };
     let target_entries = match &target {
         Side::Local(root) => {

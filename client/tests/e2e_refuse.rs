@@ -11,8 +11,6 @@ fn unimplemented_flags_hard_error() {
         &["ls", "--zip", "test/rfb"],
         &["cat", "--offset", "5", "test/rfb/x"],
         &["cat", "--tail", "5", "test/rfb/x"],
-        &["cp", "--older-than", "7d", "test/rfb/x", "test/rfb/y"],
-        &["cp", "--newer-than", "7d", "test/rfb/x", "test/rfb/y"],
         &["stat", "--recursive", "test/rfb"],
         &["mb", "--with-lock", "test/rfb2"],
         &["mb", "--with-versioning", "test/rfb3"],
