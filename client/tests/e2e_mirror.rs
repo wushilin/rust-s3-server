@@ -64,6 +64,38 @@ fn mirror_dry_run_prints_plan_and_does_nothing() {
 }
 
 #[test]
+fn mirror_json_dry_run_is_silent() {
+    // `--json --dry-run` must not leak the plain-text PUT/DEL/"Planned N
+    // put(s)" prose into what's otherwise a JSON-lines stream: mc has no
+    // documented json contract for a dry-run plan, so rs3's conservative
+    // choice is to emit nothing on stdout at all (see README known
+    // divergences).
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/mb3j"]);
+    let src = server.dir.path().join("srcdir3j");
+    write(&src, "x.txt", b"x");
+    let out = server.rs3(&[
+        "--json",
+        "mirror",
+        "--dry-run",
+        src.to_str().unwrap(),
+        "test/mb3j/p",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "expected zero stdout bytes, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let listing = server.rs3_ok(&["ls", "--recursive", "test/mb3j"]);
+    assert!(!listing.contains("x.txt"));
+}
+
+#[test]
 fn mirror_s3_to_s3_and_back_to_local() {
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/m4a"]);

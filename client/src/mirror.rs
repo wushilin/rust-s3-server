@@ -328,23 +328,31 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     }
 
     if dry_run {
-        for entry in &plan.copies {
+        // mc has no documented `--json` contract for a dry-run mirror plan
+        // ([OUT]/[SEM] research is silent on it); rather than guess at a
+        // shape, `--json --dry-run` here emits nothing on stdout at all --
+        // the conservative choice that keeps a JSON-lines stream from being
+        // corrupted by this plain-text prose (see README's known
+        // divergences).
+        if !crate::output::out().json {
+            for entry in &plan.copies {
+                println!(
+                    "PUT {}/{} -> {}/{}",
+                    args.source.trim_end_matches('/'),
+                    entry.rel,
+                    args.target.trim_end_matches('/'),
+                    entry.rel
+                );
+            }
+            for rel in &plan.deletes {
+                println!("DEL {}/{}", args.target.trim_end_matches('/'), rel);
+            }
             println!(
-                "PUT {}/{} -> {}/{}",
-                args.source.trim_end_matches('/'),
-                entry.rel,
-                args.target.trim_end_matches('/'),
-                entry.rel
+                "Planned {} put(s), {} delete(s).",
+                plan.copies.len(),
+                plan.deletes.len()
             );
         }
-        for rel in &plan.deletes {
-            println!("DEL {}/{}", args.target.trim_end_matches('/'), rel);
-        }
-        println!(
-            "Planned {} put(s), {} delete(s).",
-            plan.copies.len(),
-            plan.deletes.len()
-        );
         return Ok(());
     }
 
