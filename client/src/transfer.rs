@@ -12,8 +12,6 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use crate::config::client_for_alias;
 use crate::urls::parse_s3_url;
 
-pub(crate) const DEFAULT_PART_SIZE: u64 = 256 * 1024 * 1024;
-
 #[derive(Debug)]
 pub(crate) struct UploadedPart {
     part_number: i32,
@@ -46,7 +44,7 @@ pub(crate) async fn upload_file(
         .await
         .with_context(|| format!("stat {}", source.display()))?;
     let (client, _) = client_for_alias(&parsed.alias).await?;
-    if disable_multipart || metadata.len() <= DEFAULT_PART_SIZE {
+    if disable_multipart || metadata.len() <= part_size {
         let mut req = client
             .put_object()
             .bucket(&bucket)
@@ -65,6 +63,7 @@ pub(crate) async fn upload_file(
             metadata.len(),
             part_size,
             parallel.max(1),
+            storage_class,
         )
         .await?;
     }
@@ -80,16 +79,16 @@ pub(crate) async fn multipart_upload(
     total_size: u64,
     part_size: u64,
     parallel: usize,
+    storage_class: Option<&str>,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
-    let created = client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await?;
+    let mut create = client.create_multipart_upload().bucket(bucket).key(key);
+    if let Some(sc) = storage_class {
+        create = create.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
+    }
+    let created = create.send().await?;
     let upload_id = created
         .upload_id()
         .ok_or_else(|| anyhow!("server did not return upload id"))?

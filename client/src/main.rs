@@ -388,10 +388,17 @@ async fn mb(args: MbArgs) -> Result<()> {
         let result = req.send().await;
         match result {
             Ok(_) => println!("Bucket created successfully `{target}`."),
-            Err(err) if args.ignore_existing => {
-                eprintln!("Ignoring create error for `{target}`: {err}")
+            Err(err) => {
+                let svc = err.as_service_error();
+                let already_exists = svc.is_some_and(|e| {
+                    e.is_bucket_already_owned_by_you() || e.is_bucket_already_exists()
+                });
+                if args.ignore_existing && already_exists {
+                    println!("Bucket `{target}` already exists.");
+                } else {
+                    return Err(err.into());
+                }
             }
-            Err(err) => return Err(err.into()),
         }
     }
     Ok(())

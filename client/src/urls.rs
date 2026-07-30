@@ -9,17 +9,15 @@ pub(crate) struct S3Url {
 }
 
 pub(crate) fn parse_s3_url(input: &str) -> Result<S3Url> {
-    let normalized = input.trim_matches('/');
+    let normalized = input.trim_start_matches('/');
     let mut parts = normalized.splitn(3, '/');
-    let alias = parts.next().unwrap_or_default();
+    let alias = parts.next().unwrap_or_default().to_string();
     if alias.is_empty() {
         return Err(anyhow!("target must be ALIAS[/BUCKET[/OBJECT]]"));
     }
-    Ok(S3Url {
-        alias: alias.to_string(),
-        bucket: parts.next().map(str::to_string),
-        key: parts.next().map(str::to_string),
-    })
+    let bucket = parts.next().filter(|b| !b.is_empty()).map(str::to_string);
+    let key = parts.next().filter(|k| !k.is_empty()).map(str::to_string);
+    Ok(S3Url { alias, bucket, key })
 }
 
 pub(crate) fn is_s3_url(input: &str) -> bool {
@@ -67,4 +65,37 @@ pub(crate) fn parse_size(input: &str) -> Result<u64> {
 #[allow(dead_code)]
 pub(crate) fn format_time(time: DateTime<Utc>) -> String {
     time.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_preserves_trailing_slash_on_key() {
+        let u = parse_s3_url("alias/bucket/prefix/").unwrap();
+        assert_eq!(u.alias, "alias");
+        assert_eq!(u.bucket.as_deref(), Some("bucket"));
+        assert_eq!(u.key.as_deref(), Some("prefix/"));
+    }
+
+    #[test]
+    fn parse_bucket_root_with_trailing_slash_has_no_key() {
+        let u = parse_s3_url("alias/bucket/").unwrap();
+        assert_eq!(u.bucket.as_deref(), Some("bucket"));
+        assert_eq!(u.key, None);
+    }
+
+    #[test]
+    fn parse_plain_object_key() {
+        let u = parse_s3_url("alias/bucket/dir/obj.bin").unwrap();
+        assert_eq!(u.key.as_deref(), Some("dir/obj.bin"));
+    }
+
+    #[test]
+    fn parse_alias_only() {
+        let u = parse_s3_url("alias").unwrap();
+        assert_eq!(u.bucket, None);
+        assert_eq!(u.key, None);
+    }
 }
