@@ -34,6 +34,13 @@
 //!   (never shown) and only its stderr is forwarded, to rs3's own stdout
 //!   (not stderr) -- confirmed by piping each stream separately against
 //!   the real binary. See [`run_exec`].
+//! - **`--exec` splits the raw template into words *before* substituting
+//!   tokens, not after.** Both the doc and this task's original brief
+//!   described substitute-then-split; ground truth is the opposite (see
+//!   [`run_exec`]'s doc comment for the two probes -- a spacey key and an
+//!   unbalanced-quote key -- that only agree with real `mc` under
+//!   split-then-substitute). `--print` is unaffected: its output is never
+//!   tokenized at all, only ever the raw substituted string.
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -287,18 +294,50 @@ fn to_content_message(key: &str, size: u64, time: DateTime<Utc>) -> ContentMessa
     }
 }
 
-/// `find --exec`: tokenizes the substituted command line with
-/// `shell-words` (no shell interposed -- ground-truth-verified: a literal
-/// `>` in the command line is passed through as a plain argv token, never
-/// interpreted as a redirection), and runs it via `std::process::Command`.
+/// `find --exec`: tokenizes the **raw, un-substituted** `--exec` template
+/// with `shell-words` first, then substitutes tokens into each
+/// already-isolated word (no shell interposed -- ground-truth-verified: a
+/// literal `>` in the command line is passed through as a plain argv token,
+/// never interpreted as a redirection), and runs it via
+/// `std::process::Command`.
+///
+/// **Split-before-substitute, not substitute-before-split.**
+/// Ground-truth-verified against real `mc` (RELEASE.2025-08-13) with two
+/// probes that only disagree between the two orderings: a key containing a
+/// space (`sp file.txt`) reaches the child as a single argv word under
+/// real `mc` (splitting the *template* `"script {}"` gives `["script",
+/// "{}"]`, and only then does `{}` get replaced with the literal,
+/// unsplit key); substituting first and re-splitting the result would
+/// instead hand the child two words. Symmetrically, a key containing an
+/// unbalanced double quote (`unbal"file.txt`) runs *without error* under
+/// real `mc` -- substitute-then-split would feed shell-words a string with
+/// a stray quote and abort the whole find run on a shell-words parse
+/// error, which is not what happens. `mc-research-semantics.md` §7
+/// (and this task's original brief) both described the substitute-then-
+/// split order; this is corrected to split-then-substitute per the real
+/// binary. `--print`'s output, by contrast, is never tokenized at all --
+/// ground-truth-verified to render the raw substituted string byte-for-
+/// byte (including any spaces/quotes from the key) -- so only `--exec`
+/// needed this fix.
+///
 /// On success the child's captured stdout is forwarded to rs3's own
 /// stdout; on failure only its stderr is forwarded (its stdout is
 /// discarded, ground-truth-verified) and the whole process exits
 /// immediately with the child's exit code, aborting the rest of the find
 /// loop.
-fn run_exec(cmd_str: &str) -> Result<()> {
-    let tokens = shell_words::split(cmd_str)
-        .map_err(|e| anyhow!("find --exec: invalid command `{cmd_str}`: {e}"))?;
+fn run_exec(
+    template: &str,
+    key: &str,
+    rel_key: &str,
+    size: u64,
+    time: DateTime<Utc>,
+) -> Result<()> {
+    let raw_words = shell_words::split(template)
+        .map_err(|e| anyhow!("find --exec: invalid command `{template}`: {e}"))?;
+    let tokens: Vec<String> = raw_words
+        .iter()
+        .map(|word| substitute_tokens(word, key, rel_key, size, time))
+        .collect();
     let Some((prog, rest)) = tokens.split_first() else {
         return Err(anyhow!("find --exec: empty command"));
     };
@@ -416,9 +455,7 @@ pub(crate) async fn run_find(args: FindArgs) -> Result<()> {
         }
 
         if let Some(exec_template) = &args.exec {
-            let cmd_str =
-                substitute_tokens(exec_template, &effective_key, relative, obj.size, time);
-            run_exec(&cmd_str)?;
+            run_exec(exec_template, &effective_key, relative, obj.size, time)?;
         } else if let Some(print_template) = &args.print {
             // Ground-truth-verified: `--json` silently ignores `--print`
             // and falls back to the default `ContentMessage` line (module

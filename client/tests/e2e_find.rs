@@ -1,6 +1,20 @@
 mod common;
 use common::TestServer;
 
+/// Writes a tiny executable shell script that records `argc` (`$#`) to
+/// `out_file`, for verifying `find --exec`'s argv splitting.
+#[cfg(unix)]
+fn make_argc_script(server: &TestServer, out_file: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = server.dir.path().join("argc.sh");
+    let script = format!("#!/bin/sh\necho \"argc=$#\" > '{}'\n", out_file.display());
+    std::fs::write(&path, script).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
 fn seed(server: &TestServer, bucket: &str) {
     server.rs3_ok(&["mb", &format!("test/{bucket}")]);
     let small = server.dir.path().join("small.log");
@@ -113,4 +127,67 @@ fn find_json_matches_content_message_shape() {
     assert_eq!(v["size"], 5);
     assert_eq!(v["key"], "test/fnd7/a/foo/note.txt");
     assert!(v.get("lastModified").is_some());
+}
+
+/// Ground-truth-verified regression: `--exec` must split its *raw*
+/// template with `shell-words` *before* substituting `{}`, not after.
+/// Substitute-then-split would hand a spacey key to the child as two argv
+/// words instead of one.
+#[test]
+#[cfg(unix)]
+fn find_exec_key_with_space_is_single_argv_word() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/fnd8"]);
+    let src = server.dir.path().join("sp.txt");
+    std::fs::write(&src, b"hi").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/fnd8/sp file.txt"]);
+
+    let out_file = server.dir.path().join("argc-space.out");
+    let script = make_argc_script(&server, &out_file);
+    let exec_template = format!("{} {{}}", script.display());
+    server.rs3_ok(&[
+        "find",
+        "test/fnd8",
+        "--name",
+        "sp file.txt",
+        "--exec",
+        &exec_template,
+    ]);
+    let recorded = std::fs::read_to_string(&out_file).expect("argc script ran and wrote output");
+    assert_eq!(recorded.trim(), "argc=1", "recorded: {recorded}");
+}
+
+/// Ground-truth-verified regression: a key with an unbalanced double quote
+/// must not abort the whole find run. Substitute-then-split would hand
+/// `shell-words::split` a string with a stray quote (since the quote
+/// comes from the *substituted key*, not the template) and error out;
+/// split-then-substitute never re-parses the already-isolated `{}` word,
+/// so the literal quote character passes through untouched.
+#[test]
+#[cfg(unix)]
+fn find_exec_key_with_unbalanced_quote_does_not_abort() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/fnd9"]);
+    let src = server.dir.path().join("uq.txt");
+    std::fs::write(&src, b"hi").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/fnd9/unbal\"file.txt"]);
+
+    let out_file = server.dir.path().join("argc-quote.out");
+    let script = make_argc_script(&server, &out_file);
+    let exec_template = format!("{} {{}}", script.display());
+    let out = server.rs3(&[
+        "find",
+        "test/fnd9",
+        "--name",
+        "unbal\"file.txt",
+        "--exec",
+        &exec_template,
+    ]);
+    assert!(
+        out.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recorded = std::fs::read_to_string(&out_file).expect("argc script ran and wrote output");
+    assert_eq!(recorded.trim(), "argc=1", "recorded: {recorded}");
 }

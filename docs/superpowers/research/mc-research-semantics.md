@@ -539,13 +539,26 @@ network round-trip per match). `{url}` internally does its own `expandAlias` +
 NOT reuse whatever `--expire` a user might have configured for `share` (there's no
 such flag on `find`).
 
-`--exec` (`execFind`, `cmd/find.go:130-156`) tokenizes the (already-substituted)
-command line via `github.com/google/shlex` (POSIX shell-word splitting), then runs
-via `exec.Command` directly (no shell interposed — no `sh -c`). On any exec failure it
-prints stderr (if any) + the Go error to console and calls `os.Exit(getExitStatus(err))`,
-propagating the child's real exit code via `syscall.WaitStatus` when available — i.e.
-`find --exec` **aborts the entire find loop** on the first failing exec, exiting the
-whole `mc` process with the child's exit status.
+`--exec` (`execFind`, `cmd/find.go:130-156`) tokenizes the **raw, un-substituted**
+command line via `github.com/google/shlex` (POSIX shell-word splitting) *first*, then
+substitutes `stringsReplace`'s tokens into each already-isolated word, then runs via
+`exec.Command` directly (no shell interposed — no `sh -c`). **[Corrected against real
+mc RELEASE.2025-08-13]**: an earlier draft of this doc claimed the command line was
+tokenized *after* substitution; live-verified against the real binary that the opposite
+is true — split-then-substitute, not substitute-then-split. Two probes only disagree
+between the two orderings and both settle it: a matched key containing a space (e.g.
+`sp file.txt`) reaches the spawned child as a single argv word (splitting the template
+`"script {}"` first gives `["script", "{}"]`, and only then does `{}` get replaced with
+the literal, unsplit key — substitute-then-split would instead hand the child two argv
+words); and a matched key containing an unbalanced double quote (e.g. `unbal"file.txt`)
+runs *without error* (substitute-then-split would feed `shlex` a string with a stray
+quote from the substituted key and abort the whole find run on a parse error, which is
+not what happens). On any exec failure it prints stderr (if any) + the Go error to
+console and calls `os.Exit(getExitStatus(err))`, propagating the child's real exit code
+via `syscall.WaitStatus` when available — i.e. `find --exec` **aborts the entire find
+loop** on the first failing exec, exiting the whole `mc` process with the child's exit
+status. `--print`'s output, by contrast, is never tokenized at all — it renders the raw
+substituted string byte-for-byte (spaces/quotes from the key included).
 
 `--watch` (bool) switches `find` into a perpetual mode: after the initial listing
 completes, `watchFind` blocks on `clnt.Watch()` with `Recursive:true,
