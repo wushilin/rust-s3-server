@@ -155,6 +155,26 @@ binary itself):
   a missing required argument or an unknown flag is caught by clap itself,
   which prints its own usage message and exits with status `2` -- not
   rs3's own error machinery. This is clap's default behavior, left as-is.
+- **`alias`/`config` subcommands don't speak the mc JSON contract yet**:
+  `--json` on `alias list`/`alias set`/`alias remove`/`alias export` (and
+  `config`) still prints the same prose/pretty-JSON it always has, not
+  mc's message-per-line JSON envelope -- `alias` was never in tier-2
+  scope. Tier-3 item.
+- **`stat`'s human size omits mc's space and column padding**: for `stat`
+  specifically (not `ls`, which strips the space itself via
+  `strings.Join(strings.Fields(...), "")`), mc's raw `humanize.IBytes`
+  renders sub-1024 sizes as `12 B` (digits-space-unit) and then
+  left-justifies/pads that whole string to a fixed column width with a
+  trailing space (`%-6s `); rs3's `stat` prints the bare `12B`, no space,
+  no column padding. Byte-exact-diff nit only.
+- **`cp`/`mv` `--json` `totalSize` is real, not mc's `0`**: for a single
+  (non-recursive) object, rs3's `CopyMessage.totalSize` carries the
+  object's actual byte count; real mc always emits `0` there since it
+  only tracks running totals for multi-object operations.
+- **`ls`/`find` `--json` lack mc's `url`/`versionOrdinal` fields**:
+  `ContentMessage`'s JSON has `status`/`type`/`lastModified`/`size`/`key`/
+  `etag`/`storageClass` but no presigned `url` or version-ordinal field --
+  out of scope alongside the versioning/zip absence noted above.
 
 ## Refused and unsupported flags
 

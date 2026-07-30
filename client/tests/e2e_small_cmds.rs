@@ -309,10 +309,7 @@ fn pipe_uploads_stdin() {
     server.rs3_ok(&["mb", "test/pipeb"]);
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
     cmd.args(["pipe", "test/pipeb/from-stdin.txt"])
-        .env(
-            "MC_HOST_TEST",
-            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
-        )
+        .env("MC_HOST_TEST", server.mc_host())
         .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
@@ -353,10 +350,7 @@ fn pipe_multipart_streams_large_input() {
     let data: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
     cmd.args(["pipe", "--part-size", "5MiB", "test/pipemp/big.bin"])
-        .env(
-            "MC_HOST_TEST",
-            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
-        )
+        .env("MC_HOST_TEST", server.mc_host())
         .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
@@ -403,10 +397,7 @@ fn pipe_empty_target_passes_stdin_through_to_stdout() {
     let server = TestServer::start();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
     cmd.args(["pipe", ""])
-        .env(
-            "MC_HOST_TEST",
-            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
-        )
+        .env("MC_HOST_TEST", server.mc_host())
         .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
@@ -433,10 +424,7 @@ fn pipe_json_message_has_status_target_size() {
     server.rs3_ok(&["mb", "test/pipejson"]);
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
     cmd.args(["--json", "pipe", "test/pipejson/j.txt"])
-        .env(
-            "MC_HOST_TEST",
-            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
-        )
+        .env("MC_HOST_TEST", server.mc_host())
         .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());

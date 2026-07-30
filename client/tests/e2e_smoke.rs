@@ -70,7 +70,7 @@ fn rs3_with_envs(
 fn rs3_host_env_var_works_alone() {
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/envb"]);
-    let host = format!("http://testkey:testsecret@127.0.0.1:{}", server.port);
+    let host = server.mc_host();
     let out = rs3_with_envs(&server, &[("RS3_HOST_TEST", host)], &["ls", "test/"]);
     assert!(
         out.status.success(),
@@ -84,7 +84,7 @@ fn rs3_host_env_var_works_alone() {
 fn rs3_host_beats_mc_host() {
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/envp"]);
-    let good = format!("http://testkey:testsecret@127.0.0.1:{}", server.port);
+    let good = server.mc_host();
     let bad = format!("http://wrongkey:wrongsecret@127.0.0.1:{}", server.port);
     let out = rs3_with_envs(
         &server,

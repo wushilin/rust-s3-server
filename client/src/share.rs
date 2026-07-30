@@ -399,6 +399,14 @@ fn hex_hmac(key: &[u8], data: &[u8]) -> String {
 /// `` &;#$`<space><tab><newline><>()|'" `` -- used only for the `key`
 /// field's value (`makeCurlCmd`), never `postURL` or the other `-F`
 /// values.
+///
+/// Deliberately does **not** escape a literal backslash. Verified against
+/// real mc's own implementation (`cmd/share-upload-main.go`):
+/// `shellQuoteRegex = regexp.MustCompile("([&;#$` + "`" + ` \t\n<>()|'\"])")`
+/// -- the character class has no `\\` member, so mc itself leaves
+/// backslashes in a key unescaped in the emitted `curl` command. Matching
+/// that exactly (rather than "fixing" it) keeps the two shellQuotes
+/// byte-for-byte identical, including this shared gap.
 fn shell_quote(s: &str) -> String {
     const SPECIAL: &str = "&;#$`\t\n<>()|'\" ";
     let mut out = String::with_capacity(s.len());
@@ -523,13 +531,53 @@ async fn load_db(kind: ShareKind) -> Result<ShareDb> {
     Ok(serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?)
 }
 
+/// The share DB holds live presigned URLs (GET presigns and POST-policy
+/// signatures) -- anyone who can read `{config_dir}/share/*.json` can reuse
+/// those credentials for as long as they're valid. Lock the directory and
+/// files down to the owner only on Unix; no behavior change on other
+/// platforms (or for anything other than the on-disk mode bits here).
+#[cfg(unix)]
+async fn secure_share_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir).await?;
+    fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn secure_share_dir(dir: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(dir).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn write_share_db_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    file.write_all(data).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn write_share_db_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    fs::write(path, data).await?;
+    Ok(())
+}
+
 async fn save_db(kind: ShareKind, db: &ShareDb) -> Result<()> {
     let path = share_db_path(kind)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
+        secure_share_dir(parent).await?;
     }
     let data = serde_json::to_vec_pretty(db)?;
-    fs::write(path, data).await?;
+    write_share_db_file(&path, &data).await?;
     Ok(())
 }
 
@@ -628,5 +676,14 @@ mod tests {
         assert_eq!(shell_quote("plain.txt"), "plain.txt");
         assert_eq!(shell_quote("a b"), "a\\ b");
         assert_eq!(shell_quote("a&b"), "a\\&b");
+    }
+
+    /// Real mc's `shellQuoteRegex` character class has no backslash member
+    /// (see the doc comment on `shell_quote`), so a literal `\` in a key
+    /// passes through un-escaped in both implementations -- intentional,
+    /// not an oversight.
+    #[test]
+    fn shell_quote_matches_mc_by_leaving_backslash_unescaped() {
+        assert_eq!(shell_quote("a\\b"), "a\\b");
     }
 }

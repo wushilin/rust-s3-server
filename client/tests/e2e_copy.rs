@@ -18,10 +18,7 @@ fn same_alias_copy_small_object() {
     // verify server-side path was taken
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"))
         .args(["cp", "test/src/dir/obj name.bin", "test/dst/copy2.bin"])
-        .env(
-            "MC_HOST_TEST",
-            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
-        )
+        .env("MC_HOST_TEST", server.mc_host())
         .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
         .env("RS3_DEBUG_COPY", "1")
         .output()
@@ -72,10 +69,7 @@ fn same_alias_copy_large_object_uses_multipart() {
             "test/big/a.bin",
             "test/big/c.bin",
         ])
-        .env(
-            "MC_HOST_TEST",
-            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
-        )
+        .env("MC_HOST_TEST", server.mc_host())
         .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
         .env("RS3_DEBUG_COPY", "1")
         .output()
