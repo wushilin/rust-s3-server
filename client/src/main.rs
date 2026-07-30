@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use config::{Alias, client_for_alias, load_config, save_config};
 use list::{ObjectPaginator, collect_objects};
 use transfer::{download_key_to_path, download_object, transfer_object_between_s3, upload_file};
-use urls::{is_s3_url, join_key, join_s3_target, parse_s3_url, parse_size};
+use urls::{DEFAULT_PART_SIZE, is_s3_url, join_key, join_s3_target, parse_s3_url, parse_size};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -558,9 +558,15 @@ async fn cp(args: CpArgs) -> Result<()> {
             }
         } else if is_s3_url(source) && !is_s3_url(&target) {
             if args.recursive {
-                mirror_s3_to_local(source, Path::new(&target)).await?;
+                mirror_s3_to_local(source, Path::new(&target), part_size, args.parallel).await?;
             } else {
-                download_object(source, Some(PathBuf::from(&target))).await?;
+                download_object(
+                    source,
+                    Some(PathBuf::from(&target)),
+                    part_size,
+                    args.parallel,
+                )
+                .await?;
             }
         } else if !is_s3_url(source) && is_s3_url(&target) {
             let source_path = Path::new(source);
@@ -622,7 +628,13 @@ async fn mirror(args: MirrorArgs) -> Result<()> {
         )
         .await
     } else if is_s3_url(&args.source) && !is_s3_url(&args.target) {
-        mirror_s3_to_local(&args.source, Path::new(&args.target)).await
+        mirror_s3_to_local(
+            &args.source,
+            Path::new(&args.target),
+            part_size,
+            args.parallel,
+        )
+        .await
     } else if is_s3_url(&args.source) && is_s3_url(&args.target) {
         mirror_s3_to_s3(
             &args.source,
@@ -799,7 +811,12 @@ async fn mirror_local_to_s3(
     Ok(())
 }
 
-async fn mirror_s3_to_local(source: &str, target: &Path) -> Result<()> {
+async fn mirror_s3_to_local(
+    source: &str,
+    target: &Path,
+    part_size: u64,
+    parallel: usize,
+) -> Result<()> {
     let parsed = parse_s3_url(source)?;
     let bucket = parsed
         .bucket
@@ -818,7 +835,7 @@ async fn mirror_s3_to_local(source: &str, target: &Path) -> Result<()> {
             continue;
         }
         let output = target.join(rel);
-        download_key_to_path(&client, &bucket, &obj.key, &output).await?;
+        download_key_to_path(&client, &bucket, &obj.key, &output, part_size, parallel).await?;
         println!(
             "Mirrored `{}/{}` to `{}`.",
             bucket,
@@ -883,7 +900,10 @@ async fn mirror_s3_to_s3(
 }
 
 async fn get(args: GetArgs) -> Result<()> {
-    download_object(&args.source, args.target).await
+    if args.version_id.is_some() {
+        return Err(anyhow!("get --version-id is not implemented yet"));
+    }
+    download_object(&args.source, args.target, DEFAULT_PART_SIZE, 4).await
 }
 
 async fn cat(args: CatArgs) -> Result<()> {

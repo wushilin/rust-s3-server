@@ -47,6 +47,8 @@ pub(crate) fn join_key(prefix: &str, rel: &str) -> String {
     }
 }
 
+pub(crate) const DEFAULT_PART_SIZE: u64 = 256 * 1024 * 1024;
+
 pub(crate) fn parse_size(input: &str) -> Result<u64> {
     let s = input.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());

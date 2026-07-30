@@ -1,3 +1,4 @@
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -8,7 +9,7 @@ use aws_smithy_types::byte_stream::Length;
 use futures::stream::{self, StreamExt};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 
 use crate::config::client_for_alias;
 use crate::urls::parse_s3_url;
@@ -461,7 +462,110 @@ mod tests {
     }
 }
 
-pub(crate) async fn download_object(source: &str, target: Option<PathBuf>) -> Result<()> {
+pub(crate) async fn download_key_to_path(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    output: &Path,
+    part_size: u64,
+    parallel: usize,
+) -> Result<()> {
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
+    let size = head.content_length().unwrap_or_default() as u64;
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).await?;
+        }
+    }
+    let tmp = {
+        let mut name = output.file_name().unwrap_or_default().to_os_string();
+        name.push(".rs3.part");
+        output.with_file_name(name)
+    };
+    let result = download_to_temp(client, bucket, key, &tmp, size, part_size, parallel).await;
+    match result {
+        Ok(()) => {
+            fs::rename(&tmp, output).await?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp).await;
+            Err(err)
+        }
+    }
+}
+
+async fn download_to_temp(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    tmp: &Path,
+    size: u64,
+    part_size: u64,
+    parallel: usize,
+) -> Result<()> {
+    if size <= part_size {
+        let resp = client.get_object().bucket(bucket).key(key).send().await?;
+        let mut reader = resp.body.into_async_read();
+        let file = fs::File::create(tmp).await?;
+        let mut writer = BufWriter::new(file);
+        tokio::io::copy(&mut reader, &mut writer).await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+    let file = fs::File::create(tmp).await?;
+    file.set_len(size).await?;
+    drop(file);
+    let part_count = size.div_ceil(part_size);
+    let downloads = stream::iter((0..part_count).map(|part_index| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let tmp = tmp.to_path_buf();
+        async move {
+            let start = part_index * part_size;
+            let end = (size - 1).min(start + part_size - 1);
+            let resp = client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .range(format!("bytes={start}-{end}"))
+                .send()
+                .await?;
+            let mut file = fs::OpenOptions::new().write(true).open(&tmp).await?;
+            file.seek(SeekFrom::Start(start)).await?;
+            let mut reader = resp.body.into_async_read();
+            let copied = tokio::io::copy(&mut reader, &mut file).await?;
+            let expected = end - start + 1;
+            if copied != expected {
+                return Err(anyhow!(
+                    "short range read: got {copied} of {expected} bytes at offset {start}"
+                ));
+            }
+            file.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+    }))
+    .buffer_unordered(parallel.max(1));
+    let results = downloads.collect::<Vec<_>>().await;
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn download_object(
+    source: &str,
+    target: Option<PathBuf>,
+    part_size: u64,
+    parallel: usize,
+) -> Result<()> {
     let parsed = parse_s3_url(source)?;
     let bucket = parsed
         .bucket
@@ -475,27 +579,7 @@ pub(crate) async fn download_object(source: &str, target: Option<PathBuf>) -> Re
         Some(path) => path,
         None => PathBuf::from(key.rsplit('/').next().unwrap_or(&key)),
     };
-    download_key_to_path(&client, &bucket, &key, &output).await?;
+    download_key_to_path(&client, &bucket, &key, &output, part_size, parallel).await?;
     println!("Downloaded `{source}` to `{}`.", output.display());
-    Ok(())
-}
-
-pub(crate) async fn download_key_to_path(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    output: &Path,
-) -> Result<()> {
-    let resp = client.get_object().bucket(bucket).key(key).send().await?;
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).await?;
-        }
-    }
-    let mut reader = resp.body.into_async_read();
-    let file = fs::File::create(output).await?;
-    let mut writer = BufWriter::new(file);
-    tokio::io::copy(&mut reader, &mut writer).await?;
-    writer.flush().await?;
     Ok(())
 }
