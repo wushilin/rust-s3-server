@@ -143,3 +143,48 @@ fn cp_single_object_older_than_skips_silently() {
         "filtered-out cp must not create a target"
     );
 }
+
+#[test]
+fn mirror_remove_does_not_delete_age_excluded_but_still_present_source() {
+    // Regression test: mc applies --older-than/--newer-than per diff-URL,
+    // AFTER planning, and only to skip COPIES (mc's own
+    // isOlder/isNewer, cmd/mirror-main.go:826-838) -- source presence for
+    // --remove's extraneous-target detection is always computed
+    // unfiltered. If the time filter were applied to source_entries
+    // *before* plan_mirror, an age-excluded (but still present) source
+    // object would look absent, so its still-current target twin would
+    // be wrongly deleted under --remove.
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/flt7"]);
+    let src = server.dir.path().join("cpsrc7");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("keep.txt"), b"keep").unwrap();
+
+    // First mirror (no filter) establishes the target twin.
+    server.rs3_ok(&["mirror", src.to_str().unwrap(), "test/flt7/p"]);
+    server.rs3_ok(&["stat", "test/flt7/p/keep.txt"]);
+
+    // keep.txt is unchanged in source (age ~0), so --older-than 1000d
+    // excludes it from being re-copied -- but it must NOT be treated as
+    // absent for --remove's delete side, since it's still really there.
+    let out = server.rs3(&[
+        "mirror",
+        "--remove",
+        "--older-than",
+        "1000d",
+        src.to_str().unwrap(),
+        "test/flt7/p",
+    ]);
+    assert!(
+        out.status.success(),
+        "mirror --remove --older-than failed: stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("Removed"),
+        "age-excluded-but-present source must not trigger a delete: {stdout}"
+    );
+    server.rs3_ok(&["stat", "test/flt7/p/keep.txt"]);
+}

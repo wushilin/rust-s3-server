@@ -268,24 +268,6 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
             ..
         } => collect_s3_entries(client, bucket, prefix).await?,
     };
-    // [SEM] §1: `--older-than`/`--newer-than` apply to source content only
-    // (mc's `SourceContent.Time`, `cmd/mirror-main.go:832-838`), before the
-    // diff planner runs -- never to the target listing or to deletes.
-    let source_entries: Vec<Entry> = if args.older_than.is_some() || args.newer_than.is_some() {
-        let mut kept = Vec::with_capacity(source_entries.len());
-        for entry in source_entries {
-            if crate::timefilter::passes_filters(
-                entry.modified,
-                args.older_than.as_deref(),
-                args.newer_than.as_deref(),
-            )? {
-                kept.push(entry);
-            }
-        }
-        kept
-    } else {
-        source_entries
-    };
     let target_entries = match &target {
         Side::Local(root) => {
             if root.exists() {
@@ -302,12 +284,34 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         } => collect_s3_entries(client, bucket, prefix).await?,
     };
 
-    let plan = plan_mirror(
+    // Deletes must be computed from *true* source presence: mc's own
+    // isOlder/isNewer are applied per diff-URL, after planning, and only
+    // skip COPIES (`cmd/mirror-main.go:826-838`) -- they never affect
+    // whether a source object counts as "still present" for `--remove`'s
+    // extraneous-target detection. Filtering `source_entries` before
+    // `plan_mirror` would make an age-excluded-but-still-present source
+    // object look absent, so its still-current target twin would get
+    // deleted under `--remove`. Plan against the unfiltered entries first,
+    // then drop filtered-out copies from the plan afterward.
+    let mut plan = plan_mirror(
         &source_entries,
         &target_entries,
         args.overwrite,
         args.remove,
     );
+    if args.older_than.is_some() || args.newer_than.is_some() {
+        let mut kept = Vec::with_capacity(plan.copies.len());
+        for entry in plan.copies {
+            if crate::timefilter::passes_filters(
+                entry.modified,
+                args.older_than.as_deref(),
+                args.newer_than.as_deref(),
+            )? {
+                kept.push(entry);
+            }
+        }
+        plan.copies = kept;
+    }
 
     if dry_run {
         for entry in &plan.copies {
