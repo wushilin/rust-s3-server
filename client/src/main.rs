@@ -1,6 +1,7 @@
 mod attr;
 mod config;
 mod diff;
+mod findcmd;
 mod list;
 mod messages;
 mod mirror;
@@ -152,6 +153,8 @@ enum Commands {
     Pipe(PipeArgs),
     #[command(about = "list differences in object name, size, and date between two folders")]
     Diff(DiffArgs),
+    #[command(about = "search for objects")]
+    Find(FindArgs),
 }
 
 #[derive(Args, Debug)]
@@ -459,6 +462,41 @@ struct DiffArgs {
     second: String,
 }
 
+/// `find TARGET [FLAGS]` ([SEM] §7). `--watch`/`--metadata`/`--tags` are
+/// deliberately *not* declared here -- clap rejects them as unknown flags,
+/// which is the whole refusal mechanism for those three (no runtime code
+/// needed). `target` is a single required positional: unlike `ls`/`du`,
+/// real `mc find` has no rs3-relevant local-filesystem behavior worth
+/// replicating (see [`findcmd::run_find`]'s local-target guard), so this
+/// only ever resolves against an S3 alias.
+#[derive(Args, Debug)]
+pub(crate) struct FindArgs {
+    #[arg(long, help = "spawn an external process for each matching object")]
+    pub(crate) exec: Option<String>,
+    #[arg(long, help = "exclude objects matching the wildcard pattern")]
+    pub(crate) ignore: Option<String>,
+    #[arg(long, help = "find object names matching wildcard pattern")]
+    pub(crate) name: Option<String>,
+    #[arg(long, help = "match all objects newer than value in duration string")]
+    pub(crate) newer_than: Option<String>,
+    #[arg(long, help = "match all objects older than value in duration string")]
+    pub(crate) older_than: Option<String>,
+    #[arg(long, help = "match directory names matching wildcard pattern")]
+    pub(crate) path: Option<String>,
+    #[arg(long, help = "print in custom format to STDOUT")]
+    pub(crate) print: Option<String>,
+    #[arg(long, help = "match directory and object name with RE2 regex pattern")]
+    pub(crate) regex: Option<String>,
+    #[arg(long, help = "match all objects larger than specified size in units")]
+    pub(crate) larger: Option<String>,
+    #[arg(long, help = "match all objects smaller than specified size in units")]
+    pub(crate) smaller: Option<String>,
+    #[arg(long, help = "limit directory navigation to specified depth")]
+    pub(crate) maxdepth: Option<u32>,
+    #[arg(required = true)]
+    pub(crate) target: String,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -493,6 +531,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Tree(args) => tree(args).await,
         Commands::Pipe(args) => pipe(args).await,
         Commands::Diff(args) => diff(args).await,
+        Commands::Find(args) => findcmd::run_find(args).await,
     }
 }
 
