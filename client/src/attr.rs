@@ -13,9 +13,15 @@
 //! and a `Normal`/`Single('\'')`/`Double('"')` quote state tracks whether
 //! `;` and `=` are structural or literal. The first `=` in a segment (while
 //! outside quotes) switches `KEY` -> `VALUE`; a `;` outside quotes commits
-//! the pending pair and resets to `KEY`. An empty key at that commit point,
-//! or EOF while still inside an open quote, or EOF still in `KEY` state
-//! with a non-empty pending key (no `=` ever seen), is an error.
+//! the pending pair and resets to `KEY`. Errors (ported directly from mc's
+//! `getMetaDataEntry`, `cmd/cp-main_contrib.go:63-131`): a `;` outside
+//! quotes while still in `KEY` state (no `=` seen yet for this segment --
+//! this also covers a *trailing* `;`, since it resets into a fresh, never
+//! populated `KEY` segment); EOF while still inside an open quote; or EOF
+//! while still in `KEY` state (covers both a non-empty pending key with no
+//! `=`, and the empty segment left by a trailing `;`). EOF in `VALUE` state
+//! always commits, even with an empty value (`"a="` is valid) -- mc commits
+//! unconditionally on `pt == VALUE`, with no key-emptiness check.
 
 use std::collections::BTreeMap;
 
@@ -70,7 +76,12 @@ pub(crate) fn parse_attrs(s: &str) -> Result<BTreeMap<String, String>> {
                 '"' => mode = Mode::Double,
                 '=' if token == Token::Key => token = Token::Value,
                 ';' => {
-                    if key.is_empty() {
+                    // Unconditional per mc: `;` while still in KEY state is
+                    // always malformed, regardless of whether any key chars
+                    // were seen yet (so a trailing `;` after a well-formed
+                    // pair is caught here too, once it resets to KEY and
+                    // then hits EOF below).
+                    if token == Token::Key {
                         return Err(anyhow!(ERR_MSG));
                     }
                     map.insert(canonical_header_key(&key), std::mem::take(&mut value));
@@ -98,27 +109,14 @@ pub(crate) fn parse_attrs(s: &str) -> Result<BTreeMap<String, String>> {
         }
     }
 
-    if mode != Mode::Normal {
-        // EOF while a quote was still open.
+    // EOF while a quote was still open, or still in KEY state (no `=` ever
+    // seen for the pending segment -- including an empty segment left by a
+    // trailing `;`), is malformed. EOF in VALUE state always commits, even
+    // with an empty value: mc has no key-emptiness check here either.
+    if mode != Mode::Normal || token == Token::Key {
         return Err(anyhow!(ERR_MSG));
     }
-    match token {
-        Token::Key => {
-            // A trailing `;` leaves an empty pending key, which is fine
-            // (nothing left to commit); a non-empty key that never saw an
-            // `=` is malformed.
-            if !key.is_empty() {
-                return Err(anyhow!(ERR_MSG));
-            }
-        }
-        Token::Value => {
-            if key.is_empty() {
-                return Err(anyhow!(ERR_MSG));
-            }
-            map.insert(canonical_header_key(&key), value);
-        }
-    }
-
+    map.insert(canonical_header_key(&key), value);
     Ok(map)
 }
 
@@ -160,9 +158,19 @@ mod tests {
     }
 
     #[test]
-    fn trailing_semicolon_is_allowed() {
-        let m = parse_attrs("key1=value1;").unwrap();
-        assert_eq!(m["Key1"], "value1");
+    fn trailing_semicolon_is_rejected() {
+        // mc's EOF check fires while `pt == KEY` -- a trailing `;` resets
+        // into a fresh KEY segment, so EOF right after it is an error, even
+        // though the pair before the `;` was well-formed.
+        assert!(parse_attrs("key1=value1;").is_err());
+    }
+
+    #[test]
+    fn key_only_segment_is_rejected() {
+        // mc treats `;` while `pt == KEY` as unconditionally malformed --
+        // "abc" never saw a `=`, so hitting `;` before one is an error, even
+        // though a well-formed segment (`def=ghi`) follows.
+        assert!(parse_attrs("abc;def=ghi").is_err());
     }
 
     #[test]
