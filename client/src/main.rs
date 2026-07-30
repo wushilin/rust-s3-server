@@ -672,8 +672,8 @@ async fn copy_s3_object_to_s3(
             .unwrap_or(&source_key)
             .to_string(),
     };
-    let (source_client, _) = client_for_alias(&source_url.alias).await?;
-    let (target_client, _) = client_for_alias(&target_url.alias).await?;
+    let (source_client, source_alias) = client_for_alias(&source_url.alias).await?;
+    let (target_client, target_alias) = client_for_alias(&target_url.alias).await?;
     let head = source_client
         .head_object()
         .bucket(&source_bucket)
@@ -682,9 +682,11 @@ async fn copy_s3_object_to_s3(
         .await?;
     transfer_object_between_s3(
         &source_client,
+        &source_alias,
         &source_bucket,
         &source_key,
         &target_client,
+        &target_alias,
         &target_bucket,
         &target_key,
         head.content_length().unwrap_or_default() as u64,
@@ -844,8 +846,8 @@ async fn mirror_s3_to_s3(
         .bucket
         .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
     let target_prefix = target_url.key.unwrap_or_default();
-    let (source_client, _) = client_for_alias(&source_url.alias).await?;
-    let (target_client, _) = client_for_alias(&target_url.alias).await?;
+    let (source_client, source_alias) = client_for_alias(&source_url.alias).await?;
+    let (target_client, target_alias) = client_for_alias(&target_url.alias).await?;
 
     for obj in collect_objects(&source_client, &source_bucket, &source_prefix).await? {
         let rel = obj
@@ -859,9 +861,11 @@ async fn mirror_s3_to_s3(
         let target_key = join_key(&target_prefix, rel);
         transfer_object_between_s3(
             &source_client,
+            &source_alias,
             &source_bucket,
             &obj.key,
             &target_client,
+            &target_alias,
             &target_bucket,
             &target_key,
             obj.size,

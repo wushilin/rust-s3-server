@@ -6,11 +6,29 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::Length;
 use futures::stream::{self, StreamExt};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 use crate::config::client_for_alias;
 use crate::urls::parse_s3_url;
+
+const COPY_SOURCE_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+const MAX_SINGLE_COPY: u64 = 5 * 1024 * 1024 * 1024; // AWS CopyObject ceiling
+
+pub(crate) fn encode_copy_source(bucket: &str, key: &str) -> String {
+    format!("{bucket}/{}", utf8_percent_encode(key, COPY_SOURCE_ENCODE))
+}
+
+pub(crate) fn same_endpoint(a: &crate::config::Alias, b: &crate::config::Alias) -> bool {
+    a.url == b.url && a.access_key == b.access_key
+}
 
 #[derive(Debug)]
 pub(crate) struct UploadedPart {
@@ -263,11 +281,14 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transfer_object_between_s3(
     source_client: &Client,
+    source_alias: &crate::config::Alias,
     source_bucket: &str,
     source_key: &str,
     target_client: &Client,
+    target_alias: &crate::config::Alias,
     target_bucket: &str,
     target_key: &str,
     size: u64,
@@ -275,6 +296,34 @@ pub(crate) async fn transfer_object_between_s3(
     disable_multipart: bool,
     parallel: usize,
 ) -> Result<()> {
+    if same_endpoint(source_alias, target_alias) {
+        let single_limit = part_size.min(MAX_SINGLE_COPY);
+        if disable_multipart || size <= single_limit {
+            target_client
+                .copy_object()
+                .bucket(target_bucket)
+                .key(target_key)
+                .copy_source(encode_copy_source(source_bucket, source_key))
+                .send()
+                .await?;
+        } else {
+            multipart_server_side_copy(
+                target_client,
+                source_bucket,
+                source_key,
+                target_bucket,
+                target_key,
+                size,
+                part_size,
+                parallel,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    if std::env::var("RS3_DEBUG_COPY").is_ok() {
+        eprintln!("rs3: falling back to streaming copy");
+    }
     if disable_multipart || size <= part_size {
         let resp = source_client
             .get_object()
@@ -305,6 +354,111 @@ pub(crate) async fn transfer_object_between_s3(
         .await?;
     }
     Ok(())
+}
+
+async fn multipart_server_side_copy(
+    target_client: &Client,
+    source_bucket: &str,
+    source_key: &str,
+    target_bucket: &str,
+    target_key: &str,
+    total_size: u64,
+    part_size: u64,
+    parallel: usize,
+) -> Result<()> {
+    if part_size < 5 * 1024 * 1024 {
+        return Err(anyhow!("multipart part size must be at least 5MiB"));
+    }
+    let created = target_client
+        .create_multipart_upload()
+        .bucket(target_bucket)
+        .key(target_key)
+        .send()
+        .await?;
+    let upload_id = created
+        .upload_id()
+        .ok_or_else(|| anyhow!("server did not return upload id"))?
+        .to_string();
+    let copy_source = encode_copy_source(source_bucket, source_key);
+    let part_count = total_size.div_ceil(part_size);
+    let uploads = stream::iter((1..=part_count).map(|part_index| {
+        let client = target_client.clone();
+        let copy_source = copy_source.clone();
+        let target_bucket = target_bucket.to_string();
+        let target_key = target_key.to_string();
+        let upload_id = upload_id.clone();
+        async move {
+            let start = (part_index - 1) * part_size;
+            let end = (total_size - 1).min(start + part_size - 1);
+            let part_number = part_index as i32;
+            let resp = client
+                .upload_part_copy()
+                .bucket(target_bucket)
+                .key(target_key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .copy_source(copy_source)
+                .copy_source_range(format!("bytes={start}-{end}"))
+                .send()
+                .await?;
+            Ok::<UploadedPart, anyhow::Error>(UploadedPart {
+                part_number,
+                etag: resp
+                    .copy_part_result()
+                    .and_then(|r| r.e_tag())
+                    .map(String::from),
+            })
+        }
+    }))
+    .buffer_unordered(parallel.max(1));
+    let mut results = uploads.collect::<Vec<_>>().await;
+    if let Some(err) = results.iter().find_map(|r| r.as_ref().err()) {
+        let _ = target_client
+            .abort_multipart_upload()
+            .bucket(target_bucket)
+            .key(target_key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        return Err(anyhow!("{err}"));
+    }
+    let mut parts = results.drain(..).collect::<Result<Vec<_>>>()?;
+    parts.sort_by_key(|p| p.part_number);
+    let completed = parts
+        .into_iter()
+        .map(|p| {
+            CompletedPart::builder()
+                .part_number(p.part_number)
+                .set_e_tag(p.etag)
+                .build()
+        })
+        .collect::<Vec<_>>();
+    target_client
+        .complete_multipart_upload()
+        .bucket(target_bucket)
+        .key(target_key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build(),
+        )
+        .send()
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_source_encodes_specials_keeps_slashes() {
+        assert_eq!(
+            encode_copy_source("bkt", "dir/obj name+x.bin"),
+            "bkt/dir/obj%20name%2Bx.bin"
+        );
+    }
 }
 
 pub(crate) async fn download_object(source: &str, target: Option<PathBuf>) -> Result<()> {
