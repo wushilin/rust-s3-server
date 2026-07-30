@@ -12,15 +12,23 @@ expected to implement those APIs.
 - `alias set|list|remove|export`
 - `ls`
 - `mb`
-- `rb`
+- `rb`, including `--force` (aborts incomplete multipart uploads, empties the
+  bucket, then deletes it) and `--dangerous` (required to remove every bucket
+  on an alias when no bucket is named)
 - `put`
 - `cp` for local-to-S3 and S3-to-local
 - `get`
 - `cat`
-- `rm`
+- `rm`, including recursive removal with batched `DeleteObjects` calls
+  (1000 keys per batch); `--recursive` requires `--force` (or `--dry-run`)
 - `stat`
 - `mirror` for local directory -> S3 prefix, S3 prefix -> local directory,
-  and S3-compatible prefix -> S3-compatible prefix
+  and S3-compatible prefix -> S3-compatible prefix, including
+  S3-compatible-to-S3-compatible across different aliases; local-to-local
+  mirroring is rejected. `mirror` is incremental (size/mtime diff) and
+  supports `--remove` (delete destination-only entries), `--overwrite`
+  (replace differing destination entries), and `--dry-run` (print the plan
+  without transferring)
 
 ## Copy And Mirror Behavior
 
@@ -46,6 +54,16 @@ Multipart part uploads are parallelized with `--parallel` workers.
 S3-to-S3 copies stream small objects directly from `GetObject` into `PutObject`.
 Large S3-to-S3 copies use parallel ranged `GetObject` requests feeding multipart
 `UploadPart` requests, avoiding whole-object buffering.
+
+When source and target resolve to the same alias/endpoint, `cp`/`mirror` use
+server-side copy instead (`CopyObject` for whole-object copies, or parallel
+`UploadPartCopy` requests for objects above the multipart threshold), so data
+never round-trips through the client.
+
+Downloads (`get`, `cp`, `mirror` to a local path) above the multipart
+threshold use parallel ranged `GetObject` requests writing into a `.rs3.part`
+sibling file, which is atomically renamed into place once every range has
+completed successfully.
 
 ## Intentionally Dropped
 
@@ -87,15 +105,43 @@ compatibility target:
 Some of these could be added later if rusts3 implements the corresponding S3 or
 MinIO-compatible APIs, but they are not advertised as supported now.
 
+## Not Yet Implemented
+
+The following flags and features are recognized by the CLI (so scripts using
+them get a clear error, not a silent no-op) but are not implemented yet.
+Passing them fails with a `<command> --<flag> is not implemented yet` error
+and a non-zero exit code, rather than being silently ignored:
+
+- `ls --rewind`, `ls --versions`, `ls --incomplete`, `ls --summarize`,
+  `ls --zip`, `ls --storage-class`
+- `cat --offset`, `cat --tail`
+- `cp --older-than`, `cp --newer-than`
+- `stat --recursive`
+- `mb --with-lock`, `mb --with-versioning`
+- `rm --versions`, `rm --version-id`
+- `get --version-id`
+- `mirror --watch`
+- `alias import`
+
+More broadly, object versioning is not supported end-to-end (rusts3's
+version-related flags above are refused rather than honored), and
+`--json`/`--quiet`/`--no-color` are accepted as global flags but currently
+have no effect on output; `rs3` always prints its normal human-readable
+output pending future output-format compatibility work.
+
 ## Multipart Uploads
 
 MinIO `mc put` defaults `--part-size` to `16MiB`. `rs3` defaults it to `256MiB`.
 
-`rs3` also uses `256MiB` as the automatic multipart threshold:
+`--part-size` sets both the size of each multipart part and the automatic
+multipart threshold:
 
-- files at or below `256MiB` use `PutObject`
-- files above `256MiB` use multipart upload
-- `--disable-multipart` forces single-object upload
+- files/objects at or below `--part-size` use a single `PutObject` /
+  `CopyObject` (or a single-range `GetObject` for downloads)
+- files/objects above `--part-size` use multipart upload (or parallel
+  ranged `GetObject`/`UploadPartCopy` requests, as appropriate)
+- `--disable-multipart` forces single-request transfer regardless of size
+- `--part-size 0` is rejected as invalid
 
 ## Config
 

@@ -322,6 +322,24 @@ async fn alias(args: AliasArgs) -> Result<()> {
 }
 
 async fn ls(args: LsArgs) -> Result<()> {
+    if args.rewind.is_some() {
+        return Err(anyhow!("ls --rewind is not implemented yet"));
+    }
+    if args.versions {
+        return Err(anyhow!("ls --versions is not implemented yet"));
+    }
+    if args.incomplete {
+        return Err(anyhow!("ls --incomplete is not implemented yet"));
+    }
+    if args.summarize {
+        return Err(anyhow!("ls --summarize is not implemented yet"));
+    }
+    if args.zip {
+        return Err(anyhow!("ls --zip is not implemented yet"));
+    }
+    if args.storage_class.is_some() {
+        return Err(anyhow!("ls --storage-class is not implemented yet"));
+    }
     let targets = if args.targets.is_empty() {
         vec!["".to_string()]
     } else {
@@ -375,6 +393,12 @@ async fn ls(args: LsArgs) -> Result<()> {
 }
 
 async fn mb(args: MbArgs) -> Result<()> {
+    if args.with_lock {
+        return Err(anyhow!("mb --with-lock is not implemented yet"));
+    }
+    if args.with_versioning {
+        return Err(anyhow!("mb --with-versioning is not implemented yet"));
+    }
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
@@ -531,6 +555,12 @@ async fn put(args: PutArgs) -> Result<()> {
 }
 
 async fn cp(args: CpArgs) -> Result<()> {
+    if args.older_than.is_some() {
+        return Err(anyhow!("cp --older-than is not implemented yet"));
+    }
+    if args.newer_than.is_some() {
+        return Err(anyhow!("cp --newer-than is not implemented yet"));
+    }
     if args.paths.len() < 2 {
         return Err(anyhow!("cp requires SOURCE [SOURCE...] TARGET"));
     }
@@ -733,6 +763,12 @@ async fn get(args: GetArgs) -> Result<()> {
 }
 
 async fn cat(args: CatArgs) -> Result<()> {
+    if args.offset.is_some() {
+        return Err(anyhow!("cat --offset is not implemented yet"));
+    }
+    if args.tail.is_some() {
+        return Err(anyhow!("cat --tail is not implemented yet"));
+    }
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
@@ -873,6 +909,9 @@ async fn remove_prefix(
 }
 
 async fn stat(args: StatArgs) -> Result<()> {
+    if args.recursive {
+        return Err(anyhow!("stat --recursive is not implemented yet"));
+    }
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
