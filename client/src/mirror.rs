@@ -382,6 +382,13 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                         removed: false,
                     };
                     session.object_done(&msg, entry.size);
+                    if args.delete_source_after {
+                        // `mv`'s recursive path: delete this object's
+                        // source now that its copy has succeeded. Delete
+                        // failures are logged but must not count toward the
+                        // failure total that drives exit status ([SEM] §3).
+                        delete_source_entry(source, entry).await;
+                    }
                     0u64
                 }
                 Err(err) => {
@@ -485,6 +492,34 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         return Err(anyhow!("{total} object(s) failed"));
     }
     Ok(())
+}
+
+/// `mv`'s recursive per-object cleanup: deletes `entry` from `source` after
+/// its copy has already succeeded. Fire-and-forget -- errors are logged to
+/// stderr and swallowed, matching mc's async/decoupled `removeManager`
+/// ([SEM] §3): a delete failure must not affect the overall exit status.
+async fn delete_source_entry(source: &Side, entry: &Entry) {
+    let result: Result<()> = match source {
+        Side::Local(root) => tokio::fs::remove_file(root.join(&entry.rel))
+            .await
+            .map_err(Into::into),
+        Side::S3 {
+            client,
+            bucket,
+            prefix,
+            ..
+        } => client
+            .delete_object()
+            .bucket(bucket)
+            .key(s3_key(prefix, &entry.rel))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(Into::into),
+    };
+    if let Err(err) = result {
+        eprintln!("mv: remove `{}` failed: {err:#}", entry.rel);
+    }
 }
 
 /// Performs one entry's transfer and returns the `(source, target)`

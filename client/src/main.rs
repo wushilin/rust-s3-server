@@ -127,6 +127,8 @@ enum Commands {
     Put(PutArgs),
     #[command(about = "copy objects")]
     Cp(CpArgs),
+    #[command(about = "move objects")]
+    Mv(CpArgs),
     #[command(about = "get s3 object to local")]
     Get(GetArgs),
     #[command(about = "display object contents")]
@@ -296,6 +298,12 @@ pub(crate) struct MirrorArgs {
         help = "preserve filesystem attributes (mode, ownership, timestamps)"
     )]
     pub(crate) preserve: bool,
+    /// Not a CLI flag -- set only when `mv` drives the mirror machinery for
+    /// a recursive move ([SEM] §3): after each object's copy succeeds, its
+    /// source is deleted. Delete failures are logged but do not affect the
+    /// operation's overall exit status.
+    #[arg(skip)]
+    pub(crate) delete_source_after: bool,
     pub(crate) source: String,
     pub(crate) target: String,
 }
@@ -368,6 +376,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Rb(args) => rb(args).await,
         Commands::Put(args) => put(args).await,
         Commands::Cp(args) => cp(args).await,
+        Commands::Mv(args) => mv(args).await,
         Commands::Get(args) => get(args).await,
         Commands::Cat(args) => cat(args).await,
         Commands::Rm(args) => rm(args).await,
@@ -970,9 +979,52 @@ async fn put(args: PutArgs) -> Result<()> {
 }
 
 async fn cp(args: CpArgs) -> Result<()> {
+    run_cp_or_mv(args, false).await
+}
+
+/// `mv` = `cp` plus a per-object delete of the source once that object's
+/// copy has succeeded ([SEM] §3). Non-transactional: a copy failure leaves
+/// the source in place and fails the whole operation exactly like `cp`; a
+/// delete failure is logged to stderr but does not affect exit status.
+async fn mv(args: CpArgs) -> Result<()> {
+    // Up-front, mv-only guard ([SEM] §3): only checked when there's exactly
+    // one source and one target (2 positional args total).
+    if args.paths.len() == 2 {
+        check_mv_subdirectory_guard(&args.paths[0], &args.paths[1])?;
+    }
+    run_cp_or_mv(args, true).await
+}
+
+/// `mv`-only guard: fatal if `source`/`target` are subdirectories of each
+/// other (either nested inside the other, or identical). Applies when both
+/// sides are S3 URLs (string-prefix compare on the raw alias/bucket/key
+/// path with a `/` boundary) or both are local paths (`Path::starts_with`
+/// both directions) -- a mixed local/S3 pair can never collide this way.
+fn check_mv_subdirectory_guard(source: &str, target: &str) -> Result<()> {
+    let conflict = if is_s3_url(source) && is_s3_url(target) {
+        let a = source.trim_end_matches('/');
+        let b = target.trim_end_matches('/');
+        a == b || b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/"))
+    } else if !is_s3_url(source) && !is_s3_url(target) {
+        let a = Path::new(source);
+        let b = Path::new(target);
+        a.starts_with(b) || b.starts_with(a)
+    } else {
+        false
+    };
+    if conflict {
+        return Err(anyhow!(
+            "The source `{source}` and destination `{target}` cannot be subdirectories of each other"
+        ));
+    }
+    Ok(())
+}
+
+async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
     timefilter::validate_time_filters(args.older_than.as_deref(), args.newer_than.as_deref())?;
     if args.paths.len() < 2 {
-        return Err(anyhow!("cp requires SOURCE [SOURCE...] TARGET"));
+        let verb = if is_mv { "mv" } else { "cp" };
+        return Err(anyhow!("{verb} requires SOURCE [SOURCE...] TARGET"));
     }
     if args.preserve && !cfg!(unix) {
         return Err(anyhow!("--preserve is not supported on this platform"));
@@ -983,12 +1035,12 @@ async fn cp(args: CpArgs) -> Result<()> {
         None => BTreeMap::new(),
     };
     let target = args.paths.last().unwrap().clone();
-    let session = TransferSession::new("cp");
+    let session = TransferSession::new(if is_mv { "mv" } else { "cp" });
     let mut used_session = false;
     for source in &args.paths[..args.paths.len() - 1] {
         if is_s3_url(source) && is_s3_url(&target) {
             if args.recursive {
-                cp_recursive(source, &target, &args).await?;
+                cp_or_mv_recursive(source, &target, &args, is_mv).await?;
             } else {
                 copy_s3_object_to_s3(
                     source,
@@ -1001,13 +1053,14 @@ async fn cp(args: CpArgs) -> Result<()> {
                     args.newer_than.as_deref(),
                     &attrs,
                     args.preserve,
+                    is_mv,
                 )
                 .await?;
                 used_session = true;
             }
         } else if is_s3_url(source) && !is_s3_url(&target) {
             if args.recursive {
-                cp_recursive(source, &target, &args).await?;
+                cp_or_mv_recursive(source, &target, &args, is_mv).await?;
             } else {
                 let parsed = parse_s3_url(source)?;
                 let bucket = parsed
@@ -1041,6 +1094,20 @@ async fn cp(args: CpArgs) -> Result<()> {
                         args.preserve,
                     )
                     .await?;
+                    if is_mv {
+                        // Delete only after the copy of *this* object has
+                        // succeeded; a delete failure is logged but must not
+                        // fail the overall `mv` exit status ([SEM] §3).
+                        if let Err(err) = head_client
+                            .delete_object()
+                            .bucket(&bucket)
+                            .key(&key)
+                            .send()
+                            .await
+                        {
+                            eprintln!("mv: remove `{bucket}/{key}` failed: {err}");
+                        }
+                    }
                 }
                 used_session = true;
             }
@@ -1052,7 +1119,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                         "source `{source}` is a directory; use --recursive to copy it"
                     ));
                 }
-                cp_recursive(source, &target, &args).await?;
+                cp_or_mv_recursive(source, &target, &args, is_mv).await?;
             } else {
                 let metadata = fs::metadata(source_path)
                     .await
@@ -1085,6 +1152,11 @@ async fn cp(args: CpArgs) -> Result<()> {
                         total_size,
                     };
                     session.object_done(&msg, outcome.size);
+                    if is_mv {
+                        if let Err(err) = fs::remove_file(source_path).await {
+                            eprintln!("mv: remove `{}` failed: {err}", source_path.display());
+                        }
+                    }
                 }
                 used_session = true;
             }
@@ -1101,6 +1173,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                 &session,
                 args.older_than.as_deref(),
                 args.newer_than.as_deref(),
+                is_mv,
             )
             .await?;
             used_session = true;
@@ -1113,8 +1186,12 @@ async fn cp(args: CpArgs) -> Result<()> {
 }
 
 /// `cp --recursive` always copies everything (it is not a sync), so it drives
-/// the mirror planner with `overwrite: true` and `remove: false`.
-async fn cp_recursive(source: &str, target: &str, args: &CpArgs) -> Result<()> {
+/// the mirror planner with `overwrite: true` and `remove: false`. For `mv`,
+/// `delete_source_after` additionally tells the mirror copy loop to delete
+/// each source object right after its own copy succeeds; a local source's
+/// now-empty directories are pruned best-effort afterward (S3 sources have
+/// no directories to prune -- their per-object deletes are sufficient).
+async fn cp_or_mv_recursive(source: &str, target: &str, args: &CpArgs, is_mv: bool) -> Result<()> {
     let mirror_args = MirrorArgs {
         parallel: args.parallel,
         part_size: args.part_size.clone(),
@@ -1128,10 +1205,42 @@ async fn cp_recursive(source: &str, target: &str, args: &CpArgs) -> Result<()> {
         newer_than: args.newer_than.clone(),
         attr: args.attr.clone(),
         preserve: args.preserve,
+        delete_source_after: is_mv,
         source: source.to_string(),
         target: target.to_string(),
     };
-    mirror::run_mirror(&mirror_args).await
+    mirror::run_mirror(&mirror_args).await?;
+    if is_mv && !is_s3_url(source) {
+        prune_empty_dirs(Path::new(source)).await;
+    }
+    Ok(())
+}
+
+/// Best-effort removal of now-empty directories under `root` (including
+/// `root` itself), deepest first, after a recursive local-source `mv`. Any
+/// directory that's still non-empty (a file survived, e.g. because its copy
+/// failed) is silently left in place -- this is cleanup, not part of the
+/// operation's success/failure signal.
+async fn prune_empty_dirs(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    let mut dirs = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(metadata) = entry.metadata().await {
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        dirs.push(dir);
+    }
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for dir in dirs {
+        let _ = fs::remove_dir(&dir).await;
+    }
 }
 
 async fn mirror(args: MirrorArgs) -> Result<()> {
@@ -1150,6 +1259,7 @@ async fn copy_s3_object_to_s3(
     newer_than: Option<&str>,
     attrs: &BTreeMap<String, String>,
     preserve: bool,
+    delete_source: bool,
 ) -> Result<()> {
     if !attrs.is_empty() {
         return Err(anyhow!("--attr for S3-to-S3 copies is not implemented yet"));
@@ -1219,9 +1329,26 @@ async fn copy_s3_object_to_s3(
         total_size,
     };
     session.object_done(&msg, size);
+    if delete_source {
+        // Copy of this object has already succeeded above; delete failures
+        // are logged but must not fail the overall `mv` exit status.
+        if let Err(err) = source_client
+            .delete_object()
+            .bucket(&source_bucket)
+            .key(&source_key)
+            .send()
+            .await
+        {
+            eprintln!(
+                "mv: remove `{}/{source_bucket}/{source_key}` failed: {err}",
+                source_url.alias
+            );
+        }
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn copy_local_path(
     source: &Path,
     target: &Path,
@@ -1229,6 +1356,7 @@ async fn copy_local_path(
     session: &TransferSession,
     older_than: Option<&str>,
     newer_than: Option<&str>,
+    delete_after: bool,
 ) -> Result<()> {
     let metadata = fs::metadata(source)
         .await
@@ -1270,8 +1398,16 @@ async fn copy_local_path(
                         total_size,
                     };
                     session.object_done(&msg, size);
+                    if delete_after {
+                        if let Err(err) = fs::remove_file(&path).await {
+                            eprintln!("mv: remove `{}` failed: {err}", path.display());
+                        }
+                    }
                 }
             }
+        }
+        if delete_after {
+            prune_empty_dirs(source).await;
         }
     } else {
         let object_time = metadata.modified().ok().map(DateTime::<Utc>::from);
@@ -1304,6 +1440,11 @@ async fn copy_local_path(
             total_size,
         };
         session.object_done(&msg, size);
+        if delete_after {
+            if let Err(err) = fs::remove_file(source).await {
+                eprintln!("mv: remove `{}` failed: {err}", source.display());
+            }
+        }
     }
     Ok(())
 }
