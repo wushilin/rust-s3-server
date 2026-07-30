@@ -1,10 +1,12 @@
 mod config;
 mod list;
 mod mirror;
+mod output;
 mod transfer;
 mod urls;
 
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -14,6 +16,8 @@ use clap::{Args, Parser, Subcommand};
 use humansize::{BINARY, format_size};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+
+use output::{OutputOpts, init_output, print_error};
 
 use config::{Alias, client_for_alias, load_config, save_config};
 use list::ObjectPaginator;
@@ -242,8 +246,21 @@ struct StatArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    init_output(OutputOpts {
+        json: cli.json,
+        quiet: cli.quiet,
+        no_color: cli.no_color,
+        stdout_tty: std::io::stdout().is_terminal(),
+    });
+    if let Err(e) = run(cli).await {
+        print_error(&format!("{e:#}"), "", true);
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Alias(args) => alias(args).await,
         Commands::Ls(args) => ls(args).await,
