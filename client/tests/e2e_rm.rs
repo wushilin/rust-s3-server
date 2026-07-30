@@ -58,3 +58,14 @@ fn rm_missing_key_fails_but_later_targets_run() {
     let stat = server.rs3(&["stat", "test/bk4/real.txt"]);
     assert!(!stat.status.success());
 }
+
+#[test]
+fn rm_recursive_no_trailing_slash_does_not_leak_into_sibling_prefix() {
+    let server = TestServer::start();
+    seed(&server, "bk5", &["p/1.txt", "prefix2/x.txt"]);
+    // No trailing slash on `p` -- must not match sibling prefix `prefix2/`.
+    server.rs3_ok(&["rm", "--recursive", "--force", "test/bk5/p"]);
+    let stat_gone = server.rs3(&["stat", "test/bk5/p/1.txt"]);
+    assert!(!stat_gone.status.success());
+    server.rs3_ok(&["stat", "test/bk5/prefix2/x.txt"]);
+}

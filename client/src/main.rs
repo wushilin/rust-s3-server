@@ -875,9 +875,19 @@ async fn remove_prefix(
     dry_run: bool,
 ) -> Result<u64> {
     use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+    // S3 prefix matching is a raw string match, so a listing prefix of `p`
+    // (no trailing slash) also matches sibling keys like `prefix2/x.txt`.
+    // When the prefix doesn't already end at a path boundary, filter each
+    // page down to the exact key or its `prefix/`-rooted descendants so
+    // `rm -r bucket/p` only ever touches `p` itself and things under `p/`.
+    let boundary_safe = prefix.is_empty() || prefix.ends_with('/');
+    let descendant_prefix = format!("{prefix}/");
     let mut pager = ObjectPaginator::new(client.clone(), bucket.to_string(), prefix.to_string());
     let mut removed = 0u64;
-    while let Some(page) = pager.next_page().await? {
+    while let Some(mut page) = pager.next_page().await? {
+        if !boundary_safe {
+            page.retain(|obj| obj.key == prefix || obj.key.starts_with(&descendant_prefix));
+        }
         if page.is_empty() {
             continue;
         }
