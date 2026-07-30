@@ -60,6 +60,22 @@ fn rm_missing_key_fails_but_later_targets_run() {
 }
 
 #[test]
+fn rm_recursive_force_deletes_folder_markers_too() {
+    let server = TestServer::start();
+    seed(&server, "bk6", &["p/f.txt"]);
+    // Zero-byte "folder marker" object, as produced by some S3 clients/UIs
+    // when creating an empty "folder". rs3's own `put` can't create a key
+    // ending in `/`, so we PUT it directly via aws-sdk-s3.
+    server.put_marker("bk6", "p/sub/");
+    server.rs3_ok(&["rm", "--recursive", "--force", "test/bk6/p/"]);
+    let listing = server.rs3_ok(&["ls", "--recursive", "test/bk6"]);
+    assert!(!listing.contains("p/"), "listing: {listing}");
+    // The bucket must now be truly empty -- including the marker -- so a
+    // plain `rb` (no --force) succeeds.
+    server.rs3_ok(&["rb", "test/bk6"]);
+}
+
+#[test]
 fn rm_recursive_no_trailing_slash_does_not_leak_into_sibling_prefix() {
     let server = TestServer::start();
     seed(&server, "bk5", &["p/1.txt", "prefix2/x.txt"]);

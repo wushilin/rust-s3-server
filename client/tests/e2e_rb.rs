@@ -27,6 +27,20 @@ fn rb_force_empties_then_removes() {
 }
 
 #[test]
+fn rb_force_removes_bucket_with_only_a_folder_marker() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/full3"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"x").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/full3/p/f.txt"]);
+    // Zero-byte "folder marker" object; must not survive `rb --force`.
+    server.put_marker("full3", "p/sub/");
+    server.rs3_ok(&["rb", "--force", "test/full3"]);
+    let listing = server.rs3_ok(&["ls", "test/"]);
+    assert!(!listing.contains("full3"), "listing: {listing}");
+}
+
+#[test]
 fn rb_alias_root_requires_dangerous() {
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/one"]);

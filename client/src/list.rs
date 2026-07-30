@@ -15,6 +15,7 @@ pub(crate) struct ObjectPaginator {
     prefix: String,
     token: Option<String>,
     done: bool,
+    include_markers: bool,
 }
 
 impl ObjectPaginator {
@@ -25,6 +26,22 @@ impl ObjectPaginator {
             prefix,
             token: None,
             done: false,
+            include_markers: false,
+        }
+    }
+
+    /// Like [`ObjectPaginator::new`], but does not skip zero-byte
+    /// "folder marker" keys (keys ending in `/`). Destructive operations
+    /// (e.g. `rm -r`, `rb --force`) must enumerate and delete these markers
+    /// too, or they survive and leave the bucket non-empty.
+    pub(crate) fn new_raw(client: Client, bucket: String, prefix: String) -> Self {
+        Self {
+            client,
+            bucket,
+            prefix,
+            token: None,
+            done: false,
+            include_markers: true,
         }
     }
 
@@ -44,7 +61,7 @@ impl ObjectPaginator {
         for obj in resp.contents() {
             let Some(key) = obj.key() else { continue };
             let size = obj.size().unwrap_or_default() as u64;
-            if key.ends_with('/') && size == 0 {
+            if !self.include_markers && key.ends_with('/') && size == 0 {
                 continue; // folder marker
             }
             page.push(ListedObject {

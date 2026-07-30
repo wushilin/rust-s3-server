@@ -535,6 +535,12 @@ async fn abort_incomplete_uploads(client: &Client, bucket: &str) -> Result<()> {
         if resp.is_truncated().unwrap_or(false) {
             key_marker = resp.next_key_marker().map(String::from);
             id_marker = resp.next_upload_id_marker().map(String::from);
+            if key_marker.is_none() && id_marker.is_none() {
+                // Server claims truncation but gave us nothing to page
+                // forward with; treat as done rather than looping forever
+                // re-requesting the same first page.
+                return Ok(());
+            }
         } else {
             return Ok(());
         }
@@ -864,7 +870,11 @@ async fn remove_prefix(
     // `rm -r bucket/p` only ever touches `p` itself and things under `p/`.
     let boundary_safe = prefix.is_empty() || prefix.ends_with('/');
     let descendant_prefix = format!("{prefix}/");
-    let mut pager = ObjectPaginator::new(client.clone(), bucket.to_string(), prefix.to_string());
+    // Raw paginator: unlike listing/mirror paths, deletion must also sweep
+    // up zero-byte folder-marker keys (keys ending in `/`), or they survive
+    // `rm -r` / `rb --force` and leave the bucket non-empty.
+    let mut pager =
+        ObjectPaginator::new_raw(client.clone(), bucket.to_string(), prefix.to_string());
     let mut removed = 0u64;
     while let Some(mut page) = pager.next_page().await? {
         if !boundary_safe {

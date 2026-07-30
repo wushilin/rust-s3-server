@@ -371,6 +371,8 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                         .send()
                         .await?;
                     delete_failures += resp.errors().len() as u64;
+                    let failed_keys: HashSet<&str> =
+                        resp.errors().iter().filter_map(|err| err.key()).collect();
                     for err in resp.errors() {
                         eprintln!(
                             "mirror: remove `{}` failed: {}",
@@ -379,7 +381,10 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                         );
                     }
                     for rel in chunk {
-                        println!("Removed `{alias_name}/{bucket}/{}`.", s3_key(prefix, rel));
+                        let key = s3_key(prefix, rel);
+                        if !failed_keys.contains(key.as_str()) {
+                            println!("Removed `{alias_name}/{bucket}/{key}`.");
+                        }
                     }
                 }
             }
