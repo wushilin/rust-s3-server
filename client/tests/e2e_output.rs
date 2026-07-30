@@ -74,6 +74,62 @@ fn ls_recursive_no_trailing_slash_strips_directory_prefix() {
 }
 
 #[test]
+fn ls_exact_object_key_shows_basename_relative_to_parent() {
+    // `ls bucket/dir/f.txt` (a real object, not a directory-style prefix)
+    // must show that one object with its key relative to its *parent*
+    // directory, i.e. just "f.txt" -- not the full "dir/f.txt" ([SEM] §11:
+    // mc `Stat()`s a bare target first; a hit is listed as exactly that one
+    // object, keyed relative to its parent).
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/lsexact"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/lsexact/dir/f.txt"]);
+    let out = server.rs3_ok(&["--json", "ls", "test/lsexact/dir/f.txt"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 1, "expected exactly one entry, out: {out}");
+    let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["type"], "file");
+    assert_eq!(v["key"], "f.txt", "out: {out}");
+}
+
+#[test]
+fn ls_bare_directory_no_trailing_slash_non_recursive_matches_slash_form() {
+    // A bare target that isn't a real object but has children ("dir" with
+    // no trailing slash, no `-r`) must be treated exactly like the
+    // slash-terminated form: list `dir`'s immediate contents relative to
+    // it, not collapse to a single empty-keyed CommonPrefix entry ([SEM]
+    // §11: mc re-lists with a trailing separator appended once `Stat`
+    // confirms the bare target is a directory).
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/lsbaredir"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/lsbaredir/dir/f.txt"]);
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/lsbaredir/dir/sub/g.txt"]);
+    let out = server.rs3_ok(&["--json", "ls", "test/lsbaredir/dir"]);
+    let keys: Vec<String> = out
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["key"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert!(
+        keys.contains(&"f.txt".to_string()),
+        "keys: {keys:?}, out: {out}"
+    );
+    assert!(
+        keys.contains(&"sub/".to_string()),
+        "keys: {keys:?}, out: {out}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.is_empty()),
+        "no key should be empty: {keys:?}"
+    );
+}
+
+#[test]
 fn ls_summarize_and_human_format() {
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/lssum"]);

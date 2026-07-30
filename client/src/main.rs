@@ -46,15 +46,18 @@ fn smithy_to_chrono(t: &aws_smithy_types::DateTime) -> DateTime<Utc> {
 /// Real `mc` gets this by auto-detecting a bare (non-slash-terminated)
 /// directory target and re-listing it with a trailing separator appended
 /// *before* computing the strip-prefix (`cmd/ls.go`'s `mainList` +
-/// `generateContentMessages`'s `prefixPath` truncation, [SEM] §11). We
-/// approximate the same outcome without an extra directory-detection round
-/// trip: when `prefix` doesn't already end in `/`, a matching key must
-/// still cross exactly one `/` boundary right after `prefix` to be treated
-/// as living "under" it (i.e. `prefix` named a directory) -- that boundary
-/// slash is consumed along with `prefix` itself, rather than left as a
-/// stray leading `/` on the displayed key. A key that continues with a
-/// non-`/` character right after `prefix` was only a partial-filename match
-/// (e.g. `pre` vs. `prefix1.txt`), which mc also leaves unstripped.
+/// `generateContentMessages`'s `prefixPath` truncation, [SEM] §11). `ls`'s
+/// main object-listing path now replicates that exactly with a
+/// `HeadObject` probe (see `ls`'s `(Some(bucket), key)` arm), so by the
+/// time it calls this helper `prefix` always already ends in `/` (or is
+/// empty). `list_incomplete` has no equivalent "does an in-progress upload
+/// exist at exactly this key" probe available, so it still calls this with
+/// a possibly-bare `prefix`; the boundary-consuming fallback below covers
+/// that case reasonably (a matching key must cross exactly one `/`
+/// boundary right after a bare `prefix` to be treated as living "under"
+/// it; one that continues with a non-`/` character was only a
+/// partial-filename match, e.g. `pre` vs. `prefix1.txt`, and mc leaves
+/// those unstripped too) without needing its own probe.
 fn strip_listing_prefix(full_key: &str, prefix: &str) -> String {
     if prefix.is_empty() {
         return full_key.to_string();
@@ -441,10 +444,76 @@ async fn ls(args: LsArgs) -> Result<()> {
                 }
             }
             (Some(bucket), key) => {
-                let prefix = key.unwrap_or_default();
+                let mut prefix = key.unwrap_or_default();
                 if args.incomplete {
                     list_incomplete(&client, &bucket, &prefix, args.recursive).await?;
                     continue;
+                }
+                // mc's actual resolution order for a bare (non-empty,
+                // non-slash-terminated) target (`cmd/ls-main.go`'s
+                // `mainList`, [SEM] §11): `Stat()` it first. A hit means
+                // the target names a real object, which is listed as
+                // exactly that one entry, keyed relative to its parent
+                // directory. A miss means it's being used as a directory,
+                // so re-list with a trailing separator appended -- from
+                // that point on it behaves identically to a target the
+                // caller already slash-terminated.
+                if !prefix.is_empty() && !prefix.ends_with('/') {
+                    match client
+                        .head_object()
+                        .bucket(&bucket)
+                        .key(&prefix)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            let size = resp.content_length().unwrap_or_default() as u64;
+                            let storage_class = resp
+                                .storage_class()
+                                .map(|s| s.as_str().to_string())
+                                .unwrap_or_default();
+                            let filtered_out = storage_filter.is_some_and(|filter| {
+                                !storage_class.is_empty() && storage_class != filter
+                            });
+                            if !filtered_out {
+                                let time = resp
+                                    .last_modified()
+                                    .map(smithy_to_chrono)
+                                    .unwrap_or_else(epoch);
+                                let etag = strip_etag_quotes(resp.e_tag().unwrap_or_default());
+                                let basename =
+                                    prefix.rsplit('/').next().unwrap_or(&prefix).to_string();
+                                print_msg(&ContentMessage {
+                                    status: "success".into(),
+                                    filetype: "file".into(),
+                                    time,
+                                    size,
+                                    key: basename,
+                                    etag,
+                                    storage_class: if storage_class.is_empty() {
+                                        None
+                                    } else {
+                                        Some(storage_class)
+                                    },
+                                });
+                                if args.summarize {
+                                    print_msg(&SummaryMessage {
+                                        total_objects: 1,
+                                        total_size: size,
+                                    });
+                                }
+                            } else if args.summarize {
+                                print_msg(&SummaryMessage {
+                                    total_objects: 0,
+                                    total_size: 0,
+                                });
+                            }
+                            continue;
+                        }
+                        Err(_) => {
+                            prefix.push('/');
+                        }
+                    }
                 }
                 let delimiter = if args.recursive { None } else { Some("/") };
                 let mut token = None;
