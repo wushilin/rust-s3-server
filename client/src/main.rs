@@ -430,9 +430,18 @@ async fn rb(args: RbArgs) -> Result<()> {
                         ));
                     }
                     let resp = client.list_buckets().send().await?;
+                    let mut bucket_failures = 0u64;
                     for bucket in resp.buckets() {
                         let name = bucket.name().unwrap_or_default();
-                        remove_bucket(&client, &parsed.alias, name, args.force).await?;
+                        if let Err(err) =
+                            remove_bucket(&client, &parsed.alias, name, args.force).await
+                        {
+                            eprintln!("rb: {}/{name}: {err:#}", parsed.alias);
+                            bucket_failures += 1;
+                        }
+                    }
+                    if bucket_failures > 0 {
+                        return Err(anyhow!("{bucket_failures} bucket(s) failed"));
                     }
                     Ok(())
                 }

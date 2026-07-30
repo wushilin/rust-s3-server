@@ -37,3 +37,27 @@ fn rb_alias_root_requires_dangerous() {
     let listing = server.rs3_ok(&["ls", "test/"]);
     assert!(listing.trim().is_empty(), "listing: {listing}");
 }
+
+#[test]
+fn rb_dangerous_continues_past_per_bucket_failure() {
+    let server = TestServer::start();
+    // "abucket" sorts before "zbucket" so it is attempted first; it is left
+    // non-empty (and --force is not passed) so it fails to delete. The loop
+    // must still attempt and remove the later, empty "zbucket".
+    server.rs3_ok(&["mb", "test/abucket"]);
+    server.rs3_ok(&["mb", "test/zbucket"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"x").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/abucket/f.txt"]);
+    let out = server.rs3(&["rb", "--dangerous", "test"]);
+    assert!(!out.status.success());
+    let listing = server.rs3_ok(&["ls", "test/"]);
+    assert!(
+        !listing.contains("zbucket"),
+        "empty bucket should have been removed; listing: {listing}"
+    );
+    assert!(
+        listing.contains("abucket"),
+        "non-empty bucket should remain; listing: {listing}"
+    );
+}
