@@ -1368,6 +1368,63 @@
         }
     }
 
+    /// `DELETE /{bucket}?<subresource>` must not fall through to DeleteBucket:
+    /// `aws s3api delete-bucket-tagging` on an empty bucket used to delete the
+    /// bucket. And `PUT /{bucket}?<subresource>` must not be answered 200 by the
+    /// idempotent CreateBucket, which told clients versioning had been enabled.
+    #[tokio::test]
+    async fn unimplemented_bucket_subresources_are_refused_not_applied() {
+        for (method, subresource) in [
+            ("DELETE", "tagging"),
+            ("DELETE", "policy"),
+            ("DELETE", "lifecycle"),
+            ("DELETE", "encryption"),
+            ("DELETE", "replication"),
+            ("PUT", "versioning"),
+            ("PUT", "policy"),
+            ("PUT", "object-lock"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = seed_bucket(&tmp, "sub-bucket", &[]).await;
+
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/sub-bucket?{subresource}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "{method} ?{subresource} must be refused"
+            );
+            let body = body_text(res).await;
+            assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+
+            // Above all: the bucket is still there.
+            let head = app
+                .oneshot(
+                    Request::builder()
+                        .method("HEAD")
+                        .uri("/sub-bucket")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                head.status(),
+                StatusCode::OK,
+                "{method} ?{subresource} must not delete the bucket"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn list_objects_rejects_invalid_max_keys() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1379,6 +1379,17 @@ async fn bucket_route(
         Method::GET if ctx.query.contains_key("cors") => get_bucket_cors_s3(store, ctx).await,
         Method::PUT if ctx.query.contains_key("cors") => put_bucket_cors_s3(store, ctx, body).await,
         Method::DELETE if ctx.query.contains_key("cors") => delete_bucket_cors_s3(store, ctx).await,
+        // A sub-resource we do not implement must never fall through to
+        // CreateBucket/DeleteBucket: `PUT /{bucket}?versioning` would be
+        // answered 200 by the idempotent create (telling the client versioning
+        // is on when it is not), and `DELETE /{bucket}?tagging` would delete the
+        // bucket itself.
+        Method::PUT | Method::DELETE if unimplemented_bucket_subresource(&ctx.query) => s3_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "This bucket operation is not implemented",
+            &ctx.bucket,
+        ),
         Method::PUT => handlers::create_bucket::handle(store, ctx, body).await,
         Method::DELETE => handlers::delete_bucket::handle(store, ctx, body).await,
         Method::GET if ctx.query.contains_key("location") => {
@@ -1907,6 +1918,38 @@ fn known_unimplemented_bucket_query(query: &HashMap<String, String>) -> bool {
         "policy",
         "acl",
         "tagging",
+    ]
+    .iter()
+    .any(|k| query.contains_key(*k))
+}
+
+/// Bucket sub-resources this server does not implement, for the verbs whose
+/// fall-through is destructive or dishonest (see the routing arm). Deliberately
+/// broader than [`known_unimplemented_bucket_query`], which only guards GET —
+/// answering a write with "200, applied" or with a bucket deletion is far worse
+/// than a read returning an empty listing. `cors`, `versions`, `uploads`,
+/// `location`, `delete` and `rebuildIndex` are implemented and absent here.
+fn unimplemented_bucket_subresource(query: &HashMap<String, String>) -> bool {
+    [
+        "accelerate",
+        "acl",
+        "analytics",
+        "encryption",
+        "intelligent-tiering",
+        "inventory",
+        "lifecycle",
+        "logging",
+        "metrics",
+        "notification",
+        "object-lock",
+        "ownershipControls",
+        "policy",
+        "publicAccessBlock",
+        "replication",
+        "requestPayment",
+        "tagging",
+        "versioning",
+        "website",
     ]
     .iter()
     .any(|k| query.contains_key(*k))
