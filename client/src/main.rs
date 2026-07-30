@@ -1,28 +1,53 @@
 mod config;
 mod list;
+mod messages;
 mod mirror;
 mod output;
 mod transfer;
 mod urls;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use humansize::{BINARY, format_size};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use output::{OutputOpts, init_output, print_error};
+use output::{OutputOpts, init_output, print_error, print_msg};
 
 use config::{Alias, client_for_alias, load_config, save_config};
 use list::ObjectPaginator;
+use messages::{
+    ContentMessage, MakeBucketMessage, RemoveBucketMessage, RmMessage, StatMessage, SummaryMessage,
+};
 use transfer::{download_object, transfer_object_between_s3, upload_file};
 use urls::{DEFAULT_PART_SIZE, is_s3_url, parse_s3_url, parse_size};
+
+/// Fallback timestamp for listing entries that have no real modification
+/// time (e.g. `CommonPrefixes` "directory" entries, which S3 doesn't stamp).
+fn epoch() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).unwrap()
+}
+
+fn smithy_to_chrono(t: &aws_smithy_types::DateTime) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(t.secs(), t.subsec_nanos()).unwrap_or_else(epoch)
+}
+
+/// `ls` displays entries relative to the listed directory (e.g. `mc ls
+/// bucket/dir/` shows `f.txt`, not `dir/f.txt`), mirroring how a plain `ls`
+/// shows names relative to the queried path rather than full absolute
+/// object keys.
+fn strip_listing_prefix(full_key: &str, prefix: &str) -> String {
+    full_key
+        .strip_prefix(prefix)
+        .unwrap_or(full_key)
+        .to_string()
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -345,18 +370,16 @@ async fn ls(args: LsArgs) -> Result<()> {
     if args.versions {
         return Err(anyhow!("ls --versions is not implemented yet"));
     }
-    if args.incomplete {
-        return Err(anyhow!("ls --incomplete is not implemented yet"));
-    }
-    if args.summarize {
-        return Err(anyhow!("ls --summarize is not implemented yet"));
-    }
     if args.zip {
         return Err(anyhow!("ls --zip is not implemented yet"));
     }
-    if args.storage_class.is_some() {
-        return Err(anyhow!("ls --storage-class is not implemented yet"));
-    }
+    // Client-side post-filter: an object with an *empty* storage class is
+    // never excluded, even when a specific class was requested; "*" (or
+    // no flag at all) disables filtering entirely ([SEM] §11).
+    let storage_filter = args
+        .storage_class
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "*");
     let targets = if args.targets.is_empty() {
         vec!["".to_string()]
     } else {
@@ -369,13 +392,32 @@ async fn ls(args: LsArgs) -> Result<()> {
             (None, _) => {
                 let resp = client.list_buckets().send().await?;
                 for bucket in resp.buckets() {
-                    println!("{}", bucket.name().unwrap_or_default());
+                    let name = bucket.name().unwrap_or_default();
+                    let time = bucket
+                        .creation_date()
+                        .map(smithy_to_chrono)
+                        .unwrap_or_else(epoch);
+                    print_msg(&ContentMessage {
+                        status: "success".into(),
+                        filetype: "folder".into(),
+                        time,
+                        size: 0,
+                        key: format!("{name}/"),
+                        etag: String::new(),
+                        storage_class: None,
+                    });
                 }
             }
             (Some(bucket), key) => {
                 let prefix = key.unwrap_or_default();
+                if args.incomplete {
+                    list_incomplete(&client, &bucket, &prefix, args.recursive).await?;
+                    continue;
+                }
                 let delimiter = if args.recursive { None } else { Some("/") };
                 let mut token = None;
+                let mut total_objects = 0u64;
+                let mut total_size = 0u64;
                 loop {
                     let resp = client
                         .list_objects_v2()
@@ -386,16 +428,51 @@ async fn ls(args: LsArgs) -> Result<()> {
                         .send()
                         .await?;
                     for p in resp.common_prefixes() {
-                        println!("[DIR] {}", p.prefix().unwrap_or_default());
+                        let full = p.prefix().unwrap_or_default();
+                        print_msg(&ContentMessage {
+                            status: "success".into(),
+                            filetype: "folder".into(),
+                            time: epoch(),
+                            size: 0,
+                            key: strip_listing_prefix(full, &prefix),
+                            etag: String::new(),
+                            storage_class: None,
+                        });
                     }
                     for obj in resp.contents() {
                         let size = obj.size().unwrap_or_default() as u64;
-                        let key = obj.key().unwrap_or_default();
-                        let modified = obj
+                        let key = strip_listing_prefix(obj.key().unwrap_or_default(), &prefix);
+                        let etag = obj.e_tag().unwrap_or_default().to_string();
+                        let time = obj
                             .last_modified()
-                            .map(|d| d.to_string())
-                            .unwrap_or_else(|| "-".into());
-                        println!("{modified} {:>12} {key}", format_size(size, BINARY));
+                            .map(smithy_to_chrono)
+                            .unwrap_or_else(epoch);
+                        let storage_class = obj
+                            .storage_class()
+                            .map(|s| s.as_str().to_string())
+                            .unwrap_or_default();
+                        if let Some(filter) = storage_filter {
+                            if !storage_class.is_empty() && storage_class != filter {
+                                continue;
+                            }
+                        }
+                        if args.summarize {
+                            total_objects += 1;
+                            total_size += size;
+                        }
+                        print_msg(&ContentMessage {
+                            status: "success".into(),
+                            filetype: "file".into(),
+                            time,
+                            size,
+                            key,
+                            etag,
+                            storage_class: if storage_class.is_empty() {
+                                None
+                            } else {
+                                Some(storage_class)
+                            },
+                        });
                     }
                     if resp.is_truncated().unwrap_or(false) {
                         token = resp.next_continuation_token().map(String::from);
@@ -403,10 +480,116 @@ async fn ls(args: LsArgs) -> Result<()> {
                         break;
                     }
                 }
+                if args.summarize {
+                    print_msg(&SummaryMessage {
+                        total_objects,
+                        total_size,
+                    });
+                }
             }
         }
     }
     Ok(())
+}
+
+/// `ls --incomplete`: lists in-progress multipart uploads instead of
+/// committed objects, mapped onto the same `ContentMessage` shape ([SEM]
+/// §11). Size is bytes-uploaded-so-far, summed from `list_parts`; a
+/// listing failure there is tolerated and reported as size 0.
+async fn list_incomplete(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    recursive: bool,
+) -> Result<()> {
+    let delimiter = if recursive { None } else { Some("/") };
+    let mut key_marker: Option<String> = None;
+    let mut upload_id_marker: Option<String> = None;
+    loop {
+        let resp = client
+            .list_multipart_uploads()
+            .bucket(bucket)
+            .prefix(prefix)
+            .set_delimiter(delimiter.map(String::from))
+            .set_key_marker(key_marker.take())
+            .set_upload_id_marker(upload_id_marker.take())
+            .send()
+            .await?;
+        for p in resp.common_prefixes() {
+            let full = p.prefix().unwrap_or_default();
+            print_msg(&ContentMessage {
+                status: "success".into(),
+                filetype: "folder".into(),
+                time: epoch(),
+                size: 0,
+                key: strip_listing_prefix(full, prefix),
+                etag: String::new(),
+                storage_class: None,
+            });
+        }
+        for upload in resp.uploads() {
+            let key = upload.key().unwrap_or_default().to_string();
+            let upload_id = upload.upload_id().unwrap_or_default().to_string();
+            let time = upload
+                .initiated()
+                .map(smithy_to_chrono)
+                .unwrap_or_else(epoch);
+            let size = incomplete_upload_size(client, bucket, &key, &upload_id).await;
+            print_msg(&ContentMessage {
+                status: "success".into(),
+                filetype: "file".into(),
+                time,
+                size,
+                key: strip_listing_prefix(&key, prefix),
+                etag: String::new(),
+                storage_class: None,
+            });
+        }
+        if resp.is_truncated().unwrap_or(false) {
+            key_marker = resp.next_key_marker().map(String::from);
+            upload_id_marker = resp.next_upload_id_marker().map(String::from);
+            if key_marker.is_none() && upload_id_marker.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Sum of part sizes for an in-progress multipart upload. Best-effort: a
+/// `list_parts` error simply yields whatever total had accumulated so far
+/// (acceptable to report 0 for an upload with no parts yet).
+async fn incomplete_upload_size(client: &Client, bucket: &str, key: &str, upload_id: &str) -> u64 {
+    let mut total = 0u64;
+    let mut marker: Option<String> = None;
+    loop {
+        let resp = match client
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .set_part_number_marker(marker.take())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return total,
+        };
+        for part in resp.parts() {
+            total += part.size().unwrap_or_default() as u64;
+        }
+        if resp.is_truncated().unwrap_or(false) {
+            marker = resp.next_part_number_marker().map(String::from);
+            if marker.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    total
 }
 
 async fn mb(args: MbArgs) -> Result<()> {
@@ -432,7 +615,7 @@ async fn mb(args: MbArgs) -> Result<()> {
         }
         let result = req.send().await;
         match result {
-            Ok(_) => println!("Bucket created successfully `{target}`."),
+            Ok(_) => print_msg(&MakeBucketMessage { bucket: target }),
             Err(err) => {
                 let svc = err.as_service_error();
                 let already_exists = svc.is_some_and(|e| {
@@ -522,7 +705,9 @@ async fn remove_bucket(client: &Client, alias: &str, bucket: &str, force: bool) 
                 anyhow!(err)
             }
         })?;
-    println!("Removed `{alias}/{bucket}` successfully.");
+    print_msg(&RemoveBucketMessage {
+        bucket: format!("{alias}/{bucket}"),
+    });
     Ok(())
 }
 
@@ -858,7 +1043,11 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
             .await
             .map_err(|_| anyhow!("object does not exist"))?;
         if args.dry_run {
-            println!("DRY-RUN rm `{target}`.");
+            print_msg(&RmMessage {
+                key: target.to_string(),
+                dry_run: true,
+                mod_time: None,
+            });
             return Ok(());
         }
         client
@@ -867,7 +1056,11 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
             .key(&key)
             .send()
             .await?;
-        println!("Removed `{target}`.");
+        print_msg(&RmMessage {
+            key: target.to_string(),
+            dry_run: false,
+            mod_time: None,
+        });
         Ok(())
     }
 }
@@ -902,7 +1095,11 @@ async fn remove_prefix(
         }
         if dry_run {
             for obj in &page {
-                println!("DRY-RUN rm `{alias}/{bucket}/{}`.", obj.key);
+                print_msg(&RmMessage {
+                    key: format!("{alias}/{bucket}/{}", obj.key),
+                    dry_run: true,
+                    mod_time: None,
+                });
             }
             removed += page.len() as u64;
             continue;
@@ -927,7 +1124,11 @@ async fn remove_prefix(
                 ));
             }
             for obj in chunk {
-                println!("Removed `{alias}/{bucket}/{}`.", obj.key);
+                print_msg(&RmMessage {
+                    key: format!("{alias}/{bucket}/{}", obj.key),
+                    dry_run: false,
+                    mod_time: None,
+                });
             }
             removed += chunk.len() as u64;
         }
@@ -949,20 +1150,22 @@ async fn stat(args: StatArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
         let (client, _) = client_for_alias(&parsed.alias).await?;
         let resp = client.head_object().bucket(bucket).key(&key).send().await?;
-        println!("Name      : {key}");
-        println!(
-            "Size      : {}",
-            format_size(resp.content_length().unwrap_or_default() as u64, BINARY)
-        );
-        if let Some(etag) = resp.e_tag() {
-            println!("ETag      : {etag}");
-        }
-        if let Some(modified) = resp.last_modified() {
-            println!("Modified  : {modified}");
-        }
-        if let Some(content_type) = resp.content_type() {
-            println!("Type      : {content_type}");
-        }
+        let date = resp
+            .last_modified()
+            .map(smithy_to_chrono)
+            .unwrap_or_else(epoch);
+        let metadata: BTreeMap<String, String> = resp
+            .metadata()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        print_msg(&StatMessage {
+            key,
+            date,
+            size: resp.content_length().unwrap_or_default() as u64,
+            etag: resp.e_tag().unwrap_or_default().to_string(),
+            content_type: resp.content_type().map(str::to_string),
+            metadata,
+        });
     }
     Ok(())
 }

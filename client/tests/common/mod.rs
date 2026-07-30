@@ -147,6 +147,43 @@ impl TestServer {
     }
 }
 
+/// Start (but never complete) a multipart upload directly via the
+/// aws-sdk-s3 crate, bypassing rs3's own `put` command (which has no way to
+/// leave an upload dangling). Used to reproduce `ls --incomplete` against a
+/// real in-progress multipart upload.
+pub fn start_incomplete_multipart(server: &TestServer, bucket: &str, key: &str) {
+    use aws_config::{BehaviorVersion, Region};
+    use aws_credential_types::Credentials;
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::config::SharedCredentialsProvider;
+
+    let bucket = bucket.to_string();
+    let key = key.to_string();
+    let port = server.port;
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let creds = Credentials::new("testkey", "testsecret", None, None, "rs3-test");
+            let sdk_cfg = aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(SharedCredentialsProvider::new(creds))
+                .load()
+                .await;
+            let s3_cfg = aws_sdk_s3::config::Builder::from(&sdk_cfg)
+                .endpoint_url(format!("http://127.0.0.1:{port}"))
+                .force_path_style(true)
+                .build();
+            let client = Client::from_conf(s3_cfg);
+            client
+                .create_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .expect("create multipart upload");
+        });
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.child.kill();

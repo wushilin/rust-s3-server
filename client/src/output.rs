@@ -3,11 +3,11 @@
 //! builds on. See `docs/superpowers/research/mc-research-output.md` §1/§3
 //! for the normative `mc` behavior this mirrors.
 //!
-//! Several pieces here (e.g. `McMessage`, `print_msg`, `JsonStyle`
-//! variants, `humanize_ibytes`, `print_date`) are not yet called by any
-//! command — they're the interface later tier-2 tasks build on — so this
-//! module is allowed to have dead code until those callers land.
-#![allow(dead_code)]
+//! `McMessage`/`print_msg`/`JsonStyle`/`humanize_ibytes`/`print_date` are now
+//! consumed by `messages.rs` and its callers in `main.rs` (task 2). The
+//! `OutputOpts::quiet`/`no_color` fields are still unread -- `--quiet`/
+//! `--no-color` semantics are a later tier-2 task -- so those two fields
+//! keep a narrowly-scoped `allow` until that task lands.
 
 use std::sync::OnceLock;
 
@@ -15,7 +15,9 @@ use std::sync::OnceLock;
 /// detection in `main()` and read everywhere via [`out()`].
 pub(crate) struct OutputOpts {
     pub json: bool,
+    #[allow(dead_code)]
     pub quiet: bool,
+    #[allow(dead_code)]
     pub no_color: bool,
     pub stdout_tty: bool,
 }

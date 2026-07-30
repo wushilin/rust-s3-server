@@ -8,8 +8,6 @@ fn unimplemented_flags_hard_error() {
     let cases: &[&[&str]] = &[
         &["ls", "--rewind", "7d", "test/rfb"],
         &["ls", "--versions", "test/rfb"],
-        &["ls", "--incomplete", "test/rfb"],
-        &["ls", "--summarize", "test/rfb"],
         &["ls", "--zip", "test/rfb"],
         &["cat", "--offset", "5", "test/rfb/x"],
         &["cat", "--tail", "5", "test/rfb/x"],
