@@ -324,6 +324,8 @@ struct CatArgs {
     offset: Option<i64>,
     #[arg(long)]
     tail: Option<i64>,
+    #[arg(long = "part-number")]
+    part_number: Option<i32>,
     targets: Vec<String>,
 }
 
@@ -1484,12 +1486,27 @@ async fn get(args: GetArgs) -> Result<()> {
     Ok(())
 }
 
+/// `cat`: streams each target's body to stdout, optionally range-restricted
+/// ([SEM] §12). `--offset N` becomes a `Range: bytes=N-` GET; `--tail N` is
+/// client-side sugar computed from a prior `HeadObject` call --
+/// `RangeStart = max(size - N, 0)`, so a tail larger than the object just
+/// returns the whole thing (matches POSIX `tail -c`). `--part-number`
+/// selects a specific part of a multipart-uploaded object via
+/// `x-amz-part-number` and is mutually exclusive with both `--tail` and
+/// `--offset`. Mutual-exclusion / validation is checked up front, verbatim
+/// against mc's `parseCatSyntax`: `--tail`+`--offset` together, either
+/// negative, or `--part-number` combined with either, are all fatal.
 async fn cat(args: CatArgs) -> Result<()> {
-    if args.offset.is_some() {
-        return Err(anyhow!("cat --offset is not implemented yet"));
+    if args.offset.is_some() && args.tail.is_some() {
+        return Err(anyhow!("You cannot specify both --tail and --offset"));
     }
-    if args.tail.is_some() {
-        return Err(anyhow!("cat --tail is not implemented yet"));
+    if args.offset.is_some_and(|o| o < 0) || args.tail.is_some_and(|t| t < 0) {
+        return Err(anyhow!("You cannot specify negative --tail or --offset"));
+    }
+    if args.part_number.is_some() && (args.offset.is_some() || args.tail.is_some()) {
+        return Err(anyhow!(
+            "You cannot use --part-number with --tail or --offset"
+        ));
     }
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
@@ -1500,11 +1517,44 @@ async fn cat(args: CatArgs) -> Result<()> {
             .key
             .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
         let (client, _) = client_for_alias(&parsed.alias).await?;
-        let resp = client.get_object().bucket(bucket).key(key).send().await?;
+
+        let mut start = args.offset.unwrap_or(0);
+        if let Some(tail) = args.tail {
+            if tail > 0 {
+                let head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await?;
+                let size = head.content_length().unwrap_or(0);
+                start = (size - tail).max(0);
+            }
+        }
+
+        let mut req = client.get_object().bucket(&bucket).key(&key);
+        if start > 0 {
+            req = req.range(format!("bytes={start}-"));
+        }
+        if let Some(part_number) = args.part_number {
+            req = req.part_number(part_number);
+        }
+        let resp = req.send().await?;
         let mut reader = resp.body.into_async_read();
         let mut stdout = tokio::io::stdout();
-        tokio::io::copy(&mut reader, &mut stdout).await?;
-        stdout.flush().await?;
+        // mc treats EPIPE on stdout (reader side closed, e.g. piping into
+        // `head`) as a clean/silent success, not an error ([SEM] §12).
+        match tokio::io::copy(&mut reader, &mut stdout).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        if let Err(e) = stdout.flush().await {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
     }
     Ok(())
 }
@@ -1800,37 +1850,60 @@ async fn remove_prefix(
     Ok(removed)
 }
 
+/// `stat`: prints a full metadata block per target. `--recursive` walks the
+/// target as a prefix (like `ls -r`) and prints one block per object under
+/// it instead of stat'ing a single key ([SEM] §13); an empty listing is a
+/// quiet success (matches `ls`'s own empty-prefix behavior), not an error --
+/// only the non-recursive single-key path treats a miss as fatal.
 async fn stat(args: StatArgs) -> Result<()> {
-    if args.recursive {
-        return Err(anyhow!("stat --recursive is not implemented yet"));
-    }
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
             .bucket
             .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
-        let key = parsed
-            .key
-            .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
         let (client, _) = client_for_alias(&parsed.alias).await?;
-        let resp = client.head_object().bucket(bucket).key(&key).send().await?;
-        let date = resp
-            .last_modified()
-            .map(smithy_to_chrono)
-            .unwrap_or_else(epoch);
-        let metadata: BTreeMap<String, String> = resp
-            .metadata()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        print_msg(&StatMessage {
-            key,
-            date,
-            size: resp.content_length().unwrap_or_default() as u64,
-            etag: strip_etag_quotes(resp.e_tag().unwrap_or_default()),
-            content_type: resp.content_type().map(str::to_string),
-            cache_control: resp.cache_control().map(str::to_string),
-            metadata,
-        });
+        if args.recursive {
+            let prefix = parsed.key.unwrap_or_default();
+            let objects = list::collect_objects(&client, &bucket, &prefix).await?;
+            for obj in objects {
+                stat_one(&client, &parsed.alias, &bucket, &obj.key).await?;
+            }
+        } else {
+            let key = parsed
+                .key
+                .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
+            stat_one(&client, &parsed.alias, &bucket, &key).await?;
+        }
     }
+    Ok(())
+}
+
+/// Shared `HeadObject` + [`StatMessage`] print used by both the single-key
+/// and `--recursive` paths of `stat`.
+async fn stat_one(client: &Client, alias: &str, bucket: &str, key: &str) -> Result<()> {
+    let resp = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .with_context(|| format!("stat `{alias}/{bucket}/{key}`"))?;
+    let date = resp
+        .last_modified()
+        .map(smithy_to_chrono)
+        .unwrap_or_else(epoch);
+    let metadata: BTreeMap<String, String> = resp
+        .metadata()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    print_msg(&StatMessage {
+        key: key.to_string(),
+        date,
+        size: resp.content_length().unwrap_or_default() as u64,
+        etag: strip_etag_quotes(resp.e_tag().unwrap_or_default()),
+        content_type: resp.content_type().map(str::to_string),
+        cache_control: resp.cache_control().map(str::to_string),
+        metadata,
+    });
     Ok(())
 }

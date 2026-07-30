@@ -116,3 +116,94 @@ fn head_bzip2_content_type_is_hard_error() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn cat_offset_and_tail() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/catb"]);
+    let src = server.dir.path().join("abc.txt");
+    std::fs::write(&src, b"0123456789").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/catb/abc.txt"]);
+    assert_eq!(
+        server.rs3_ok(&["cat", "--offset", "7", "test/catb/abc.txt"]),
+        "789"
+    );
+    assert_eq!(
+        server.rs3_ok(&["cat", "--tail", "3", "test/catb/abc.txt"]),
+        "789"
+    );
+    assert_eq!(
+        server.rs3_ok(&["cat", "--tail", "99", "test/catb/abc.txt"]),
+        "0123456789"
+    );
+    let out = server.rs3(&["cat", "--tail", "1", "--offset", "1", "test/catb/abc.txt"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn cat_negative_offset_or_tail_is_fatal() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/catn"]);
+    let src = server.dir.path().join("abc.txt");
+    std::fs::write(&src, b"0123456789").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/catn/abc.txt"]);
+    let out = server.rs3(&["cat", "--offset", "-1", "test/catn/abc.txt"]);
+    assert!(!out.status.success());
+    let out = server.rs3(&["cat", "--tail", "-1", "test/catn/abc.txt"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn cat_part_number_with_tail_or_offset_is_fatal() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/catpn"]);
+    let src = server.dir.path().join("abc.txt");
+    std::fs::write(&src, b"0123456789").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/catpn/abc.txt"]);
+    let out = server.rs3(&[
+        "cat",
+        "--part-number",
+        "1",
+        "--offset",
+        "1",
+        "test/catpn/abc.txt",
+    ]);
+    assert!(!out.status.success());
+    let out = server.rs3(&[
+        "cat",
+        "--part-number",
+        "1",
+        "--tail",
+        "1",
+        "test/catpn/abc.txt",
+    ]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn stat_recursive_walks_prefix() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/statr"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"x").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/statr/p/a.txt"]);
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/statr/p/b.txt"]);
+    let out = server.rs3_ok(&["stat", "-r", "test/statr/p/"]);
+    assert!(out.contains("a.txt") && out.contains("b.txt"), "out: {out}");
+}
+
+#[test]
+fn stat_recursive_empty_prefix_is_success_no_output() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/statempty"]);
+    let out = server.rs3_ok(&["stat", "-r", "test/statempty/nosuchprefix/"]);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn stat_nonrecursive_missing_key_is_error() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/statmiss"]);
+    let out = server.rs3(&["stat", "test/statmiss/nosuch.txt"]);
+    assert!(!out.status.success());
+}
