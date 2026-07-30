@@ -317,6 +317,41 @@ impl McMessage for AccountStat {
     }
 }
 
+/// `du` per-prefix message ([SEM] §5's `duMessage`). `main.rs`'s `du_walk`
+/// prints one of these per directory level actually visited, per the depth
+/// semantics implemented there; `isVersions` is always `false` -- rs3 has no
+/// `--versions`-aware `du` path yet.
+pub(crate) struct DuMessage {
+    pub prefix: String,
+    pub size: u64,
+    pub objects: u64,
+}
+
+impl McMessage for DuMessage {
+    fn human(&self) -> String {
+        let mut label = "object".to_string();
+        if self.objects != 1 {
+            label.push('s');
+        }
+        format!(
+            "{}\t{} {label}\t{}",
+            humanize_ibytes(self.size),
+            self.objects,
+            self.prefix
+        )
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "prefix": self.prefix,
+            "size": self.size,
+            "objects": self.objects,
+            "status": "success",
+            "isVersions": false,
+        })
+    }
+}
+
 #[derive(Default)]
 struct SessionState {
     total_count: u64,
@@ -653,6 +688,33 @@ mod tests {
         assert!(v["duration"].is_u64(), "duration must serialize as an int");
         assert_eq!(v["transferred"], 1024);
         assert_eq!(v["speed"], 1024.0 * 1024.0);
+    }
+
+    #[test]
+    fn du_message_pluralizes_and_serializes_field_order() {
+        let msg = DuMessage {
+            prefix: "test/dub/a/sub".into(),
+            size: 1024,
+            objects: 1,
+        };
+        assert_eq!(msg.human(), "1.0KiB\t1 object\ttest/dub/a/sub");
+        assert_eq!(
+            msg.json(),
+            json!({
+                "prefix": "test/dub/a/sub",
+                "size": 1024,
+                "objects": 1,
+                "status": "success",
+                "isVersions": false,
+            })
+        );
+
+        let plural = DuMessage {
+            prefix: "test/dub".into(),
+            size: 3072,
+            objects: 3,
+        };
+        assert_eq!(plural.human(), "3.0KiB\t3 objects\ttest/dub");
     }
 
     #[test]

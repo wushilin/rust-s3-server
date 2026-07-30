@@ -9,8 +9,10 @@ mod transfer;
 mod urls;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
@@ -25,8 +27,8 @@ use output::{OutputOpts, init_output, out, print_error, print_msg};
 use config::{Alias, client_for_alias, load_config, save_config};
 use list::ObjectPaginator;
 use messages::{
-    ContentMessage, CopyMessage, MakeBucketMessage, RemoveBucketMessage, RmMessage, StatMessage,
-    SummaryMessage, TransferSession,
+    ContentMessage, CopyMessage, DuMessage, MakeBucketMessage, RemoveBucketMessage, RmMessage,
+    StatMessage, SummaryMessage, TransferSession,
 };
 use transfer::{download_object, transfer_object_between_s3, upload_file};
 use urls::{DEFAULT_PART_SIZE, is_s3_url, parse_s3_url, parse_size};
@@ -141,6 +143,8 @@ enum Commands {
     Stat(StatArgs),
     #[command(about = "synchronize object(s) to a remote site")]
     Mirror(MirrorArgs),
+    #[command(about = "summarize disk usage recursively")]
+    Du(DuArgs),
 }
 
 #[derive(Args, Debug)]
@@ -369,6 +373,19 @@ struct StatArgs {
     targets: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct DuArgs {
+    /// mc can't tell `-d 0` apart from "not set" ([SEM] §5's `mainDu`
+    /// resolution): both fall through to the same default-depth branch, so
+    /// treating `0` as "unset" here reproduces that quirk faithfully rather
+    /// than special-casing it away.
+    #[arg(short = 'd', long, default_value_t = 0)]
+    depth: i32,
+    #[arg(short = 'r', long)]
+    recursive: bool,
+    targets: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -399,6 +416,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Rm(args) => rm(args).await,
         Commands::Stat(args) => stat(args).await,
         Commands::Mirror(args) => mirror(args).await,
+        Commands::Du(args) => du(args).await,
     }
 }
 
@@ -1906,4 +1924,139 @@ async fn stat_one(client: &Client, alias: &str, bucket: &str, key: &str) -> Resu
         metadata,
     });
     Ok(())
+}
+
+/// `du`: recursive disk-usage summary matching mc's exact depth semantics
+/// ([SEM] §5, `mainDu`). Depth resolution: an explicit non-zero `-d` wins;
+/// otherwise `-r` means unlimited (`-1`); otherwise the default is `1` (a
+/// single flat total for the whole target). mc's `-d 0` is indistinguishable
+/// from "unset" (`cliCtx.Int("depth") == 0` can't tell "the user typed `-d
+/// 0`" from "the flag was never given"), so it falls through to the same
+/// default here too, rather than being treated as its own case.
+async fn du(args: DuArgs) -> Result<()> {
+    if args.targets.is_empty() {
+        return Err(anyhow!("du: this command requires at least one argument"));
+    }
+    let effective_depth = if args.depth != 0 {
+        args.depth
+    } else if args.recursive {
+        -1
+    } else {
+        1
+    };
+    let mut first_err = None;
+    for target in &args.targets {
+        let parsed = parse_s3_url(target)?;
+        let bucket = parsed.bucket.clone().ok_or_else(|| {
+            anyhow!("du: `{target}` is not a folder. Only folders are supported by 'du' command.")
+        })?;
+        let (client, _) = client_for_alias(&parsed.alias).await?;
+        let prefix = parsed.key.unwrap_or_default();
+        if let Err(e) = du_walk(&client, &parsed.alias, &bucket, &prefix, effective_depth).await
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Recursive walk mirroring mc's `du()` (`cmd/du-main.go`, [SEM] §5): a
+/// `depth` of exactly `1` does one flat recursive listing and sums it into a
+/// single number -- the terminal/leaf case, "no more per-level breakdown
+/// below here". Any other depth does a non-recursive (delimiter) listing,
+/// sums the files found directly at this level, and recurses into every
+/// subdirectory with `depth - 1` (a positive depth counts down; `-1` --
+/// unlimited -- and an already-exhausted `0` both stay put, since mc only
+/// decrements `depth` while it's `> 0`). A line is printed for every level
+/// *except* when the current call's `depth` is exactly `0`: that level's
+/// total still folds into its parent's sum via the return value, it just
+/// isn't printed on its own (mc's `if depth != 0 { printMsg(...) }`).
+///
+/// Boxed because an `async fn` can't recurse into itself directly (its
+/// future would need to contain itself, which isn't a statically sized
+/// type).
+fn du_walk<'a>(
+    client: &'a Client,
+    alias: &'a str,
+    bucket: &'a str,
+    prefix: &'a str,
+    depth: i32,
+) -> Pin<Box<dyn Future<Output = Result<(u64, u64)>> + 'a>> {
+    Box::pin(async move {
+        let mut size = 0u64;
+        let mut objects = 0u64;
+        if depth == 1 {
+            for obj in list::collect_objects(client, bucket, prefix).await? {
+                size += obj.size;
+                objects += 1;
+            }
+        } else {
+            let mut token: Option<String> = None;
+            let mut subdirs: Vec<String> = Vec::new();
+            loop {
+                let resp = client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(prefix)
+                    .delimiter("/")
+                    .set_continuation_token(token.take())
+                    .send()
+                    .await?;
+                for obj in resp.contents() {
+                    let key = obj.key().unwrap_or_default();
+                    let obj_size = obj.size().unwrap_or_default() as u64;
+                    if key.ends_with('/') && obj_size == 0 {
+                        continue; // folder marker
+                    }
+                    size += obj_size;
+                    objects += 1;
+                }
+                for p in resp.common_prefixes() {
+                    if let Some(full) = p.prefix() {
+                        subdirs.push(full.to_string());
+                    }
+                }
+                if resp.is_truncated().unwrap_or(false) {
+                    token = resp.next_continuation_token().map(String::from);
+                    if token.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let child_depth = if depth > 0 { depth - 1 } else { depth };
+            for subdir in subdirs {
+                let (sub_size, sub_objects) =
+                    du_walk(client, alias, bucket, &subdir, child_depth).await?;
+                size += sub_size;
+                objects += sub_objects;
+            }
+        }
+        if depth != 0 {
+            print_msg(&DuMessage {
+                prefix: du_display_prefix(alias, bucket, prefix),
+                size,
+                objects,
+            });
+        }
+        Ok((size, objects))
+    })
+}
+
+/// `alias/bucket[/prefix]` with any trailing slash trimmed off -- the
+/// user-facing display form for a `du` line's prefix, matching how the
+/// target argument itself is styled (rather than mc's own host-relative
+/// `bucket/prefix` form, which drops the alias entirely).
+fn du_display_prefix(alias: &str, bucket: &str, prefix: &str) -> String {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        format!("{alias}/{bucket}")
+    } else {
+        format!("{alias}/{bucket}/{trimmed}")
+    }
 }

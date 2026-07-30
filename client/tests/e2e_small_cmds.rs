@@ -207,3 +207,34 @@ fn stat_nonrecursive_missing_key_is_error() {
     let out = server.rs3(&["stat", "test/statmiss/nosuch.txt"]);
     assert!(!out.status.success());
 }
+
+#[test]
+fn du_depth_semantics() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/dub"]);
+    let src = server.dir.path().join("k.bin");
+    std::fs::write(&src, vec![0u8; 1024]).unwrap();
+    for key in ["a/1.bin", "a/sub/2.bin", "b/3.bin"] {
+        server.rs3_ok(&["put", src.to_str().unwrap(), &format!("test/dub/{key}")]);
+    }
+    // plain du => depth 1 => single total line for the target
+    let out = server.rs3_ok(&["du", "test/dub"]);
+    assert_eq!(out.lines().count(), 1, "plain du = one line: {out}");
+    assert!(
+        out.contains("3.0KiB") && out.contains("3 objects"),
+        "out: {out}"
+    );
+    // du -r => unlimited => one line per directory level + total (a/sub, a, b, root = 4 lines)
+    let out = server.rs3_ok(&["du", "-r", "test/dub"]);
+    assert_eq!(out.lines().count(), 4, "out: {out}");
+    assert!(
+        out.lines()
+            .any(|l| l.ends_with("a/sub") && l.contains("1 object")),
+        "out: {out}"
+    );
+    // du -d 1: children aggregated silently, single top line
+    let json = server.rs3_ok(&["--json", "du", "test/dub"]);
+    let v: serde_json::Value = serde_json::from_str(json.lines().last().unwrap()).unwrap();
+    assert_eq!(v["objects"], 3);
+    assert_eq!(v["size"], 3072);
+}
