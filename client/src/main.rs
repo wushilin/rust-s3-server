@@ -1,5 +1,6 @@
 mod attr;
 mod config;
+mod diff;
 mod list;
 mod messages;
 mod mirror;
@@ -149,6 +150,8 @@ enum Commands {
     Tree(TreeArgs),
     #[command(about = "stream stdin to an object (or, with no target, to stdout)")]
     Pipe(PipeArgs),
+    #[command(about = "list differences in object name, size, and date between two folders")]
+    Diff(DiffArgs),
 }
 
 #[derive(Args, Debug)]
@@ -448,6 +451,14 @@ struct TreeArgs {
     targets: Vec<String>,
 }
 
+/// `diff FIRST SECOND`: exactly two positionals, no flags of its own
+/// ([SEM] §9 -- `diffFlags = []cli.Flag{}` beyond the CLI globals).
+#[derive(Args, Debug)]
+struct DiffArgs {
+    first: String,
+    second: String,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -481,7 +492,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Du(args) => du(args).await,
         Commands::Tree(args) => tree(args).await,
         Commands::Pipe(args) => pipe(args).await,
+        Commands::Diff(args) => diff(args).await,
     }
+}
+
+async fn diff(args: DiffArgs) -> Result<()> {
+    diff::run_diff(&args.first, &args.second).await
 }
 
 async fn alias(args: AliasArgs) -> Result<()> {

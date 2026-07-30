@@ -193,7 +193,11 @@ mod tests {
     }
 }
 
-enum Side {
+/// Resolved local-vs-S3 identity for one side of a `mirror`/`diff` operand.
+/// `pub(crate)` so `diff.rs` can reuse `resolve_side`'s exists()/`is_s3_url`
+/// disambiguation and the same display-URL fields (`alias_name`/`bucket`/
+/// `prefix`) instead of re-parsing the operand itself.
+pub(crate) enum Side {
     Local(std::path::PathBuf),
     S3 {
         client: Client,
@@ -204,7 +208,7 @@ enum Side {
     },
 }
 
-async fn resolve_side(spec: &str) -> Result<Side> {
+pub(crate) async fn resolve_side(spec: &str) -> Result<Side> {
     let path = Path::new(spec);
     if path.exists() || !crate::urls::is_s3_url(spec) {
         return Ok(Side::Local(path.to_path_buf()));

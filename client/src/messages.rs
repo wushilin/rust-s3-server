@@ -403,6 +403,46 @@ impl McMessage for TreeMessage {
     }
 }
 
+/// `diff` per-pair message ([OUT] §2's `diffMessage`). `diff` is the raw
+/// `differType` int code -- mc's `differType` has no `MarshalJSON`, so
+/// `--json` serializes the bare integer, not the human `String()` word
+/// (gotcha 6): `2` size, `4` type (unreachable here -- `diff.rs`'s entries
+/// are always plain files, rs3 has no directory-vs-file `Entry` variant),
+/// `5` only-in-first, `6` only-in-second, `7` mm-source-mtime. `first`/
+/// `second` are always present (empty string, not omitted, when the pair
+/// has no counterpart on that side) -- ground-truth verified against real
+/// `mc --json`: an only-in-first line prints `"second":""`, not a missing
+/// key.
+pub(crate) struct DiffMessage {
+    pub first: String,
+    pub second: String,
+    pub diff: i64,
+}
+
+impl McMessage for DiffMessage {
+    fn human(&self) -> String {
+        match self.diff {
+            5 => format!("< {}", self.first),
+            6 => format!("> {}", self.second),
+            // 2 (size), 3 (metadata, unreachable), 4 (type, unreachable),
+            // 7 (mm-source-mtime) all share the same "!" marker in mc's own
+            // diffMessage.String() ([OUT] §2 gotcha 6 / [SEM] §9's LEGEND
+            // note: the legend text undersells this, the code covers all
+            // four with the same glyph).
+            _ => format!("! {}", self.second),
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "status": "success",
+            "first": self.first,
+            "second": self.second,
+            "diff": self.diff,
+        })
+    }
+}
+
 #[derive(Default)]
 struct SessionState {
     total_count: u64,
