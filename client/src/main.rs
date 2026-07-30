@@ -47,12 +47,15 @@ fn smithy_to_chrono(t: &aws_smithy_types::DateTime) -> DateTime<Utc> {
 /// directory target and re-listing it with a trailing separator appended
 /// *before* computing the strip-prefix (`cmd/ls.go`'s `mainList` +
 /// `generateContentMessages`'s `prefixPath` truncation, [SEM] §11). `ls`'s
-/// main object-listing path now replicates that exactly with a
-/// `HeadObject` probe (see `ls`'s `(Some(bucket), key)` arm), so by the
-/// time it calls this helper `prefix` always already ends in `/` (or is
-/// empty). `list_incomplete` has no equivalent "does an in-progress upload
-/// exist at exactly this key" probe available, so it still calls this with
-/// a possibly-bare `prefix`; the boundary-consuming fallback below covers
+/// main object-listing path replicates that exactly (a `HeadObject` +
+/// child-probe resolution, then mc's parent-directory truncation of the
+/// strip boundary -- see `ls`'s `(Some(bucket), key)` arm), so it always
+/// calls this helper with a `prefix` that ends in `/` or is empty, i.e.
+/// only the plain `strip_prefix` branches below.
+///
+/// `list_incomplete` has no equivalent "does an in-progress upload exist
+/// at exactly this key" probe available, so it still calls this with a
+/// possibly-bare `prefix`; the boundary-consuming fallback below covers
 /// that case reasonably (a matching key must cross exactly one `/`
 /// boundary right after a bare `prefix` to be treated as living "under"
 /// it; one that continues with a non-`/` character was only a
@@ -527,6 +530,10 @@ async fn ls(args: LsArgs) -> Result<()> {
                                 .max_keys(1)
                                 .send()
                                 .await;
+                            // (the `common_prefixes` half mirrors mc's own
+                            // condition; this probe sets no delimiter, so S3
+                            // never populates it -- it's kept only so the
+                            // check reads the same as the Go original.)
                             let is_directory = probe.is_ok_and(|r| {
                                 !r.contents().is_empty() || !r.common_prefixes().is_empty()
                             });
@@ -536,6 +543,19 @@ async fn ls(args: LsArgs) -> Result<()> {
                         }
                     }
                 }
+                // The boundary displayed keys are stripped of. mc truncates
+                // the prefix to its *parent directory* before stripping
+                // (`prefixPath = prefixPath[:strings.LastIndex(prefixPath,
+                // "/")+1]`, `cmd/ls.go`'s `generateContentMessages`), which
+                // matters for a bare prefix kept as a partial-filename
+                // search: `ls bucket/dir/pre` matching `dir/prefix1.txt`
+                // displays `prefix1.txt`, relative to `dir/`. For every
+                // other path `prefix` is already slash-terminated (or
+                // empty) by this point, and this truncation is a no-op.
+                let strip_from = match prefix.rfind('/') {
+                    Some(i) => prefix[..i + 1].to_string(),
+                    None => String::new(),
+                };
                 let delimiter = if args.recursive { None } else { Some("/") };
                 let mut token = None;
                 let mut total_objects = 0u64;
@@ -556,14 +576,14 @@ async fn ls(args: LsArgs) -> Result<()> {
                             filetype: "folder".into(),
                             time: epoch(),
                             size: 0,
-                            key: strip_listing_prefix(full, &prefix),
+                            key: strip_listing_prefix(full, &strip_from),
                             etag: String::new(),
                             storage_class: None,
                         });
                     }
                     for obj in resp.contents() {
                         let size = obj.size().unwrap_or_default() as u64;
-                        let key = strip_listing_prefix(obj.key().unwrap_or_default(), &prefix);
+                        let key = strip_listing_prefix(obj.key().unwrap_or_default(), &strip_from);
                         let etag = strip_etag_quotes(obj.e_tag().unwrap_or_default());
                         let time = obj
                             .last_modified()

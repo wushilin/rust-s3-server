@@ -153,6 +153,33 @@ fn ls_bare_prefix_with_no_directory_children_falls_back_to_partial_name_match() 
 }
 
 #[test]
+fn ls_nested_bare_prefix_partial_match_strips_only_parent_dir() {
+    // Same partial-filename-search path as the test above, but nested one
+    // directory down. mc's `generateContentMessages` (cmd/ls.go) truncates
+    // the strip boundary to the bare prefix's *parent directory*
+    // (`prefixPath = prefixPath[:strings.LastIndex(prefixPath, "/")+1]`),
+    // so `ls bucket/dir/pre` matching `dir/prefix1.txt` displays
+    // `prefix1.txt` -- relative to `dir/`, not the full key. The bare
+    // prefix must still be the *query* prefix (that's what scopes the
+    // search), which is why `dir2/other.txt` must not appear at all.
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/lsnested"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&[
+        "put",
+        src.to_str().unwrap(),
+        "test/lsnested/dir/prefix1.txt",
+    ]);
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/lsnested/dir2/other.txt"]);
+    let out = server.rs3_ok(&["--json", "ls", "test/lsnested/dir/pre"]);
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected exactly one entry, out: {out:?}");
+    let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["key"], "prefix1.txt", "out: {out}");
+}
+
+#[test]
 fn ls_summarize_and_human_format() {
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/lssum"]);
