@@ -1,15 +1,20 @@
-//! mc-shaped message structs for `ls`, `mb`, `rb`, `rm`, and `stat`. Field
-//! names/order and human/JSON rendering rules are normative per
+//! mc-shaped message structs for `ls`, `mb`, `rb`, `rm`, `stat`, and the
+//! transfer commands (`cp`/`put`/`get`/`mirror`). Field names/order and
+//! human/JSON rendering rules are normative per
 //! `docs/superpowers/research/mc-research-output.md` §2
 //! (`contentMessage`/`summaryMessage`/`makeBucketMessage`/
-//! `removeBucketMessage`/`rmMessage`/`statMessage`).
+//! `removeBucketMessage`/`rmMessage`/`statMessage`/`copyMessage`/
+//! `mirrorMessage`) and §5 (`accountStat`, progress bar).
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 
-use crate::output::{JsonStyle, McMessage, humanize_ibytes, print_date};
+use crate::output::{JsonStyle, McMessage, humanize_ibytes, out, print_date, print_msg};
 
 /// `ls` per-entry message (also reused for `--incomplete` uploads and the
 /// alias-only bucket listing, where `filetype` is `"folder"`).
@@ -212,6 +217,213 @@ impl McMessage for StatMessage {
     }
 }
 
+/// `cp`/`mv`/`put`/`get` per-object completion message.
+pub(crate) struct CopyMessage {
+    pub source: String,
+    pub target: String,
+    pub size: u64,
+    pub total_count: u64,
+    pub total_size: u64,
+}
+
+impl McMessage for CopyMessage {
+    fn human(&self) -> String {
+        format!("`{}` -> `{}`", self.source, self.target)
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "status": "success",
+            "source": self.source,
+            "target": self.target,
+            "size": self.size,
+            "totalCount": self.total_count,
+            "totalSize": self.total_size,
+        })
+    }
+}
+
+/// `mirror` per-object completion message: either a copy (`removed:
+/// false`) or a delete of a target-only object (`removed: true`).
+pub(crate) struct MirrorMessage {
+    pub source: String,
+    pub target: String,
+    pub size: u64,
+    pub total_count: u64,
+    pub total_size: u64,
+    pub removed: bool,
+}
+
+impl McMessage for MirrorMessage {
+    fn human(&self) -> String {
+        if self.removed {
+            format!("Removed `{}`.", self.target)
+        } else {
+            format!("`{}` -> `{}`", self.source, self.target)
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "status": "success",
+            "source": self.source,
+            "target": self.target,
+            "size": self.size,
+            "totalCount": self.total_count,
+            "totalSize": self.total_size,
+            "eventTime": if self.removed { Utc::now().to_rfc3339() } else { String::new() },
+            "eventType": if self.removed { "s3:ObjectRemoved:Delete" } else { "" },
+        })
+    }
+}
+
+/// Final summary for a transfer session (`cp`/`put`/`get`/`mirror`).
+/// `duration_ns` serializes as a raw nanosecond integer, matching mc's
+/// `time.Duration`-has-no-custom-marshaling footgun (research doc §5,
+/// gotcha 7). `speed_bps` is bytes/sec (mc's `accounter.Speed()`); only the
+/// human rendering converts to MB/s.
+pub(crate) struct AccountStat {
+    pub total: u64,
+    pub transferred: u64,
+    pub duration_ns: u128,
+    pub speed_bps: f64,
+}
+
+impl McMessage for AccountStat {
+    fn human(&self) -> String {
+        let secs = self.duration_ns as f64 / 1_000_000_000.0;
+        let mb_per_sec = self.speed_bps / (1024.0 * 1024.0);
+        format!(
+            "Total: {} | Transferred: {} | Duration: {secs:.2}s | Speed: {mb_per_sec:.2} MB/s",
+            humanize_ibytes(self.total),
+            humanize_ibytes(self.transferred),
+        )
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "status": "success",
+            "total": self.total,
+            "transferred": self.transferred,
+            "duration": self.duration_ns.min(u64::MAX as u128) as u64,
+            "speed": self.speed_bps,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SessionState {
+    total_count: u64,
+    total_size: u64,
+    transferred_count: u64,
+    transferred_size: u64,
+}
+
+/// Tracks one `cp`/`put`/`get`/`mirror` invocation's progress and owns the
+/// choice between an animated byte-progress bar and printing a message per
+/// object. Per `docs/superpowers/research/mc-research-output.md` §5, the
+/// bar is shown iff stdout is a TTY and neither `--quiet` nor `--json` is
+/// set; otherwise every object completion is a printed
+/// `CopyMessage`/`MirrorMessage` and a final `AccountStat` line closes the
+/// session (mc's "`--quiet` is not silence" behavior, §4).
+///
+/// Deviates from the brief's sketched `&mut self` API: mirror's copies run
+/// concurrently via `buffer_unordered`, so every method here takes `&self`
+/// and guards the mutable bookkeeping with an internal `Mutex`. This lets
+/// callers hold a single shared `&TransferSession` across concurrent
+/// futures instead of threading `&mut` through them (which `buffer_unordered`
+/// can't express). Noted in the task report.
+pub(crate) struct TransferSession {
+    bar: Option<ProgressBar>,
+    state: Mutex<SessionState>,
+    started: Instant,
+}
+
+impl TransferSession {
+    /// `label` is reserved for a future bar prefix/caption; the bar itself
+    /// is intentionally plain for now since no e2e test observes it (bar
+    /// mode requires a real TTY, which the test harness never provides).
+    pub(crate) fn new(_label: &str) -> Self {
+        let use_bar = out().stdout_tty && !out().quiet && !out().json;
+        let bar = if use_bar {
+            let pb = ProgressBar::new(0);
+            if let Ok(style) = ProgressStyle::with_template(
+                "{bar:40.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})",
+            ) {
+                pb.set_style(style);
+            }
+            Some(pb)
+        } else {
+            None
+        };
+        Self {
+            bar,
+            state: Mutex::new(SessionState::default()),
+            started: Instant::now(),
+        }
+    }
+
+    /// Register `bytes` of additional planned transfer for one more object
+    /// (called once per object, as its size becomes known -- typically
+    /// right before or as its transfer starts).
+    pub(crate) fn add_total(&self, bytes: u64) {
+        let mut state = self.state.lock().expect("TransferSession state poisoned");
+        state.total_count += 1;
+        state.total_size += bytes;
+        if let Some(bar) = &self.bar {
+            bar.inc_length(bytes);
+        }
+    }
+
+    /// Current running totals, for filling in a `CopyMessage`/
+    /// `MirrorMessage`'s `total_count`/`total_size` fields.
+    pub(crate) fn totals(&self) -> (u64, u64) {
+        let state = self.state.lock().expect("TransferSession state poisoned");
+        (state.total_count, state.total_size)
+    }
+
+    /// Mark one object's transfer complete (`size` bytes moved -- `0` for
+    /// a delete event, which carries no transferred payload). In Bar mode
+    /// this ticks the bar and prints nothing; otherwise it prints `msg` via
+    /// [`print_msg`].
+    pub(crate) fn object_done(&self, msg: &dyn McMessage, size: u64) {
+        {
+            let mut state = self.state.lock().expect("TransferSession state poisoned");
+            state.transferred_count += 1;
+            state.transferred_size += size;
+        }
+        match &self.bar {
+            Some(bar) => bar.inc(size),
+            None => print_msg(msg),
+        }
+    }
+
+    /// Close the session: Bar mode clears the bar and prints nothing;
+    /// otherwise prints a final [`AccountStat`] summary line (mc prints
+    /// this even in `--quiet` mode -- research doc §4 point 3).
+    pub(crate) fn finish(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+            return;
+        }
+        let state = self.state.lock().expect("TransferSession state poisoned");
+        let elapsed = self.started.elapsed();
+        let secs = elapsed.as_secs_f64();
+        let speed_bps = if secs > 0.0 {
+            state.transferred_size as f64 / secs
+        } else {
+            0.0
+        };
+        let stat = AccountStat {
+            total: state.total_size,
+            transferred: state.transferred_size,
+            duration_ns: elapsed.as_nanos(),
+            speed_bps,
+        };
+        print_msg(&stat);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +575,102 @@ mod tests {
         };
         assert!(msg.json().get("metadata").is_none());
         assert!(!msg.human().contains("Metadata"));
+    }
+
+    #[test]
+    fn copy_message_human_and_json() {
+        let msg = CopyMessage {
+            source: "local/f.txt".into(),
+            target: "alias/bucket/f.txt".into(),
+            size: 5,
+            total_count: 1,
+            total_size: 5,
+        };
+        assert_eq!(msg.human(), "`local/f.txt` -> `alias/bucket/f.txt`");
+        assert_eq!(
+            msg.json(),
+            json!({
+                "status": "success",
+                "source": "local/f.txt",
+                "target": "alias/bucket/f.txt",
+                "size": 5,
+                "totalCount": 1,
+                "totalSize": 5,
+            })
+        );
+    }
+
+    #[test]
+    fn mirror_message_copy_vs_delete_human_and_event_fields() {
+        let copy = MirrorMessage {
+            source: "local/a.txt".into(),
+            target: "alias/bucket/a.txt".into(),
+            size: 3,
+            total_count: 1,
+            total_size: 3,
+            removed: false,
+        };
+        assert_eq!(copy.human(), "`local/a.txt` -> `alias/bucket/a.txt`");
+        assert_eq!(copy.json()["eventType"], "");
+        assert_eq!(copy.json()["eventTime"], "");
+
+        let delete = MirrorMessage {
+            source: String::new(),
+            target: "alias/bucket/stale.txt".into(),
+            size: 0,
+            total_count: 1,
+            total_size: 3,
+            removed: true,
+        };
+        assert_eq!(delete.human(), "Removed `alias/bucket/stale.txt`.");
+        assert_eq!(delete.json()["eventType"], "s3:ObjectRemoved:Delete");
+        assert!(!delete.json()["eventTime"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn account_stat_human_and_raw_nanosecond_json() {
+        let stat = AccountStat {
+            total: 1024,
+            transferred: 1024,
+            duration_ns: 2_000_000_000, // 2s
+            speed_bps: 1024.0 * 1024.0, // 1 MiB/s
+        };
+        let human = stat.human();
+        assert!(human.contains("Total: 1.0KiB"), "human: {human}");
+        assert!(human.contains("Transferred: 1.0KiB"), "human: {human}");
+        assert!(human.contains("Duration: 2.00s"), "human: {human}");
+        assert!(human.contains("Speed: 1.00 MB/s"), "human: {human}");
+        let v = stat.json();
+        assert_eq!(v["duration"], 2_000_000_000u64);
+        assert!(v["duration"].is_u64(), "duration must serialize as an int");
+        assert_eq!(v["transferred"], 1024);
+        assert_eq!(v["speed"], 1024.0 * 1024.0);
+    }
+
+    #[test]
+    fn transfer_session_lines_mode_tracks_totals_and_prints_account_stat() {
+        // Not using TransferSession::new here since it reads the process-
+        // global `out()` singleton (shared across every test in this
+        // binary); construct the same Lines-mode shape directly instead so
+        // this test is independent of init/ordering.
+        let session = TransferSession {
+            bar: None,
+            state: Mutex::new(SessionState::default()),
+            started: Instant::now(),
+        };
+        session.add_total(10);
+        session.add_total(20);
+        assert_eq!(session.totals(), (2, 30));
+        let msg = CopyMessage {
+            source: "a".into(),
+            target: "b".into(),
+            size: 10,
+            total_count: 2,
+            total_size: 30,
+        };
+        session.object_done(&msg, 10);
+        let state = session.state.lock().unwrap();
+        assert_eq!(state.transferred_count, 1);
+        assert_eq!(state.transferred_size, 10);
     }
 }

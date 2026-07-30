@@ -23,6 +23,16 @@ const COPY_SOURCE_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
 
 const MAX_SINGLE_COPY: u64 = 5 * 1024 * 1024 * 1024; // AWS CopyObject ceiling
 
+/// Result of a single [`upload_file`] call: enough for a caller to build its
+/// own `CopyMessage`/`MirrorMessage` (this module intentionally prints
+/// nothing itself -- message shape/type is the caller's call, since `cp`/
+/// `put`/`get` want `CopyMessage` while `mirror` wants `MirrorMessage`).
+pub(crate) struct UploadOutcome {
+    /// Fully resolved `alias/bucket/key` the object now lives at.
+    pub target: String,
+    pub size: u64,
+}
+
 pub(crate) fn encode_copy_source(bucket: &str, key: &str) -> String {
     format!("{bucket}/{}", utf8_percent_encode(key, COPY_SOURCE_ENCODE))
 }
@@ -44,7 +54,7 @@ pub(crate) async fn upload_file(
     parallel: usize,
     disable_multipart: bool,
     storage_class: Option<&str>,
-) -> Result<()> {
+) -> Result<UploadOutcome> {
     let parsed = parse_s3_url(target)?;
     let bucket = parsed
         .bucket
@@ -86,8 +96,10 @@ pub(crate) async fn upload_file(
         )
         .await?;
     }
-    println!("Uploaded `{}` to `{}/{}`.", source.display(), bucket, key);
-    Ok(())
+    Ok(UploadOutcome {
+        target: format!("{}/{bucket}/{key}", parsed.alias),
+        size: metadata.len(),
+    })
 }
 
 pub(crate) async fn multipart_upload(
@@ -462,6 +474,9 @@ mod tests {
     }
 }
 
+/// Downloads `bucket/key` to `output`, returning the transferred size so
+/// callers can build their own `CopyMessage`/`MirrorMessage` (this module
+/// intentionally prints nothing itself -- see [`UploadOutcome`]).
 pub(crate) async fn download_key_to_path(
     client: &Client,
     bucket: &str,
@@ -469,7 +484,7 @@ pub(crate) async fn download_key_to_path(
     output: &Path,
     part_size: u64,
     parallel: usize,
-) -> Result<()> {
+) -> Result<u64> {
     let head = client
         .head_object()
         .bucket(bucket)
@@ -492,7 +507,7 @@ pub(crate) async fn download_key_to_path(
     match result {
         Ok(()) => {
             fs::rename(&tmp, output).await?;
-            Ok(())
+            Ok(size)
         }
         Err(err) => {
             let _ = fs::remove_file(&tmp).await;
@@ -565,6 +580,7 @@ pub(crate) async fn download_object(
     target: Option<PathBuf>,
     part_size: u64,
     parallel: usize,
+    session: &crate::messages::TransferSession,
 ) -> Result<()> {
     let parsed = parse_s3_url(source)?;
     let bucket = parsed
@@ -579,7 +595,16 @@ pub(crate) async fn download_object(
         Some(path) => path,
         None => PathBuf::from(key.rsplit('/').next().unwrap_or(&key)),
     };
-    download_key_to_path(&client, &bucket, &key, &output, part_size, parallel).await?;
-    println!("Downloaded `{source}` to `{}`.", output.display());
+    let size = download_key_to_path(&client, &bucket, &key, &output, part_size, parallel).await?;
+    session.add_total(size);
+    let (total_count, total_size) = session.totals();
+    let msg = crate::messages::CopyMessage {
+        source: source.to_string(),
+        target: output.display().to_string(),
+        size,
+        total_count,
+        total_size,
+    };
+    session.object_done(&msg, size);
     Ok(())
 }

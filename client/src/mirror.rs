@@ -5,6 +5,8 @@ use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use chrono::{DateTime, Utc};
 
+use crate::messages::{MirrorMessage, TransferSession};
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Entry {
     pub rel: String,
@@ -305,9 +307,18 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     }
 
     // --- copies, cross-object parallel ---
+    // Totals are known upfront from the plan, so register them before
+    // starting any transfer -- matches mc's copyMessage/mirrorMessage
+    // totalCount/totalSize, which reflect the whole session's planned
+    // work, not a running tally.
+    let session = TransferSession::new("mirror");
+    for entry in &plan.copies {
+        session.add_total(entry.size);
+    }
     let failures = stream::iter(plan.copies.iter().map(|entry| {
         let source = &source;
         let target = &target;
+        let session = &session;
         async move {
             let result = copy_entry(
                 source,
@@ -319,8 +330,17 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
             )
             .await;
             match result {
-                Ok(()) => {
-                    println!("Mirrored `{}`.", entry.rel);
+                Ok((source_display, target_display)) => {
+                    let (total_count, total_size) = session.totals();
+                    let msg = MirrorMessage {
+                        source: source_display,
+                        target: target_display,
+                        size: entry.size,
+                        total_count,
+                        total_size,
+                        removed: false,
+                    };
+                    session.object_done(&msg, entry.size);
                     0u64
                 }
                 Err(err) => {
@@ -335,6 +355,12 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     .await;
 
     // --- deletes ---
+    // Deletes carry no transferred payload, so they don't touch the
+    // session's byte totals (`add_total`/`accountStat`) -- only Copy/
+    // add_total feeds those, matching mc's accounter tracking copy bytes
+    // only. They still emit a `MirrorMessage{removed: true}` through the
+    // same session so Bar-mode suppresses them and Lines-mode prints them,
+    // exactly like the copy path.
     let mut delete_failures = 0u64;
     if !plan.deletes.is_empty() {
         match &target {
@@ -342,7 +368,18 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 for rel in &plan.deletes {
                     let path = root.join(rel);
                     match tokio::fs::remove_file(&path).await {
-                        Ok(()) => println!("Removed `{}`.", path.display()),
+                        Ok(()) => {
+                            let (total_count, total_size) = session.totals();
+                            let msg = MirrorMessage {
+                                source: String::new(),
+                                target: path.display().to_string(),
+                                size: 0,
+                                total_count,
+                                total_size,
+                                removed: true,
+                            };
+                            session.object_done(&msg, 0);
+                        }
                         Err(err) => {
                             eprintln!("mirror: remove `{}` failed: {err}", path.display());
                             delete_failures += 1;
@@ -383,13 +420,24 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                     for rel in chunk {
                         let key = s3_key(prefix, rel);
                         if !failed_keys.contains(key.as_str()) {
-                            println!("Removed `{alias_name}/{bucket}/{key}`.");
+                            let (total_count, total_size) = session.totals();
+                            let msg = MirrorMessage {
+                                source: String::new(),
+                                target: format!("{alias_name}/{bucket}/{key}"),
+                                size: 0,
+                                total_count,
+                                total_size,
+                                removed: true,
+                            };
+                            session.object_done(&msg, 0);
                         }
                     }
                 }
             }
         }
     }
+
+    session.finish();
 
     let total = failures + delete_failures;
     if total > 0 {
@@ -398,6 +446,10 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     Ok(())
 }
 
+/// Performs one entry's transfer and returns the `(source, target)`
+/// user-facing aliased-path display strings for the caller's
+/// `MirrorMessage`. This module (like `transfer::upload_file`/
+/// `download_key_to_path`) intentionally prints nothing itself.
 async fn copy_entry(
     source: &Side,
     target: &Side,
@@ -405,7 +457,7 @@ async fn copy_entry(
     part_size: u64,
     disable_multipart: bool,
     parallel: usize,
-) -> Result<()> {
+) -> Result<(String, String)> {
     match (source, target) {
         (
             Side::Local(src_root),
@@ -426,11 +478,13 @@ async fn copy_entry(
                 disable_multipart,
                 None,
             )
-            .await
+            .await?;
+            Ok((src.display().to_string(), target_url))
         }
         (
             Side::S3 {
                 client,
+                alias_name,
                 bucket,
                 prefix,
                 ..
@@ -442,12 +496,17 @@ async fn copy_entry(
             crate::transfer::download_key_to_path(
                 client, bucket, &key, &output, part_size, parallel,
             )
-            .await
+            .await?;
+            Ok((
+                format!("{alias_name}/{bucket}/{key}"),
+                output.display().to_string(),
+            ))
         }
         (
             Side::S3 {
                 client: sc,
                 alias: sa,
+                alias_name: san,
                 bucket: sb,
                 prefix: sp,
                 ..
@@ -455,26 +514,33 @@ async fn copy_entry(
             Side::S3 {
                 client: tc,
                 alias: ta,
+                alias_name: tan,
                 bucket: tb,
                 prefix: tp,
                 ..
             },
         ) => {
+            let source_key = s3_key(sp, &entry.rel);
+            let target_key = s3_key(tp, &entry.rel);
             crate::transfer::transfer_object_between_s3(
                 sc,
                 sa,
                 sb,
-                &s3_key(sp, &entry.rel),
+                &source_key,
                 tc,
                 ta,
                 tb,
-                &s3_key(tp, &entry.rel),
+                &target_key,
                 entry.size,
                 part_size,
                 disable_multipart,
                 parallel,
             )
-            .await
+            .await?;
+            Ok((
+                format!("{san}/{sb}/{source_key}"),
+                format!("{tan}/{tb}/{target_key}"),
+            ))
         }
         (Side::Local(_), Side::Local(_)) => {
             Err(anyhow!("mirror between two local paths is not supported"))

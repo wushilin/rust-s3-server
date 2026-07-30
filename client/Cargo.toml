@@ -14,6 +14,7 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 dirs = "6"
 futures = "0.3"
 humansize = "2"
+indicatif = "0.17"
 percent-encoding = "2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

@@ -19,15 +19,20 @@ fn mirror_is_incremental() {
     let listing = server.rs3_ok(&["ls", "--recursive", "test/mb1"]);
     assert!(listing.contains("pfx/a.txt") && listing.contains("pfx/sub/b.txt"));
 
-    // second run with nothing changed must transfer nothing
+    // second run with nothing changed must transfer nothing. A no-op
+    // session still prints its final `accountStat` summary line (mc's
+    // "--quiet is not silence" behavior applies to the default non-tty
+    // mode this test harness runs under too), but must emit zero
+    // `MirrorMessage` copy lines ("`src` -> `dst`", tier-2's replacement
+    // for the old "Mirrored `...`." prose).
     let out = server.rs3_ok(&["mirror", src.to_str().unwrap(), "test/mb1/pfx"]);
-    assert!(!out.contains("Mirrored"), "second run re-copied: {out}");
+    assert!(!out.contains(" -> "), "second run re-copied: {out}");
 
     // touch one file with new content -> exactly one transfer
     std::thread::sleep(std::time::Duration::from_millis(1100)); // S3 mtime granularity
     write(&src, "a.txt", b"aaa2");
     let out = server.rs3_ok(&["mirror", src.to_str().unwrap(), "test/mb1/pfx"]);
-    assert_eq!(out.matches("Mirrored").count(), 1, "out: {out}");
+    assert_eq!(out.matches(" -> ").count(), 1, "out: {out}");
 }
 
 #[test]

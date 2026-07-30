@@ -23,7 +23,8 @@ use output::{OutputOpts, init_output, out, print_error, print_msg};
 use config::{Alias, client_for_alias, load_config, save_config};
 use list::ObjectPaginator;
 use messages::{
-    ContentMessage, MakeBucketMessage, RemoveBucketMessage, RmMessage, StatMessage, SummaryMessage,
+    ContentMessage, CopyMessage, MakeBucketMessage, RemoveBucketMessage, RmMessage, StatMessage,
+    SummaryMessage, TransferSession,
 };
 use transfer::{download_object, transfer_object_between_s3, upload_file};
 use urls::{DEFAULT_PART_SIZE, is_s3_url, parse_s3_url, parse_size};
@@ -898,7 +899,8 @@ async fn abort_incomplete_uploads(client: &Client, bucket: &str) -> Result<()> {
 
 async fn put(args: PutArgs) -> Result<()> {
     let part_size = parse_size(&args.part_size)?;
-    upload_file(
+    let session = TransferSession::new("put");
+    let outcome = upload_file(
         &args.source,
         &args.target,
         part_size,
@@ -906,7 +908,19 @@ async fn put(args: PutArgs) -> Result<()> {
         args.disable_multipart,
         args.storage_class.as_deref(),
     )
-    .await
+    .await?;
+    session.add_total(outcome.size);
+    let (total_count, total_size) = session.totals();
+    let msg = CopyMessage {
+        source: args.source.display().to_string(),
+        target: outcome.target,
+        size: outcome.size,
+        total_count,
+        total_size,
+    };
+    session.object_done(&msg, outcome.size);
+    session.finish();
+    Ok(())
 }
 
 async fn cp(args: CpArgs) -> Result<()> {
@@ -921,6 +935,8 @@ async fn cp(args: CpArgs) -> Result<()> {
     }
     let part_size = parse_size(&args.part_size)?;
     let target = args.paths.last().unwrap().clone();
+    let session = TransferSession::new("cp");
+    let mut used_session = false;
     for source in &args.paths[..args.paths.len() - 1] {
         if is_s3_url(source) && is_s3_url(&target) {
             if args.recursive {
@@ -932,8 +948,10 @@ async fn cp(args: CpArgs) -> Result<()> {
                     part_size,
                     args.disable_multipart,
                     args.parallel,
+                    &session,
                 )
                 .await?;
+                used_session = true;
             }
         } else if is_s3_url(source) && !is_s3_url(&target) {
             if args.recursive {
@@ -944,8 +962,10 @@ async fn cp(args: CpArgs) -> Result<()> {
                     Some(PathBuf::from(&target)),
                     part_size,
                     args.parallel,
+                    &session,
                 )
                 .await?;
+                used_session = true;
             }
         } else if !is_s3_url(source) && is_s3_url(&target) {
             let source_path = Path::new(source);
@@ -957,7 +977,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                 }
                 cp_recursive(source, &target, &args).await?;
             } else {
-                upload_file(
+                let outcome = upload_file(
                     source_path,
                     &target,
                     part_size,
@@ -966,10 +986,31 @@ async fn cp(args: CpArgs) -> Result<()> {
                     args.storage_class.as_deref(),
                 )
                 .await?;
+                session.add_total(outcome.size);
+                let (total_count, total_size) = session.totals();
+                let msg = CopyMessage {
+                    source: source_path.display().to_string(),
+                    target: outcome.target,
+                    size: outcome.size,
+                    total_count,
+                    total_size,
+                };
+                session.object_done(&msg, outcome.size);
+                used_session = true;
             }
         } else {
-            copy_local_path(Path::new(source), Path::new(&target), args.recursive).await?;
+            copy_local_path(
+                Path::new(source),
+                Path::new(&target),
+                args.recursive,
+                &session,
+            )
+            .await?;
+            used_session = true;
         }
+    }
+    if used_session {
+        session.finish();
     }
     Ok(())
 }
@@ -1002,6 +1043,7 @@ async fn copy_s3_object_to_s3(
     part_size: u64,
     disable_multipart: bool,
     parallel: usize,
+    session: &TransferSession,
 ) -> Result<()> {
     let source_url = parse_s3_url(source)?;
     let source_bucket = source_url
@@ -1037,6 +1079,7 @@ async fn copy_s3_object_to_s3(
         .key(&source_key)
         .send()
         .await?;
+    let size = head.content_length().unwrap_or_default() as u64;
     transfer_object_between_s3(
         &source_client,
         &source_alias,
@@ -1046,20 +1089,31 @@ async fn copy_s3_object_to_s3(
         &target_alias,
         &target_bucket,
         &target_key,
-        head.content_length().unwrap_or_default() as u64,
+        size,
         part_size,
         disable_multipart,
         parallel,
     )
     .await?;
-    println!(
-        "Copied `{}/{}` to `{}/{}`.",
-        source_bucket, source_key, target_bucket, target_key
-    );
+    session.add_total(size);
+    let (total_count, total_size) = session.totals();
+    let msg = CopyMessage {
+        source: format!("{}/{source_bucket}/{source_key}", source_url.alias),
+        target: format!("{}/{target_bucket}/{target_key}", target_url.alias),
+        size,
+        total_count,
+        total_size,
+    };
+    session.object_done(&msg, size);
     Ok(())
 }
 
-async fn copy_local_path(source: &Path, target: &Path, recursive: bool) -> Result<()> {
+async fn copy_local_path(
+    source: &Path,
+    target: &Path,
+    recursive: bool,
+    session: &TransferSession,
+) -> Result<()> {
     let metadata = fs::metadata(source)
         .await
         .with_context(|| format!("stat {}", source.display()))?;
@@ -1085,7 +1139,17 @@ async fn copy_local_path(source: &Path, target: &Path, recursive: bool) -> Resul
                         fs::create_dir_all(parent).await?;
                     }
                     fs::copy(&path, &output).await?;
-                    println!("Copied `{}` to `{}`.", path.display(), output.display());
+                    let size = metadata.len();
+                    session.add_total(size);
+                    let (total_count, total_size) = session.totals();
+                    let msg = CopyMessage {
+                        source: path.display().to_string(),
+                        target: output.display().to_string(),
+                        size,
+                        total_count,
+                        total_size,
+                    };
+                    session.object_done(&msg, size);
                 }
             }
         }
@@ -1105,7 +1169,17 @@ async fn copy_local_path(source: &Path, target: &Path, recursive: bool) -> Resul
             }
         }
         fs::copy(source, &output).await?;
-        println!("Copied `{}` to `{}`.", source.display(), output.display());
+        let size = metadata.len();
+        session.add_total(size);
+        let (total_count, total_size) = session.totals();
+        let msg = CopyMessage {
+            source: source.display().to_string(),
+            target: output.display().to_string(),
+            size,
+            total_count,
+            total_size,
+        };
+        session.object_done(&msg, size);
     }
     Ok(())
 }
@@ -1114,7 +1188,10 @@ async fn get(args: GetArgs) -> Result<()> {
     if args.version_id.is_some() {
         return Err(anyhow!("get --version-id is not implemented yet"));
     }
-    download_object(&args.source, args.target, DEFAULT_PART_SIZE, 4).await
+    let session = TransferSession::new("get");
+    download_object(&args.source, args.target, DEFAULT_PART_SIZE, 4, &session).await?;
+    session.finish();
+    Ok(())
 }
 
 async fn cat(args: CatArgs) -> Result<()> {

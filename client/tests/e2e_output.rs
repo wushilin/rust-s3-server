@@ -244,6 +244,48 @@ fn ls_storage_class_filters_non_matching_but_keeps_empty_class() {
 }
 
 #[test]
+fn cp_quiet_and_json_emit_per_object_lines_plus_summary() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/cpout"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    // --json: one copyMessage line + one accountStat line
+    let out = server.rs3_ok(&["--json", "cp", src.to_str().unwrap(), "test/cpout/f.txt"]);
+    let lines: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "expected copyMessage + accountStat: {out}");
+    assert_eq!(lines[0]["target"], "test/cpout/f.txt");
+    assert_eq!(lines[0]["size"], 5);
+    assert!(
+        lines[1]["duration"].is_u64() || lines[1]["duration"].is_i64(),
+        "duration must be raw ns int"
+    );
+    assert_eq!(lines[1]["transferred"], 5);
+    // --quiet human: "`src` -> `dst`" line + summary line
+    let out = server.rs3_ok(&["--quiet", "cp", src.to_str().unwrap(), "test/cpout/f2.txt"]);
+    assert!(out.contains("` -> `test/cpout/f2.txt`"), "out: {out}");
+    assert!(out.contains("Transferred:"), "out: {out}");
+}
+
+#[test]
+fn mirror_json_emits_mirror_messages() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/mirout"]);
+    let dir = server.dir.path().join("mo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), b"a").unwrap();
+    let out = server.rs3_ok(&["--json", "mirror", dir.to_str().unwrap(), "test/mirout/p"]);
+    let first: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert_eq!(first["status"], "success");
+    assert!(
+        first["target"].as_str().unwrap().ends_with("p/a.txt"),
+        "out: {out}"
+    );
+}
+
+#[test]
 fn errors_are_mc_shaped() {
     let server = TestServer::start();
     // human mode: stderr line starts with "rs3: <ERROR> ", exit 1

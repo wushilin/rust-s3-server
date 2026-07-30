@@ -4,10 +4,11 @@
 //! for the normative `mc` behavior this mirrors.
 //!
 //! `McMessage`/`print_msg`/`JsonStyle`/`humanize_ibytes`/`print_date` are now
-//! consumed by `messages.rs` and its callers in `main.rs` (task 2). The
-//! `OutputOpts::quiet`/`no_color` fields are still unread -- `--quiet`/
-//! `--no-color` semantics are a later tier-2 task -- so those two fields
-//! keep a narrowly-scoped `allow` until that task lands.
+//! consumed by `messages.rs` and its callers in `main.rs` (task 2).
+//! `OutputOpts::quiet` now drives the transfer commands' bar-vs-lines
+//! decision (task 3, `messages::TransferSession::new`). `no_color` is still
+//! unread -- `--no-color` semantics are a later tier-2 task -- so it keeps a
+//! narrowly-scoped `allow` until that task lands.
 
 use std::sync::OnceLock;
 
@@ -15,7 +16,6 @@ use std::sync::OnceLock;
 /// detection in `main()` and read everywhere via [`out()`].
 pub(crate) struct OutputOpts {
     pub json: bool,
-    #[allow(dead_code)]
     pub quiet: bool,
     #[allow(dead_code)]
     pub no_color: bool,
