@@ -1,13 +1,21 @@
 mod common;
 use common::TestServer;
 
-/// Writes a tiny executable shell script that records `argc` (`$#`) to
-/// `out_file`, for verifying `find --exec`'s argv splitting.
+/// Writes a tiny executable shell script that records both `argc` (`$#`)
+/// and the *verbatim* first argument (`$1`) to `out_file`, for verifying
+/// `find --exec`'s argv splitting AND that the substituted value itself
+/// survives untouched (not just that argc happens to come out right --
+/// see `find_exec_key_with_unbalanced_quote_does_not_abort`, which checks
+/// the recorded `arg1=` line matches the full aliased key exactly,
+/// embedded quote included).
 #[cfg(unix)]
 fn make_argc_script(server: &TestServer, out_file: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = server.dir.path().join("argc.sh");
-    let script = format!("#!/bin/sh\necho \"argc=$#\" > '{}'\n", out_file.display());
+    let script = format!(
+        "#!/bin/sh\n{{\n  echo \"argc=$#\"\n  echo \"arg1=$1\"\n}} > '{}'\n",
+        out_file.display()
+    );
     std::fs::write(&path, script).unwrap();
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
@@ -154,15 +162,24 @@ fn find_exec_key_with_space_is_single_argv_word() {
         &exec_template,
     ]);
     let recorded = std::fs::read_to_string(&out_file).expect("argc script ran and wrote output");
-    assert_eq!(recorded.trim(), "argc=1", "recorded: {recorded}");
+    let mut lines = recorded.lines();
+    assert_eq!(lines.next(), Some("argc=1"), "recorded: {recorded}");
+    assert_eq!(
+        lines.next(),
+        Some("arg1=test/fnd8/sp file.txt"),
+        "recorded: {recorded}"
+    );
 }
 
 /// Ground-truth-verified regression: a key with an unbalanced double quote
-/// must not abort the whole find run. Substitute-then-split would hand
-/// `shell-words::split` a string with a stray quote (since the quote
-/// comes from the *substituted key*, not the template) and error out;
-/// split-then-substitute never re-parses the already-isolated `{}` word,
-/// so the literal quote character passes through untouched.
+/// must not abort the whole find run, AND the child must receive that key
+/// verbatim (embedded quote included), not a corrupted/stripped variant --
+/// argc alone can't tell those apart, so this asserts the recorded `arg1=`
+/// line too. Substitute-then-split would hand `shell-words::split` a
+/// string with a stray quote (since the quote comes from the *substituted
+/// key*, not the template) and error out; split-then-substitute never
+/// re-parses the already-isolated `{}` word, so the literal quote
+/// character passes through untouched.
 #[test]
 #[cfg(unix)]
 fn find_exec_key_with_unbalanced_quote_does_not_abort() {
@@ -189,5 +206,15 @@ fn find_exec_key_with_unbalanced_quote_does_not_abort() {
         String::from_utf8_lossy(&out.stderr)
     );
     let recorded = std::fs::read_to_string(&out_file).expect("argc script ran and wrote output");
-    assert_eq!(recorded.trim(), "argc=1", "recorded: {recorded}");
+    let mut lines = recorded.lines();
+    assert_eq!(lines.next(), Some("argc=1"), "recorded: {recorded}");
+    // The critical assertion: the child received the literal key,
+    // embedded double quote and all, not a corrupted/truncated/re-quoted
+    // variant. A regression that mangled the substituted word while
+    // coincidentally leaving argc at 1 would be caught here.
+    assert_eq!(
+        lines.next(),
+        Some("arg1=test/fnd9/unbal\"file.txt"),
+        "recorded: {recorded}"
+    );
 }
