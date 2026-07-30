@@ -511,7 +511,28 @@ async fn ls(args: LsArgs) -> Result<()> {
                             continue;
                         }
                         Err(_) => {
-                            prefix.push('/');
+                            // No object at exactly `prefix` -- but that
+                            // alone doesn't mean it's a directory. mc only
+                            // commits to the directory interpretation once
+                            // a 1-key probe under `prefix + "/"` actually
+                            // finds something (`client-s3.go:1684-1697`);
+                            // otherwise the bare prefix is kept as-is and
+                            // listed literally, which is what makes a
+                            // partial-filename search like `ls bucket/pre`
+                            // (matching `prefix1.txt`) work.
+                            let probe = client
+                                .list_objects_v2()
+                                .bucket(&bucket)
+                                .prefix(format!("{prefix}/"))
+                                .max_keys(1)
+                                .send()
+                                .await;
+                            let is_directory = probe.is_ok_and(|r| {
+                                !r.contents().is_empty() || !r.common_prefixes().is_empty()
+                            });
+                            if is_directory {
+                                prefix.push('/');
+                            }
                         }
                     }
                 }

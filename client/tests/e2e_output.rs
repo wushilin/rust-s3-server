@@ -130,6 +130,29 @@ fn ls_bare_directory_no_trailing_slash_non_recursive_matches_slash_form() {
 }
 
 #[test]
+fn ls_bare_prefix_with_no_directory_children_falls_back_to_partial_name_match() {
+    // A bare target that isn't a real object AND has no children under
+    // `<target>/` isn't a directory at all -- it's a partial-filename
+    // search (`ls bucket/pre` matching `prefix1.txt`). The HeadObject miss
+    // in `ls` must not unconditionally treat every miss as "append '/' and
+    // list as a directory": that would silently drop `prefix1.txt` from
+    // the result (real mc, and rs3 before the bare-directory fix, list it
+    // by falling back to a literal-prefix listing; `client-s3.go:1684-1697`
+    // gates the directory interpretation on a 1-key probe under
+    // `pre + "/"` actually finding something).
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/lspartial"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/lspartial/prefix1.txt"]);
+    let out = server.rs3_ok(&["--json", "ls", "test/lspartial/pre"]);
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected exactly one entry, out: {out:?}");
+    let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["key"], "prefix1.txt", "out: {out}");
+}
+
+#[test]
 fn ls_summarize_and_human_format() {
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/lssum"]);
