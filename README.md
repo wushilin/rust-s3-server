@@ -99,19 +99,21 @@ vice versa. Each surface can be firewalled or proxied independently.
 
 ### MinIO Mint
 
-The latest MinIO Mint core run exercised all 15 suites: **361 passes out of 416
-checks**, 40 failures, 15 not applicable. Core bucket/object CRUD, ranged reads,
+The latest MinIO Mint core run exercised all 15 suites: **362 passes out of 417
+checks**, 25 failures, 30 not applicable. Core bucket/object CRUD, ranged reads,
 ListObjects v1/v2, multipart, copy/compose, presigned GET/PUT, browser POST,
-health checks, and metrics passed broadly across clients.
+health checks, and metrics passed broadly across clients. Unimplemented features
+now report `NotImplemented` instead of being silently accepted, which is why the
+not-applicable count is higher and the failure count lower than in earlier runs.
 
 | Client/suite | Result |
 |---|---|
 | `s3cmd` | 8 pass, 0 fail |
 | AWS SDK for Ruby | 13 pass, 0 fail |
 | Health checks | 6 pass, 0 fail |
-| AWS CLI | 13 pass, 1 feature-gap failure |
+| AWS CLI | 16 pass, 0 fail |
 | MinIO Client (`mc`) | 26 pass, 1 feature-gap failure |
-| MinIO JavaScript | 225 pass, 11 feature-gap failures |
+| MinIO JavaScript | 234 pass, 3 feature-gap failures |
 
 The dated [MinIO Mint compatibility report](test_report.md) is the source of
 truth — the summary above is not a claim of complete S3 or MinIO compatibility.
