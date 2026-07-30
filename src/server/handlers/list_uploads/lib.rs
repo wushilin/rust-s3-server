@@ -47,7 +47,9 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, _body: Body)
                 .filter(|u| prefix.is_empty() || u.object_key.starts_with(prefix))
                 .filter(after_marker)
                 .collect();
-            let is_truncated = page.len() > max_uploads;
+            // `max_uploads == 0` can never advance the markers, so reporting
+            // truncation would make a paginating client replay forever.
+            let is_truncated = max_uploads > 0 && page.len() > max_uploads;
             page.truncate(max_uploads);
             let (next_key_marker, next_upload_id_marker) = if is_truncated {
                 page.last()

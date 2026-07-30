@@ -31,7 +31,9 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
                 .into_iter()
                 .filter(|p| p.number > part_number_marker)
                 .collect();
-            let is_truncated = page.len() > max_parts;
+            // `max_parts == 0` can never advance the part-number marker, so
+            // reporting truncation would make a paginating client replay forever.
+            let is_truncated = max_parts > 0 && page.len() > max_parts;
             page.truncate(max_parts);
             let next_part_number_marker = if is_truncated {
                 page.last().map(|p| p.number)

@@ -53,7 +53,15 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, _body: Body)
         .list_objects(&ctx.bucket, prefix, delimiter, after, max_keys)
         .await
     {
-        Ok(page) => {
+        Ok(mut page) => {
+            // A zero-sized page can never carry the cursor forward: the token
+            // would come back identical (or absent), so a client that honours
+            // IsTruncated would replay the same request forever. S3 answers
+            // `max-keys=0` with an empty, non-truncated result.
+            if max_keys == 0 {
+                page.is_truncated = false;
+                page.next_after = None;
+            }
             let object_count = page.entries.len() + page.common_prefixes.len();
             let xml = if is_v2 {
                 list_objects_v2_xml(

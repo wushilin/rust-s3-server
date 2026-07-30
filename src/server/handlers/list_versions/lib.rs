@@ -36,7 +36,9 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, _body: Body)
                 .into_iter()
                 .filter(|v| key_marker.is_empty() || v.meta.object_key.as_str() > key_marker)
                 .collect();
-            let is_truncated = page.len() > max_keys;
+            // `max_keys == 0` can never advance the key marker, so reporting
+            // truncation would make a paginating client replay forever.
+            let is_truncated = max_keys > 0 && page.len() > max_keys;
             page.truncate(max_keys);
             let next_key_marker = if is_truncated {
                 page.last().map(|v| v.meta.object_key.clone())

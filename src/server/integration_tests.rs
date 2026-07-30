@@ -1083,6 +1083,291 @@
         assert_eq!(unique.len(), 35, "no duplicate keys");
     }
 
+    /// Reproduces the `mc mirror` / `mc ls --recursive` infinite listing loop:
+    /// with `encoding-type=url` the continuation token must stay opaque. Clients
+    /// (minio-go, aws-sdk) never percent-decode it, they just put it straight
+    /// back into the query string — so a token we url-encoded arrives
+    /// double-encoded, no longer matches any key, and the scan restarts.
+    #[tokio::test]
+    async fn pagination_with_url_encoding_terminates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/enc-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Keys carry characters that percent-encoding rewrites ('/', '=').
+        let mut expected = Vec::new();
+        for part in 0..5u32 {
+            for file in 0..5u32 {
+                let key = format!("part={part:02}/file-{file:02}.parquet");
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri(format!("/enc-bucket/{}", urlencoding::encode(&key)))
+                            .body(Body::from("data"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                expected.push(key);
+            }
+        }
+        expected.sort();
+
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            let mut uri = "/enc-bucket?list-type=2&encoding-type=url&max-keys=10".to_string();
+            if let Some(t) = &token {
+                // Exactly what a client does: the token is opaque, so it is
+                // url-encoded for the query string without being decoded first.
+                uri.push_str(&format!("&continuation-token={}", urlencoding::encode(t)));
+            }
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = body_text(res).await;
+            pages += 1;
+
+            for key in extract_all_xml_tags(&body, "Key") {
+                all_keys.push(urlencoding::decode(&key).unwrap().into_owned());
+            }
+
+            let is_truncated = extract_xml_tag(&body, "IsTruncated") == Some("true");
+            token = extract_xml_tag(&body, "NextContinuationToken").map(str::to_string);
+            if !is_truncated {
+                break;
+            }
+            assert!(pages < 10, "pagination did not terminate: {pages} pages");
+        }
+
+        assert_eq!(all_keys, expected, "every key exactly once, in order");
+    }
+
+    /// Puts `keys` into a fresh bucket and returns the app.
+    async fn seed_bucket(tmp: &tempfile::TempDir, bucket: &str, keys: &[String]) -> axum::Router {
+        let app = make_app(tmp);
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/{bucket}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        for key in keys {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/{bucket}/{}", urlencoding::encode(key)))
+                        .body(Body::from("data"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "put {key}");
+        }
+        app
+    }
+
+    async fn get_body_post(app: &axum::Router, uri: &str) -> String {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "POST {uri}");
+        body_text(res).await
+    }
+
+    async fn get_body(app: &axum::Router, uri: &str) -> String {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "GET {uri}");
+        body_text(res).await
+    }
+
+    /// ListObjectsV1 without a delimiter omits NextMarker by design, so the
+    /// client resumes from the last returned key. Under `encoding-type=url`
+    /// that key is encoded and the client decodes it before replaying it.
+    #[tokio::test]
+    async fn list_objects_v1_marker_pagination_iterates_all_keys_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected: Vec<String> = (0..25)
+            .map(|i| format!("part={:02}/file-{i:02}.parquet", i % 5))
+            .collect();
+        let mut expected = expected;
+        expected.sort();
+        let app = seed_bucket(&tmp, "v1-page", &expected).await;
+
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut uri = "/v1-page?encoding-type=url&max-keys=10".to_string();
+            if let Some(m) = &marker {
+                uri.push_str(&format!("&marker={}", urlencoding::encode(m)));
+            }
+            let body = get_body(&app, &uri).await;
+            pages += 1;
+            let page_keys: Vec<String> = extract_all_xml_tags(&body, "Key")
+                .iter()
+                .map(|k| urlencoding::decode(k).unwrap().into_owned())
+                .collect();
+            assert!(!page_keys.is_empty(), "page {pages} returned no keys");
+            all_keys.extend(page_keys.clone());
+            if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                break;
+            }
+            marker = Some(page_keys.last().unwrap().clone());
+            assert!(pages < 10, "pagination did not terminate: {pages} pages");
+        }
+        assert_eq!(all_keys, expected, "every key exactly once, in order");
+    }
+
+    /// With a delimiter, V1 supplies NextMarker and the client replays that.
+    #[tokio::test]
+    async fn list_objects_v1_next_marker_pagination_walks_all_prefixes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Vec<String> = (0..5)
+            .flat_map(|d| (0..4).map(move |f| format!("dir-{d:02}/file-{f:02}")))
+            .collect();
+        let app = seed_bucket(&tmp, "v1-delim", &keys).await;
+
+        let mut prefixes: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut uri = "/v1-delim?delimiter=%2F&max-keys=2".to_string();
+            if let Some(m) = &marker {
+                uri.push_str(&format!("&marker={}", urlencoding::encode(m)));
+            }
+            let body = get_body(&app, &uri).await;
+            pages += 1;
+            prefixes.extend(
+                extract_all_xml_tags(&body, "Prefix")
+                    .into_iter()
+                    .filter(|p| !p.is_empty()),
+            );
+            if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                break;
+            }
+            let next = extract_xml_tag(&body, "NextMarker")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            marker = Some(next.expect("truncated delimiter page must carry NextMarker"));
+            assert!(pages < 10, "pagination did not terminate: {pages} pages");
+        }
+        let expected: Vec<String> = (0..5).map(|d| format!("dir-{d:02}/")).collect();
+        assert_eq!(prefixes, expected, "every common prefix exactly once");
+    }
+
+    /// V2 + delimiter: common prefixes count toward max-keys, and a prefix whose
+    /// keys straddle a page boundary must not be emitted twice.
+    #[tokio::test]
+    async fn list_objects_v2_delimiter_pagination_walks_all_prefixes_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Vec<String> = (0..6)
+            .flat_map(|d| (0..5).map(move |f| format!("dir-{d:02}/file-{f:02}")))
+            .collect();
+        let app = seed_bucket(&tmp, "v2-delim", &keys).await;
+
+        let mut prefixes: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut uri = "/v2-delim?list-type=2&delimiter=%2F&max-keys=2".to_string();
+            if let Some(t) = &token {
+                uri.push_str(&format!("&continuation-token={}", urlencoding::encode(t)));
+            }
+            let body = get_body(&app, &uri).await;
+            pages += 1;
+            prefixes.extend(
+                extract_all_xml_tags(&body, "Prefix")
+                    .into_iter()
+                    .filter(|p| !p.is_empty()),
+            );
+            if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                break;
+            }
+            token = Some(
+                extract_xml_tag(&body, "NextContinuationToken")
+                    .expect("truncated page must carry NextContinuationToken")
+                    .to_string(),
+            );
+            assert!(pages < 12, "pagination did not terminate: {pages} pages");
+        }
+        let expected: Vec<String> = (0..6).map(|d| format!("dir-{d:02}/")).collect();
+        assert_eq!(prefixes, expected, "every common prefix exactly once");
+    }
+
+    /// `max-keys=0` must not advertise a further page: a client that trusts
+    /// IsTruncated would replay the same request forever, since a zero-sized
+    /// page can never carry the cursor forward.
+    #[tokio::test]
+    async fn list_objects_max_keys_zero_does_not_advertise_another_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Vec<String> = vec!["a/1".to_string(), "a/2".to_string()];
+        let app = seed_bucket(&tmp, "zero-keys", &keys).await;
+
+        for uri in [
+            "/zero-keys?list-type=2&max-keys=0",
+            "/zero-keys?list-type=2&max-keys=0&continuation-token=a/1",
+            "/zero-keys?max-keys=0",
+        ] {
+            let body = get_body(&app, uri).await;
+            assert!(
+                extract_all_xml_tags(&body, "Key").is_empty(),
+                "max-keys=0 must return no keys: {body}"
+            );
+            assert_eq!(
+                extract_xml_tag(&body, "IsTruncated"),
+                Some("false"),
+                "max-keys=0 cannot make progress, so it must not claim truncation: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn list_objects_rejects_invalid_max_keys() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1765,6 +2050,46 @@
         assert_eq!(body.matches("<Key>object.txt</Key>").count(), 2);
         assert!(body.contains("<IsLatest>true</IsLatest>"));
         assert!(body.contains("<IsLatest>false</IsLatest>"));
+    }
+
+    #[tokio::test]
+    async fn list_versions_key_marker_pagination_iterates_all_keys_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected: Vec<String> = (0..7).map(|i| format!("dir/obj-{i:02}.txt")).collect();
+        let app = seed_bucket(&tmp, "ver-page", &expected).await;
+
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut uri = "/ver-page?versions&max-keys=3".to_string();
+            if let Some(m) = &marker {
+                uri.push_str(&format!("&key-marker={}", urlencoding::encode(m)));
+            }
+            let body = get_body(&app, &uri).await;
+            pages += 1;
+            all_keys.extend(extract_all_xml_tags(&body, "Key"));
+            if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                break;
+            }
+            marker = extract_xml_tag(&body, "NextKeyMarker")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            assert!(
+                marker.is_some(),
+                "truncated version page must carry a non-empty NextKeyMarker: {body}"
+            );
+            assert!(pages < 8, "pagination did not terminate: {pages} pages");
+        }
+        assert_eq!(all_keys, expected, "every version exactly once, in order");
+
+        // A zero-sized page cannot advance the marker, so it must not claim truncation.
+        let body = get_body(&app, "/ver-page?versions&max-keys=0").await;
+        assert_eq!(
+            extract_xml_tag(&body, "IsTruncated"),
+            Some("false"),
+            "max-keys=0 must not advertise another page: {body}"
+        );
     }
 
     #[tokio::test]
@@ -2739,6 +3064,68 @@
         assert!(body.contains("<Code>NoSuchUpload</Code>"));
     }
 
+    #[tokio::test]
+    async fn list_parts_part_number_marker_pagination_iterates_all_parts_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = seed_bucket(&tmp, "lp-page", &[]).await;
+
+        let init = get_body_post(&app, "/lp-page/big.bin?uploads").await;
+        let upload_id = extract_xml_tag(&init, "UploadId").unwrap().to_string();
+        for part in 1..=5u32 {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/lp-page/big.bin?uploadId={upload_id}&partNumber={part}"
+                        ))
+                        .body(Body::from(format!("part-{part}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        let mut all_parts: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut uri = format!("/lp-page/big.bin?uploadId={upload_id}&max-parts=2");
+            if let Some(m) = &marker {
+                uri.push_str(&format!("&part-number-marker={m}"));
+            }
+            let body = get_body(&app, &uri).await;
+            pages += 1;
+            all_parts.extend(extract_all_xml_tags(&body, "PartNumber"));
+            if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                break;
+            }
+            marker = extract_xml_tag(&body, "NextPartNumberMarker")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            assert!(
+                marker.is_some(),
+                "truncated part page must carry NextPartNumberMarker: {body}"
+            );
+            assert!(pages < 6, "pagination did not terminate: {pages} pages");
+        }
+        assert_eq!(
+            all_parts,
+            vec!["1", "2", "3", "4", "5"],
+            "every part exactly once, in order"
+        );
+
+        let zero_uri = format!("/lp-page/big.bin?uploadId={upload_id}&max-parts=0");
+        let body = get_body(&app, &zero_uri).await;
+        assert_eq!(
+            extract_xml_tag(&body, "IsTruncated"),
+            Some("false"),
+            "max-parts=0 must not advertise another page: {body}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // GET /{bucket}?uploads — List Multipart Uploads
     // ---------------------------------------------------------------------------
@@ -2834,6 +3221,67 @@
         let body = body_text(res).await;
         assert!(!body.contains(&uid1), "aborted upload must not appear");
         assert!(body.contains(&uid2), "active upload must still appear");
+    }
+
+    #[tokio::test]
+    async fn list_uploads_key_marker_pagination_iterates_all_uploads_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = seed_bucket(&tmp, "lmu-page", &[]).await;
+
+        let expected: Vec<String> = (0..5).map(|i| format!("dir/upload-{i:02}.bin")).collect();
+        for key in &expected {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/lmu-page/{key}?uploads"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut markers: Option<(String, String)> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut uri = "/lmu-page?uploads&max-uploads=2".to_string();
+            if let Some((key, upload)) = &markers {
+                uri.push_str(&format!(
+                    "&key-marker={}&upload-id-marker={}",
+                    urlencoding::encode(key),
+                    urlencoding::encode(upload)
+                ));
+            }
+            let body = get_body(&app, &uri).await;
+            pages += 1;
+            all_keys.extend(extract_all_xml_tags(&body, "Key"));
+            if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                break;
+            }
+            let next_key = extract_xml_tag(&body, "NextKeyMarker")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let next_upload = extract_xml_tag(&body, "NextUploadIdMarker")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            markers = Some((
+                next_key.expect("truncated upload page must carry NextKeyMarker"),
+                next_upload.expect("truncated upload page must carry NextUploadIdMarker"),
+            ));
+            assert!(pages < 6, "pagination did not terminate: {pages} pages");
+        }
+        assert_eq!(all_keys, expected, "every upload exactly once, in order");
+
+        let body = get_body(&app, "/lmu-page?uploads&max-uploads=0").await;
+        assert_eq!(
+            extract_xml_tag(&body, "IsTruncated"),
+            Some("false"),
+            "max-uploads=0 must not advertise another page: {body}"
+        );
     }
 
     // ---------------------------------------------------------------------------

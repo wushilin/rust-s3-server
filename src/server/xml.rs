@@ -70,24 +70,19 @@ pub fn list_objects_v2_xml(
             escape_xml(&encode_list_value(p, encode_keys))
         ));
     }
+    // Continuation tokens are opaque: `encoding-type=url` covers Key, Prefix,
+    // Delimiter and StartAfter, never the token. Clients hand the token back
+    // verbatim (url-encoding it into the query string), so encoding it here
+    // would return a double-encoded token that matches no key — the scan would
+    // restart from the top and the client would list forever.
     let next = page
         .next_after
         .as_ref()
         .filter(|_| page.is_truncated)
-        .map(|v| {
-            format!(
-                "<NextContinuationToken>{}</NextContinuationToken>",
-                escape_xml(&encode_list_value(v, encode_keys))
-            )
-        })
+        .map(|v| format!("<NextContinuationToken>{}</NextContinuationToken>", escape_xml(v)))
         .unwrap_or_default();
     let token = continuation_token
-        .map(|v| {
-            format!(
-                "<ContinuationToken>{}</ContinuationToken>",
-                escape_xml(&encode_list_value(v, encode_keys))
-            )
-        })
+        .map(|v| format!("<ContinuationToken>{}</ContinuationToken>", escape_xml(v)))
         .unwrap_or_default();
     let start_after_xml = start_after
         .map(|v| {
@@ -469,8 +464,10 @@ mod tests {
         assert!(xml.contains("<Delimiter>%2B</Delimiter>"));
         assert!(xml.contains("<Key>a%2Bb%20c</Key>"));
         assert!(xml.contains("<CommonPrefixes><Prefix>a%2Bb%2F</Prefix></CommonPrefixes>"));
-        assert!(xml.contains("<NextContinuationToken>a%2Bb%20c</NextContinuationToken>"));
-        assert!(xml.contains("<ContinuationToken>a%2Bb%20</ContinuationToken>"));
+        // Continuation tokens are opaque and stay unencoded even under
+        // encoding-type=url — clients replay them verbatim.
+        assert!(xml.contains("<NextContinuationToken>a+b c</NextContinuationToken>"));
+        assert!(xml.contains("<ContinuationToken>a+b </ContinuationToken>"));
         assert!(xml.contains("<StartAfter>z%20z</StartAfter>"));
     }
 
