@@ -97,44 +97,13 @@ pub struct ObjectVersionEntry {
     pub is_latest: bool,
 }
 
-/// One page of `ListObjectVersions`. Ordered by key, newest version first
-/// within a key, and never split across keys — see
-/// [`LocalObjectStore::list_object_versions`].
+/// One page of `ListObjectVersions`, key-ordered — one live version per key,
+/// see [`LocalObjectStore::list_object_versions`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectVersionPage {
     pub entries: Vec<ObjectVersionEntry>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
-}
-
-/// The key range one version page cares about: `prefix`-matching keys strictly
-/// after `after` and strictly before `before` (when bounded).
-struct VersionKeyWindow<'a> {
-    prefix: &'a str,
-    after: &'a str,
-    before: Option<&'a str>,
-}
-
-impl VersionKeyWindow<'_> {
-    fn contains(&self, key: &str) -> bool {
-        key.starts_with(self.prefix)
-            && (self.after.is_empty() || key > self.after)
-            && self.before.is_none_or(|before| key < before)
-    }
-}
-
-/// Index and length of each run of equal keys in a key-ordered slice.
-fn group_starts(versions: &[ObjectVersionEntry]) -> Vec<(usize, usize)> {
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    for (index, entry) in versions.iter().enumerate() {
-        match groups.last_mut() {
-            Some((start, len)) if versions[*start].meta.object_key == entry.meta.object_key => {
-                *len += 1
-            }
-            _ => groups.push((index, 1)),
-        }
-    }
-    groups
 }
 
 /// Returned by a successful PUT or multipart complete.
@@ -1308,13 +1277,16 @@ impl LocalObjectStore {
 
     /// One page of `ListObjectVersions`, resuming strictly after `key_marker`.
     ///
-    /// Only the page's own key range is materialised: the live side comes from
-    /// one bounded index scan (`max_keys + 1` rows), and only that window's
-    /// blob metadata is read. A page never splits one key's versions across a
-    /// boundary — every version id this server reports is the literal "null",
-    /// so a client cannot resume mid-key, and the marker must always name a
-    /// fully-emitted key. A key with more versions than `max_keys` therefore
-    /// overshoots the limit rather than losing versions or stalling.
+    /// This server is unversioned, so a key has exactly one version — the live
+    /// one — and that is all the listing reports, matching what S3 returns for
+    /// an unversioned bucket. Retired blobs sitting in trash are deliberately
+    /// omitted: no API can address them (there is no `?versionId` route), they
+    /// would all report `VersionId=null` like the live object, and a
+    /// version-aware client acting on such a row would hit the live object
+    /// instead. Trash is a recovery buffer for operators, not an API surface.
+    ///
+    /// Only the page's own key range is touched: one bounded index scan of
+    /// `max_keys + 1` rows, and blob metadata for those rows alone.
     pub async fn list_object_versions(
         &self,
         bucket: &str,
@@ -1335,10 +1307,9 @@ impl LocalObjectStore {
         let after = (!key_marker.is_empty()).then_some(key_marker);
 
         // One extra row tells us whether a further key exists without a second
-        // query; each live key contributes at least one version row, so
-        // `max_keys + 1` keys can always fill a `max_keys`-sized page.
+        // query.
         let live = index.list(prefix, None, after, max_keys + 1).await?;
-        let live_overflow_key = live.entries.get(max_keys).map(|row| row.object_key.clone());
+        let has_more = live.entries.len() > max_keys;
 
         let mut versions: Vec<ObjectVersionEntry> = Vec::new();
         for row in live.entries.iter().take(max_keys) {
@@ -1363,52 +1334,21 @@ impl LocalObjectStore {
             });
         }
 
-        // Retired versions still in trash are reported as non-latest. Trash is a
-        // flat directory of retired blobs with no key ordering, so it has to be
-        // walked; entries outside this page's key range are dropped as they are
-        // read rather than accumulated.
-        let trash_dir = self.layout.trash_dir(bucket)?;
-        let window = VersionKeyWindow {
-            prefix,
-            after: key_marker,
-            // Keys at or past the overflow key belong to a later page, and the
-            // overflow key itself already proves the response is truncated.
-            before: live_overflow_key.as_deref(),
-        };
-        collect_object_versions_from_dir(&trash_dir, &window, false, &mut versions).await?;
-
-        versions.sort_by(|a, b| {
-            a.meta
-                .object_key
-                .cmp(&b.meta.object_key)
-                .then_with(|| b.meta.last_modified_ms.cmp(&a.meta.last_modified_ms))
-        });
-
-        // Cut at a key boundary: whole version groups only.
-        let mut emitted = 0usize;
-        for (start, group) in group_starts(&versions) {
-            if start > 0 && emitted + group > max_keys {
-                break;
-            }
-            emitted += group;
-        }
-        let more_keys_in_window = emitted < versions.len();
-        versions.truncate(emitted);
-
+        // The index scan is already key-ordered, so the page needs no sorting.
         let mut next_key_marker = versions.last().map(|v| v.meta.object_key.clone());
-        let mut is_truncated = more_keys_in_window || live_overflow_key.is_some();
-        if is_truncated && next_key_marker.is_none() {
+        if has_more && next_key_marker.is_none() {
             // Every blob in this window was unreadable. Hand back the last key
             // we scanned so the client skips the hole instead of replaying it.
             next_key_marker = live
                 .entries
                 .get(max_keys - 1)
                 .map(|row| row.object_key.clone());
-            is_truncated = next_key_marker.is_some();
         }
 
         Ok(ObjectVersionPage {
-            is_truncated,
+            // Without a marker to hand back there is no way to make progress,
+            // so the response must not claim there is more.
+            is_truncated: has_more && next_key_marker.is_some(),
             next_key_marker,
             entries: versions,
         })
@@ -2864,52 +2804,6 @@ async fn has_active_staging(bucket_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Used only for the trash section of `list_object_versions` — the live
-/// namespace is enumerated through rows. Trash has no key ordering, so the walk
-/// is unavoidable, but `window` keeps only the keys the current page can use.
-async fn collect_object_versions_from_dir(
-    root: &Path,
-    window: &VersionKeyWindow<'_>,
-    is_latest: bool,
-    out: &mut Vec<ObjectVersionEntry>,
-) -> Result<()> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-            continue;
-        };
-        let mut has_meta = false;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.file_name().and_then(|n| n.to_str()) == Some("meta.json") {
-                has_meta = true;
-            } else if path.is_dir() {
-                stack.push(path);
-            }
-        }
-        if !has_meta {
-            continue;
-        }
-        let Ok(meta) = read_json::<ObjectMeta>(&dir.join("meta.json")).await else {
-            continue;
-        };
-        if !window.contains(&meta.object_key) {
-            continue;
-        }
-        let version_id = dir
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("null")
-            .to_string();
-        out.push(ObjectVersionEntry {
-            meta,
-            version_id,
-            is_latest,
-        });
-    }
-    Ok(())
-}
-
 fn md5_hex(bytes: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(bytes);
@@ -3540,12 +3434,13 @@ mod tests {
         );
     }
 
-    /// A key's versions must never straddle a page boundary: the marker can only
-    /// name a key, so a split would silently drop the rest of that key.
+    /// Retired blobs in trash are not versions: they have no addressable id and
+    /// would duplicate the live object's `VersionId=null`, so overwrites must
+    /// not add rows.
     #[tokio::test]
-    async fn version_page_never_splits_one_keys_versions() {
+    async fn version_page_ignores_retired_blobs_in_trash() {
         let (_tmp, store) = store_and_bucket().await;
-        // 3 versions of "a", 1 of "b", 2 of "c" — 6 versions over 3 keys.
+        // Overwrites retire blobs to trash; only the live version is reportable.
         for (key, writes) in [("a", 3), ("b", 1), ("c", 2)] {
             for n in 0..writes {
                 store
@@ -3569,9 +3464,9 @@ mod tests {
                 .iter()
                 .map(|v| v.meta.object_key.clone())
                 .collect();
-            // Whole groups only: a key present on this page appears nowhere else.
+            assert!(keys.len() <= 2, "a page holds at most max_keys rows");
             for key in &keys {
-                assert!(!seen.contains(key), "key {key} split across pages");
+                assert!(!seen.contains(key), "key {key} reported twice");
             }
             seen.extend(keys);
             if !page.is_truncated {
@@ -3581,9 +3476,17 @@ mod tests {
             assert!(pages < 6, "pagination did not terminate");
         }
 
-        // A key with more versions than max-keys overshoots the limit rather
-        // than losing versions.
-        assert_eq!(seen, vec!["a", "a", "a", "b", "c", "c"]);
+        assert_eq!(seen, vec!["a", "b", "c"], "one live version per key");
+        // Every row is the live version, and the trash blobs are still on disk —
+        // they are simply not listable.
+        let page = store.list_object_versions("bucket", "", "", 10).await.unwrap();
+        assert!(page.entries.iter().all(|v| v.is_latest));
+        let trash = store.layout().trash_dir("bucket").unwrap();
+        let mut trash_dirs = tokio::fs::read_dir(&trash).await.unwrap();
+        assert!(
+            trash_dirs.next_entry().await.unwrap().is_some(),
+            "retired blobs must still be recoverable on disk"
+        );
     }
 
     // ── rebuild ───────────────────────────────────────────────────────────────

@@ -151,9 +151,11 @@ Not implemented:
 - MinIO admin APIs and Snowball archive extraction;
 - **TLS termination** — put rusts3 behind a reverse proxy (see below).
 
-`GET /{bucket}?versions` is a compatibility view of the current object plus any
-overwritten/deleted snapshots still in trash. It is not durable versioning: the
-trash-retention job eventually removes those snapshots.
+`GET /{bucket}?versions` is a compatibility view that reports the current object
+of each key as its single `null` version, exactly as S3 answers for an
+unversioned bucket. Overwritten and deleted blobs are retained in trash for the
+retention window, but they are an operator recovery buffer, not versions: there
+is no `?versionId` API to fetch or delete one, so they are not listed.
 
 ## Configuration
 
@@ -415,7 +417,7 @@ request/byte totals and rates are in the periodic logs and the console task view
 | `GET` | `/{bucket}?location` | Get bucket location. |
 | `GET` | `/{bucket}?uploads` | List multipart uploads. |
 | `GET/PUT/DELETE` | `/{bucket}?cors` | Read, replace, or remove bucket CORS rules. |
-| `GET` | `/{bucket}?versions` | Compatibility listing of retained current/retired snapshots; not S3 versioning. |
+| `GET` | `/{bucket}?versions` | Compatibility listing: one `null` version per live key, paginated by `key-marker`; not S3 versioning. |
 | `POST` | `/{bucket}?delete` | Multi-object delete, including quiet mode. |
 | `POST` | `/{bucket}?rebuildIndex` | Start an index rebuild (`202`; `409` if already running). |
 | `POST` | `/{bucket}` | SigV4 browser form upload with policy validation. |

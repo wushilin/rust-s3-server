@@ -1,5 +1,6 @@
-//! `GET /{bucket}?versions` — list object versions (this server keeps only the
-//! latest live version plus retired versions still in trash).
+//! `GET /{bucket}?versions` — list object versions. This server is unversioned,
+//! so each key has exactly one `null` version: the live object. Blobs retired to
+//! trash are not listed — no API can address them.
 
 use axum::body::Body;
 use axum::http::StatusCode;

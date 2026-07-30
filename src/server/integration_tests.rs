@@ -1994,8 +1994,13 @@
         assert!(body.contains("<Code>XAmzContentSHA256Mismatch</Code>"));
     }
 
+    /// The bucket is unversioned, so an overwritten key has exactly one
+    /// reportable version — the live one. The retired blob still sits in trash
+    /// as a recovery buffer, but no API can address it (there is no
+    /// `?versionId` route) and it would claim the same `VersionId=null` as the
+    /// live object, so the listing must not offer it.
     #[tokio::test]
-    async fn list_object_versions_includes_overwritten_objects() {
+    async fn list_object_versions_reports_only_the_live_version() {
         let tmp = tempfile::tempdir().unwrap();
         let app = make_app(&tmp);
 
@@ -2046,10 +2051,15 @@
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_text(res).await;
         assert!(body.contains("<ListVersionsResult"));
-        assert_eq!(body.matches("<Version>").count(), 2);
-        assert_eq!(body.matches("<Key>object.txt</Key>").count(), 2);
+        assert_eq!(body.matches("<Version>").count(), 1);
+        assert_eq!(body.matches("<Key>object.txt</Key>").count(), 1);
         assert!(body.contains("<IsLatest>true</IsLatest>"));
-        assert!(body.contains("<IsLatest>false</IsLatest>"));
+        assert!(
+            !body.contains("<IsLatest>false</IsLatest>"),
+            "retired trash blobs must not be reported as versions: {body}"
+        );
+        // The live version wins: the listing shows the latest write.
+        assert_eq!(extract_xml_tag(&body, "Size"), Some("6"), "{body}");
     }
 
     #[tokio::test]
@@ -2092,10 +2102,10 @@
         );
     }
 
-    /// Paging must not drop the older versions of an overwritten key: the marker
-    /// only names a key, so a page has to end on a key boundary.
+    /// Overwrites do not multiply version rows: one live version per key, so a
+    /// page holds exactly `max-keys` keys and the marker always advances.
     #[tokio::test]
-    async fn list_versions_pagination_keeps_every_version_of_overwritten_keys() {
+    async fn list_versions_pagination_reports_one_row_per_overwritten_key() {
         let tmp = tempfile::tempdir().unwrap();
         let app = seed_bucket(&tmp, "ver-multi", &[]).await;
         for (key, writes) in [("a.txt", 3), ("b.txt", 1), ("c.txt", 2)] {
@@ -2126,11 +2136,12 @@
             let body = get_body(&app, &uri).await;
             pages += 1;
             let page_keys = extract_all_xml_tags(&body, "Key");
+            assert!(
+                page_keys.len() <= 2,
+                "a page must hold at most max-keys rows: {body}"
+            );
             for key in &page_keys {
-                assert!(
-                    !all_keys.contains(key),
-                    "versions of {key} split across pages: {body}"
-                );
+                assert!(!all_keys.contains(key), "{key} reported twice: {body}");
             }
             all_keys.extend(page_keys);
             if extract_xml_tag(&body, "IsTruncated") != Some("true") {
@@ -2146,8 +2157,8 @@
         }
         assert_eq!(
             all_keys,
-            vec!["a.txt", "a.txt", "a.txt", "b.txt", "c.txt", "c.txt"],
-            "every version exactly once"
+            vec!["a.txt", "b.txt", "c.txt"],
+            "one live version per key, whatever the overwrite count"
         );
     }
 
