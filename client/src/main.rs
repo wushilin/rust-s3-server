@@ -18,7 +18,7 @@ use clap::{Args, Parser, Subcommand};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use output::{OutputOpts, init_output, print_error, print_msg};
+use output::{OutputOpts, init_output, out, print_error, print_msg};
 
 use config::{Alias, client_for_alias, load_config, save_config};
 use list::ObjectPaginator;
@@ -42,11 +42,43 @@ fn smithy_to_chrono(t: &aws_smithy_types::DateTime) -> DateTime<Utc> {
 /// bucket/dir/` shows `f.txt`, not `dir/f.txt`), mirroring how a plain `ls`
 /// shows names relative to the queried path rather than full absolute
 /// object keys.
+///
+/// Real `mc` gets this by auto-detecting a bare (non-slash-terminated)
+/// directory target and re-listing it with a trailing separator appended
+/// *before* computing the strip-prefix (`cmd/ls.go`'s `mainList` +
+/// `generateContentMessages`'s `prefixPath` truncation, [SEM] §11). We
+/// approximate the same outcome without an extra directory-detection round
+/// trip: when `prefix` doesn't already end in `/`, a matching key must
+/// still cross exactly one `/` boundary right after `prefix` to be treated
+/// as living "under" it (i.e. `prefix` named a directory) -- that boundary
+/// slash is consumed along with `prefix` itself, rather than left as a
+/// stray leading `/` on the displayed key. A key that continues with a
+/// non-`/` character right after `prefix` was only a partial-filename match
+/// (e.g. `pre` vs. `prefix1.txt`), which mc also leaves unstripped.
 fn strip_listing_prefix(full_key: &str, prefix: &str) -> String {
-    full_key
-        .strip_prefix(prefix)
-        .unwrap_or(full_key)
-        .to_string()
+    if prefix.is_empty() {
+        return full_key.to_string();
+    }
+    let Some(rest) = full_key.strip_prefix(prefix) else {
+        return full_key.to_string();
+    };
+    if prefix.ends_with('/') {
+        return rest.to_string();
+    }
+    match rest.strip_prefix('/') {
+        Some(after_boundary) => after_boundary.to_string(),
+        None => full_key.to_string(),
+    }
+}
+
+/// mc trims exactly one leading and one trailing literal `"` from an S3
+/// ETag before displaying/serializing it (`cmd/ls.go:146-148`,
+/// `cmd/stat.go:189-190` -- `strings.TrimPrefix`/`TrimSuffix`, not a
+/// general quote-stripping loop).
+fn strip_etag_quotes(etag: &str) -> String {
+    let etag = etag.strip_prefix('"').unwrap_or(etag);
+    let etag = etag.strip_suffix('"').unwrap_or(etag);
+    etag.to_string()
 }
 
 #[derive(Parser, Debug)]
@@ -442,7 +474,7 @@ async fn ls(args: LsArgs) -> Result<()> {
                     for obj in resp.contents() {
                         let size = obj.size().unwrap_or_default() as u64;
                         let key = strip_listing_prefix(obj.key().unwrap_or_default(), &prefix);
-                        let etag = obj.e_tag().unwrap_or_default().to_string();
+                        let etag = strip_etag_quotes(obj.e_tag().unwrap_or_default());
                         let time = obj
                             .last_modified()
                             .map(smithy_to_chrono)
@@ -622,7 +654,12 @@ async fn mb(args: MbArgs) -> Result<()> {
                     e.is_bucket_already_owned_by_you() || e.is_bucket_already_exists()
                 });
                 if args.ignore_existing && already_exists {
-                    println!("Bucket `{target}` already exists.");
+                    // Human-only informational line -- not one of mc's
+                    // message structs, so it must not corrupt a --json
+                    // stream (bare prose on stdout wouldn't parse as JSON).
+                    if !out().json {
+                        println!("Bucket `{target}` already exists.");
+                    }
                 } else {
                     return Err(err.into());
                 }
@@ -1026,7 +1063,10 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
     if args.recursive {
         let prefix = parsed.key.unwrap_or_default();
         let removed = remove_prefix(&client, &parsed.alias, &bucket, &prefix, args.dry_run).await?;
-        if removed == 0 {
+        // Human-only informational line -- not an RmMessage (nothing was
+        // actually removed), so it must not corrupt a --json stream; a
+        // zero-match `rm -r` under --json legitimately emits nothing.
+        if removed == 0 && !out().json {
             println!("Nothing to remove under `{target}`.");
         }
         Ok(())
@@ -1162,7 +1202,7 @@ async fn stat(args: StatArgs) -> Result<()> {
             key,
             date,
             size: resp.content_length().unwrap_or_default() as u64,
-            etag: resp.e_tag().unwrap_or_default().to_string(),
+            etag: strip_etag_quotes(resp.e_tag().unwrap_or_default()),
             content_type: resp.content_type().map(str::to_string),
             metadata,
         });

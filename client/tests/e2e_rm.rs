@@ -49,6 +49,21 @@ fn rm_dry_run_deletes_nothing() {
 }
 
 #[test]
+fn rm_recursive_zero_match_is_silent_under_json() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/bk7"]);
+    // "Nothing to remove under ..." isn't an mc message type (nothing was
+    // actually removed, so RmMessage doesn't apply), so under --json it
+    // must not print bare prose that would corrupt the JSON stream -- a
+    // zero-match `rm -r` legitimately emits nothing at all.
+    let out = server.rs3_ok(&["--json", "rm", "--recursive", "--force", "test/bk7/nope/"]);
+    assert!(
+        out.trim().is_empty(),
+        "zero-match rm -r must be silent under --json, got: {out}"
+    );
+}
+
+#[test]
 fn rm_missing_key_fails_but_later_targets_run() {
     let server = TestServer::start();
     seed(&server, "bk4", &["real.txt"]);

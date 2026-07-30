@@ -20,7 +20,57 @@ fn ls_json_is_content_message() {
     assert_eq!(v["size"], 5);
     assert_eq!(v["key"], "f.txt");
     assert!(v["lastModified"].as_str().unwrap().contains('T'));
-    assert!(v.get("etag").is_some());
+    let etag = v["etag"].as_str().expect("etag present");
+    assert!(
+        !etag.starts_with('"'),
+        "etag must be quote-stripped like real mc: {etag:?}"
+    );
+
+    // Same object via `stat --json`: StatMessage's etag must also be
+    // quote-stripped (mc's cmd/stat.go:189-190 does the same TrimPrefix/
+    // TrimSuffix `"` as cmd/ls.go:146-148).
+    let stat_out = server.rs3_ok(&["--json", "stat", "test/lsjson/dir/f.txt"]);
+    let sv: serde_json::Value = serde_json::from_str(stat_out.trim()).unwrap();
+    let stat_etag = sv["etag"].as_str().expect("stat etag present");
+    assert!(
+        !stat_etag.starts_with('"'),
+        "stat etag must be quote-stripped like real mc: {stat_etag:?}"
+    );
+}
+
+#[test]
+fn ls_recursive_no_trailing_slash_strips_directory_prefix() {
+    // mc auto-detects a bare (non-slash-terminated) directory target and
+    // displays entries relative to it, same as a slash-terminated one --
+    // `ls -r bucket/dir` must show `f.txt`/`sub/g.txt`, not `dir/f.txt` (a
+    // leading-`/`-prefixed leftover from a naive `strip_prefix("dir")`) or
+    // the raw un-stripped full key.
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/lsnoslash"]);
+    let src = server.dir.path().join("f.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/lsnoslash/dir/f.txt"]);
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/lsnoslash/dir/sub/g.txt"]);
+    let out = server.rs3_ok(&["--json", "ls", "-r", "test/lsnoslash/dir"]);
+    let keys: Vec<String> = out
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["key"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert!(
+        keys.contains(&"f.txt".to_string()),
+        "keys: {keys:?}, out: {out}"
+    );
+    assert!(
+        keys.contains(&"sub/g.txt".to_string()),
+        "keys: {keys:?}, out: {out}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.starts_with('/')),
+        "no key should have a stray leading '/': {keys:?}"
+    );
 }
 
 #[test]
