@@ -18,7 +18,7 @@ use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use output::{OutputOpts, init_output, out, print_error, print_msg};
 
@@ -133,6 +133,8 @@ enum Commands {
     Get(GetArgs),
     #[command(about = "display object contents")]
     Cat(CatArgs),
+    #[command(about = "display first n lines of an object")]
+    Head(HeadArgs),
     #[command(about = "remove object(s)")]
     Rm(RmArgs),
     #[command(about = "show object metadata")]
@@ -326,6 +328,18 @@ struct CatArgs {
 }
 
 #[derive(Args, Debug)]
+struct HeadArgs {
+    #[arg(
+        short = 'n',
+        long = "lines",
+        default_value_t = 10,
+        allow_hyphen_values = true
+    )]
+    lines: i64,
+    targets: Vec<String>,
+}
+
+#[derive(Args, Debug)]
 struct RmArgs {
     #[arg(short = 'r', long)]
     recursive: bool,
@@ -379,6 +393,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Mv(args) => mv(args).await,
         Commands::Get(args) => get(args).await,
         Commands::Cat(args) => cat(args).await,
+        Commands::Head(args) => head(args).await,
         Commands::Rm(args) => rm(args).await,
         Commands::Stat(args) => stat(args).await,
         Commands::Mirror(args) => mirror(args).await,
@@ -1490,6 +1505,121 @@ async fn cat(args: CatArgs) -> Result<()> {
         let mut stdout = tokio::io::stdout();
         tokio::io::copy(&mut reader, &mut stdout).await?;
         stdout.flush().await?;
+    }
+    Ok(())
+}
+
+/// Strips a trailing line terminator from a `read_until(b'\n', ..)` buffer:
+/// the `\n` itself (if present, i.e. not the final unterminated line at
+/// EOF) and, if the source used CRLF, the preceding `\r` too ([SEM] §4:
+/// `head` always re-emits Unix `\n` regardless of the source's line
+/// ending).
+fn strip_line_terminator(mut buf: Vec<u8>) -> Vec<u8> {
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    buf
+}
+
+/// Reads up to `lines` lines off an async buffered reader and writes each
+/// one to stdout followed by an explicit `\n`, stopping (and dropping the
+/// underlying stream without draining it) once `lines` is reached or the
+/// stream ends -- mirrors mc's `bufio.Reader.ReadLine()` loop in
+/// `headURL` ([SEM] §4).
+async fn head_stream_async<R>(reader: &mut R, lines: i64) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut stdout = tokio::io::stdout();
+    let mut count = 0i64;
+    while count < lines {
+        let mut buf = Vec::new();
+        let n = reader.read_until(b'\n', &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        let buf = strip_line_terminator(buf);
+        stdout.write_all(&buf).await?;
+        stdout.write_all(b"\n").await?;
+        count += 1;
+    }
+    stdout.flush().await?;
+    Ok(())
+}
+
+/// Same line-limited read loop as [`head_stream_async`], but over a
+/// synchronous `BufRead` -- used for the gzip-decoded path, where the
+/// whole (typically small) compressed object has already been buffered in
+/// memory and run through `flate2::read::MultiGzDecoder`.
+fn head_stream_sync<R: std::io::BufRead>(reader: &mut R, lines: i64) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let mut count = 0i64;
+    while count < lines {
+        let mut buf = Vec::new();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let buf = strip_line_terminator(buf);
+        stdout.write_all(&buf)?;
+        stdout.write_all(b"\n")?;
+        count += 1;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// `head`: full un-ranged GET per target, then a client-side first-N-lines
+/// loop that stops early and drops the stream ([SEM] §4). `--json` has no
+/// effect on this command's payload ([OUT] gotcha 14: `head`/`cat` sit
+/// entirely outside the message/printMsg system). `--rewind`,
+/// `--version-id`, and `--zip` are not implemented -- rather than accept
+/// and hard-error on them, they are simply absent from `HeadArgs`, so
+/// clap itself rejects them with its normal "unexpected argument" error;
+/// simpler than a bespoke refusal message for flags this command never
+/// otherwise touches. Likewise, a stdin/`-` fallback for "no targets" is
+/// out of scope here (that's pipe's territory in a later task) -- with no
+/// targets clap's own "required" error fires instead.
+async fn head(args: HeadArgs) -> Result<()> {
+    // mc's own defensive reset: an explicit negative -n silently becomes
+    // the default of 10 (the flag's own default already covers "unset").
+    let lines = if args.lines < 0 { 10 } else { args.lines };
+    for target in args.targets {
+        let parsed = parse_s3_url(&target)?;
+        let bucket = parsed
+            .bucket
+            .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
+        let key = parsed
+            .key
+            .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
+        let (client, _) = client_for_alias(&parsed.alias).await?;
+        let resp = client.get_object().bucket(bucket).key(key).send().await?;
+        let content_type = resp.content_type().unwrap_or_default().to_ascii_lowercase();
+        if content_type.contains("bzip") {
+            return Err(anyhow!(
+                "head: bzip2-compressed objects are not supported yet"
+            ));
+        }
+        if content_type.contains("gzip") {
+            // No streaming gzip bridge between the SDK's async body and a
+            // sync flate2 decoder here -- buffer the whole (head-sized,
+            // typically small) compressed object in memory first. Fine for
+            // `head`'s use case; would need revisiting for arbitrarily
+            // large gzip objects.
+            let mut reader = resp.body.into_async_read();
+            let mut compressed = Vec::new();
+            reader.read_to_end(&mut compressed).await?;
+            let decoder = flate2::read::MultiGzDecoder::new(std::io::Cursor::new(compressed));
+            let mut buf_reader = std::io::BufReader::new(decoder);
+            head_stream_sync(&mut buf_reader, lines)?;
+        } else {
+            let mut reader = tokio::io::BufReader::new(resp.body.into_async_read());
+            head_stream_async(&mut reader, lines).await?;
+        }
     }
     Ok(())
 }
