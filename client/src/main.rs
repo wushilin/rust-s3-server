@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use aws_sdk_s3::Client;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use clap::{Args, Parser, Subcommand};
 use humansize::{BINARY, format_size};
@@ -14,7 +15,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use config::{Alias, client_for_alias, load_config, save_config};
-use list::collect_objects;
+use list::{ObjectPaginator, collect_objects};
 use transfer::{download_key_to_path, download_object, transfer_object_between_s3, upload_file};
 use urls::{is_s3_url, join_key, join_s3_target, parse_s3_url, parse_size};
 
@@ -225,6 +226,8 @@ struct RmArgs {
     versions: bool,
     #[arg(long = "version-id", visible_alias = "vid")]
     version_id: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
     targets: Vec<String>,
 }
 
@@ -803,24 +806,114 @@ async fn cat(args: CatArgs) -> Result<()> {
 }
 
 async fn rm(args: RmArgs) -> Result<()> {
-    for target in args.targets {
-        let parsed = parse_s3_url(&target)?;
-        let bucket = parsed
-            .bucket
-            .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
+    if args.versions || args.version_id.is_some() {
+        return Err(anyhow!("rm --versions/--version-id is not implemented yet"));
+    }
+    if args.recursive && !args.force && !args.dry_run {
+        return Err(anyhow!(
+            "removal with --recursive requires --force (or use --dry-run)"
+        ));
+    }
+    let mut failures = 0u64;
+    for target in &args.targets {
+        if let Err(err) = rm_one_target(target, &args).await {
+            eprintln!("rm: {target}: {err:#}");
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        return Err(anyhow!("{failures} target(s) failed"));
+    }
+    Ok(())
+}
+
+async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
+    let parsed = parse_s3_url(target)?;
+    let bucket = parsed
+        .bucket
+        .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
+    let (client, _) = client_for_alias(&parsed.alias).await?;
+    if args.recursive {
+        let prefix = parsed.key.unwrap_or_default();
+        let removed = remove_prefix(&client, &parsed.alias, &bucket, &prefix, args.dry_run).await?;
+        if removed == 0 {
+            println!("Nothing to remove under `{target}`.");
+        }
+        Ok(())
+    } else {
         let key = parsed
             .key
             .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
-        let (client, _) = client_for_alias(&parsed.alias).await?;
+        // DeleteObject succeeds for missing keys; stat first for an mc-like error.
+        client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|_| anyhow!("object does not exist"))?;
+        if args.dry_run {
+            println!("DRY-RUN rm `{target}`.");
+            return Ok(());
+        }
         client
             .delete_object()
-            .bucket(bucket)
-            .key(key)
+            .bucket(&bucket)
+            .key(&key)
             .send()
             .await?;
         println!("Removed `{target}`.");
+        Ok(())
     }
-    Ok(())
+}
+
+async fn remove_prefix(
+    client: &Client,
+    alias: &str,
+    bucket: &str,
+    prefix: &str,
+    dry_run: bool,
+) -> Result<u64> {
+    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+    let mut pager = ObjectPaginator::new(client.clone(), bucket.to_string(), prefix.to_string());
+    let mut removed = 0u64;
+    while let Some(page) = pager.next_page().await? {
+        if page.is_empty() {
+            continue;
+        }
+        if dry_run {
+            for obj in &page {
+                println!("DRY-RUN rm `{alias}/{bucket}/{}`.", obj.key);
+            }
+            removed += page.len() as u64;
+            continue;
+        }
+        for chunk in page.chunks(1000) {
+            let ids = chunk
+                .iter()
+                .map(|o| ObjectIdentifier::builder().key(&o.key).build())
+                .collect::<Result<Vec<_>, _>>()?;
+            let delete = Delete::builder().set_objects(Some(ids)).build()?;
+            let resp = client
+                .delete_objects()
+                .bucket(bucket)
+                .delete(delete)
+                .send()
+                .await?;
+            for err in resp.errors() {
+                return Err(anyhow!(
+                    "delete failed for `{}`: {}",
+                    err.key().unwrap_or("?"),
+                    err.message().unwrap_or("unknown error")
+                ));
+            }
+            for obj in chunk {
+                println!("Removed `{alias}/{bucket}/{}`.", obj.key);
+            }
+            removed += chunk.len() as u64;
+        }
+    }
+    Ok(removed)
 }
 
 async fn stat(args: StatArgs) -> Result<()> {
