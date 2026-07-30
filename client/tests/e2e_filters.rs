@@ -398,3 +398,55 @@ fn cp_preserve_s3_to_s3_same_endpoint_succeeds() {
         "Mc-Attrs should have been carried over by server-side copy: {out}"
     );
 }
+
+// Regression test: `upload_part_copy` (unlike `copy_object`) has no
+// metadata-directive carry-over -- `create_multipart_upload` starts a
+// brand-new object with no metadata at all unless it's set explicitly.
+// Above the single-copy threshold, a same-endpoint `cp` used to go through
+// `multipart_server_side_copy`, which called `create_multipart_upload`
+// with no metadata at all, silently dropping Content-Type and every
+// user-metadata key -- including `Mc-Attrs` from `--preserve`, but also
+// any plain `--attr` metadata on an ordinary large copy. Seeded via
+// `--attr` (Task 5) rather than `--preserve` so this test doesn't need to
+// touch fs attrs at all; the same `multipart_server_side_copy` fix covers
+// both call sites.
+#[test]
+fn cp_multipart_same_endpoint_copy_preserves_metadata() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/mpcopy"]);
+    let src = server.dir.path().join("big.bin");
+    let data: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&src, &data).unwrap();
+    server.rs3_ok(&[
+        "put",
+        "--part-size",
+        "5MiB",
+        "--attr",
+        "X-Amz-Meta-Big=yes",
+        src.to_str().unwrap(),
+        "test/mpcopy/src.bin",
+    ]);
+    // `--part-size 5MiB` on a 12MiB object with a 12MiB source forces the
+    // same-endpoint copy above `MAX_SINGLE_COPY`'s per-part-size cap onto
+    // the multipart server-side-copy path (`upload_part_copy` x3), not the
+    // single-shot `copy_object` path that already carries metadata over
+    // for free.
+    server.rs3_ok(&[
+        "cp",
+        "--part-size",
+        "5MiB",
+        "test/mpcopy/src.bin",
+        "test/mpcopy/dst.bin",
+    ]);
+    let stat = server.rs3_ok(&["stat", "test/mpcopy/dst.bin"]);
+    assert!(
+        stat.contains("-3"),
+        "expected a multipart-etag target proving the multipart copy path ran: {stat}"
+    );
+    let out = server.rs3_ok(&["stat", "--json", "test/mpcopy/dst.bin"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        v["metadata"]["big"], "yes",
+        "user metadata must survive a same-endpoint multipart server-side copy: {out}"
+    );
+}

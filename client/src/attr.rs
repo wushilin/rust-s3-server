@@ -188,6 +188,14 @@ fn parse_sec_nsec(v: &str) -> Option<std::time::SystemTime> {
 /// failing the whole call, matching mc's `preserveAttributes` (mode/uid/gid
 /// default to "leave unchanged" on parse failure, and mc's own
 /// `probe.Error` from these calls is logged, not fatal, at the call site).
+///
+/// Order matters: atime/mtime are applied *before* mode. Setting times
+/// needs the file opened `write(true)`, and a preserved read-only mode
+/// (e.g. `0o444`) would make that open fail (`EACCES`) if mode were
+/// applied first -- silently dropping the timestamp restore along with it,
+/// since every field here is best-effort. Applying times while the file
+/// still has its original (writable-by-us) permissions, then chmod-ing
+/// last, avoids that ordering trap.
 #[cfg(unix)]
 pub(crate) fn apply_fs_attrs(path: &std::path::Path, encoded: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -207,10 +215,6 @@ pub(crate) fn apply_fs_attrs(path: &std::path::Path, encoded: &str) -> Result<()
         }
     }
 
-    if let Some(mode) = fields.get("mode").and_then(|v| parse_uint_auto(v)) {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
-    }
-
     let atime = fields.get("atime").and_then(|v| parse_sec_nsec(v));
     let mtime = fields.get("mtime").and_then(|v| parse_sec_nsec(v));
     if atime.is_some() || mtime.is_some() {
@@ -224,6 +228,10 @@ pub(crate) fn apply_fs_attrs(path: &std::path::Path, encoded: &str) -> Result<()
             }
             let _ = file.set_times(times);
         }
+    }
+
+    if let Some(mode) = fields.get("mode").and_then(|v| parse_uint_auto(v)) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
     }
 
     let uid = fields.get("uid").and_then(|v| v.parse::<u32>().ok());
@@ -355,5 +363,59 @@ mod tests {
         apply_fs_attrs(&dst, "mode:0x1A4").unwrap(); // 0x1A4 == 0644
         let dst_meta = std::fs::metadata(&dst).unwrap();
         assert_eq!(dst_meta.permissions().mode() & 0o777, 0o644);
+    }
+
+    // Regression test: a preserved read-only mode (0o444) must not prevent
+    // atime/mtime from being restored. If mode were applied before times,
+    // the `File::options().write(true).open(path)` needed to set times
+    // would fail with EACCES against the now-read-only file -- and since
+    // every field here is independently best-effort (by design, matching
+    // mc), that failure is silently swallowed, so the whole call still
+    // returns `Ok(())` while quietly dropping the timestamp restore. Order
+    // must be times-then-mode so the file is still writable-by-us when
+    // times are applied.
+    #[cfg(unix)]
+    #[test]
+    fn apply_fs_attrs_restores_mtime_even_with_readonly_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        // Pin the source's mtime to a value far from "now" (rather than
+        // relying on its just-created timestamp), so this test can't pass
+        // by coincidence: dst is also created moments later in this same
+        // test, and on a coarse-grained fs clock the two "just created"
+        // timestamps could land in the same tick even without the code
+        // under test ever actually applying anything.
+        let pinned =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 123_000);
+        let file = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(pinned)
+            .set_accessed(pinned);
+        file.set_times(times).unwrap();
+        drop(file);
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let encoded = encode_fs_attrs(&src_meta);
+
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&dst, b"world").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        apply_fs_attrs(&dst, &encoded).unwrap();
+
+        let dst_meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(
+            dst_meta.permissions().mode() & 0o777,
+            0o444,
+            "mode should still apply"
+        );
+        assert_eq!(
+            dst_meta.modified().unwrap(),
+            pinned,
+            "mtime must be restored even though the encoded mode is read-only"
+        );
     }
 }

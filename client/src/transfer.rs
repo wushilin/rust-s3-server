@@ -506,12 +506,37 @@ async fn multipart_server_side_copy(
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
-    let created = target_client
+    // `upload_part_copy` has no equivalent of `copy_object`'s
+    // `x-amz-metadata-directive: COPY` -- `create_multipart_upload` starts
+    // a brand-new object with no metadata at all unless it's set
+    // explicitly here, so a same-endpoint copy above the single-copy
+    // threshold would otherwise silently drop `Content-Type` and every
+    // user-metadata key (including `Mc-Attrs`) that the single-shot
+    // `copy_object` path above carries over for free ([SEM] §2's
+    // `getAllMetadata`). `target_client` is safe to use for this HEAD:
+    // this function is only reached from the same-endpoint branch of
+    // `transfer_object_between_s3`, so it's the same credentials/endpoint
+    // as `source_client` would be.
+    let head = target_client
+        .head_object()
+        .bucket(source_bucket)
+        .key(source_key)
+        .send()
+        .await
+        .map_err(|err| anyhow!("stat `{source_bucket}/{source_key}`: {err}"))?;
+    let mut create = target_client
         .create_multipart_upload()
         .bucket(target_bucket)
-        .key(target_key)
-        .send()
-        .await?;
+        .key(target_key);
+    if let Some(content_type) = head.content_type() {
+        create = create.content_type(content_type.to_string());
+    }
+    if let Some(metadata) = head.metadata() {
+        for (k, v) in metadata {
+            create = create.metadata(k.clone(), v.clone());
+        }
+    }
+    let created = create.send().await?;
     let upload_id = created
         .upload_id()
         .ok_or_else(|| anyhow!("server did not return upload id"))?
