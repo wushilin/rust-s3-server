@@ -27,14 +27,6 @@ pub(crate) fn is_s3_url(input: &str) -> bool {
         && input.split('/').count() >= 2
 }
 
-pub(crate) fn join_s3_target(target: &str, rel: &str) -> String {
-    format!(
-        "{}/{}",
-        target.trim_end_matches('/'),
-        rel.trim_start_matches('/')
-    )
-}
-
 pub(crate) fn join_key(prefix: &str, rel: &str) -> String {
     if prefix.is_empty() {
         rel.trim_start_matches('/').to_string()

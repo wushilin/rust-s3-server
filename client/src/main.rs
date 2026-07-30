@@ -1,5 +1,6 @@
 mod config;
 mod list;
+mod mirror;
 mod transfer;
 mod urls;
 
@@ -15,9 +16,9 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use config::{Alias, client_for_alias, load_config, save_config};
-use list::{ObjectPaginator, collect_objects};
-use transfer::{download_key_to_path, download_object, transfer_object_between_s3, upload_file};
-use urls::{DEFAULT_PART_SIZE, is_s3_url, join_key, join_s3_target, parse_s3_url, parse_size};
+use list::ObjectPaginator;
+use transfer::{download_object, transfer_object_between_s3, upload_file};
+use urls::{DEFAULT_PART_SIZE, is_s3_url, parse_s3_url, parse_size};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -178,25 +179,25 @@ struct CpArgs {
 }
 
 #[derive(Args, Debug)]
-struct MirrorArgs {
+pub(crate) struct MirrorArgs {
     #[arg(short = 'P', long, default_value_t = 4)]
-    parallel: usize,
+    pub(crate) parallel: usize,
     #[arg(short = 's', long, default_value = "256MiB", help = "each part size")]
-    part_size: String,
+    pub(crate) part_size: String,
     #[arg(long)]
-    overwrite: bool,
+    pub(crate) overwrite: bool,
     #[arg(long)]
-    remove: bool,
+    pub(crate) remove: bool,
     #[arg(long)]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
     #[arg(long, alias = "fake")]
-    fake: bool,
+    pub(crate) fake: bool,
     #[arg(short = 'w', long)]
-    watch: bool,
+    pub(crate) watch: bool,
     #[arg(long)]
-    disable_multipart: bool,
-    source: String,
-    target: String,
+    pub(crate) disable_multipart: bool,
+    pub(crate) source: String,
+    pub(crate) target: String,
 }
 
 #[derive(Args, Debug)]
@@ -538,14 +539,7 @@ async fn cp(args: CpArgs) -> Result<()> {
     for source in &args.paths[..args.paths.len() - 1] {
         if is_s3_url(source) && is_s3_url(&target) {
             if args.recursive {
-                mirror_s3_to_s3(
-                    source,
-                    &target,
-                    part_size,
-                    args.disable_multipart,
-                    args.parallel,
-                )
-                .await?;
+                cp_recursive(source, &target, &args).await?;
             } else {
                 copy_s3_object_to_s3(
                     source,
@@ -558,7 +552,7 @@ async fn cp(args: CpArgs) -> Result<()> {
             }
         } else if is_s3_url(source) && !is_s3_url(&target) {
             if args.recursive {
-                mirror_s3_to_local(source, Path::new(&target), part_size, args.parallel).await?;
+                cp_recursive(source, &target, &args).await?;
             } else {
                 download_object(
                     source,
@@ -576,14 +570,7 @@ async fn cp(args: CpArgs) -> Result<()> {
                         "source `{source}` is a directory; use --recursive to copy it"
                     ));
                 }
-                mirror_local_to_s3(
-                    source_path,
-                    &target,
-                    part_size,
-                    args.disable_multipart,
-                    args.parallel,
-                )
-                .await?;
+                cp_recursive(source, &target, &args).await?;
             } else {
                 upload_file(
                     source_path,
@@ -602,53 +589,26 @@ async fn cp(args: CpArgs) -> Result<()> {
     Ok(())
 }
 
-async fn mirror(args: MirrorArgs) -> Result<()> {
-    let part_size = parse_size(&args.part_size)?;
-    if args.watch {
-        return Err(anyhow!("mirror --watch is not implemented yet"));
-    }
-    if args.remove {
-        eprintln!(
-            "mirror --remove is accepted, but removal of extraneous target objects is not implemented yet"
-        );
-    }
-    if args.dry_run || args.fake {
-        println!("mirror dry run: {} -> {}", args.source, args.target);
-        return Ok(());
-    }
+/// `cp --recursive` always copies everything (it is not a sync), so it drives
+/// the mirror planner with `overwrite: true` and `remove: false`.
+async fn cp_recursive(source: &str, target: &str, args: &CpArgs) -> Result<()> {
+    let mirror_args = MirrorArgs {
+        parallel: args.parallel,
+        part_size: args.part_size.clone(),
+        overwrite: true,
+        remove: false,
+        dry_run: false,
+        fake: false,
+        watch: false,
+        disable_multipart: args.disable_multipart,
+        source: source.to_string(),
+        target: target.to_string(),
+    };
+    mirror::run_mirror(&mirror_args).await
+}
 
-    let source_path = Path::new(&args.source);
-    if source_path.exists() && is_s3_url(&args.target) {
-        mirror_local_to_s3(
-            source_path,
-            &args.target,
-            part_size,
-            args.disable_multipart,
-            args.parallel,
-        )
-        .await
-    } else if is_s3_url(&args.source) && !is_s3_url(&args.target) {
-        mirror_s3_to_local(
-            &args.source,
-            Path::new(&args.target),
-            part_size,
-            args.parallel,
-        )
-        .await
-    } else if is_s3_url(&args.source) && is_s3_url(&args.target) {
-        mirror_s3_to_s3(
-            &args.source,
-            &args.target,
-            part_size,
-            args.disable_multipart,
-            args.parallel,
-        )
-        .await
-    } else {
-        Err(anyhow!(
-            "mirror currently supports local directory -> S3 prefix, S3 prefix -> local directory, and S3 prefix -> S3 prefix"
-        ))
-    }
+async fn mirror(args: MirrorArgs) -> Result<()> {
+    mirror::run_mirror(&args).await
 }
 
 async fn copy_s3_object_to_s3(
@@ -761,140 +721,6 @@ async fn copy_local_path(source: &Path, target: &Path, recursive: bool) -> Resul
         }
         fs::copy(source, &output).await?;
         println!("Copied `{}` to `{}`.", source.display(), output.display());
-    }
-    Ok(())
-}
-
-async fn mirror_local_to_s3(
-    source: &Path,
-    target: &str,
-    part_size: u64,
-    disable_multipart: bool,
-    parallel: usize,
-) -> Result<()> {
-    let metadata = fs::metadata(source)
-        .await
-        .with_context(|| format!("stat {}", source.display()))?;
-    if !metadata.is_dir() {
-        return upload_file(source, target, part_size, parallel, disable_multipart, None).await;
-    }
-
-    let mut dirs = VecDeque::from([source.to_path_buf()]);
-    while let Some(dir) = dirs.pop_front() {
-        let mut entries = fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let metadata = entry.metadata().await?;
-            if metadata.is_dir() {
-                dirs.push_back(path);
-                continue;
-            }
-            if !metadata.is_file() {
-                continue;
-            }
-            let rel = path
-                .strip_prefix(source)?
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            let object_target = join_s3_target(target, &rel);
-            upload_file(
-                &path,
-                &object_target,
-                part_size,
-                parallel,
-                disable_multipart,
-                None,
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn mirror_s3_to_local(
-    source: &str,
-    target: &Path,
-    part_size: u64,
-    parallel: usize,
-) -> Result<()> {
-    let parsed = parse_s3_url(source)?;
-    let bucket = parsed
-        .bucket
-        .ok_or_else(|| anyhow!("bucket is required in source `{source}`"))?;
-    let prefix = parsed.key.unwrap_or_default();
-    let (client, _) = client_for_alias(&parsed.alias).await?;
-    fs::create_dir_all(target).await?;
-
-    for obj in collect_objects(&client, &bucket, &prefix).await? {
-        let rel = obj
-            .key
-            .strip_prefix(&prefix)
-            .unwrap_or(&obj.key)
-            .trim_start_matches('/');
-        if rel.is_empty() {
-            continue;
-        }
-        let output = target.join(rel);
-        download_key_to_path(&client, &bucket, &obj.key, &output, part_size, parallel).await?;
-        println!(
-            "Mirrored `{}/{}` to `{}`.",
-            bucket,
-            obj.key,
-            output.display()
-        );
-    }
-    Ok(())
-}
-
-async fn mirror_s3_to_s3(
-    source: &str,
-    target: &str,
-    part_size: u64,
-    disable_multipart: bool,
-    parallel: usize,
-) -> Result<()> {
-    let source_url = parse_s3_url(source)?;
-    let source_bucket = source_url
-        .bucket
-        .ok_or_else(|| anyhow!("bucket is required in source `{source}`"))?;
-    let source_prefix = source_url.key.unwrap_or_default();
-    let target_url = parse_s3_url(target)?;
-    let target_bucket = target_url
-        .bucket
-        .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
-    let target_prefix = target_url.key.unwrap_or_default();
-    let (source_client, source_alias) = client_for_alias(&source_url.alias).await?;
-    let (target_client, target_alias) = client_for_alias(&target_url.alias).await?;
-
-    for obj in collect_objects(&source_client, &source_bucket, &source_prefix).await? {
-        let rel = obj
-            .key
-            .strip_prefix(&source_prefix)
-            .unwrap_or(&obj.key)
-            .trim_start_matches('/');
-        if rel.is_empty() {
-            continue;
-        }
-        let target_key = join_key(&target_prefix, rel);
-        transfer_object_between_s3(
-            &source_client,
-            &source_alias,
-            &source_bucket,
-            &obj.key,
-            &target_client,
-            &target_alias,
-            &target_bucket,
-            &target_key,
-            obj.size,
-            part_size,
-            disable_multipart,
-            parallel,
-        )
-        .await?;
-        println!(
-            "Mirrored `{}/{}` to `{}/{}`.",
-            source_bucket, obj.key, target_bucket, target_key
-        );
     }
     Ok(())
 }
