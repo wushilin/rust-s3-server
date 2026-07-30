@@ -61,7 +61,11 @@ pub(crate) fn parse_size(input: &str) -> Result<u64> {
         "g" | "gb" | "gib" => 1024 * 1024 * 1024,
         _ => return Err(anyhow!("unsupported size unit `{}`", &s[split..])),
     };
-    Ok(number * multiplier)
+    let result = number * multiplier;
+    if result == 0 {
+        return Err(anyhow!("size must be greater than zero"));
+    }
+    Ok(result)
 }
 
 #[allow(dead_code)]
@@ -99,5 +103,20 @@ mod tests {
         let u = parse_s3_url("alias").unwrap();
         assert_eq!(u.bucket, None);
         assert_eq!(u.key, None);
+    }
+
+    #[test]
+    fn parse_size_normal_case() {
+        assert_eq!(parse_size("5MiB").unwrap(), 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_size_rejects_zero() {
+        assert!(parse_size("0").is_err());
+    }
+
+    #[test]
+    fn parse_size_rejects_zero_with_unit() {
+        assert!(parse_size("0MiB").is_err());
     }
 }
