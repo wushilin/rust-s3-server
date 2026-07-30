@@ -22,29 +22,17 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, _body: Body)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1000)
         .min(1000);
-    match store.list_object_versions(&ctx.bucket, prefix).await {
-        Ok(mut versions) => {
-            // Order by key, then newest-first within a key (S3's ordering), and
-            // resume strictly after `key-marker`.
-            versions.sort_by(|a, b| {
-                a.meta
-                    .object_key
-                    .cmp(&b.meta.object_key)
-                    .then(b.meta.last_modified_ms.cmp(&a.meta.last_modified_ms))
-            });
-            let mut page: Vec<_> = versions
-                .into_iter()
-                .filter(|v| key_marker.is_empty() || v.meta.object_key.as_str() > key_marker)
-                .collect();
-            // `max_keys == 0` can never advance the key marker, so reporting
-            // truncation would make a paginating client replay forever.
-            let is_truncated = max_keys > 0 && page.len() > max_keys;
-            page.truncate(max_keys);
-            let next_key_marker = if is_truncated {
-                page.last().map(|v| v.meta.object_key.clone())
-            } else {
-                None
-            };
+    // The store resolves ordering, the `key-marker` cursor and truncation: only
+    // this page's key range is read, and a key's versions are never split
+    // across pages.
+    match store
+        .list_object_versions(&ctx.bucket, prefix, key_marker, max_keys)
+        .await
+    {
+        Ok(page) => {
+            let is_truncated = page.is_truncated;
+            let next_key_marker = page.next_key_marker;
+            let page = page.entries;
             let count = page.len();
             srv::with_measure(
                 srv::xml_response(

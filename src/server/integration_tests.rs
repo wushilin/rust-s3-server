@@ -2092,6 +2092,78 @@
         );
     }
 
+    /// Paging must not drop the older versions of an overwritten key: the marker
+    /// only names a key, so a page has to end on a key boundary.
+    #[tokio::test]
+    async fn list_versions_pagination_keeps_every_version_of_overwritten_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = seed_bucket(&tmp, "ver-multi", &[]).await;
+        for (key, writes) in [("a.txt", 3), ("b.txt", 1), ("c.txt", 2)] {
+            for n in 0..writes {
+                let res = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri(format!("/ver-multi/{key}"))
+                            .body(Body::from(format!("v{n}")))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+            }
+        }
+
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut uri = "/ver-multi?versions&max-keys=2".to_string();
+            if let Some(m) = &marker {
+                uri.push_str(&format!("&key-marker={}", urlencoding::encode(m)));
+            }
+            let body = get_body(&app, &uri).await;
+            pages += 1;
+            let page_keys = extract_all_xml_tags(&body, "Key");
+            for key in &page_keys {
+                assert!(
+                    !all_keys.contains(key),
+                    "versions of {key} split across pages: {body}"
+                );
+            }
+            all_keys.extend(page_keys);
+            if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                break;
+            }
+            marker = Some(
+                extract_xml_tag(&body, "NextKeyMarker")
+                    .filter(|v| !v.is_empty())
+                    .expect("truncated page must carry NextKeyMarker")
+                    .to_string(),
+            );
+            assert!(pages < 6, "pagination did not terminate: {pages} pages");
+        }
+        assert_eq!(
+            all_keys,
+            vec!["a.txt", "a.txt", "a.txt", "b.txt", "c.txt", "c.txt"],
+            "every version exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_versions_max_keys_zero_does_not_advertise_another_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = vec!["only.txt".to_string()];
+        let app = seed_bucket(&tmp, "ver-zero", &keys).await;
+        let body = get_body(&app, "/ver-zero?versions&max-keys=0").await;
+        assert_eq!(
+            extract_xml_tag(&body, "IsTruncated"),
+            Some("false"),
+            "max-keys=0 must not advertise another page: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn get_with_missing_physical_part_returns_error_not_success() {
         let tmp = tempfile::tempdir().unwrap();
