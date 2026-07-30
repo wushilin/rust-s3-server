@@ -9,15 +9,18 @@ aws-config = "1"
 aws-credential-types = "1"
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }
 dirs = "6"
 flate2 = "1"
 futures = "0.3"
+hmac = "0.12"
 humansize = "2"
 indicatif = "0.17"
 percent-encoding = "2"
 regex = "1"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 shell-words = "1"

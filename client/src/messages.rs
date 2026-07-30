@@ -556,6 +556,85 @@ impl TransferSession {
     }
 }
 
+/// `share download`/`share upload`/`share list` message ([OUT] §2's
+/// `shareMessage`, shared by all three subcommands). `time_left_ns` mirrors
+/// mc's `TimeLeft time.Duration` field, which JSON-marshals as a raw int64
+/// **nanoseconds** number, not a duration string or a humanized string --
+/// ground-truth-verified against real `mc --json share download/upload`.
+/// `content_type` is upload-only (`None` for every `download`/`list
+/// download` message, and for an `upload` that didn't pass
+/// `--content-type`) and is emitted as JSON `"contentType"` only when
+/// present (`omitempty` on the Go side).
+///
+/// mc's `JSON()` additionally un-escapes `&`/`</`>` that Go's
+/// `encoding/json` HTML-escapes by default -- `serde_json` never escapes
+/// those in the first place, so there is nothing to reverse here (noted in
+/// the task report, not a rs3 gap).
+pub(crate) struct ShareMessage {
+    pub object_url: String,
+    pub share_url: String,
+    pub time_left_ns: i64,
+    pub content_type: Option<String>,
+}
+
+/// Renders a `time.Duration`-shaped nanosecond count as mc's `share`
+/// humanized `Expire:` line: ground-truth-verified against real `mc
+/// share download` at several expiries (1s, 30m, 90s, 3661s, 25h, 604800s)
+/// -- components are day/hour/minute/second (86400/3600/60/1s), rendered
+/// from the first non-zero unit (days, else hours, else minutes, else
+/// nothing skipped) down through seconds inclusive, e.g. `90s` ->
+/// `"1 minutes 30 seconds"` (no "hours"/"days"), `3661s` -> `"1 hours 1
+/// minutes 1 seconds"` (no "days"), `1s` -> `"1 seconds"` alone. Always
+/// plural ("1 seconds", not "1 second") -- ground-truth confirmed, not a
+/// rs3 simplification.
+fn humanize_expiry(time_left_ns: i64) -> String {
+    let total_seconds = time_left_ns / 1_000_000_000;
+    let days = total_seconds / 86400;
+    let hours = (total_seconds % 86400) / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days} days"));
+    }
+    if days > 0 || hours > 0 {
+        parts.push(format!("{hours} hours"));
+    }
+    if days > 0 || hours > 0 || minutes > 0 {
+        parts.push(format!("{minutes} minutes"));
+    }
+    parts.push(format!("{seconds} seconds"));
+    parts.join(" ")
+}
+
+impl McMessage for ShareMessage {
+    fn human(&self) -> String {
+        let mut s = format!(
+            "URL: {}\nExpire: {}\n",
+            self.object_url,
+            humanize_expiry(self.time_left_ns)
+        );
+        if let Some(content_type) = &self.content_type {
+            s.push_str(&format!("Content-Type: {content_type}\n"));
+        }
+        s.push_str(&format!("Share: {}", self.share_url));
+        s
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let mut v = json!({
+            "status": "success",
+            "url": self.object_url,
+            "share": self.share_url,
+            "timeLeft": self.time_left_ns,
+        });
+        if let Some(content_type) = &self.content_type {
+            v["contentType"] = json!(content_type);
+        }
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,5 +912,55 @@ mod tests {
         let state = session.state.lock().unwrap();
         assert_eq!(state.transferred_count, 1);
         assert_eq!(state.transferred_size, 10);
+    }
+
+    #[test]
+    fn share_message_humanize_matches_ground_truth() {
+        // Ground-truth-verified against real `mc share download` at each of
+        // these expiries (see share.rs module docs).
+        assert_eq!(
+            humanize_expiry(604_800_000_000_000),
+            "7 days 0 hours 0 minutes 0 seconds"
+        );
+        assert_eq!(humanize_expiry(1_800_000_000_000), "30 minutes 0 seconds");
+        assert_eq!(humanize_expiry(90_000_000_000), "1 minutes 30 seconds");
+        assert_eq!(humanize_expiry(1_000_000_000), "1 seconds");
+        assert_eq!(
+            humanize_expiry(3_661_000_000_000),
+            "1 hours 1 minutes 1 seconds"
+        );
+        assert_eq!(
+            humanize_expiry(90_000_000_000_000),
+            "1 days 1 hours 0 minutes 0 seconds"
+        );
+    }
+
+    #[test]
+    fn share_message_human_and_json_shape() {
+        let msg = ShareMessage {
+            object_url: "http://h/b/k.txt".into(),
+            share_url: "http://h/b/k.txt?X-Amz-Signature=abc".into(),
+            time_left_ns: 1_000_000_000,
+            content_type: None,
+        };
+        let human = msg.human();
+        assert_eq!(
+            human,
+            "URL: http://h/b/k.txt\nExpire: 1 seconds\nShare: http://h/b/k.txt?X-Amz-Signature=abc"
+        );
+        let v = msg.json();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["url"], "http://h/b/k.txt");
+        assert_eq!(v["timeLeft"], 1_000_000_000i64);
+        assert!(v.get("contentType").is_none());
+
+        let upload = ShareMessage {
+            object_url: "http://h/b/k.png".into(),
+            share_url: "curl http://h/b/ -F file=@<FILE>".into(),
+            time_left_ns: 2_000_000_000,
+            content_type: Some("image/png".into()),
+        };
+        assert!(upload.human().contains("Content-Type: image/png\n"));
+        assert_eq!(upload.json()["contentType"], "image/png");
     }
 }

@@ -6,6 +6,7 @@ mod list;
 mod messages;
 mod mirror;
 mod output;
+mod share;
 mod timefilter;
 mod transfer;
 mod urls;
@@ -155,6 +156,8 @@ enum Commands {
     Diff(DiffArgs),
     #[command(about = "search for objects")]
     Find(FindArgs),
+    #[command(about = "generate URL for temporary access to an object")]
+    Share(ShareArgs),
 }
 
 #[derive(Args, Debug)]
@@ -187,6 +190,70 @@ enum AliasCommand {
     Export { alias: Option<String> },
     #[command(about = "import configuration info from stdin")]
     Import,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ShareArgs {
+    #[command(subcommand)]
+    pub(crate) command: ShareCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ShareCommand {
+    #[command(about = "generate URL for download access")]
+    Download(ShareDownloadArgs),
+    #[command(
+        about = "generate a `curl` command to upload objects without requiring access/secret keys"
+    )]
+    Upload(ShareUploadArgs),
+    #[command(about = "list previously shared objects", visible_alias = "ls")]
+    List(ShareListArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ShareDownloadArgs {
+    #[arg(short = 'r', long, help = "share all objects recursively")]
+    pub(crate) recursive: bool,
+    #[arg(
+        short = 'E',
+        long,
+        default_value = "168h",
+        help = "set expiry in NN[h|m|s]"
+    )]
+    pub(crate) expire: String,
+    #[arg(required = true)]
+    pub(crate) targets: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ShareUploadArgs {
+    #[arg(
+        short = 'r',
+        long,
+        help = "recursively upload any object matching the prefix"
+    )]
+    pub(crate) recursive: bool,
+    #[arg(
+        short = 'E',
+        long,
+        default_value = "168h",
+        help = "set expiry in NN[h|m|s]"
+    )]
+    pub(crate) expire: String,
+    #[arg(
+        short = 'T',
+        long = "content-type",
+        help = "specify a content-type to allow"
+    )]
+    pub(crate) content_type: Option<String>,
+    #[arg(required = true)]
+    pub(crate) targets: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ShareListArgs {
+    #[arg(help = "one of `upload` or `download`")]
+    pub(crate) kind: String,
 }
 
 #[derive(Args, Debug)]
@@ -532,6 +599,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Pipe(args) => pipe(args).await,
         Commands::Diff(args) => diff(args).await,
         Commands::Find(args) => findcmd::run_find(args).await,
+        Commands::Share(args) => share::run_share(args).await,
     }
 }
 

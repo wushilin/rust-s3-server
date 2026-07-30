@@ -55,12 +55,7 @@ pub(crate) async fn client_for_alias(alias_name: &str) -> Result<(Client, Alias)
         None,
         "rs3",
     );
-    let region = alias
-        .region
-        .clone()
-        .or_else(|| std::env::var("AWS_S3_REGION").ok())
-        .or_else(|| std::env::var("AWS_REGION").ok())
-        .unwrap_or_else(|| "us-east-1".to_string());
+    let region = resolve_region(&alias);
     let sdk_cfg = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(region))
         .credentials_provider(SharedCredentialsProvider::new(creds))
@@ -72,6 +67,20 @@ pub(crate) async fn client_for_alias(alias_name: &str) -> Result<(Client, Alias)
         .force_path_style(force_path_style)
         .build();
     Ok((Client::from_conf(s3_cfg), alias))
+}
+
+/// Resolves the effective SigV4 region for an alias: an explicit
+/// per-alias `region` wins, then `AWS_S3_REGION`/`AWS_REGION`, then the
+/// `us-east-1` default. Shared by [`client_for_alias`] (SDK client config)
+/// and `share.rs`'s hand-rolled POST-policy signer, which needs the same
+/// value outside of an SDK `Client`.
+pub(crate) fn resolve_region(alias: &Alias) -> String {
+    alias
+        .region
+        .clone()
+        .or_else(|| std::env::var("AWS_S3_REGION").ok())
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .unwrap_or_else(|| "us-east-1".to_string())
 }
 
 pub(crate) fn env_alias(name: &str) -> Option<Alias> {
