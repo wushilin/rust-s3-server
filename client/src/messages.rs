@@ -352,6 +352,33 @@ impl McMessage for DuMessage {
     }
 }
 
+/// `tree` per-entry message ([OUT] §2's `treeMessage`): a pre-rendered
+/// `branch_string` (glyphs + continuation columns, built by the caller) and
+/// the bare entry name. `is_dir` mirrors mc's `IsDir` field (selects the
+/// `"Dir"`/`"File"` colorize tag there; unread here since rs3's `--no-color`
+/// path never emits ANSI codes at all).
+pub(crate) struct TreeMessage {
+    pub entry: String,
+    pub is_dir: bool,
+    pub branch_string: String,
+}
+
+impl McMessage for TreeMessage {
+    fn human(&self) -> String {
+        format!("{}{}", self.branch_string, self.entry)
+    }
+
+    fn json(&self) -> serde_json::Value {
+        // mc's own `treeMessage.JSON()` is a deliberate `fatalIf`-panic --
+        // `tree --json` never reaches it, since `main.rs`'s `tree()` reroutes
+        // to the `ls --recursive --json` code path before constructing any
+        // `TreeMessage` ([OUT] §2 gotcha 9). Kept non-panicking here (rather
+        // than mirroring the panic) since nothing depends on this shape ever
+        // being observed.
+        json!({"entry": self.entry, "isDir": self.is_dir, "branchString": self.branch_string})
+    }
+}
+
 #[derive(Default)]
 struct SessionState {
     total_count: u64,

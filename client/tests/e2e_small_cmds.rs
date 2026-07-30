@@ -238,3 +238,67 @@ fn du_depth_semantics() {
     assert_eq!(v["objects"], 3);
     assert_eq!(v["size"], 3072);
 }
+
+#[test]
+fn tree_draws_branches_and_json_aliases_ls() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/treeb"]);
+    let src = server.dir.path().join("t.txt");
+    std::fs::write(&src, b"x").unwrap();
+    for key in ["a/1.txt", "a/sub/2.txt", "b/3.txt"] {
+        server.rs3_ok(&["put", src.to_str().unwrap(), &format!("test/treeb/{key}")]);
+    }
+    let out = server.rs3_ok(&["tree", "test/treeb"]);
+    assert!(out.contains("├─ a") || out.contains("├─ a/"), "out: {out}");
+    assert!(out.contains("└─ "), "out: {out}");
+    assert!(
+        !out.contains("1.txt"),
+        "files hidden without --files: {out}"
+    );
+    // byte-for-byte against a real `mc tree` run on the same layout
+    // ([task 11] ground-truth comparison): root line first (verbatim
+    // target), then "a" (non-last, "├─ "), its child "sub" continued under
+    // "│  ", then "b" (last, "└─ ").
+    assert_eq!(
+        out, "test/treeb\n├─ a\n│  └─ sub\n└─ b\n",
+        "byte-for-byte vs real mc tree: {out}"
+    );
+
+    let out = server.rs3_ok(&["tree", "--files", "test/treeb"]);
+    assert!(out.contains("1.txt"), "out: {out}");
+    assert_eq!(
+        out, "test/treeb\n├─ a\n│  ├─ 1.txt\n│  └─ sub\n│     └─ 2.txt\n└─ b\n   └─ 3.txt\n",
+        "byte-for-byte vs real mc tree --files: {out}"
+    );
+
+    // --depth 1: level-1 dirs (a, b) are expanded, but level-2 dirs (sub)
+    // are shown without being descended into further.
+    let out = server.rs3_ok(&["tree", "--files", "--depth", "1", "test/treeb"]);
+    assert_eq!(
+        out, "test/treeb\n├─ a\n│  ├─ 1.txt\n│  └─ sub\n└─ b\n   └─ 3.txt\n",
+        "out: {out}"
+    );
+
+    let out = server.rs3(&["tree", "--depth", "0", "test/treeb"]);
+    assert!(!out.status.success(), "depth 0 must be rejected");
+    let out = server.rs3(&["tree", "--depth", "-2", "test/treeb"]);
+    assert!(!out.status.success(), "depth < -1 must be rejected");
+
+    // a target with no visible children (fully empty bucket) prints
+    // nothing at all -- not even the root line.
+    server.rs3_ok(&["mb", "test/emptytreeb"]);
+    let out = server.rs3_ok(&["tree", "test/emptytreeb"]);
+    assert_eq!(out, "", "empty target prints nothing: {out}");
+
+    let out = server.rs3_ok(&["--json", "tree", "test/treeb"]);
+    let first: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert!(
+        first.get("key").is_some(),
+        "tree --json = ls -r --json: {out}"
+    );
+    assert_eq!(
+        out.lines().count(),
+        3,
+        "recursive, one line per object: {out}"
+    );
+}

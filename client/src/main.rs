@@ -28,7 +28,7 @@ use config::{Alias, client_for_alias, load_config, save_config};
 use list::ObjectPaginator;
 use messages::{
     ContentMessage, CopyMessage, DuMessage, MakeBucketMessage, RemoveBucketMessage, RmMessage,
-    StatMessage, SummaryMessage, TransferSession,
+    StatMessage, SummaryMessage, TransferSession, TreeMessage,
 };
 use transfer::{download_object, transfer_object_between_s3, upload_file};
 use urls::{DEFAULT_PART_SIZE, is_s3_url, parse_s3_url, parse_size};
@@ -145,6 +145,8 @@ enum Commands {
     Mirror(MirrorArgs),
     #[command(about = "summarize disk usage recursively")]
     Du(DuArgs),
+    #[command(about = "list buckets and objects in a tree format")]
+    Tree(TreeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -386,6 +388,18 @@ struct DuArgs {
     targets: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct TreeArgs {
+    #[arg(short = 'f', long)]
+    files: bool,
+    /// `-1` (unlimited) is the only negative value accepted; `0` and any
+    /// other negative value are rejected by [`tree`]'s own validation
+    /// ([SEM] §6's `parseTreeSyntax`), not by clap itself.
+    #[arg(short = 'd', long, default_value_t = -1, allow_negative_numbers = true)]
+    depth: i32,
+    targets: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -417,6 +431,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Stat(args) => stat(args).await,
         Commands::Mirror(args) => mirror(args).await,
         Commands::Du(args) => du(args).await,
+        Commands::Tree(args) => tree(args).await,
     }
 }
 
@@ -2059,4 +2074,255 @@ fn du_display_prefix(alias: &str, bucket: &str, prefix: &str) -> String {
     } else {
         format!("{alias}/{bucket}/{trimmed}")
     }
+}
+
+/// `tree` glyph constants ([SEM] §6 / [OUT] §2's `treeEntry`/`treeLastEntry`/
+/// `treeNext`/`treeLevel`). `TREE_OPEN`/`TREE_CLOSED` are the two-part
+/// continuation columns (`treeNext+treeLevel` / `" "+treeLevel`) prepended to
+/// every descendant of a still-open vs. already-closed ancestor branch.
+const TREE_ENTRY: &str = "├─ ";
+const TREE_LAST_ENTRY: &str = "└─ ";
+const TREE_OPEN: &str = "│  ";
+const TREE_CLOSED: &str = "   ";
+
+/// One child in a `tree` directory listing.
+struct TreeEntry {
+    name: String,
+    is_dir: bool,
+}
+
+/// A `tree` traversal position: either the alias root (whose children are
+/// bucket names) or a prefix inside a specific bucket (whose children are a
+/// delimiter listing). Verified against real `mc tree` ([task 11] ground
+/// truth run): unlike `ls`, `tree` never `HeadObject`-probes a bare target --
+/// it always lists the target as a directory prefix (appending `/` when
+/// missing), so a target that names a plain object simply yields zero
+/// children and prints nothing at all, not even the root line.
+enum TreeNode {
+    AliasRoot,
+    Path { bucket: String, prefix: String },
+}
+
+impl TreeNode {
+    fn child(&self, name: &str) -> TreeNode {
+        match self {
+            TreeNode::AliasRoot => TreeNode::Path {
+                bucket: name.to_string(),
+                prefix: String::new(),
+            },
+            TreeNode::Path { bucket, prefix } => TreeNode::Path {
+                bucket: bucket.clone(),
+                prefix: format!("{prefix}{name}/"),
+            },
+        }
+    }
+}
+
+/// List the immediate children of `node`: for [`TreeNode::AliasRoot`], every
+/// bucket (always a "directory"); for [`TreeNode::Path`], a non-recursive
+/// delimiter listing split into files (only included when `files`) followed
+/// by directories -- matching real `mc tree`'s observed per-directory order
+/// (files sorted, then directories sorted; *not* a single lexicographic
+/// merge across both -- confirmed against real `mc tree --files` on a
+/// directory containing both a file and a directory that would sort earlier
+/// than it, e.g. `0dir/` after `1.txt`/`ab.txt`).
+async fn tree_list_children(
+    client: &Client,
+    node: &TreeNode,
+    files: bool,
+) -> Result<Vec<TreeEntry>> {
+    match node {
+        TreeNode::AliasRoot => {
+            let resp = client.list_buckets().send().await?;
+            let mut names: Vec<String> = resp
+                .buckets()
+                .iter()
+                .filter_map(|b| b.name().map(String::from))
+                .collect();
+            names.sort();
+            Ok(names
+                .into_iter()
+                .map(|name| TreeEntry { name, is_dir: true })
+                .collect())
+        }
+        TreeNode::Path { bucket, prefix } => {
+            let mut file_names: Vec<String> = Vec::new();
+            let mut dir_names: Vec<String> = Vec::new();
+            let mut token: Option<String> = None;
+            loop {
+                let resp = client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(prefix.as_str())
+                    .delimiter("/")
+                    .set_continuation_token(token.take())
+                    .send()
+                    .await?;
+                for obj in resp.contents() {
+                    let key = obj.key().unwrap_or_default();
+                    let Some(name) = key.strip_prefix(prefix.as_str()) else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue; // folder-marker object exactly at this prefix
+                    }
+                    file_names.push(name.to_string());
+                }
+                for p in resp.common_prefixes() {
+                    let Some(full) = p.prefix() else { continue };
+                    let name = full
+                        .strip_prefix(prefix.as_str())
+                        .unwrap_or(full)
+                        .trim_end_matches('/');
+                    if name.is_empty() {
+                        continue;
+                    }
+                    dir_names.push(name.to_string());
+                }
+                if resp.is_truncated().unwrap_or(false) {
+                    token = resp.next_continuation_token().map(String::from);
+                    if token.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let mut entries = Vec::new();
+            if files {
+                entries.extend(file_names.into_iter().map(|name| TreeEntry {
+                    name,
+                    is_dir: false,
+                }));
+            }
+            entries.extend(
+                dir_names
+                    .into_iter()
+                    .map(|name| TreeEntry { name, is_dir: true }),
+            );
+            Ok(entries)
+        }
+    }
+}
+
+/// Print `entries` (the children of `node`, whose own line -- root or an
+/// ancestor entry -- has already been printed) at tree `level`, recursing
+/// into directory children while `depth == -1 || level <= depth` ([SEM] §6).
+/// `continuation` is the already-built prefix of `│  `/`   ` columns
+/// inherited from every still-open/closed ancestor branch; each entry here
+/// prepends its own `├─ `/`└─ ` glyph to it.
+///
+/// Boxed for the same reason as `du_walk`: async recursion needs a
+/// heap-allocated, pinned future.
+fn tree_print_entries<'a>(
+    client: &'a Client,
+    node: TreeNode,
+    entries: Vec<TreeEntry>,
+    level: i32,
+    depth: i32,
+    files: bool,
+    continuation: String,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let last_idx = entries.len().checked_sub(1);
+        for (i, entry) in entries.into_iter().enumerate() {
+            let is_last = Some(i) == last_idx;
+            let glyph = if is_last { TREE_LAST_ENTRY } else { TREE_ENTRY };
+            print_msg(&TreeMessage {
+                entry: entry.name.clone(),
+                is_dir: entry.is_dir,
+                branch_string: format!("{continuation}{glyph}"),
+            });
+            if entry.is_dir && (depth == -1 || level <= depth) {
+                let child = node.child(&entry.name);
+                let child_entries = tree_list_children(client, &child, files).await?;
+                let child_continuation = format!(
+                    "{continuation}{}",
+                    if is_last { TREE_CLOSED } else { TREE_OPEN }
+                );
+                tree_print_entries(
+                    client,
+                    child,
+                    child_entries,
+                    level + 1,
+                    depth,
+                    files,
+                    child_continuation,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Walk one `tree` target: prints the root line (the target exactly as
+/// typed) followed by its descendants, but only if the target has at least
+/// one (post-`--files`-filter) child -- an empty target prints *nothing*,
+/// not even the root line (confirmed against real `mc tree` on an empty
+/// bucket and on a bucket containing only files with `--files` unset).
+async fn tree_walk(
+    client: &Client,
+    node: TreeNode,
+    root_label: &str,
+    depth: i32,
+    files: bool,
+) -> Result<()> {
+    let entries = tree_list_children(client, &node, files).await?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    print_msg(&TreeMessage {
+        entry: root_label.to_string(),
+        is_dir: true,
+        branch_string: String::new(),
+    });
+    tree_print_entries(client, node, entries, 1, depth, files, String::new()).await
+}
+
+/// `mc tree` ([SEM] §6): draws a directory tree of buckets/objects.
+/// `--json` bypasses tree drawing entirely and aliases the exact `ls
+/// --recursive --json` code path ([OUT] §2 gotcha 9) -- but only *after* the
+/// depth validation below, which real `mc --json tree -d 0 ...` still
+/// enforces before rerouting (verified against the real binary).
+async fn tree(args: TreeArgs) -> Result<()> {
+    if args.depth == 0 || args.depth < -1 {
+        return Err(anyhow!(
+            "please set a proper depth, for example: '--depth 1' to limit the tree output, default (-1) output displays everything"
+        ));
+    }
+    if out().json {
+        return ls(LsArgs {
+            rewind: None,
+            versions: false,
+            recursive: true,
+            incomplete: false,
+            summarize: false,
+            storage_class: None,
+            zip: false,
+            targets: args.targets,
+        })
+        .await;
+    }
+    if args.targets.is_empty() {
+        return Err(anyhow!("tree: this command requires at least one argument"));
+    }
+    for target in &args.targets {
+        let parsed = parse_s3_url(target)?;
+        let (client, _) = client_for_alias(&parsed.alias).await?;
+        let node = match parsed.bucket {
+            None => TreeNode::AliasRoot,
+            Some(bucket) => {
+                let key = parsed.key.unwrap_or_default();
+                let prefix = if key.is_empty() || key.ends_with('/') {
+                    key
+                } else {
+                    format!("{key}/")
+                };
+                TreeNode::Path { bucket, prefix }
+            }
+        };
+        tree_walk(&client, node, target, args.depth, args.files).await?;
+    }
+    Ok(())
 }
