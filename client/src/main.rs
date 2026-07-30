@@ -408,16 +408,103 @@ async fn mb(args: MbArgs) -> Result<()> {
 }
 
 async fn rb(args: RbArgs) -> Result<()> {
-    for target in args.targets {
-        let parsed = parse_s3_url(&target)?;
-        let bucket = parsed
-            .bucket
-            .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
-        let (client, _) = client_for_alias(&parsed.alias).await?;
-        client.delete_bucket().bucket(&bucket).send().await?;
-        println!("Removed `{target}` successfully.");
+    let mut failures = 0u64;
+    for target in &args.targets {
+        let parsed = match parse_s3_url(target) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("rb: {target}: {err:#}");
+                failures += 1;
+                continue;
+            }
+        };
+        let result: Result<()> = async {
+            let (client, _) = client_for_alias(&parsed.alias).await?;
+            match &parsed.bucket {
+                Some(bucket) => remove_bucket(&client, &parsed.alias, bucket, args.force).await,
+                None => {
+                    if !args.dangerous {
+                        return Err(anyhow!(
+                            "removing all buckets on `{}` requires --dangerous",
+                            parsed.alias
+                        ));
+                    }
+                    let resp = client.list_buckets().send().await?;
+                    for bucket in resp.buckets() {
+                        let name = bucket.name().unwrap_or_default();
+                        remove_bucket(&client, &parsed.alias, name, args.force).await?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+        .await;
+        if let Err(err) = result {
+            eprintln!("rb: {target}: {err:#}");
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        return Err(anyhow!("{failures} target(s) failed"));
     }
     Ok(())
+}
+
+async fn remove_bucket(client: &Client, alias: &str, bucket: &str, force: bool) -> Result<()> {
+    if force {
+        abort_incomplete_uploads(client, bucket).await?;
+        remove_prefix(client, alias, bucket, "", false).await?;
+    }
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .map_err(|err| {
+            let not_empty = err
+                .as_service_error()
+                .map(|e| format!("{e:?}").contains("BucketNotEmpty"))
+                .unwrap_or(false);
+            if not_empty {
+                anyhow!("`{alias}/{bucket}` is not empty; use --force to remove its contents")
+            } else {
+                anyhow!(err)
+            }
+        })?;
+    println!("Removed `{alias}/{bucket}` successfully.");
+    Ok(())
+}
+
+async fn abort_incomplete_uploads(client: &Client, bucket: &str) -> Result<()> {
+    let mut key_marker: Option<String> = None;
+    let mut id_marker: Option<String> = None;
+    loop {
+        let resp = client
+            .list_multipart_uploads()
+            .bucket(bucket)
+            .set_key_marker(key_marker.take())
+            .set_upload_id_marker(id_marker.take())
+            .send()
+            .await?;
+        for upload in resp.uploads() {
+            let (Some(key), Some(id)) = (upload.key(), upload.upload_id()) else {
+                continue;
+            };
+            client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(id)
+                .send()
+                .await?;
+        }
+        if resp.is_truncated().unwrap_or(false) {
+            key_marker = resp.next_key_marker().map(String::from);
+            id_marker = resp.next_upload_id_marker().map(String::from);
+        } else {
+            return Ok(());
+        }
+    }
 }
 
 async fn put(args: PutArgs) -> Result<()> {
