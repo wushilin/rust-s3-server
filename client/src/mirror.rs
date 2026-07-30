@@ -93,8 +93,15 @@ pub(crate) async fn collect_s3_entries(
     prefix: &str,
 ) -> Result<Vec<Entry>> {
     let objects = crate::list::collect_objects(client, bucket, prefix).await?;
+    // S3 prefix matching is a raw string match, so a listing prefix of `p`
+    // (no trailing slash) also matches sibling keys like `p2/x.txt`. Guard
+    // the boundary the same way `remove_prefix` does in main.rs before
+    // stripping, so a mirror of `bucket/p` never picks up `p2/...` objects.
+    let boundary_safe = prefix.is_empty() || prefix.ends_with('/');
+    let descendant_prefix = format!("{prefix}/");
     let mut entries: Vec<Entry> = objects
         .into_iter()
+        .filter(|o| boundary_safe || o.key == prefix || o.key.starts_with(&descendant_prefix))
         .filter_map(|o| {
             let rel = o
                 .key
@@ -231,6 +238,10 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
 
     let source = resolve_side(&args.source).await?;
     let target = resolve_side(&args.target).await?;
+
+    if matches!((&source, &target), (Side::Local(_), Side::Local(_))) {
+        return Err(anyhow!("mirror between two local paths is not supported"));
+    }
 
     let source_entries = match &source {
         Side::Local(root) => {

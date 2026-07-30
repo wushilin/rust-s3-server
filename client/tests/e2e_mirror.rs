@@ -73,3 +73,58 @@ fn mirror_s3_to_s3_and_back_to_local() {
     assert_eq!(fs::read(dst.join("one.bin")).unwrap(), b"11111");
     assert_eq!(fs::read(dst.join("d/two.bin")).unwrap(), b"22222");
 }
+
+#[test]
+fn mirror_local_to_local_is_rejected_and_does_not_delete() {
+    let server = TestServer::start();
+    let src = server.dir.path().join("la");
+    let dst = server.dir.path().join("lb");
+    write(&src, "a.txt", b"a");
+    write(&dst, "stale.txt", b"stale");
+    let out = server.rs3(&[
+        "mirror",
+        "--remove",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "mirror between two local paths should fail, stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        dst.join("stale.txt").exists(),
+        "stale file was deleted despite local->local mirror being unsupported"
+    );
+}
+
+#[test]
+fn mirror_does_not_leak_sibling_prefix_objects() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/mb5"]);
+    let src = server.dir.path().join("srcdir5");
+    write(&src, "a.txt", b"a");
+    server.rs3_ok(&["mirror", src.to_str().unwrap(), "test/mb5/p"]);
+    let extra = server.dir.path().join("extra5");
+    write(&extra, "x.txt", b"x");
+    server.rs3_ok(&["mirror", extra.to_str().unwrap(), "test/mb5/p2"]);
+
+    let dst = server.dir.path().join("outdir5");
+    let out = server.rs3(&["mirror", "test/mb5/p", dst.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "mirror failed: stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dst.join("a.txt").exists(), "a.txt was not mirrored");
+    assert!(
+        !dst.join("2/x.txt").exists(),
+        "sibling prefix `p2/x.txt` leaked into the mirror as `2/x.txt`"
+    );
+    assert!(
+        !dst.join("x.txt").exists(),
+        "sibling prefix `p2/x.txt` leaked into the mirror as `x.txt`"
+    );
+}
