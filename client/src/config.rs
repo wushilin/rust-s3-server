@@ -75,8 +75,10 @@ pub(crate) async fn client_for_alias(alias_name: &str) -> Result<(Client, Alias)
 }
 
 pub(crate) fn env_alias(name: &str) -> Option<Alias> {
-    let key = format!("MC_HOST_{}", name.to_ascii_uppercase().replace('-', "_"));
-    let value = std::env::var(key).ok()?;
+    let suffix = name.to_ascii_uppercase().replace('-', "_");
+    let value = std::env::var(format!("RS3_HOST_{suffix}"))
+        .or_else(|_| std::env::var(format!("MC_HOST_{suffix}")))
+        .ok()?;
     let value = value.trim_end_matches('/');
     let (scheme, rest) = value.split_once("://")?;
     let (access_key, rest) = rest.split_once(':')?;
@@ -113,6 +115,13 @@ pub(crate) async fn save_config(cfg: &McConfig) -> Result<()> {
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {
+    // rs3-specific variables win over their mc-compatible equivalents.
+    if let Ok(file) = std::env::var("RS3_CONFIG_FILE") {
+        return Ok(PathBuf::from(file));
+    }
+    if let Ok(dir) = std::env::var("RS3_CONFIG_DIR") {
+        return Ok(PathBuf::from(dir).join("config.json"));
+    }
     if let Ok(file) = std::env::var("MC_CONFIG_FILE") {
         return Ok(PathBuf::from(file));
     }

@@ -145,11 +145,19 @@ multipart threshold:
 
 ## Config
 
-`rs3` reads and writes an `mc`-style config file:
+`rs3` reads and writes an `mc`-style config file. rs3-specific variables win
+over their `mc`-compatible equivalents:
 
+- `$RS3_CONFIG_FILE`, when set
+- `$RS3_CONFIG_DIR/config.json`, when set
 - `$MC_CONFIG_FILE`, when set
 - `$MC_CONFIG_DIR/config.json`, when set
 - `~/.mc/config.json`, by default
+
+Aliases can also come from the environment without a config file:
+`RS3_HOST_<ALIAS>` (preferred) or `MC_HOST_<ALIAS>`, in the form
+`https://ACCESS_KEY:SECRET_KEY@host:port`. `AWS_S3_REGION` or `AWS_REGION`
+sets the region for environment aliases.
 
 Example:
 
