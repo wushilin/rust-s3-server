@@ -330,11 +330,14 @@ fn pipe_uploads_stdin() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // pipeMessage human format: "{size} bytes -> `{target}`"
+    // pipeMessage human format: "{size} bytes -> `{target}`" -- and, unlike
+    // cp/put/get/mirror, real `mc pipe` has no accountStat summary line at
+    // all (ground-truth verified against the real mc binary), so stdout
+    // must be exactly this one line, not this line plus a second one.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("14 bytes -> `test/pipeb/from-stdin.txt`"),
-        "stdout: {stdout}"
+    assert_eq!(
+        stdout, "14 bytes -> `test/pipeb/from-stdin.txt`\n",
+        "stdout must be exactly one line, no accountStat summary: {stdout}"
     );
     let dst = server.dir.path().join("back.txt");
     server.rs3_ok(&["get", "test/pipeb/from-stdin.txt", dst.to_str().unwrap()]);
@@ -447,6 +450,15 @@ fn pipe_json_message_has_status_target_size() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Ground-truth verified against the real mc binary: `mc --json pipe`
+    // emits exactly one JSON document, not a pipeMessage plus a second
+    // accountStat summary line the way cp/put/get/mirror's --json output
+    // does.
+    assert_eq!(
+        stdout.trim().lines().count(),
+        1,
+        "must be exactly one JSON line, no accountStat summary: {stdout}"
+    );
     let first: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
     assert_eq!(first["status"], "success");
     assert_eq!(first["target"], "test/pipejson/j.txt");

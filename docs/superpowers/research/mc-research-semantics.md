@@ -570,8 +570,17 @@ meaning "use library default") and formats the resulting `partSize` via
 `OptimalPartInfo`), with `configuredPartSize==0` the library falls back to
 `minPartSize = 16 MiB` (constant in `minio-go/v7/constants.go`:
 `absMinPartSize = 5 MiB`, `minPartSize = 16 MiB`, `maxPartSize = 5 GiB`,
-`maxPartsCount = 10000`, `maxMultipartPutObjectSize = 5 TiB`). So **pipe's default
-chunk size is 16 MiB**, matching the flag's displayed default `--part-size` value.
+`maxPartsCount = 10000`, `maxMultipartPutObjectSize = 5 TiB`). **However, `minPartSize`
+is only an *input* to the unknown-size branch's formula, not the final default itself**:
+with `objectSize == -1`, `OptimalPartInfo` first substitutes `objectSize =
+maxMultipartPutObjectSize` (5 TiB), then computes `partSizeFlt =
+ceil((objectSize / maxPartsCount) / minPartSize) * minPartSize` = `ceil((5 TiB / 10000)
+/ 16 MiB) * 16 MiB` = `ceil(32.768) * 16 MiB` = `33 * 16 MiB` = **528 MiB**. So **pipe's
+actual default chunk size is 528 MiB**, matching the flag's displayed default
+`--part-size` value ([Corrected against real mc RELEASE.2025-08-13]: the real binary's
+own `mc pipe --help` shows `--part-size value ... (default: "528 MiB")`, confirming this
+value directly — the original "16 MiB" conclusion above stopped short of finishing the
+`OptimalPartInfo` arithmetic for the unknown-size case).
 
 **Streaming/unknown-size handling**: `pipe()` (lines 141-208) always calls
 `putTargetStreamWithURL(targetURL, reader, /*size=*/-1, opts)` — size is hardcoded to
@@ -594,11 +603,22 @@ N)` (e.g. `F_SETPIPE_SZ` on Linux, see `cmd/pipe_supported.go` / `pipe_unsupport
 before streaming — an OS pipe-buffer tuning knob, unrelated to S3 multipart sizing;
 not portable across OSes (no-op on unsupported platforms).
 
-**Target semantics**: `pipe [TARGET]` — if `TARGET` is omitted entirely (`len(ctx.Args())
-== 0`), `pipe` degenerates to `cat`: it just tees stdin to stdout (`catOut(os.Stdin,
--1)`), i.e. `mc pipe` with no args is a no-op passthrough, not an error. `--attr` and
-`--tags` build a metadata map exactly like `cp`'s `getMetaDataEntry` (tags become
-`X-Amz-Tagging` header value verbatim, not URL-encoded by mc itself).
+**Target semantics**: `pipe [TARGET]` — the `pipe()` helper does treat an empty
+`targetURL` as "degenerate to `cat`" (`if targetURL == "" { return catOut(os.Stdin,
+-1).Trace() }`), but **that branch is unreachable via a truly omitted argument**:
+`mainPipe`'s `checkPipeSyntax(ctx)` runs first and unconditionally requires `len(ctx.Args())
+== 1` (`if len(ctx.Args()) != 1 { showCommandHelpAndExit(ctx, 1) }`), so `mc pipe` with
+**zero** args (or 2+) shows the full command help on stdout and exits `1` — it is *not* a
+no-op passthrough, contrary to what the surface reading of `pipe()` alone suggests. The
+passthrough is only reachable by supplying **exactly one, empty-string** argument (`mc
+pipe ""`): `mainPipe` then calls `pipe(ctx, "", ...)` with that empty `targetURL`, and
+*that* triggers the `catOut` branch. `--attr` and `--tags` build a metadata map exactly
+like `cp`'s `getMetaDataEntry` (tags become `X-Amz-Tagging` header value verbatim, not
+URL-encoded by mc itself). [Corrected against real mc RELEASE.2025-08-13]: confirmed on
+the real binary — `echo -n x | mc pipe` (zero args) prints the full `pipe --help` text
+and exits 1; `echo -n x | mc pipe ""` (one empty-string arg) streams `x` through to
+stdout and exits 0; `echo -n x | mc pipe a b` (two args) also prints help and exits 1,
+same as zero args.
 
 ---
 

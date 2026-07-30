@@ -1693,7 +1693,6 @@ async fn pipe(args: PipeArgs) -> Result<()> {
         .key
         .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
     let (client, _) = client_for_alias(&parsed.alias).await?;
-    let session = TransferSession::new("pipe");
     let mut stdin = tokio::io::stdin();
     let size = upload_stream(
         &client,
@@ -1706,13 +1705,19 @@ async fn pipe(args: PipeArgs) -> Result<()> {
         args.storage_class.as_deref(),
     )
     .await?;
-    session.add_total(size);
-    let msg = PipeMessage {
+    // Unlike `cp`/`put`/`get`/`mirror`, real `mc pipe` has no accounting
+    // wrapper at all (`cmd/pipe-main.go`'s `pipe()` calls `printMsg`
+    // directly, once, on success -- no `newProgressBar`/`accountStat`
+    // summary line the way the other transfer commands' non-bar path
+    // does). Ground-truth verified: `mc pipe`/`mc --json pipe` both emit
+    // exactly one line. A `TransferSession` here would print a second
+    // `AccountStat` line real `mc` never does -- so this intentionally
+    // does NOT go through `TransferSession`, printing `PipeMessage`
+    // directly instead.
+    print_msg(&PipeMessage {
         target: format!("{}/{bucket}/{key}", parsed.alias),
         size,
-    };
-    session.object_done(&msg, size);
-    session.finish();
+    });
     Ok(())
 }
 
