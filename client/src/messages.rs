@@ -249,6 +249,30 @@ impl McMessage for CopyMessage {
     }
 }
 
+/// `pipe`'s single completion message (`pipeMessage`,
+/// mc-research-output.md §2). Unlike `cp`/`put`/`get`'s `CopyMessage`, mc's
+/// struct carries only `status`/`target`/`size` -- no running
+/// total-count/total-size fields, since a `pipe` invocation only ever
+/// streams one object. Human rendering: `` "{size} bytes -> `{target}`" ``.
+pub(crate) struct PipeMessage {
+    pub target: String,
+    pub size: u64,
+}
+
+impl McMessage for PipeMessage {
+    fn human(&self) -> String {
+        format!("{} bytes -> `{}`", self.size, self.target)
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "status": "success",
+            "target": self.target,
+            "size": self.size,
+        })
+    }
+}
+
 /// `mirror` per-object completion message: either a copy (`removed:
 /// false`) or a delete of a target-only object (`removed: true`).
 pub(crate) struct MirrorMessage {

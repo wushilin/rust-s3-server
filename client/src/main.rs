@@ -27,10 +27,10 @@ use output::{OutputOpts, init_output, out, print_error, print_msg};
 use config::{Alias, client_for_alias, load_config, save_config};
 use list::ObjectPaginator;
 use messages::{
-    ContentMessage, CopyMessage, DuMessage, MakeBucketMessage, RemoveBucketMessage, RmMessage,
-    StatMessage, SummaryMessage, TransferSession, TreeMessage,
+    ContentMessage, CopyMessage, DuMessage, MakeBucketMessage, PipeMessage, RemoveBucketMessage,
+    RmMessage, StatMessage, SummaryMessage, TransferSession, TreeMessage,
 };
-use transfer::{download_object, transfer_object_between_s3, upload_file};
+use transfer::{download_object, transfer_object_between_s3, upload_file, upload_stream};
 use urls::{DEFAULT_PART_SIZE, is_s3_url, parse_s3_url, parse_size};
 
 /// Fallback timestamp for listing entries that have no real modification
@@ -147,6 +147,8 @@ enum Commands {
     Du(DuArgs),
     #[command(about = "list buckets and objects in a tree format")]
     Tree(TreeArgs),
+    #[command(about = "stream stdin to an object (or, with no target, to stdout)")]
+    Pipe(PipeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -388,6 +390,52 @@ struct DuArgs {
     targets: Vec<String>,
 }
 
+/// `target` is a single **required** positional, not `Option<String>`:
+/// ground-truth-verified against the real `mc` binary (RELEASE.2025-08-13,
+/// `cmd/pipe-main.go`'s `checkPipeSyntax`), `mc pipe` with zero args prints
+/// its full command help to stdout and exits `1` -- it does *not*
+/// passthrough. The "no target -> `cat` stdin to stdout" behavior
+/// documented in `mc-research-semantics.md` §8 is real but only reachable
+/// via a single **empty-string** argument (`mc pipe ""`, confirmed against
+/// the real binary): `checkPipeSyntax` requires `len(args) == 1` before
+/// `mainPipe` ever looks at whether that one argument is empty. `pipe()`
+/// below reproduces that exact shape (see its doc comment) rather than
+/// making `target` optional at the clap level.
+#[derive(Args, Debug)]
+struct PipeArgs {
+    #[arg(long = "storage-class", visible_alias = "sc")]
+    storage_class: Option<String>,
+    #[arg(long, help = "add custom metadata for the object")]
+    attr: Option<String>,
+    /// Default is **528MiB**, not the naively-expected 16MiB. Ground-truth
+    /// verified against the real `mc` binary's own `--help` output
+    /// (`default: "528 MiB"`) and independently re-derived by hand from
+    /// vendored `minio-go/v7`'s `OptimalPartInfo(-1, 0)`
+    /// (`api-put-object-common.go`): with `objectSize == -1` substituted to
+    /// `maxMultipartPutObjectSize` (5TiB) and `configuredPartSize == 0`
+    /// substituted to `minPartSize` (16MiB), the unknown-size branch computes
+    /// `ceil((5TiB / 10000) / 16MiB) * 16MiB` = `ceil(32.768) * 16MiB` =
+    /// `33 * 16MiB` = `528MiB` -- i.e. `defaultPartSize()`'s 16MiB
+    /// `minPartSize` constant is only an input to that formula, not the
+    /// final default itself. `mc-research-semantics.md` §8 stops its
+    /// analysis at the 16MiB constant and is wrong about the actual
+    /// default; this flag's default corrects that.
+    #[arg(
+        short = 's',
+        long,
+        default_value = "528MiB",
+        help = "each part size (pipe's total size is unknown up front, unlike put/cp)"
+    )]
+    part_size: String,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "allow N concurrent uploads [WARNING: will use more memory, use it with caution]"
+    )]
+    concurrent: usize,
+    target: String,
+}
+
 #[derive(Args, Debug)]
 struct TreeArgs {
     #[arg(short = 'f', long)]
@@ -432,6 +480,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Mirror(args) => mirror(args).await,
         Commands::Du(args) => du(args).await,
         Commands::Tree(args) => tree(args).await,
+        Commands::Pipe(args) => pipe(args).await,
     }
 }
 
@@ -1589,6 +1638,81 @@ async fn cat(args: CatArgs) -> Result<()> {
             return Err(e.into());
         }
     }
+    Ok(())
+}
+
+/// `pipe`: streams stdin to `TARGET` -- or, when `TARGET` is the **empty
+/// string** (`rs3 pipe ""`), straight through to stdout, exactly like
+/// `cat`. This mirrors real `mc`'s exact, ground-truth-verified shape
+/// ([`PipeArgs`]'s doc comment): `TARGET` is a required positional (clap
+/// itself rejects zero or 2+ of them, matching `checkPipeSyntax`'s
+/// `len(args) != 1` gate), and *only once exactly one argument is present*
+/// does its content (empty vs. non-empty) pick cat-passthrough vs. upload
+/// -- there is no "omit the argument entirely" passthrough shape in real
+/// `mc`, despite `mc-research-semantics.md` §8 describing one.
+/// `--json`/`--quiet` have no effect on the passthrough case, same as
+/// `cat`/`head`. With a non-empty target, total size is unknown up front,
+/// so the default part size is **528MiB** (`--part-size`'s own displayed
+/// default -- see [`PipeArgs::part_size`]'s doc comment for the full
+/// derivation), deliberately different from `put`/`cp`'s 256MiB -- see
+/// [`transfer::upload_stream`]. `--concurrent N` bounds in-flight
+/// `UploadPart` calls; mc's own flag help warns this trades memory for
+/// throughput, so no clamp is applied here beyond the usual 5MiB part-size
+/// floor. mc has no `--tags` support surfaced through this struct at all
+/// ([SEM] §8 lists it as a real `pipe` flag, but rs3 refuses tags
+/// everywhere else in this codebase, so it's simply absent here too, same
+/// as the rest of rs3's tier-2 commands).
+async fn pipe(args: PipeArgs) -> Result<()> {
+    if args.target.is_empty() {
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        match tokio::io::copy(&mut stdin, &mut stdout).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        if let Err(e) = stdout.flush().await {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+        return Ok(());
+    }
+    let target = args.target;
+    let part_size = parse_size(&args.part_size)?;
+    let metadata = match args.attr.as_deref() {
+        Some(spec) => attr::parse_attrs(spec)?,
+        None => BTreeMap::new(),
+    };
+    let parsed = parse_s3_url(&target)?;
+    let bucket = parsed
+        .bucket
+        .ok_or_else(|| anyhow!("bucket is required in target `{target}`"))?;
+    let key = parsed
+        .key
+        .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
+    let (client, _) = client_for_alias(&parsed.alias).await?;
+    let session = TransferSession::new("pipe");
+    let mut stdin = tokio::io::stdin();
+    let size = upload_stream(
+        &client,
+        &mut stdin,
+        &bucket,
+        &key,
+        part_size,
+        args.concurrent.max(1),
+        &metadata,
+        args.storage_class.as_deref(),
+    )
+    .await?;
+    session.add_total(size);
+    let msg = PipeMessage {
+        target: format!("{}/{bucket}/{key}", parsed.alias),
+        size,
+    };
+    session.object_done(&msg, size);
+    session.finish();
     Ok(())
 }
 

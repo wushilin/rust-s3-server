@@ -10,10 +10,10 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::Length;
 use aws_smithy_types::date_time::Format as DateTimeFormat;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::fs;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 
 use crate::config::client_for_alias;
 use crate::urls::parse_s3_url;
@@ -301,6 +301,206 @@ pub(crate) async fn multipart_upload(
     }
     complete.send().await?;
     Ok(())
+}
+
+/// Reads from `reader` until `buf` is completely filled or EOF, returning
+/// the number of bytes actually read (`< buf.len()` iff EOF was reached
+/// first). A plain single `AsyncReadExt::read` can return a short read well
+/// before EOF (pipes, sockets), so this loops rather than trusting one call
+/// to fill the buffer.
+async fn fill_buffer<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+/// Streams `reader` (`pipe`'s stdin -- total size unknown up front, [SEM]
+/// §8) to `bucket/key`, filling `part_size`-byte buffers as it goes. If EOF
+/// arrives before the very first buffer is completely full, the whole
+/// input was small enough for a single `PutObject`; otherwise it's a
+/// streaming multipart upload, uploading parts as buffers fill and keeping
+/// at most `concurrent` `UploadPart` calls in flight at once (mc's `pipe
+/// --concurrent`). Returns the total byte count transferred, for the
+/// caller's `pipeMessage`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_stream<R>(
+    client: &Client,
+    reader: &mut R,
+    bucket: &str,
+    key: &str,
+    part_size: u64,
+    concurrent: usize,
+    metadata: &BTreeMap<String, String>,
+    storage_class: Option<&str>,
+) -> Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if part_size < 5 * 1024 * 1024 {
+        return Err(anyhow!("multipart part size must be at least 5MiB"));
+    }
+    let part_size = usize::try_from(part_size).unwrap_or(usize::MAX);
+    let concurrent = concurrent.max(1);
+
+    let mut first_buf = vec![0u8; part_size];
+    let first_filled = fill_buffer(reader, &mut first_buf).await?;
+    if first_filled < part_size {
+        // EOF before the first buffer even filled up: the whole object
+        // fits in memory already and its size is now known, so just do a
+        // single-shot PutObject rather than paying for a multipart upload.
+        first_buf.truncate(first_filled);
+        let total = first_buf.len() as u64;
+        let mut req = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(first_buf));
+        if let Some(sc) = storage_class {
+            req = req.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
+        }
+        req = apply_attrs(req, metadata)?;
+        req.send().await?;
+        return Ok(total);
+    }
+
+    let mut create = client.create_multipart_upload().bucket(bucket).key(key);
+    if let Some(sc) = storage_class {
+        create = create.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
+    }
+    create = apply_attrs(create, metadata)?;
+    let created = create.send().await?;
+    let upload_id = created
+        .upload_id()
+        .ok_or_else(|| anyhow!("server did not return upload id"))?
+        .to_string();
+
+    let result = stream_parts(
+        client, reader, bucket, key, &upload_id, part_size, concurrent, first_buf,
+    )
+    .await;
+    let (total, mut uploaded_parts) = match result {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(err);
+        }
+    };
+
+    uploaded_parts.sort_by_key(|part| part.part_number);
+    let completed = uploaded_parts
+        .into_iter()
+        .map(|part| {
+            CompletedPart::builder()
+                .part_number(part.part_number)
+                .set_e_tag(part.etag)
+                .build()
+        })
+        .collect::<Vec<_>>();
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build(),
+        )
+        .send()
+        .await?;
+    Ok(total)
+}
+
+/// Reads and uploads part 2 onward (part 1's buffer -- already known to be
+/// completely full, since that's what routed the caller into the
+/// multipart path -- is passed in as `first_body`), keeping at most
+/// `concurrent` `UploadPart` calls in flight via [`FuturesUnordered`].
+/// Reading is inherently sequential (there's only one `reader`), so this
+/// interleaves it with uploading: once `concurrent` uploads are
+/// outstanding, the next read waits for one to finish first, which also
+/// bounds how many `part_size` buffers are held in memory at once. With
+/// `concurrent == 1` this degenerates to plain sequential read-then-upload
+/// without any special-cased branch, since a single already-outstanding
+/// upload always blocks the next read.
+async fn stream_parts<R>(
+    client: &Client,
+    reader: &mut R,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_size: usize,
+    concurrent: usize,
+    first_body: Vec<u8>,
+) -> Result<(u64, Vec<UploadedPart>)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut total = first_body.len() as u64;
+    let mut next_part_number = 2i32;
+    let mut uploaded = Vec::new();
+    let mut in_flight = FuturesUnordered::new();
+    let mut eof = false;
+
+    let spawn_upload = |part_number: i32, body: Vec<u8>| {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let upload_id = upload_id.to_string();
+        async move {
+            let resp = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(body))
+                .send()
+                .await?;
+            Ok::<UploadedPart, anyhow::Error>(UploadedPart {
+                part_number,
+                etag: resp.e_tag().map(String::from),
+            })
+        }
+    };
+
+    in_flight.push(spawn_upload(1, first_body));
+
+    loop {
+        if !eof && in_flight.len() < concurrent {
+            let mut buf = vec![0u8; part_size];
+            let filled = fill_buffer(reader, &mut buf).await?;
+            if filled == 0 {
+                eof = true;
+            } else {
+                buf.truncate(filled);
+                total += filled as u64;
+                in_flight.push(spawn_upload(next_part_number, buf));
+                next_part_number += 1;
+            }
+            continue;
+        }
+        match in_flight.next().await {
+            Some(res) => uploaded.push(res?),
+            None => break,
+        }
+    }
+
+    Ok((total, uploaded))
 }
 
 pub(crate) async fn multipart_copy_s3_to_s3(

@@ -302,3 +302,153 @@ fn tree_draws_branches_and_json_aliases_ls() {
         "recursive, one line per object: {out}"
     );
 }
+
+#[test]
+fn pipe_uploads_stdin() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/pipeb"]);
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
+    cmd.args(["pipe", "test/pipeb/from-stdin.txt"])
+        .env(
+            "MC_HOST_TEST",
+            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
+        )
+        .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"streamed bytes")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // pipeMessage human format: "{size} bytes -> `{target}`"
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("14 bytes -> `test/pipeb/from-stdin.txt`"),
+        "stdout: {stdout}"
+    );
+    let dst = server.dir.path().join("back.txt");
+    server.rs3_ok(&["get", "test/pipeb/from-stdin.txt", dst.to_str().unwrap()]);
+    assert_eq!(std::fs::read(dst).unwrap(), b"streamed bytes");
+}
+
+#[test]
+fn pipe_multipart_streams_large_input() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/pipemp"]);
+    // 12 MiB of patterned data with a 5 MiB part size -> must take the
+    // multipart path (unknown-size streaming, [SEM] §8).
+    let data: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
+    cmd.args(["pipe", "--part-size", "5MiB", "test/pipemp/big.bin"])
+        .env(
+            "MC_HOST_TEST",
+            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
+        )
+        .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(&data).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stat = server.rs3_ok(&["stat", "test/pipemp/big.bin"]);
+    // Multipart ETags contain "-<parts>"; 12MiB / 5MiB = 3 parts.
+    assert!(stat.contains("-3"), "expected multipart etag, stat: {stat}");
+
+    let dst = server.dir.path().join("big.out");
+    server.rs3_ok(&["get", "test/pipemp/big.bin", dst.to_str().unwrap()]);
+    assert_eq!(std::fs::read(dst).unwrap(), data);
+}
+
+#[test]
+fn pipe_missing_target_is_rejected() {
+    // Ground-truth verified against the real `mc` binary: `mc pipe` with
+    // zero positional args shows the command's full help and exits 1
+    // (`cmd/pipe-main.go`'s `checkPipeSyntax`: `len(args) != 1`) -- it does
+    // NOT pass stdin through to stdout. rs3 mirrors the "exactly one
+    // required positional" shape via clap; the passthrough case instead
+    // requires that one argument to be present but empty (see the next
+    // test), matching `mc pipe ""`.
+    let server = TestServer::start();
+    let out = server.rs3(&["pipe"]);
+    assert!(
+        !out.status.success(),
+        "pipe with no target must be rejected"
+    );
+}
+
+#[test]
+fn pipe_empty_target_passes_stdin_through_to_stdout() {
+    // `mc pipe ""` (one argument, but empty) is real mc's actual
+    // passthrough shape -- confirmed against the real binary.
+    let server = TestServer::start();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
+    cmd.args(["pipe", ""])
+        .env(
+            "MC_HOST_TEST",
+            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
+        )
+        .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"cat me back")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"cat me back");
+}
+
+#[test]
+fn pipe_json_message_has_status_target_size() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/pipejson"]);
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rs3"));
+    cmd.args(["--json", "pipe", "test/pipejson/j.txt"])
+        .env(
+            "MC_HOST_TEST",
+            format!("http://testkey:testsecret@127.0.0.1:{}", server.port),
+        )
+        .env("MC_CONFIG_DIR", server.dir.path().join("mc-config"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"hi").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(first["status"], "success");
+    assert_eq!(first["target"], "test/pipejson/j.txt");
+    assert_eq!(first["size"], 2);
+}
