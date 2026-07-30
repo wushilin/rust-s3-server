@@ -14,7 +14,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use config::{Alias, client_for_alias, load_config, save_config};
-use list::list_s3_objects;
+use list::collect_objects;
 use transfer::{download_key_to_path, download_object, transfer_object_between_s3, upload_file};
 use urls::{is_s3_url, join_key, join_s3_target, parse_s3_url, parse_size};
 
@@ -707,7 +707,7 @@ async fn mirror_s3_to_local(source: &str, target: &Path) -> Result<()> {
     let (client, _) = client_for_alias(&parsed.alias).await?;
     fs::create_dir_all(target).await?;
 
-    for obj in list_s3_objects(&client, &bucket, &prefix).await? {
+    for obj in collect_objects(&client, &bucket, &prefix).await? {
         let rel = obj
             .key
             .strip_prefix(&prefix)
@@ -748,7 +748,7 @@ async fn mirror_s3_to_s3(
     let (source_client, _) = client_for_alias(&source_url.alias).await?;
     let (target_client, _) = client_for_alias(&target_url.alias).await?;
 
-    for obj in list_s3_objects(&source_client, &source_bucket, &source_prefix).await? {
+    for obj in collect_objects(&source_client, &source_bucket, &source_prefix).await? {
         let rel = obj
             .key
             .strip_prefix(&source_prefix)
