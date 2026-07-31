@@ -403,7 +403,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                         // source now that its copy has succeeded. Delete
                         // failures are logged but must not count toward the
                         // failure total that drives exit status ([SEM] §3).
-                        delete_source_entry(source, entry).await;
+                        delete_source_entry(source, entry, stream_budget, session.ui()).await;
                     }
                     0u64
                 }
@@ -465,6 +465,10 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                         .map(|rel| ObjectIdentifier::builder().key(s3_key(prefix, rel)).build())
                         .collect::<Result<Vec<_>, _>>()?;
                     let delete = Delete::builder().set_objects(Some(ids)).build()?;
+                    // Built unconditionally even when `session.ui()` is
+                    // `None` (dispatch just no-ops the task line then) --
+                    // one string format over a <=1000-key chunk is
+                    // negligible next to the network round trip it labels.
                     let label_path = match chunk {
                         [only] => s3_key(prefix, only),
                         _ => format!("{} (+{} more)", s3_key(prefix, &chunk[0]), chunk.len() - 1),
@@ -524,7 +528,12 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
 /// its copy has already succeeded. Fire-and-forget -- errors are logged to
 /// stderr and swallowed, matching mc's async/decoupled `removeManager`
 /// ([SEM] §3): a delete failure must not affect the overall exit status.
-async fn delete_source_entry(source: &Side, entry: &Entry) {
+async fn delete_source_entry(
+    source: &Side,
+    entry: &Entry,
+    budget: &crate::budget::StreamBudget,
+    progress: Option<&crate::progress::ProgressUi>,
+) {
     let result: Result<()> = match source {
         Side::Local(root) => tokio::fs::remove_file(root.join(&entry.rel))
             .await
@@ -534,14 +543,23 @@ async fn delete_source_entry(source: &Side, entry: &Entry) {
             bucket,
             prefix,
             ..
-        } => client
-            .delete_object()
-            .bucket(bucket)
-            .key(s3_key(prefix, &entry.rel))
-            .send()
+        } => {
+            let key = s3_key(prefix, &entry.rel);
+            crate::budget::dispatch(
+                budget,
+                progress,
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Removing,
+                    path: key.clone(),
+                    part: None,
+                },
+                "DeleteObject",
+                client.delete_object().bucket(bucket).key(key).send(),
+            )
             .await
             .map(|_| ())
-            .map_err(Into::into),
+            .map_err(Into::into)
+        }
     };
     if let Err(err) = result {
         eprintln!("mv: remove `{}` failed: {err:#}", entry.rel);

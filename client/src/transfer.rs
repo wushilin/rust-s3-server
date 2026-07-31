@@ -323,7 +323,7 @@ pub(crate) async fn multipart_upload(
             progress.as_ref(),
             crate::progress::TransferLabel {
                 verb: crate::progress::Verb::Aborting,
-                path: source_label.clone(),
+                path: source_label,
                 part: None,
             },
             "AbortMultipartUpload",
@@ -678,7 +678,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
             progress.as_ref(),
             crate::progress::TransferLabel {
                 verb: crate::progress::Verb::Aborting,
-                path: source_key_label.clone(),
+                path: source_key_label,
                 part: None,
             },
             "AbortMultipartUpload",
@@ -987,7 +987,7 @@ async fn multipart_server_side_copy(
             progress.as_ref(),
             crate::progress::TransferLabel {
                 verb: crate::progress::Verb::Aborting,
-                path: source_key_label.clone(),
+                path: source_key_label,
                 part: None,
             },
             "AbortMultipartUpload",
