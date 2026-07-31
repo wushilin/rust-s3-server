@@ -19,17 +19,26 @@ pub(crate) struct McConfig {
     pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// One alias entry, wire-compatible with mc's `aliasConfigV10`
+/// (camelCase keys: url/accessKey/secretKey/api/path). `region` is an
+/// rs3-only extension mc ignores; mc's own optional fields
+/// (sessionToken, license, apiKey, src) round-trip through `extra` so an
+/// `rs3 alias set` never destroys them in a shared `~/.mc/config.json`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Alias {
     pub(crate) url: String,
+    #[serde(rename = "accessKey")]
     pub(crate) access_key: String,
+    #[serde(rename = "secretKey")]
     pub(crate) secret_key: String,
     #[serde(default = "default_api")]
     pub(crate) api: String,
     #[serde(default = "default_path")]
     pub(crate) path: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) region: Option<String>,
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
 pub(crate) fn default_api() -> String {
@@ -98,6 +107,7 @@ pub(crate) fn env_alias(name: &str) -> Option<Alias> {
         secret_key: secret_key.into(),
         api: default_api(),
         path: default_path(),
+        extra: BTreeMap::new(),
         region: std::env::var("AWS_S3_REGION")
             .ok()
             .or_else(|| std::env::var("AWS_REGION").ok()),
@@ -139,4 +149,62 @@ pub(crate) fn config_path() -> Result<PathBuf> {
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("unable to locate home directory"))?;
     Ok(home.join(".mc").join("config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verbatim shape of a config.json written by real mc (RELEASE.2025-08-13):
+    // camelCase keys, optional sessionToken/license/apiKey/src fields.
+    const MC_WRITTEN_CONFIG: &str = r#"{
+        "version": "10",
+        "aliases": {
+            "play": {
+                "url": "https://play.min.io",
+                "accessKey": "Q3AM3UQ867SPQQA43P2F",
+                "secretKey": "zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG",
+                "api": "S3v4",
+                "path": "auto",
+                "sessionToken": "tok123"
+            }
+        }
+    }"#;
+
+    #[test]
+    fn parses_real_mc_written_config() {
+        let cfg: McConfig = serde_json::from_str(MC_WRITTEN_CONFIG).unwrap();
+        let play = &cfg.aliases["play"];
+        assert_eq!(play.access_key, "Q3AM3UQ867SPQQA43P2F");
+        assert_eq!(play.secret_key, "zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG");
+        assert_eq!(play.api, "S3v4");
+        assert_eq!(play.path, "auto");
+    }
+
+    #[test]
+    fn saves_camelcase_and_preserves_mc_fields() {
+        let cfg: McConfig = serde_json::from_str(MC_WRITTEN_CONFIG).unwrap();
+        let out = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(
+            out.contains("\"accessKey\""),
+            "must write mc's camelCase: {out}"
+        );
+        assert!(
+            out.contains("\"secretKey\""),
+            "must write mc's camelCase: {out}"
+        );
+        assert!(
+            !out.contains("access_key"),
+            "no snake_case in saved config: {out}"
+        );
+        assert!(
+            out.contains("\"sessionToken\": \"tok123\""),
+            "mc's optional fields must survive a roundtrip: {out}"
+        );
+        // rs3's own extension must not pollute configs that never set it
+        assert!(
+            !out.contains("\"region\""),
+            "region must be omitted when None: {out}"
+        );
+    }
 }

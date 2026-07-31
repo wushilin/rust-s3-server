@@ -843,6 +843,7 @@ mod tests {
             api: "s3v4".to_string(),
             path: "auto".to_string(),
             region: None,
+            extra: std::collections::BTreeMap::new(),
         }
     }
 

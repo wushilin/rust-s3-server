@@ -627,6 +627,7 @@ async fn alias(args: AliasArgs) -> Result<()> {
                     secret_key,
                     api,
                     path,
+                    extra: BTreeMap::new(),
                     region: std::env::var("AWS_S3_REGION")
                         .ok()
                         .or_else(|| std::env::var("AWS_REGION").ok()),
