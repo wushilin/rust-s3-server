@@ -759,7 +759,7 @@ async fn ls(args: LsArgs) -> Result<()> {
                         ui.as_ref(),
                         crate::progress::TransferLabel {
                             verb: crate::progress::Verb::Inspecting,
-                            path: format!("{bucket}/{prefix}"),
+                            path: crate::progress::bucket_prefix_label(&bucket, &prefix),
                             part: None,
                         },
                         "HeadObject",
@@ -831,7 +831,7 @@ async fn ls(args: LsArgs) -> Result<()> {
                                 ui.as_ref(),
                                 crate::progress::TransferLabel {
                                     verb: crate::progress::Verb::Listing,
-                                    path: format!("{bucket}/{prefix}"),
+                                    path: crate::progress::bucket_prefix_label(&bucket, &prefix),
                                     part: None,
                                 },
                                 "ListObjectsV2",
@@ -880,7 +880,7 @@ async fn ls(args: LsArgs) -> Result<()> {
                         ui.as_ref(),
                         crate::progress::TransferLabel {
                             verb: crate::progress::Verb::Listing,
-                            path: format!("{bucket}/{prefix}"),
+                            path: crate::progress::bucket_prefix_label(&bucket, &prefix),
                             part: None,
                         },
                         "ListObjectsV2",
@@ -980,7 +980,7 @@ async fn list_incomplete(
             ui,
             crate::progress::TransferLabel {
                 verb: crate::progress::Verb::Listing,
-                path: format!("{bucket}/{prefix}"),
+                path: crate::progress::bucket_prefix_label(bucket, prefix),
                 part: None,
             },
             "ListMultipartUploads",
@@ -2381,7 +2381,7 @@ async fn remove_prefix(
                 ui,
                 crate::progress::TransferLabel {
                     verb: crate::progress::Verb::Removing,
-                    path: format!("{bucket}/{prefix}"),
+                    path: crate::progress::bucket_prefix_label(bucket, prefix),
                     part: None,
                 },
                 "DeleteObjects",
@@ -2589,7 +2589,7 @@ fn du_walk<'a>(
                     ui,
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Listing,
-                        path: format!("{bucket}/{prefix}"),
+                        path: crate::progress::bucket_prefix_label(bucket, prefix),
                         part: None,
                     },
                     "ListObjectsV2",
@@ -2750,7 +2750,7 @@ async fn tree_list_children(
                     ui,
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Listing,
-                        path: format!("{bucket}/{prefix}"),
+                        path: crate::progress::bucket_prefix_label(bucket, prefix),
                         part: None,
                     },
                     "ListObjectsV2",

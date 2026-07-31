@@ -90,7 +90,7 @@ impl ObjectPaginator {
                     ui.as_ref(),
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Listing,
-                        path: format!("{}/{}", self.bucket, self.prefix),
+                        path: crate::progress::bucket_prefix_label(&self.bucket, &self.prefix),
                         part: None,
                     },
                     "ListObjectsV2",

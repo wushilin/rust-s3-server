@@ -271,14 +271,14 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     }
 
     // Decided here (rather than at the usual post-planning `TransferSession`
-    // spot below) so the planning listing calls can dispatch through the
-    // same `ProgressUi` the session reuses via `from_ui` -- two independent
-    // `ProgressUi`s would be two `MultiProgress`es fighting over the
-    // terminal. Suppressed for `--dry-run`/`--fake`: that path returns
-    // before any `TransferSession` exists to finish the bar, so creating
-    // one here would leave a stray unfinished line on screen.
-    let ui = (!dry_run).then(crate::progress::worker_ui).flatten();
-    let dispatch_ctx = Some((&stream_budget, ui.as_ref()));
+    // spot below) so the planning listing calls can dispatch through it too.
+    // `worker_ui()` is always tasks-only mode (no persistent overall bar --
+    // see `ProgressUi::new_tasks_only`'s doc), so it's safe to use
+    // unconditionally here even on the `--dry-run` path, which prints
+    // PUT/DEL lines right after planning: a tasks-only `ProgressUi` never
+    // leaves a persistent, unfinished line for those prints to glue onto.
+    let planning_ui = crate::progress::worker_ui();
+    let dispatch_ctx = Some((&stream_budget, planning_ui.as_ref()));
     let source_entries = match &source {
         Side::Local(root) => {
             if !root.is_dir() {
@@ -375,7 +375,14 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     // starting any transfer -- matches mc's copyMessage/mirrorMessage
     // totalCount/totalSize, which reflect the whole session's planned
     // work, not a running tally.
-    let session = TransferSession::from_ui(ui);
+    // A fresh `TransferSession` (bar mode, its own persistent overall bar)
+    // rather than reusing `planning_ui`: the planning listing above used a
+    // tasks-only `ProgressUi` (spinner lines only), and by this point every
+    // one of its task lines has already finished and been removed (each
+    // `dispatch` call finishes synchronously before `collect_s3_entries`
+    // returns), so there's nothing left on screen for a second, independent
+    // `ProgressUi` to conflict with.
+    let session = TransferSession::new("mirror");
     for entry in &plan.copies {
         session.add_total(entry.size);
     }

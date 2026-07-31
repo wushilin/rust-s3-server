@@ -138,6 +138,18 @@ fn bytes_pair_key(state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write)
     let _ = w.write_str(&format_bytes_pair(state.pos(), state.len().unwrap_or(0)));
 }
 
+/// `bucket/prefix` for a `TransferLabel`'s path, without a dangling `/`
+/// when `prefix` is empty -- an empty-prefix `ListObjectsV2`/batch-delete
+/// call operates on the whole bucket, not on a `bucket/` "sub-path", so the
+/// label should read `Listing bucket`, not `Listing bucket/`.
+pub(crate) fn bucket_prefix_label(bucket: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        bucket.to_string()
+    } else {
+        format!("{bucket}/{prefix}")
+    }
+}
+
 struct UiState {
     objects_total: u64,
     objects_done: u64,
@@ -146,7 +158,19 @@ struct UiState {
 
 struct UiInner {
     mp: MultiProgress,
-    overall: ProgressBar,
+    // `None` in "tasks-only" mode (`ProgressUi::new_tasks_only`): standalone
+    // commands print their own stdout lines interleaved with dispatch's
+    // spinner task lines, and a *persistent* bar (one that outlives every
+    // individual draw, unlike a task line that's removed the moment its
+    // dispatch call resolves) parks the terminal cursor at the end of its
+    // own line with no trailing newline -- the next `println!` then glues
+    // onto it instead of starting a fresh line (reproduced under a pty:
+    // `TOTAL 0/0 objects [...] ... [2026-07-31 ...] 14B f1.txt`). Bar mode
+    // (`ProgressUi::new`, used by `TransferSession`) keeps the overall bar:
+    // transfer commands never print per-object stdout lines while the bar
+    // is active (bar-mode-silent, see `TransferSession::object_done`), so
+    // there is nothing for it to glue onto.
+    overall: Option<ProgressBar>,
     bar_width: usize,
     state: Mutex<UiState>,
 }
@@ -179,42 +203,77 @@ fn bar_width_for(cols: Option<u16>) -> usize {
     }
 }
 
+/// Shared bar-vs-lines predicate for both [`worker_ui`] and
+/// [`crate::messages::TransferSession::new`]: stdout is a TTY, and none of
+/// `--quiet`/`--json`/`--no-color` is set.
+fn ui_enabled() -> bool {
+    let out = crate::output::out();
+    out.stdout_tty && !out.quiet && !out.json && !out.no_color
+}
+
 /// Standalone commands' (ls/rm/stat/head/cat/du/tree/find/diff/mb/rb/mv...)
 /// equivalent of [`crate::messages::TransferSession::new`]'s bar-vs-lines
-/// decision: `Some` under the exact same predicate (stdout is a TTY, and
-/// none of `--quiet`/`--json`/`--no-color` is set), `None` otherwise so
-/// `dispatch` degrades to its noop task line and non-TTY/`--json`/`--quiet`
-/// stdout stays byte-identical.
+/// decision: `Some` under [`ui_enabled`], `None` otherwise so `dispatch`
+/// degrades to its noop task line and non-TTY/`--json`/`--quiet` stdout
+/// stays byte-identical. Always **tasks-only** mode (see
+/// [`ProgressUi::new_tasks_only`]) -- these commands print their own stdout
+/// lines, which a persistent bar would corrupt.
 pub(crate) fn worker_ui() -> Option<ProgressUi> {
-    let out = crate::output::out();
-    (out.stdout_tty && !out.quiet && !out.json && !out.no_color).then(ProgressUi::new)
+    ui_enabled().then(ProgressUi::new_tasks_only)
+}
+
+/// [`crate::messages::TransferSession`]'s bar-vs-lines decision: `Some`
+/// under the same [`ui_enabled`] predicate, full bar mode (persistent
+/// overall bar) -- transfer commands never print per-object stdout lines
+/// while the bar is active, so there's nothing for it to glue onto.
+pub(crate) fn transfer_ui() -> Option<ProgressUi> {
+    ui_enabled().then(ProgressUi::new)
 }
 
 impl ProgressUi {
     pub(crate) fn new() -> Self {
         let cols = console::Term::stderr().size_checked().map(|(_, c)| c);
-        Self::with_target(ProgressDrawTarget::stderr(), bar_width_for(cols))
+        Self::with_target(ProgressDrawTarget::stderr(), bar_width_for(cols), true)
+    }
+
+    /// Spinner-task-only mode: no persistent overall bar. Used by
+    /// [`worker_ui`] for standalone commands, which print their own stdout
+    /// lines between dispatch calls -- see [`UiInner::overall`]'s doc for
+    /// why a persistent bar is unsafe there.
+    pub(crate) fn new_tasks_only() -> Self {
+        let cols = console::Term::stderr().size_checked().map(|(_, c)| c);
+        Self::with_target(ProgressDrawTarget::stderr(), bar_width_for(cols), false)
     }
 
     /// Hidden draw target for unit tests: full accounting, no rendering.
     #[cfg(test)]
     pub(crate) fn hidden() -> Self {
-        Self::with_target(ProgressDrawTarget::hidden(), bar_width_for(None))
+        Self::with_target(ProgressDrawTarget::hidden(), bar_width_for(None), true)
     }
 
-    fn with_target(target: ProgressDrawTarget, bar_width: usize) -> Self {
+    /// Like [`Self::hidden`], but tasks-only (no overall bar) -- for tests
+    /// exercising [`worker_ui`]'s mode specifically.
+    #[cfg(test)]
+    pub(crate) fn hidden_tasks_only() -> Self {
+        Self::with_target(ProgressDrawTarget::hidden(), bar_width_for(None), false)
+    }
+
+    fn with_target(target: ProgressDrawTarget, bar_width: usize, with_overall: bool) -> Self {
         let mp = MultiProgress::with_draw_target(target);
-        let overall = mp.add(ProgressBar::new(0));
-        if let Ok(style) = ProgressStyle::with_template(&format!(
-            "TOTAL {{msg}} [{{bar:{bar_width}.white/240}}] {{bytes_pair}} {{binary_bytes_per_sec}} eta {{eta}}",
-        )) {
-            overall.set_style(
-                style
-                    .progress_chars(BAR_CHARS)
-                    .with_key("bytes_pair", bytes_pair_key),
-            );
-        }
-        overall.set_message("0/0 objects");
+        let overall = with_overall.then(|| {
+            let overall = mp.add(ProgressBar::new(0));
+            if let Ok(style) = ProgressStyle::with_template(&format!(
+                "TOTAL {{msg}} [{{bar:{bar_width}.white/240}}] {{bytes_pair}} {{binary_bytes_per_sec}} eta {{eta}}",
+            )) {
+                overall.set_style(
+                    style
+                        .progress_chars(BAR_CHARS)
+                        .with_key("bytes_pair", bytes_pair_key),
+                );
+            }
+            overall.set_message("0/0 objects");
+            overall
+        });
         Self {
             inner: Arc::new(UiInner {
                 mp,
@@ -232,7 +291,9 @@ impl ProgressUi {
     pub(crate) fn add_object(&self, bytes: u64) {
         let mut state = self.lock_state();
         state.objects_total += 1;
-        self.inner.overall.inc_length(bytes);
+        if let Some(overall) = &self.inner.overall {
+            overall.inc_length(bytes);
+        }
         self.refresh_msg(&state);
     }
 
@@ -242,16 +303,23 @@ impl ProgressUi {
         self.refresh_msg(&state);
     }
 
+    /// Inserts `pb` into the multi-bar stack: above the overall bar (so the
+    /// overall bar stays pinned at the bottom) in bar mode, or just appended
+    /// in tasks-only mode (there's no overall bar to stay pinned above).
+    fn insert_bar(&self, pb: ProgressBar) -> ProgressBar {
+        match &self.inner.overall {
+            Some(overall) => self.inner.mp.insert_before(overall, pb),
+            None => self.inner.mp.add(pb),
+        }
+    }
+
     /// One in-flight transfer unit. If all detail slots are busy the handle
     /// is silent: no bar, but its ticks still advance the overall bar.
     pub(crate) fn unit(&self, label: TransferLabel, len: u64) -> UnitHandle {
         let mut state = self.lock_state();
         let bar = if state.active_bars < MAX_DETAIL_BARS {
             state.active_bars += 1;
-            let pb = self
-                .inner
-                .mp
-                .insert_before(&self.inner.overall, ProgressBar::new(len));
+            let pb = self.insert_bar(ProgressBar::new(len));
             let bar_width = self.inner.bar_width;
             if let Ok(style) = ProgressStyle::with_template(&format!(
                 "{{msg}} [{{bar:{bar_width}.white/240}}] {{bytes_pair}} {{binary_bytes_per_sec}}",
@@ -294,10 +362,7 @@ impl ProgressUi {
         let mut state = self.lock_state();
         let bar = if state.active_bars < MAX_DETAIL_BARS {
             state.active_bars += 1;
-            let pb = self
-                .inner
-                .mp
-                .insert_before(&self.inner.overall, ProgressBar::new_spinner());
+            let pb = self.insert_bar(ProgressBar::new_spinner());
             if let Ok(style) = ProgressStyle::with_template(&format!("{{msg}} {{spinner}} {api}")) {
                 pb.set_style(style);
             }
@@ -325,22 +390,37 @@ impl ProgressUi {
         }
     }
 
-    /// Session end: detail bars are already gone (finished or dropped);
-    /// the overall bar finishes in place and stays visible, like mc's.
+    /// Session end: detail bars are already gone (finished or dropped); the
+    /// overall bar finishes in place and stays visible, like mc's. No-op in
+    /// tasks-only mode (no overall bar to finish).
     pub(crate) fn finish_and_keep(&self) {
         let state = self.lock_state();
         self.refresh_msg(&state);
-        self.inner.overall.finish();
+        if let Some(overall) = &self.inner.overall {
+            overall.finish();
+        }
+    }
+
+    /// Explicit pre-hard-exit teardown: clears every remaining bar/spinner
+    /// from the terminal. `std::process::exit` skips `Drop`, so a caller
+    /// about to call it (e.g. `find --exec`'s failure path) should call this
+    /// first rather than rely on cleanup that will never run. Normally a
+    /// no-op by the time it matters: task lines are finished synchronously
+    /// inside `dispatch` well before any exit path, so there's nothing left
+    /// to clear -- this is defense in depth, not a load-bearing fix.
+    pub(crate) fn clear(&self) {
+        let _ = self.inner.mp.clear();
     }
 
     fn refresh_msg(&self, state: &UiState) {
+        let Some(overall) = &self.inner.overall else {
+            return;
+        };
         // Mirror `--remove` delete events complete objects that never went
         // through a transfer function's add_object — clamp so the display
         // never shows done > total.
         let total = state.objects_total.max(state.objects_done);
-        self.inner
-            .overall
-            .set_message(format!("{}/{} objects", state.objects_done, total));
+        overall.set_message(format!("{}/{} objects", state.objects_done, total));
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, UiState> {
@@ -349,12 +429,20 @@ impl ProgressUi {
 
     #[allow(dead_code)]
     pub(crate) fn overall_position(&self) -> u64 {
-        self.inner.overall.position()
+        self.inner
+            .overall
+            .as_ref()
+            .map(|o| o.position())
+            .unwrap_or(0)
     }
 
     #[allow(dead_code)]
     pub(crate) fn overall_length(&self) -> u64 {
-        self.inner.overall.length().unwrap_or(0)
+        self.inner
+            .overall
+            .as_ref()
+            .and_then(|o| o.length())
+            .unwrap_or(0)
     }
 
     #[allow(dead_code)]
@@ -411,7 +499,9 @@ impl UnitHandle {
         if let Some(bar) = &inner.bar {
             bar.inc(n);
         }
-        inner.ui.inner.overall.inc(n);
+        if let Some(overall) = &inner.ui.inner.overall {
+            overall.inc(n);
+        }
     }
 
     /// Reset to the unit's start (an upload part retry re-streams from
@@ -426,7 +516,9 @@ impl UnitHandle {
         if let Some(bar) = &inner.bar {
             bar.set_position(0);
         }
-        inner.ui.inner.overall.dec(pos);
+        if let Some(overall) = &inner.ui.inner.overall {
+            overall.dec(pos);
+        }
     }
 
     /// Snap to 100% (top up any rounding shortfall exactly once), remove
@@ -441,7 +533,9 @@ impl UnitHandle {
         let shortfall = inner.len.saturating_sub(state.pos);
         state.pos = inner.len;
         drop(state);
-        inner.ui.inner.overall.inc(shortfall);
+        if let Some(overall) = &inner.ui.inner.overall {
+            overall.inc(shortfall);
+        }
         inner.ui.release_slot(&inner.bar);
     }
 }
@@ -853,6 +947,94 @@ mod tests {
             ui.overall_position(),
             25,
             "rewind must atomically subtract without losing concurrent increments"
+        );
+    }
+
+    // --- tasks-only mode (`worker_ui`'s `ProgressUi::new_tasks_only`) ---
+    // F1 fix: standalone commands print their own stdout lines, so their
+    // `ProgressUi` must have no persistent overall bar (see `UiInner::overall`'s
+    // doc) or those prints glue onto it. These pin the resulting no-overall-bar
+    // contract: `overall_position`/`overall_length` read as a well-defined `0`
+    // rather than panicking, slot accounting still works, and `add_object`/
+    // `object_done` (which a plain standalone command never calls, but which
+    // must stay harmless if one did) don't panic either.
+
+    #[test]
+    fn tasks_only_mode_has_no_overall_position_or_length() {
+        let ui = ProgressUi::hidden_tasks_only();
+        assert_eq!(ui.overall_position(), 0, "no overall bar: reads as 0");
+        assert_eq!(ui.overall_length(), 0, "no overall bar: reads as 0");
+    }
+
+    #[test]
+    fn tasks_only_mode_task_line_accounts_slots_but_not_bytes() {
+        let ui = ProgressUi::hidden_tasks_only();
+        assert_eq!(ui.active_detail_bars(), 0);
+        let t = ui.task(lbl(Verb::Listing, "bucket/p", None), "ListObjectsV2");
+        assert_eq!(ui.active_detail_bars(), 1, "task line takes a slot");
+        assert_eq!(
+            ui.overall_position(),
+            0,
+            "no overall bar to tick even while a task is active"
+        );
+        t.finish();
+        assert_eq!(ui.active_detail_bars(), 0, "finish frees the slot");
+    }
+
+    #[test]
+    fn tasks_only_mode_caps_at_ten_task_lines_like_bar_mode() {
+        let ui = ProgressUi::hidden_tasks_only();
+        let tasks: Vec<UnitHandle> = (0..10)
+            .map(|i| ui.task(lbl(Verb::Listing, &format!("b/{i}"), None), "ListObjectsV2"))
+            .collect();
+        assert_eq!(ui.active_detail_bars(), 10);
+        let eleventh = ui.task(lbl(Verb::Listing, "b/x", None), "ListObjectsV2");
+        assert_eq!(
+            ui.active_detail_bars(),
+            10,
+            "11th is silent, same cap as bar mode"
+        );
+        eleventh.finish();
+        drop(tasks);
+    }
+
+    #[test]
+    fn tasks_only_mode_add_object_and_object_done_do_not_panic() {
+        // Not part of any standalone command's real usage (they never call
+        // these), but `add_object`/`object_done`/`finish_and_keep` must
+        // still degrade gracefully rather than unwrap a `None` overall bar,
+        // in case a future caller reuses a tasks-only `ProgressUi` this way.
+        let ui = ProgressUi::hidden_tasks_only();
+        ui.add_object(100);
+        ui.add_object(50);
+        ui.object_done();
+        ui.object_done();
+        ui.object_done(); // more done than added: must not panic (bar mode clamps too)
+        ui.finish_and_keep(); // no overall bar to finish: must not panic
+        ui.clear(); // no bars left: must not panic or error
+    }
+
+    #[test]
+    fn tasks_only_mode_unit_finish_does_not_panic_without_overall_bar() {
+        // `unit()` isn't used by any tasks-only-mode caller today (standalone
+        // commands only ever call `task()` via `dispatch`), but the no-overall
+        // guard in `UnitHandle::inc`/`rewind`/`finish` must hold for it too.
+        let ui = ProgressUi::hidden_tasks_only();
+        let h = ui.unit(lbl(Verb::Downloading, "b/k", None), 10);
+        h.inc(4);
+        h.rewind();
+        h.inc(10);
+        h.finish();
+        assert_eq!(ui.overall_position(), 0, "still reads as 0: no overall bar");
+    }
+
+    #[test]
+    fn bucket_prefix_label_omits_trailing_slash_for_empty_prefix() {
+        assert_eq!(bucket_prefix_label("mybucket", ""), "mybucket");
+        assert_eq!(bucket_prefix_label("mybucket", "dir/"), "mybucket/dir/");
+        assert_eq!(
+            bucket_prefix_label("mybucket", "dir/f.txt"),
+            "mybucket/dir/f.txt"
         );
     }
 }

@@ -475,16 +475,13 @@ impl TransferSession {
     /// to `crate::progress::ProgressUi` for multi-bar TTY-live display (the label
     /// parameter is not yet used).
     pub(crate) fn new(_label: &str) -> Self {
-        Self::from_ui(crate::progress::worker_ui())
+        Self::from_ui(crate::progress::transfer_ui())
     }
 
-    /// Like [`Self::new`], but reuses an already-decided `ui` instead of
-    /// deciding (and constructing a fresh [`crate::progress::ProgressUi`])
-    /// again -- for callers (`mirror`) that need the same bar-vs-lines
-    /// decision earlier than session creation, e.g. to dispatch planning
-    /// listing calls through the same `ProgressUi` the session later ticks.
-    /// Constructing two independent `ProgressUi`s would mean two
-    /// `MultiProgress` instances fighting over the same terminal.
+    /// Like [`Self::new`], but takes an already-decided `ui` directly --
+    /// currently only `new` itself uses this (kept as a separate
+    /// constructor for testability/symmetry with `progress::worker_ui`'s
+    /// callers, which build their own `Option<ProgressUi>` the same way).
     pub(crate) fn from_ui(ui: Option<crate::progress::ProgressUi>) -> Self {
         Self {
             ui,

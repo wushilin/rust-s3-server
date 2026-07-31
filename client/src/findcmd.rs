@@ -324,12 +324,22 @@ fn to_content_message(key: &str, size: u64, time: DateTime<Utc>) -> ContentMessa
 /// discarded, ground-truth-verified) and the whole process exits
 /// immediately with the child's exit code, aborting the rest of the find
 /// loop.
+///
+/// `ui` (the caller's `worker_ui()`, possibly still holding finished-but-
+/// undropped task lines) is cleared explicitly before `std::process::exit`:
+/// that call skips every `Drop` impl on the stack, so anything relying on
+/// `Drop`-based cleanup would never run it. In practice this is defense in
+/// depth, not load-bearing -- by this point in `run_find`'s loop, listing
+/// has fully finished (`dispatch` finishes each task line synchronously
+/// inside `collect_objects_with`, before it returns), so there should be
+/// nothing left to clear.
 fn run_exec(
     template: &str,
     key: &str,
     rel_key: &str,
     size: u64,
     time: DateTime<Utc>,
+    ui: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     let raw_words = shell_words::split(template)
         .map_err(|e| anyhow!("find --exec: invalid command `{template}`: {e}"))?;
@@ -352,6 +362,9 @@ fn run_exec(
         let _ = stdout.write_all(&output.stderr);
         let _ = stdout.flush();
         let code = output.status.code().unwrap_or(1);
+        if let Some(ui) = ui {
+            ui.clear();
+        }
         std::process::exit(code);
     }
 }
@@ -458,7 +471,14 @@ pub(crate) async fn run_find(args: FindArgs) -> Result<()> {
         }
 
         if let Some(exec_template) = &args.exec {
-            run_exec(exec_template, &effective_key, relative, obj.size, time)?;
+            run_exec(
+                exec_template,
+                &effective_key,
+                relative,
+                obj.size,
+                time,
+                ui.as_ref(),
+            )?;
         } else if let Some(print_template) = &args.print {
             // Ground-truth-verified: `--json` silently ignores `--print`
             // and falls back to the default `ContentMessage` line (module
