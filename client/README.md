@@ -184,7 +184,7 @@ binary itself):
   segments draw from the same 5 tokens) -- **default 5**. A per-unit bar is
   visible exactly while its stream holds a budget token, so the number of
   bars on screen at any moment *is* the live parallelism, never more than
-  `-P`; this is a deliberate reduction from the old per-layer worst case of
+  `-P` (display is capped at 10 bars — with `-P` above 10, the extra streams still run and count toward the TOTAL bar, just without their own bar); this is a deliberate reduction from the old per-layer worst case of
   up to `P` objects each running `P` segments (`P`\*`P` concurrent streams).
   Bar labels are a verb plus the condensing path, e.g.
   `Uploading asdf/a.img part 4/24` (long paths lose middle components, then
