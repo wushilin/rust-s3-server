@@ -465,12 +465,22 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                         .map(|rel| ObjectIdentifier::builder().key(s3_key(prefix, rel)).build())
                         .collect::<Result<Vec<_>, _>>()?;
                     let delete = Delete::builder().set_objects(Some(ids)).build()?;
-                    let resp = client
-                        .delete_objects()
-                        .bucket(bucket)
-                        .delete(delete)
-                        .send()
-                        .await?;
+                    let label_path = match chunk {
+                        [only] => s3_key(prefix, only),
+                        _ => format!("{} (+{} more)", s3_key(prefix, &chunk[0]), chunk.len() - 1),
+                    };
+                    let resp = crate::budget::dispatch(
+                        &stream_budget,
+                        session.ui(),
+                        crate::progress::TransferLabel {
+                            verb: crate::progress::Verb::Removing,
+                            path: label_path,
+                            part: None,
+                        },
+                        "DeleteObjects",
+                        client.delete_objects().bucket(bucket).delete(delete).send(),
+                    )
+                    .await?;
                     delete_failures += resp.errors().len() as u64;
                     let failed_keys: HashSet<&str> =
                         resp.errors().iter().filter_map(|err| err.key()).collect();

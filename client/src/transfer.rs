@@ -239,12 +239,24 @@ pub(crate) async fn multipart_upload(
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
+    let source_label = source.display().to_string();
     let mut create = client.create_multipart_upload().bucket(bucket).key(key);
     if let Some(sc) = storage_class {
         create = create.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
     }
     create = apply_attrs(create, metadata)?;
-    let created = create.send().await?;
+    let created = crate::budget::dispatch(
+        budget,
+        progress,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Creating,
+            path: source_label.clone(),
+            part: None,
+        },
+        "CreateMultipartUpload",
+        create.send(),
+    )
+    .await?;
     let upload_id = created
         .upload_id()
         .ok_or_else(|| anyhow!("server did not return upload id"))?
@@ -253,7 +265,6 @@ pub(crate) async fn multipart_upload(
     let part_numbers = 1..=part_count;
     let progress = progress.cloned();
     let budget = budget.clone();
-    let source_label = source.display().to_string();
     let uploads = stream::iter(part_numbers.map(|part_index| {
         let client = client.clone();
         let source = source.to_path_buf();
@@ -307,13 +318,23 @@ pub(crate) async fn multipart_upload(
     .buffer_unordered(parallel.max(1));
     let mut completed_uploads = uploads.collect::<Vec<_>>().await;
     if let Some(err) = completed_uploads.iter().find_map(|res| res.as_ref().err()) {
-        let _ = client
-            .abort_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .send()
-            .await;
+        let _ = crate::budget::dispatch(
+            &budget,
+            progress.as_ref(),
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Aborting,
+                path: source_label.clone(),
+                part: None,
+            },
+            "AbortMultipartUpload",
+            client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send(),
+        )
+        .await;
         return Err(anyhow!("{err}"));
     }
     let mut uploaded_parts = completed_uploads.drain(..).collect::<Result<Vec<_>>>()?;
@@ -340,7 +361,18 @@ pub(crate) async fn multipart_upload(
     if if_not_exists {
         complete = complete.if_none_match("*");
     }
-    complete.send().await?;
+    crate::budget::dispatch(
+        &budget,
+        progress.as_ref(),
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Completing,
+            path: source_label,
+            part: None,
+        },
+        "CompleteMultipartUpload",
+        complete.send(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -561,12 +593,23 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
-    let created = target_client
-        .create_multipart_upload()
-        .bucket(target_bucket)
-        .key(target_key)
-        .send()
-        .await?;
+    let source_key_label = source_key.to_string();
+    let created = crate::budget::dispatch(
+        budget,
+        progress,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Creating,
+            path: source_key_label.clone(),
+            part: None,
+        },
+        "CreateMultipartUpload",
+        target_client
+            .create_multipart_upload()
+            .bucket(target_bucket)
+            .key(target_key)
+            .send(),
+    )
+    .await?;
     let upload_id = created
         .upload_id()
         .ok_or_else(|| anyhow!("server did not return upload id"))?
@@ -574,7 +617,6 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     let part_count = total_size.div_ceil(part_size);
     let progress = progress.cloned();
     let budget = budget.clone();
-    let source_key_label = source_key.to_string();
     let uploads = stream::iter((1..=part_count).map(|part_index| {
         let source_client = source_client.clone();
         let target_client = target_client.clone();
@@ -631,13 +673,23 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     .buffer_unordered(parallel.max(1));
     let mut completed_uploads = uploads.collect::<Vec<_>>().await;
     if let Some(err) = completed_uploads.iter().find_map(|res| res.as_ref().err()) {
-        let _ = target_client
-            .abort_multipart_upload()
-            .bucket(target_bucket)
-            .key(target_key)
-            .upload_id(&upload_id)
-            .send()
-            .await;
+        let _ = crate::budget::dispatch(
+            &budget,
+            progress.as_ref(),
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Aborting,
+                path: source_key_label.clone(),
+                part: None,
+            },
+            "AbortMultipartUpload",
+            target_client
+                .abort_multipart_upload()
+                .bucket(target_bucket)
+                .key(target_key)
+                .upload_id(&upload_id)
+                .send(),
+        )
+        .await;
         return Err(anyhow!("{err}"));
     }
     let mut uploaded_parts = completed_uploads.drain(..).collect::<Result<Vec<_>>>()?;
@@ -651,18 +703,28 @@ pub(crate) async fn multipart_copy_s3_to_s3(
                 .build()
         })
         .collect::<Vec<_>>();
-    target_client
-        .complete_multipart_upload()
-        .bucket(target_bucket)
-        .key(target_key)
-        .upload_id(upload_id)
-        .multipart_upload(
-            CompletedMultipartUpload::builder()
-                .set_parts(Some(completed))
-                .build(),
-        )
-        .send()
-        .await?;
+    crate::budget::dispatch(
+        &budget,
+        progress.as_ref(),
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Completing,
+            path: source_key_label,
+            part: None,
+        },
+        "CompleteMultipartUpload",
+        target_client
+            .complete_multipart_upload()
+            .bucket(target_bucket)
+            .key(target_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed))
+                    .build(),
+            )
+            .send(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -811,6 +873,7 @@ async fn multipart_server_side_copy(
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
+    let source_key_label = source_key.to_string();
     // `upload_part_copy` has no equivalent of `copy_object`'s
     // `x-amz-metadata-directive: COPY` -- `create_multipart_upload` starts
     // a brand-new object with no metadata at all unless it's set
@@ -822,13 +885,23 @@ async fn multipart_server_side_copy(
     // this function is only reached from the same-endpoint branch of
     // `transfer_object_between_s3`, so it's the same credentials/endpoint
     // as `source_client` would be.
-    let head = target_client
-        .head_object()
-        .bucket(source_bucket)
-        .key(source_key)
-        .send()
-        .await
-        .map_err(|err| anyhow!("stat `{source_bucket}/{source_key}`: {err}"))?;
+    let head = crate::budget::dispatch(
+        budget,
+        progress,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Inspecting,
+            path: source_key_label.clone(),
+            part: None,
+        },
+        "HeadObject",
+        target_client
+            .head_object()
+            .bucket(source_bucket)
+            .key(source_key)
+            .send(),
+    )
+    .await
+    .map_err(|err| anyhow!("stat `{source_bucket}/{source_key}`: {err}"))?;
     let mut create = target_client
         .create_multipart_upload()
         .bucket(target_bucket)
@@ -841,7 +914,18 @@ async fn multipart_server_side_copy(
             create = create.metadata(k.clone(), v.clone());
         }
     }
-    let created = create.send().await?;
+    let created = crate::budget::dispatch(
+        budget,
+        progress,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Creating,
+            path: source_key_label.clone(),
+            part: None,
+        },
+        "CreateMultipartUpload",
+        create.send(),
+    )
+    .await?;
     let upload_id = created
         .upload_id()
         .ok_or_else(|| anyhow!("server did not return upload id"))?
@@ -850,7 +934,6 @@ async fn multipart_server_side_copy(
     let part_count = total_size.div_ceil(part_size);
     let progress = progress.cloned();
     let budget = budget.clone();
-    let source_key_label = source_key.to_string();
     let uploads = stream::iter((1..=part_count).map(|part_index| {
         let client = target_client.clone();
         let copy_source = copy_source.clone();
@@ -899,13 +982,23 @@ async fn multipart_server_side_copy(
     .buffer_unordered(parallel.max(1));
     let mut results = uploads.collect::<Vec<_>>().await;
     if let Some(err) = results.iter().find_map(|r| r.as_ref().err()) {
-        let _ = target_client
-            .abort_multipart_upload()
-            .bucket(target_bucket)
-            .key(target_key)
-            .upload_id(&upload_id)
-            .send()
-            .await;
+        let _ = crate::budget::dispatch(
+            &budget,
+            progress.as_ref(),
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Aborting,
+                path: source_key_label.clone(),
+                part: None,
+            },
+            "AbortMultipartUpload",
+            target_client
+                .abort_multipart_upload()
+                .bucket(target_bucket)
+                .key(target_key)
+                .upload_id(&upload_id)
+                .send(),
+        )
+        .await;
         return Err(anyhow!("{err}"));
     }
     let mut parts = results.drain(..).collect::<Result<Vec<_>>>()?;
@@ -919,18 +1012,28 @@ async fn multipart_server_side_copy(
                 .build()
         })
         .collect::<Vec<_>>();
-    target_client
-        .complete_multipart_upload()
-        .bucket(target_bucket)
-        .key(target_key)
-        .upload_id(upload_id)
-        .multipart_upload(
-            CompletedMultipartUpload::builder()
-                .set_parts(Some(completed))
-                .build(),
-        )
-        .send()
-        .await?;
+    crate::budget::dispatch(
+        &budget,
+        progress.as_ref(),
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Completing,
+            path: source_key_label,
+            part: None,
+        },
+        "CompleteMultipartUpload",
+        target_client
+            .complete_multipart_upload()
+            .bucket(target_bucket)
+            .key(target_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed))
+                    .build(),
+            )
+            .send(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1031,13 +1134,19 @@ pub(crate) async fn download_key_to_path(
     if preserve {
         return Err(anyhow!("--preserve is not supported on this platform"));
     }
-    let head = client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
+    let head = crate::budget::dispatch(
+        budget,
+        progress,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Inspecting,
+            path: format!("{bucket}/{key}"),
+            part: None,
+        },
+        "HeadObject",
+        client.head_object().bucket(bucket).key(key).send(),
+    )
+    .await
+    .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
     let size = head.content_length().unwrap_or_default() as u64;
     if let Some(ui) = progress {
         ui.add_object(size);

@@ -46,10 +46,6 @@ pub(crate) struct StreamPermit {
 /// so a visible line always means a held token; the line is finished on
 /// both the `Ok` and `Err` paths, and the permit drops (returning the
 /// token) when this function returns.
-// Not yet called outside tests -- later tasks wire this into command call
-// sites for the byte-less S3 ops it names (HEAD, create/complete/abort
-// multipart, list, delete).
-#[allow(dead_code)]
 pub(crate) async fn dispatch<T, F: std::future::Future<Output = T>>(
     budget: &StreamBudget,
     ui: Option<&crate::progress::ProgressUi>,

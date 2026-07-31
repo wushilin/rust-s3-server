@@ -52,20 +52,16 @@ pub(crate) enum Verb {
     Uploading,
     Downloading,
     Copying,
-    // Not yet constructed outside tests -- later tasks (dispatch call
-    // sites for HEAD/create/complete/abort-multipart/list/delete) wire
-    // these in.
-    #[allow(dead_code)]
     Creating,
-    #[allow(dead_code)]
     Completing,
-    #[allow(dead_code)]
     Aborting,
-    #[allow(dead_code)]
     Inspecting,
+    // The ListObjectsV2 call sites live in `list.rs`'s shared
+    // `ObjectPaginator`/`collect_objects` (used by mirror.rs, share.rs,
+    // findcmd.rs, main.rs alike) rather than in one dispatch-call-site
+    // owner, so this isn't wired to a `dispatch` call yet.
     #[allow(dead_code)]
     Listing,
-    #[allow(dead_code)]
     Removing,
 }
 
@@ -285,9 +281,6 @@ impl ProgressUi {
     /// cap-10 slot pool as [`unit`](Self::unit), contributing zero bytes
     /// to the overall bar. Silent handle when slots are exhausted, same
     /// as `unit`.
-    // Not yet called outside tests -- `budget::dispatch` is its first
-    // caller and later tasks wire dispatch into command call sites.
-    #[allow(dead_code)]
     pub(crate) fn task(&self, label: TransferLabel, api: &'static str) -> UnitHandle {
         let mut state = self.lock_state();
         let bar = if state.active_bars < MAX_DETAIL_BARS {
