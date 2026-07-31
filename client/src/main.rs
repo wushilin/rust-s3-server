@@ -1692,10 +1692,10 @@ async fn get(args: GetArgs) -> Result<()> {
     let session = TransferSession::new("get");
     // GetArgs has no `--preserve` flag ([SEM] §2 lists it on cp/mirror/put
     // only), so `get` never preserves filesystem attributes. It also has no
-    // `-P` flag; the local worker count below is unchanged by the `-P`
-    // default bump, and the budget is sized to match it 1:1 since `get`
-    // transfers a single object.
-    let parallel = 4;
+    // `-P` flag, so the worker count is pinned to the same default the
+    // `-P`-bearing commands use (5), and the budget is sized to match it
+    // 1:1 since `get` transfers a single object.
+    let parallel = 5;
     let stream_budget = crate::budget::StreamBudget::new(parallel);
     download_object(
         &args.source,
