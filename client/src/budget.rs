@@ -19,7 +19,7 @@ pub(crate) struct StreamBudget {
 impl StreamBudget {
     pub(crate) fn new(permits: usize) -> Self {
         Self {
-            sem: Arc::new(Semaphore::new(permits.max(1))),
+            sem: Arc::new(Semaphore::new(permits.clamp(1, Semaphore::MAX_PERMITS))),
         }
     }
 
@@ -98,5 +98,14 @@ mod tests {
     async fn zero_permits_clamps_to_one() {
         let budget = StreamBudget::new(0);
         let _permit = budget.acquire().await; // must not hang or panic
+    }
+
+    #[tokio::test]
+    async fn huge_permit_count_does_not_panic() {
+        // `-P 18446744073709551615` (usize::MAX) must not panic building the
+        // semaphore -- `Semaphore::new` panics above `Semaphore::MAX_PERMITS`,
+        // so `new` must clamp rather than pass the raw CLI value through.
+        let budget = StreamBudget::new(usize::MAX);
+        let _permit = budget.acquire().await;
     }
 }

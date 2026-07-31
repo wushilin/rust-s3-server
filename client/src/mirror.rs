@@ -246,7 +246,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     )?;
     let part_size = crate::urls::parse_size(&args.part_size)?;
     let parallel = args.parallel.max(1);
-    let stream_budget = crate::budget::StreamBudget::new(args.parallel);
+    let stream_budget = crate::budget::StreamBudget::new(parallel);
     let dry_run = args.dry_run || args.fake;
     let attrs = match args.attr.as_deref() {
         Some(spec) => crate::attr::parse_attrs(spec)?,

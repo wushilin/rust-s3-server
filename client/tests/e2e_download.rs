@@ -45,7 +45,10 @@ fn cp_multipart_completes_with_p1() {
     // future must be able to acquire, run to completion, and release before
     // the next one starts. If a permit were ever held across an await that
     // depends on another part (or acquired twice by the same task), this
-    // test hangs and the harness's own process-level timeout fails it.
+    // test hangs indefinitely instead of failing -- there's no process-level
+    // timeout in this harness, only `TestServer::start`'s own 30s
+    // server-readiness deadline (which this test is already past by the
+    // time it would deadlock). A hang here blocks the whole test run.
     let server = TestServer::start();
     server.rs3_ok(&["mb", "test/p1b"]);
     let src = server.dir.path().join("p1.bin");
