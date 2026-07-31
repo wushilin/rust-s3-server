@@ -40,6 +40,33 @@ pub(crate) struct StreamPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Runs a byte-less S3 operation (HEAD, create/complete/abort multipart,
+/// list, delete...) under the stream budget, with a spinner task line for
+/// the duration. The token is acquired *before* the task line is created,
+/// so a visible line always means a held token; the line is finished on
+/// both the `Ok` and `Err` paths, and the permit drops (returning the
+/// token) when this function returns.
+// Not yet called outside tests -- later tasks wire this into command call
+// sites for the byte-less S3 ops it names (HEAD, create/complete/abort
+// multipart, list, delete).
+#[allow(dead_code)]
+pub(crate) async fn dispatch<T, F: std::future::Future<Output = T>>(
+    budget: &StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
+    label: crate::progress::TransferLabel,
+    api: &'static str,
+    fut: F,
+) -> T {
+    let _permit = budget.acquire().await;
+    let task = match ui {
+        Some(ui) => ui.task(label, api),
+        None => crate::progress::UnitHandle::noop(),
+    };
+    let result = fut.await;
+    task.finish();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +134,50 @@ mod tests {
         // so `new` must clamp rather than pass the raw CLI value through.
         let budget = StreamBudget::new(usize::MAX);
         let _permit = budget.acquire().await;
+    }
+
+    use crate::progress::{ProgressUi, TransferLabel, Verb};
+
+    fn lbl(verb: Verb, path: &str, part: Option<(u64, u64)>) -> TransferLabel {
+        TransferLabel {
+            verb,
+            path: path.into(),
+            part,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_releases_token_and_slot_on_ok_and_err() {
+        let ui = ProgressUi::hidden();
+        let budget = StreamBudget::new(1);
+        let ok: Result<u32, anyhow::Error> = dispatch(
+            &budget,
+            Some(&ui),
+            lbl(Verb::Inspecting, "b/k", None),
+            "HeadObject",
+            async { Ok(7) },
+        )
+        .await;
+        assert_eq!(ok.unwrap(), 7);
+        let err: Result<u32, anyhow::Error> = dispatch(
+            &budget,
+            Some(&ui),
+            lbl(Verb::Completing, "b/k", None),
+            "CompleteMultipartUpload",
+            async { Err(anyhow::anyhow!("boom")) },
+        )
+        .await;
+        assert!(err.is_err());
+        // budget of 1: a third dispatch only completes if both tokens were returned
+        let again: Result<u32, anyhow::Error> = dispatch(
+            &budget,
+            Some(&ui),
+            lbl(Verb::Listing, "b", None),
+            "ListObjectsV2",
+            async { Ok(1) },
+        )
+        .await;
+        assert_eq!(again.unwrap(), 1);
+        assert_eq!(ui.active_detail_bars(), 0, "all task lines cleared");
     }
 }

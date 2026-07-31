@@ -52,6 +52,21 @@ pub(crate) enum Verb {
     Uploading,
     Downloading,
     Copying,
+    // Not yet constructed outside tests -- later tasks (dispatch call
+    // sites for HEAD/create/complete/abort-multipart/list/delete) wire
+    // these in.
+    #[allow(dead_code)]
+    Creating,
+    #[allow(dead_code)]
+    Completing,
+    #[allow(dead_code)]
+    Aborting,
+    #[allow(dead_code)]
+    Inspecting,
+    #[allow(dead_code)]
+    Listing,
+    #[allow(dead_code)]
+    Removing,
 }
 
 impl Verb {
@@ -60,6 +75,12 @@ impl Verb {
             Verb::Uploading => "Uploading",
             Verb::Downloading => "Downloading",
             Verb::Copying => "Copying",
+            Verb::Creating => "Creating",
+            Verb::Completing => "Completing",
+            Verb::Aborting => "Aborting",
+            Verb::Inspecting => "Inspecting",
+            Verb::Listing => "Listing",
+            Verb::Removing => "Removing",
         }
     }
 }
@@ -251,6 +272,49 @@ impl ProgressUi {
                 ui: self.clone(),
                 bar,
                 len,
+                state: Mutex::new(UnitProgress {
+                    pos: 0,
+                    finished: false,
+                }),
+            })),
+        }
+    }
+
+    /// One in-flight byte-less S3 operation (HEAD, create/complete/abort
+    /// multipart, list, delete...): a spinner line sharing the same
+    /// cap-10 slot pool as [`unit`](Self::unit), contributing zero bytes
+    /// to the overall bar. Silent handle when slots are exhausted, same
+    /// as `unit`.
+    // Not yet called outside tests -- `budget::dispatch` is its first
+    // caller and later tasks wire dispatch into command call sites.
+    #[allow(dead_code)]
+    pub(crate) fn task(&self, label: TransferLabel, api: &'static str) -> UnitHandle {
+        let mut state = self.lock_state();
+        let bar = if state.active_bars < MAX_DETAIL_BARS {
+            state.active_bars += 1;
+            let pb = self
+                .inner
+                .mp
+                .insert_before(&self.inner.overall, ProgressBar::new_spinner());
+            if let Ok(style) = ProgressStyle::with_template(&format!("{{msg}} {{spinner}} {api}")) {
+                pb.set_style(style);
+            }
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            // Pad by char count, not byte count: `render` may emit a
+            // multi-byte `…`, and byte-length padding would under-pad.
+            let mut rendered = label.render(LABEL_WIDTH);
+            let padding = LABEL_WIDTH.saturating_sub(rendered.chars().count());
+            rendered.extend(std::iter::repeat_n(' ', padding));
+            pb.set_message(rendered);
+            Some(pb)
+        } else {
+            None
+        };
+        UnitHandle {
+            inner: Some(Arc::new(UnitInner {
+                ui: self.clone(),
+                bar,
+                len: 0,
                 state: Mutex::new(UnitProgress {
                     pos: 0,
                     finished: false,
@@ -745,6 +809,27 @@ mod tests {
             10,
             "degenerate terminal still floors"
         );
+    }
+
+    #[test]
+    fn task_lines_share_the_slot_pool_and_add_no_bytes() {
+        let ui = ProgressUi::hidden();
+        ui.add_object(100);
+        let bars: Vec<UnitHandle> = (0..9)
+            .map(|i| ui.unit(lbl(Verb::Uploading, "x", Some((i + 1, 9))), 10))
+            .collect();
+        let t1 = ui.task(
+            lbl(Verb::Creating, "asdf/a.img", None),
+            "CreateMultipartUpload",
+        );
+        assert_eq!(ui.active_detail_bars(), 10, "task takes the 10th slot");
+        let t2 = ui.task(lbl(Verb::Listing, "bucket/p", None), "ListObjectsV2");
+        assert_eq!(ui.active_detail_bars(), 10, "11th is silent");
+        t1.finish();
+        t2.finish();
+        assert_eq!(ui.active_detail_bars(), 9);
+        assert_eq!(ui.overall_position(), 0, "tasks contribute no bytes");
+        drop(bars);
     }
 
     #[test]
