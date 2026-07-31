@@ -84,7 +84,14 @@ fn display_url(side: &Side, rel: &str) -> String {
 /// "does at least one object exist under this prefix" existence probe that
 /// no other rs3 command (`mirror` included) has; not exercised by the e2e
 /// suite, so left as a documented simplification rather than new machinery.
-async fn collect_entries(side: &Side, required: bool) -> Result<Vec<Entry>> {
+async fn collect_entries(
+    side: &Side,
+    required: bool,
+    dispatch_ctx: Option<(
+        &crate::budget::StreamBudget,
+        Option<&crate::progress::ProgressUi>,
+    )>,
+) -> Result<Vec<Entry>> {
     match side {
         Side::Local(root) => {
             if root.is_dir() {
@@ -100,7 +107,7 @@ async fn collect_entries(side: &Side, required: bool) -> Result<Vec<Entry>> {
             bucket,
             prefix,
             ..
-        } => collect_s3_entries(client, bucket, prefix).await,
+        } => collect_s3_entries(client, bucket, prefix, dispatch_ctx).await,
     }
 }
 
@@ -144,8 +151,11 @@ pub(crate) async fn run_diff(first: &str, second: &str) -> Result<()> {
     let source = resolve_side(first).await?;
     let target = resolve_side(second).await?;
 
-    let source_entries = collect_entries(&source, true).await?;
-    let target_entries = collect_entries(&target, false).await?;
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
+    let dispatch_ctx = Some((&budget, ui.as_ref()));
+    let source_entries = collect_entries(&source, true, dispatch_ctx).await?;
+    let target_entries = collect_entries(&target, false, dispatch_ctx).await?;
 
     // Sorted merge-join over both entry lists (mc's `differenceInternal`,
     // [SEM] §9), comparing by relative key (`Entry::rel`) -- both lists are

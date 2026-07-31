@@ -49,7 +49,6 @@ use std::io::Write;
 
 use crate::FindArgs;
 use crate::config::client_for_alias;
-use crate::list::collect_objects;
 use crate::messages::ContentMessage;
 use crate::output::{McMessage, humanize_ibytes, out, print_date, print_msg};
 use crate::timefilter::{include_newer_than, include_older_than, validate_time_filters};
@@ -396,7 +395,11 @@ pub(crate) async fn run_find(args: FindArgs) -> Result<()> {
     let root_with_slash = format!("{root_raw}/");
     let maxdepth = args.maxdepth.unwrap_or(0);
 
-    let objects = collect_objects(&client, &bucket, &prefix).await?;
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
+    let objects =
+        crate::list::collect_objects_with(&client, &bucket, &prefix, Some((&budget, ui.as_ref())))
+            .await?;
     for obj in objects {
         // Real `mc` unconditionally skips `StorageClass == "GLACIER"`
         // objects before any filter ([SEM] §7); rs3's own listing helper

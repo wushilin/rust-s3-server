@@ -93,8 +93,12 @@ pub(crate) async fn collect_s3_entries(
     client: &Client,
     bucket: &str,
     prefix: &str,
+    dispatch_ctx: Option<(
+        &crate::budget::StreamBudget,
+        Option<&crate::progress::ProgressUi>,
+    )>,
 ) -> Result<Vec<Entry>> {
-    let objects = crate::list::collect_objects(client, bucket, prefix).await?;
+    let objects = crate::list::collect_objects_with(client, bucket, prefix, dispatch_ctx).await?;
     // S3 prefix matching is a raw string match, so a listing prefix of `p`
     // (no trailing slash) also matches sibling keys like `p2/x.txt`. Guard
     // the boundary the same way `remove_prefix` does in main.rs before
@@ -266,6 +270,15 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         return Err(anyhow!("--attr for S3-to-S3 copies is not implemented yet"));
     }
 
+    // Decided here (rather than at the usual post-planning `TransferSession`
+    // spot below) so the planning listing calls can dispatch through the
+    // same `ProgressUi` the session reuses via `from_ui` -- two independent
+    // `ProgressUi`s would be two `MultiProgress`es fighting over the
+    // terminal. Suppressed for `--dry-run`/`--fake`: that path returns
+    // before any `TransferSession` exists to finish the bar, so creating
+    // one here would leave a stray unfinished line on screen.
+    let ui = (!dry_run).then(crate::progress::worker_ui).flatten();
+    let dispatch_ctx = Some((&stream_budget, ui.as_ref()));
     let source_entries = match &source {
         Side::Local(root) => {
             if !root.is_dir() {
@@ -281,7 +294,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
             bucket,
             prefix,
             ..
-        } => collect_s3_entries(client, bucket, prefix).await?,
+        } => collect_s3_entries(client, bucket, prefix, dispatch_ctx).await?,
     };
     let target_entries = match &target {
         Side::Local(root) => {
@@ -296,7 +309,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
             bucket,
             prefix,
             ..
-        } => collect_s3_entries(client, bucket, prefix).await?,
+        } => collect_s3_entries(client, bucket, prefix, dispatch_ctx).await?,
     };
 
     // Deletes must be computed from *true* source presence: mc's own
@@ -362,7 +375,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     // starting any transfer -- matches mc's copyMessage/mirrorMessage
     // totalCount/totalSize, which reflect the whole session's planned
     // work, not a running tally.
-    let session = TransferSession::new("mirror");
+    let session = TransferSession::from_ui(ui);
     for entry in &plan.copies {
         session.add_total(entry.size);
     }

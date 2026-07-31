@@ -694,12 +694,25 @@ async fn ls(args: LsArgs) -> Result<()> {
     } else {
         args.targets
     };
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in targets {
         let parsed = parse_s3_url(&target)?;
         let (client, _) = client_for_alias(&parsed.alias).await?;
         match (parsed.bucket, parsed.key) {
             (None, _) => {
-                let resp = client.list_buckets().send().await?;
+                let resp = crate::budget::dispatch(
+                    &budget,
+                    ui.as_ref(),
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Listing,
+                        path: parsed.alias.clone(),
+                        part: None,
+                    },
+                    "ListBuckets",
+                    client.list_buckets().send(),
+                )
+                .await?;
                 for bucket in resp.buckets() {
                     let name = bucket.name().unwrap_or_default();
                     let time = bucket
@@ -720,7 +733,15 @@ async fn ls(args: LsArgs) -> Result<()> {
             (Some(bucket), key) => {
                 let mut prefix = key.unwrap_or_default();
                 if args.incomplete {
-                    list_incomplete(&client, &bucket, &prefix, args.recursive).await?;
+                    list_incomplete(
+                        &client,
+                        &bucket,
+                        &prefix,
+                        args.recursive,
+                        &budget,
+                        ui.as_ref(),
+                    )
+                    .await?;
                     continue;
                 }
                 // mc's actual resolution order for a bare (non-empty,
@@ -733,12 +754,18 @@ async fn ls(args: LsArgs) -> Result<()> {
                 // that point on it behaves identically to a target the
                 // caller already slash-terminated.
                 if !prefix.is_empty() && !prefix.ends_with('/') {
-                    match client
-                        .head_object()
-                        .bucket(&bucket)
-                        .key(&prefix)
-                        .send()
-                        .await
+                    match crate::budget::dispatch(
+                        &budget,
+                        ui.as_ref(),
+                        crate::progress::TransferLabel {
+                            verb: crate::progress::Verb::Inspecting,
+                            path: format!("{bucket}/{prefix}"),
+                            part: None,
+                        },
+                        "HeadObject",
+                        client.head_object().bucket(&bucket).key(&prefix).send(),
+                    )
+                    .await
                     {
                         Ok(resp) => {
                             let size = resp.content_length().unwrap_or_default() as u64;
@@ -794,13 +821,23 @@ async fn ls(args: LsArgs) -> Result<()> {
                             // listed literally, which is what makes a
                             // partial-filename search like `ls bucket/pre`
                             // (matching `prefix1.txt`) work.
-                            let probe = client
+                            let probe_req = client
                                 .list_objects_v2()
                                 .bucket(&bucket)
                                 .prefix(format!("{prefix}/"))
-                                .max_keys(1)
-                                .send()
-                                .await;
+                                .max_keys(1);
+                            let probe = crate::budget::dispatch(
+                                &budget,
+                                ui.as_ref(),
+                                crate::progress::TransferLabel {
+                                    verb: crate::progress::Verb::Listing,
+                                    path: format!("{bucket}/{prefix}"),
+                                    part: None,
+                                },
+                                "ListObjectsV2",
+                                probe_req.send(),
+                            )
+                            .await;
                             // (the `common_prefixes` half mirrors mc's own
                             // condition; this probe sets no delimiter, so S3
                             // never populates it -- it's kept only so the
@@ -832,14 +869,24 @@ async fn ls(args: LsArgs) -> Result<()> {
                 let mut total_objects = 0u64;
                 let mut total_size = 0u64;
                 loop {
-                    let resp = client
+                    let req = client
                         .list_objects_v2()
                         .bucket(&bucket)
                         .prefix(&prefix)
                         .set_delimiter(delimiter.map(String::from))
-                        .set_continuation_token(token)
-                        .send()
-                        .await?;
+                        .set_continuation_token(token);
+                    let resp = crate::budget::dispatch(
+                        &budget,
+                        ui.as_ref(),
+                        crate::progress::TransferLabel {
+                            verb: crate::progress::Verb::Listing,
+                            path: format!("{bucket}/{prefix}"),
+                            part: None,
+                        },
+                        "ListObjectsV2",
+                        req.send(),
+                    )
+                    .await?;
                     for p in resp.common_prefixes() {
                         let full = p.prefix().unwrap_or_default();
                         print_msg(&ContentMessage {
@@ -914,20 +961,32 @@ async fn list_incomplete(
     bucket: &str,
     prefix: &str,
     recursive: bool,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     let delimiter = if recursive { None } else { Some("/") };
     let mut key_marker: Option<String> = None;
     let mut upload_id_marker: Option<String> = None;
     loop {
-        let resp = client
+        let req = client
             .list_multipart_uploads()
             .bucket(bucket)
             .prefix(prefix)
             .set_delimiter(delimiter.map(String::from))
             .set_key_marker(key_marker.take())
-            .set_upload_id_marker(upload_id_marker.take())
-            .send()
-            .await?;
+            .set_upload_id_marker(upload_id_marker.take());
+        let resp = crate::budget::dispatch(
+            budget,
+            ui,
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Listing,
+                path: format!("{bucket}/{prefix}"),
+                part: None,
+            },
+            "ListMultipartUploads",
+            req.send(),
+        )
+        .await?;
         for p in resp.common_prefixes() {
             let full = p.prefix().unwrap_or_default();
             print_msg(&ContentMessage {
@@ -947,7 +1006,7 @@ async fn list_incomplete(
                 .initiated()
                 .map(smithy_to_chrono)
                 .unwrap_or_else(epoch);
-            let size = incomplete_upload_size(client, bucket, &key, &upload_id).await;
+            let size = incomplete_upload_size(client, bucket, &key, &upload_id, budget, ui).await;
             print_msg(&ContentMessage {
                 status: "success".into(),
                 filetype: "file".into(),
@@ -974,18 +1033,35 @@ async fn list_incomplete(
 /// Sum of part sizes for an in-progress multipart upload. Best-effort: a
 /// `list_parts` error simply yields whatever total had accumulated so far
 /// (acceptable to report 0 for an upload with no parts yet).
-async fn incomplete_upload_size(client: &Client, bucket: &str, key: &str, upload_id: &str) -> u64 {
+async fn incomplete_upload_size(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
+) -> u64 {
     let mut total = 0u64;
     let mut marker: Option<String> = None;
     loop {
-        let resp = match client
+        let req = client
             .list_parts()
             .bucket(bucket)
             .key(key)
             .upload_id(upload_id)
-            .set_part_number_marker(marker.take())
-            .send()
-            .await
+            .set_part_number_marker(marker.take());
+        let resp = match crate::budget::dispatch(
+            budget,
+            ui,
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Listing,
+                path: format!("{bucket}/{key}"),
+                part: None,
+            },
+            "ListParts",
+            req.send(),
+        )
+        .await
         {
             Ok(r) => r,
             Err(_) => return total,
@@ -1012,6 +1088,8 @@ async fn mb(args: MbArgs) -> Result<()> {
     if args.with_versioning {
         return Err(anyhow!("mb --with-versioning is not implemented yet"));
     }
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
@@ -1026,7 +1104,18 @@ async fn mb(args: MbArgs) -> Result<()> {
                     .build(),
             );
         }
-        let result = req.send().await;
+        let result = crate::budget::dispatch(
+            &budget,
+            ui.as_ref(),
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Creating,
+                path: bucket.clone(),
+                part: None,
+            },
+            "CreateBucket",
+            req.send(),
+        )
+        .await;
         match result {
             Ok(_) => print_msg(&MakeBucketMessage { bucket: target }),
             Err(err) => {
@@ -1052,6 +1141,8 @@ async fn mb(args: MbArgs) -> Result<()> {
 
 async fn rb(args: RbArgs) -> Result<()> {
     let mut failures = 0u64;
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         let parsed = match parse_s3_url(target) {
             Ok(p) => p,
@@ -1064,7 +1155,17 @@ async fn rb(args: RbArgs) -> Result<()> {
         let result: Result<()> = async {
             let (client, _) = client_for_alias(&parsed.alias).await?;
             match &parsed.bucket {
-                Some(bucket) => remove_bucket(&client, &parsed.alias, bucket, args.force).await,
+                Some(bucket) => {
+                    remove_bucket(
+                        &client,
+                        &parsed.alias,
+                        bucket,
+                        args.force,
+                        &budget,
+                        ui.as_ref(),
+                    )
+                    .await
+                }
                 None => {
                     if !args.dangerous {
                         return Err(anyhow!(
@@ -1072,12 +1173,30 @@ async fn rb(args: RbArgs) -> Result<()> {
                             parsed.alias
                         ));
                     }
-                    let resp = client.list_buckets().send().await?;
+                    let resp = crate::budget::dispatch(
+                        &budget,
+                        ui.as_ref(),
+                        crate::progress::TransferLabel {
+                            verb: crate::progress::Verb::Listing,
+                            path: parsed.alias.clone(),
+                            part: None,
+                        },
+                        "ListBuckets",
+                        client.list_buckets().send(),
+                    )
+                    .await?;
                     let mut bucket_failures = 0u64;
                     for bucket in resp.buckets() {
                         let name = bucket.name().unwrap_or_default();
-                        if let Err(err) =
-                            remove_bucket(&client, &parsed.alias, name, args.force).await
+                        if let Err(err) = remove_bucket(
+                            &client,
+                            &parsed.alias,
+                            name,
+                            args.force,
+                            &budget,
+                            ui.as_ref(),
+                        )
+                        .await
                         {
                             eprintln!("rb: {}/{name}: {err:#}", parsed.alias);
                             bucket_failures += 1;
@@ -1102,55 +1221,95 @@ async fn rb(args: RbArgs) -> Result<()> {
     Ok(())
 }
 
-async fn remove_bucket(client: &Client, alias: &str, bucket: &str, force: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn remove_bucket(
+    client: &Client,
+    alias: &str,
+    bucket: &str,
+    force: bool,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
+) -> Result<()> {
     if force {
-        abort_incomplete_uploads(client, bucket).await?;
-        remove_prefix(client, alias, bucket, "", false, None, None).await?;
+        abort_incomplete_uploads(client, bucket, budget, ui).await?;
+        remove_prefix(client, alias, bucket, "", false, None, None, budget, ui).await?;
     }
-    client
-        .delete_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .map_err(|err| {
-            let not_empty = err
-                .as_service_error()
-                .map(|e| format!("{e:?}").contains("BucketNotEmpty"))
-                .unwrap_or(false);
-            if not_empty {
-                anyhow!("`{alias}/{bucket}` is not empty; use --force to remove its contents")
-            } else {
-                anyhow!(err)
-            }
-        })?;
+    crate::budget::dispatch(
+        budget,
+        ui,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Removing,
+            path: bucket.to_string(),
+            part: None,
+        },
+        "DeleteBucket",
+        client.delete_bucket().bucket(bucket).send(),
+    )
+    .await
+    .map_err(|err| {
+        let not_empty = err
+            .as_service_error()
+            .map(|e| format!("{e:?}").contains("BucketNotEmpty"))
+            .unwrap_or(false);
+        if not_empty {
+            anyhow!("`{alias}/{bucket}` is not empty; use --force to remove its contents")
+        } else {
+            anyhow!(err)
+        }
+    })?;
     print_msg(&RemoveBucketMessage {
         bucket: format!("{alias}/{bucket}"),
     });
     Ok(())
 }
 
-async fn abort_incomplete_uploads(client: &Client, bucket: &str) -> Result<()> {
+async fn abort_incomplete_uploads(
+    client: &Client,
+    bucket: &str,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
+) -> Result<()> {
     let mut key_marker: Option<String> = None;
     let mut id_marker: Option<String> = None;
     loop {
-        let resp = client
+        let req = client
             .list_multipart_uploads()
             .bucket(bucket)
             .set_key_marker(key_marker.take())
-            .set_upload_id_marker(id_marker.take())
-            .send()
-            .await?;
+            .set_upload_id_marker(id_marker.take());
+        let resp = crate::budget::dispatch(
+            budget,
+            ui,
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Listing,
+                path: bucket.to_string(),
+                part: None,
+            },
+            "ListMultipartUploads",
+            req.send(),
+        )
+        .await?;
         for upload in resp.uploads() {
             let (Some(key), Some(id)) = (upload.key(), upload.upload_id()) else {
                 continue;
             };
-            client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(id)
-                .send()
-                .await?;
+            crate::budget::dispatch(
+                budget,
+                ui,
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Aborting,
+                    path: format!("{bucket}/{key}"),
+                    part: None,
+                },
+                "AbortMultipartUpload",
+                client
+                    .abort_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(id)
+                    .send(),
+            )
+            .await?;
         }
         if resp.is_truncated().unwrap_or(false) {
             key_marker = resp.next_key_marker().map(String::from);
@@ -1302,13 +1461,19 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                     .clone()
                     .ok_or_else(|| anyhow!("object key is required in source `{source}`"))?;
                 let (head_client, _) = client_for_alias(&parsed.alias).await?;
-                let head = head_client
-                    .head_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
+                let head = crate::budget::dispatch(
+                    &stream_budget,
+                    session.ui(),
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Inspecting,
+                        path: format!("{bucket}/{key}"),
+                        part: None,
+                    },
+                    "HeadObject",
+                    head_client.head_object().bucket(&bucket).key(&key).send(),
+                )
+                .await
+                .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
                 let object_time = head.last_modified().map(smithy_to_chrono);
                 if timefilter::passes_filters(
                     object_time,
@@ -1329,12 +1494,18 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         // Delete only after the copy of *this* object has
                         // succeeded; a delete failure is logged but must not
                         // fail the overall `mv` exit status ([SEM] §3).
-                        if let Err(err) = head_client
-                            .delete_object()
-                            .bucket(&bucket)
-                            .key(&key)
-                            .send()
-                            .await
+                        if let Err(err) = crate::budget::dispatch(
+                            &stream_budget,
+                            session.ui(),
+                            crate::progress::TransferLabel {
+                                verb: crate::progress::Verb::Removing,
+                                path: format!("{bucket}/{key}"),
+                                part: None,
+                            },
+                            "DeleteObject",
+                            head_client.delete_object().bucket(&bucket).key(&key).send(),
+                        )
+                        .await
                         {
                             eprintln!("mv: remove `{bucket}/{key}` failed: {err}");
                         }
@@ -1526,12 +1697,22 @@ async fn copy_s3_object_to_s3(
     };
     let (source_client, source_alias) = client_for_alias(&source_url.alias).await?;
     let (target_client, target_alias) = client_for_alias(&target_url.alias).await?;
-    let head = source_client
-        .head_object()
-        .bucket(&source_bucket)
-        .key(&source_key)
-        .send()
-        .await?;
+    let head = crate::budget::dispatch(
+        budget,
+        session.ui(),
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Inspecting,
+            path: format!("{source_bucket}/{source_key}"),
+            part: None,
+        },
+        "HeadObject",
+        source_client
+            .head_object()
+            .bucket(&source_bucket)
+            .key(&source_key)
+            .send(),
+    )
+    .await?;
     let size = head.content_length().unwrap_or_default() as u64;
     let object_time = head.last_modified().map(smithy_to_chrono);
     if !timefilter::passes_filters(object_time, older_than, newer_than)? {
@@ -1568,12 +1749,22 @@ async fn copy_s3_object_to_s3(
     if delete_source {
         // Copy of this object has already succeeded above; delete failures
         // are logged but must not fail the overall `mv` exit status.
-        if let Err(err) = source_client
-            .delete_object()
-            .bucket(&source_bucket)
-            .key(&source_key)
-            .send()
-            .await
+        if let Err(err) = crate::budget::dispatch(
+            budget,
+            session.ui(),
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Removing,
+                path: format!("{source_bucket}/{source_key}"),
+                part: None,
+            },
+            "DeleteObject",
+            source_client
+                .delete_object()
+                .bucket(&source_bucket)
+                .key(&source_key)
+                .send(),
+        )
+        .await
         {
             eprintln!(
                 "mv: remove `{}/{source_bucket}/{source_key}` failed: {err}",
@@ -1733,6 +1924,8 @@ async fn cat(args: CatArgs) -> Result<()> {
             "You cannot use --part-number with --tail or --offset"
         ));
     }
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
@@ -1746,12 +1939,18 @@ async fn cat(args: CatArgs) -> Result<()> {
         let mut start = args.offset.unwrap_or(0);
         if let Some(tail) = args.tail {
             if tail > 0 {
-                let head = client
-                    .head_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .send()
-                    .await?;
+                let head = crate::budget::dispatch(
+                    &budget,
+                    ui.as_ref(),
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Inspecting,
+                        path: format!("{bucket}/{key}"),
+                        part: None,
+                    },
+                    "HeadObject",
+                    client.head_object().bucket(&bucket).key(&key).send(),
+                )
+                .await?;
                 let size = head.content_length().unwrap_or(0);
                 start = (size - tail).max(0);
             }
@@ -1764,7 +1963,18 @@ async fn cat(args: CatArgs) -> Result<()> {
         if let Some(part_number) = args.part_number {
             req = req.part_number(part_number);
         }
-        let resp = req.send().await?;
+        let resp = crate::budget::dispatch(
+            &budget,
+            ui.as_ref(),
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Downloading,
+                path: format!("{bucket}/{key}"),
+                part: None,
+            },
+            "GetObject",
+            req.send(),
+        )
+        .await?;
         let mut reader = resp.body.into_async_read();
         let mut stdout = tokio::io::stdout();
         // mc treats EPIPE on stdout (reader side closed, e.g. piping into
@@ -1943,6 +2153,8 @@ async fn head(args: HeadArgs) -> Result<()> {
     // mc's own defensive reset: an explicit negative -n silently becomes
     // the default of 10 (the flag's own default already covers "unset").
     let lines = if args.lines < 0 { 10 } else { args.lines };
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
@@ -1952,7 +2164,18 @@ async fn head(args: HeadArgs) -> Result<()> {
             .key
             .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
         let (client, _) = client_for_alias(&parsed.alias).await?;
-        let resp = client.get_object().bucket(bucket).key(key).send().await?;
+        let resp = crate::budget::dispatch(
+            &budget,
+            ui.as_ref(),
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Downloading,
+                path: format!("{bucket}/{key}"),
+                part: None,
+            },
+            "GetObject",
+            client.get_object().bucket(bucket).key(key).send(),
+        )
+        .await?;
         let content_type = resp.content_type().unwrap_or_default().to_ascii_lowercase();
         if content_type.contains("bzip") {
             return Err(anyhow!(
@@ -1990,8 +2213,10 @@ async fn rm(args: RmArgs) -> Result<()> {
         ));
     }
     let mut failures = 0u64;
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
-        if let Err(err) = rm_one_target(target, &args).await {
+        if let Err(err) = rm_one_target(target, &args, &budget, ui.as_ref()).await {
             eprintln!("rm: {target}: {err:#}");
             failures += 1;
         }
@@ -2002,7 +2227,12 @@ async fn rm(args: RmArgs) -> Result<()> {
     Ok(())
 }
 
-async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
+async fn rm_one_target(
+    target: &str,
+    args: &RmArgs,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
+) -> Result<()> {
     let parsed = parse_s3_url(target)?;
     let bucket = parsed
         .bucket
@@ -2018,6 +2248,8 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
             args.dry_run,
             args.older_than.as_deref(),
             args.newer_than.as_deref(),
+            budget,
+            ui,
         )
         .await?;
         // Human-only informational line -- not an RmMessage (nothing was
@@ -2034,13 +2266,19 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
             .key
             .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
         // DeleteObject succeeds for missing keys; stat first for an mc-like error.
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|_| anyhow!("object does not exist"))?;
+        let head = crate::budget::dispatch(
+            budget,
+            ui,
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Inspecting,
+                path: format!("{bucket}/{key}"),
+                part: None,
+            },
+            "HeadObject",
+            client.head_object().bucket(&bucket).key(&key).send(),
+        )
+        .await
+        .map_err(|_| anyhow!("object does not exist"))?;
         let object_time = head.last_modified().map(smithy_to_chrono);
         if !timefilter::passes_filters(
             object_time,
@@ -2057,12 +2295,18 @@ async fn rm_one_target(target: &str, args: &RmArgs) -> Result<()> {
             });
             return Ok(());
         }
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(&key)
-            .send()
-            .await?;
+        crate::budget::dispatch(
+            budget,
+            ui,
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Removing,
+                path: format!("{bucket}/{key}"),
+                part: None,
+            },
+            "DeleteObject",
+            client.delete_object().bucket(&bucket).key(&key).send(),
+        )
+        .await?;
         print_msg(&RmMessage {
             key: target.to_string(),
             dry_run: false,
@@ -2081,6 +2325,8 @@ async fn remove_prefix(
     dry_run: bool,
     older_than: Option<&str>,
     newer_than: Option<&str>,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
 ) -> Result<u64> {
     use aws_sdk_s3::types::{Delete, ObjectIdentifier};
     // S3 prefix matching is a raw string match, so a listing prefix of `p`
@@ -2094,7 +2340,8 @@ async fn remove_prefix(
     // up zero-byte folder-marker keys (keys ending in `/`), or they survive
     // `rm -r` / `rb --force` and leave the bucket non-empty.
     let mut pager =
-        ObjectPaginator::new_raw(client.clone(), bucket.to_string(), prefix.to_string());
+        ObjectPaginator::new_raw(client.clone(), bucket.to_string(), prefix.to_string())
+            .with_dispatch(budget.clone(), ui.cloned());
     let mut removed = 0u64;
     while let Some(mut page) = pager.next_page().await? {
         if !boundary_safe {
@@ -2129,12 +2376,18 @@ async fn remove_prefix(
                 .map(|o| ObjectIdentifier::builder().key(&o.key).build())
                 .collect::<Result<Vec<_>, _>>()?;
             let delete = Delete::builder().set_objects(Some(ids)).build()?;
-            let resp = client
-                .delete_objects()
-                .bucket(bucket)
-                .delete(delete)
-                .send()
-                .await?;
+            let resp = crate::budget::dispatch(
+                budget,
+                ui,
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Removing,
+                    path: format!("{bucket}/{prefix}"),
+                    part: None,
+                },
+                "DeleteObjects",
+                client.delete_objects().bucket(bucket).delete(delete).send(),
+            )
+            .await?;
             for err in resp.errors() {
                 return Err(anyhow!(
                     "delete failed for `{}`: {}",
@@ -2161,6 +2414,8 @@ async fn remove_prefix(
 /// quiet success (matches `ls`'s own empty-prefix behavior), not an error --
 /// only the non-recursive single-key path treats a miss as fatal.
 async fn stat(args: StatArgs) -> Result<()> {
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
         let bucket = parsed
@@ -2169,15 +2424,25 @@ async fn stat(args: StatArgs) -> Result<()> {
         let (client, _) = client_for_alias(&parsed.alias).await?;
         if args.recursive {
             let prefix = parsed.key.unwrap_or_default();
-            let objects = list::collect_objects(&client, &bucket, &prefix).await?;
+            let objects =
+                list::collect_objects_with(&client, &bucket, &prefix, Some((&budget, ui.as_ref())))
+                    .await?;
             for obj in objects {
-                stat_one(&client, &parsed.alias, &bucket, &obj.key).await?;
+                stat_one(
+                    &client,
+                    &parsed.alias,
+                    &bucket,
+                    &obj.key,
+                    &budget,
+                    ui.as_ref(),
+                )
+                .await?;
             }
         } else {
             let key = parsed
                 .key
                 .ok_or_else(|| anyhow!("object key is required in target `{target}`"))?;
-            stat_one(&client, &parsed.alias, &bucket, &key).await?;
+            stat_one(&client, &parsed.alias, &bucket, &key, &budget, ui.as_ref()).await?;
         }
     }
     Ok(())
@@ -2185,14 +2450,27 @@ async fn stat(args: StatArgs) -> Result<()> {
 
 /// Shared `HeadObject` + [`StatMessage`] print used by both the single-key
 /// and `--recursive` paths of `stat`.
-async fn stat_one(client: &Client, alias: &str, bucket: &str, key: &str) -> Result<()> {
-    let resp = client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .with_context(|| format!("stat `{alias}/{bucket}/{key}`"))?;
+async fn stat_one(
+    client: &Client,
+    alias: &str,
+    bucket: &str,
+    key: &str,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
+) -> Result<()> {
+    let resp = crate::budget::dispatch(
+        budget,
+        ui,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Inspecting,
+            path: format!("{bucket}/{key}"),
+            part: None,
+        },
+        "HeadObject",
+        client.head_object().bucket(bucket).key(key).send(),
+    )
+    .await
+    .with_context(|| format!("stat `{alias}/{bucket}/{key}`"))?;
     let date = resp
         .last_modified()
         .map(smithy_to_chrono)
@@ -2232,6 +2510,8 @@ async fn du(args: DuArgs) -> Result<()> {
         1
     };
     let mut first_err = None;
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         let parsed = parse_s3_url(target)?;
         let bucket = parsed.bucket.clone().ok_or_else(|| {
@@ -2239,7 +2519,16 @@ async fn du(args: DuArgs) -> Result<()> {
         })?;
         let (client, _) = client_for_alias(&parsed.alias).await?;
         let prefix = parsed.key.unwrap_or_default();
-        if let Err(e) = du_walk(&client, &parsed.alias, &bucket, &prefix, effective_depth).await
+        if let Err(e) = du_walk(
+            &client,
+            &parsed.alias,
+            &bucket,
+            &prefix,
+            effective_depth,
+            &budget,
+            ui.as_ref(),
+        )
+        .await
             && first_err.is_none()
         {
             first_err = Some(e);
@@ -2272,12 +2561,16 @@ fn du_walk<'a>(
     bucket: &'a str,
     prefix: &'a str,
     depth: i32,
+    budget: &'a crate::budget::StreamBudget,
+    ui: Option<&'a crate::progress::ProgressUi>,
 ) -> Pin<Box<dyn Future<Output = Result<(u64, u64)>> + 'a>> {
     Box::pin(async move {
         let mut size = 0u64;
         let mut objects = 0u64;
         if depth == 1 {
-            for obj in list::collect_objects(client, bucket, prefix).await? {
+            for obj in
+                list::collect_objects_with(client, bucket, prefix, Some((budget, ui))).await?
+            {
                 size += obj.size;
                 objects += 1;
             }
@@ -2285,14 +2578,24 @@ fn du_walk<'a>(
             let mut token: Option<String> = None;
             let mut subdirs: Vec<String> = Vec::new();
             loop {
-                let resp = client
+                let req = client
                     .list_objects_v2()
                     .bucket(bucket)
                     .prefix(prefix)
                     .delimiter("/")
-                    .set_continuation_token(token.take())
-                    .send()
-                    .await?;
+                    .set_continuation_token(token.take());
+                let resp = crate::budget::dispatch(
+                    budget,
+                    ui,
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Listing,
+                        path: format!("{bucket}/{prefix}"),
+                        part: None,
+                    },
+                    "ListObjectsV2",
+                    req.send(),
+                )
+                .await?;
                 for obj in resp.contents() {
                     let key = obj.key().unwrap_or_default();
                     let obj_size = obj.size().unwrap_or_default() as u64;
@@ -2319,7 +2622,7 @@ fn du_walk<'a>(
             let child_depth = if depth > 0 { depth - 1 } else { depth };
             for subdir in subdirs {
                 let (sub_size, sub_objects) =
-                    du_walk(client, alias, bucket, &subdir, child_depth).await?;
+                    du_walk(client, alias, bucket, &subdir, child_depth, budget, ui).await?;
                 size += sub_size;
                 objects += sub_objects;
             }
@@ -2400,12 +2703,26 @@ impl TreeNode {
 /// than it, e.g. `0dir/` after `1.txt`/`ab.txt`).
 async fn tree_list_children(
     client: &Client,
+    alias: &str,
     node: &TreeNode,
     files: bool,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
 ) -> Result<Vec<TreeEntry>> {
     match node {
         TreeNode::AliasRoot => {
-            let resp = client.list_buckets().send().await?;
+            let resp = crate::budget::dispatch(
+                budget,
+                ui,
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Listing,
+                    path: alias.to_string(),
+                    part: None,
+                },
+                "ListBuckets",
+                client.list_buckets().send(),
+            )
+            .await?;
             let mut names: Vec<String> = resp
                 .buckets()
                 .iter()
@@ -2422,14 +2739,24 @@ async fn tree_list_children(
             let mut dir_names: Vec<String> = Vec::new();
             let mut token: Option<String> = None;
             loop {
-                let resp = client
+                let req = client
                     .list_objects_v2()
                     .bucket(bucket)
                     .prefix(prefix.as_str())
                     .delimiter("/")
-                    .set_continuation_token(token.take())
-                    .send()
-                    .await?;
+                    .set_continuation_token(token.take());
+                let resp = crate::budget::dispatch(
+                    budget,
+                    ui,
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Listing,
+                        path: format!("{bucket}/{prefix}"),
+                        part: None,
+                    },
+                    "ListObjectsV2",
+                    req.send(),
+                )
+                .await?;
                 for obj in resp.contents() {
                     let key = obj.key().unwrap_or_default();
                     let Some(name) = key.strip_prefix(prefix.as_str()) else {
@@ -2486,14 +2813,18 @@ async fn tree_list_children(
 ///
 /// Boxed for the same reason as `du_walk`: async recursion needs a
 /// heap-allocated, pinned future.
+#[allow(clippy::too_many_arguments)]
 fn tree_print_entries<'a>(
     client: &'a Client,
+    alias: &'a str,
     node: TreeNode,
     entries: Vec<TreeEntry>,
     level: i32,
     depth: i32,
     files: bool,
     continuation: String,
+    budget: &'a crate::budget::StreamBudget,
+    ui: Option<&'a crate::progress::ProgressUi>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         let last_idx = entries.len().checked_sub(1);
@@ -2507,19 +2838,23 @@ fn tree_print_entries<'a>(
             });
             if entry.is_dir && (depth == -1 || level <= depth) {
                 let child = node.child(&entry.name);
-                let child_entries = tree_list_children(client, &child, files).await?;
+                let child_entries =
+                    tree_list_children(client, alias, &child, files, budget, ui).await?;
                 let child_continuation = format!(
                     "{continuation}{}",
                     if is_last { TREE_CLOSED } else { TREE_OPEN }
                 );
                 tree_print_entries(
                     client,
+                    alias,
                     child,
                     child_entries,
                     level + 1,
                     depth,
                     files,
                     child_continuation,
+                    budget,
+                    ui,
                 )
                 .await?;
             }
@@ -2533,14 +2868,18 @@ fn tree_print_entries<'a>(
 /// one (post-`--files`-filter) child -- an empty target prints *nothing*,
 /// not even the root line (confirmed against real `mc tree` on an empty
 /// bucket and on a bucket containing only files with `--files` unset).
+#[allow(clippy::too_many_arguments)]
 async fn tree_walk(
     client: &Client,
+    alias: &str,
     node: TreeNode,
     root_label: &str,
     depth: i32,
     files: bool,
+    budget: &crate::budget::StreamBudget,
+    ui: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
-    let entries = tree_list_children(client, &node, files).await?;
+    let entries = tree_list_children(client, alias, &node, files, budget, ui).await?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -2549,7 +2888,19 @@ async fn tree_walk(
         is_dir: true,
         branch_string: String::new(),
     });
-    tree_print_entries(client, node, entries, 1, depth, files, String::new()).await
+    tree_print_entries(
+        client,
+        alias,
+        node,
+        entries,
+        1,
+        depth,
+        files,
+        String::new(),
+        budget,
+        ui,
+    )
+    .await
 }
 
 /// `mc tree` ([SEM] §6): draws a directory tree of buckets/objects.
@@ -2579,6 +2930,8 @@ async fn tree(args: TreeArgs) -> Result<()> {
     if args.targets.is_empty() {
         return Err(anyhow!("tree: this command requires at least one argument"));
     }
+    let ui = crate::progress::worker_ui();
+    let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         let parsed = parse_s3_url(target)?;
         let (client, _) = client_for_alias(&parsed.alias).await?;
@@ -2594,7 +2947,17 @@ async fn tree(args: TreeArgs) -> Result<()> {
                 TreeNode::Path { bucket, prefix }
             }
         };
-        tree_walk(&client, node, target, args.depth, args.files).await?;
+        tree_walk(
+            &client,
+            &parsed.alias,
+            node,
+            target,
+            args.depth,
+            args.files,
+            &budget,
+            ui.as_ref(),
+        )
+        .await?;
     }
     Ok(())
 }

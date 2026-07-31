@@ -56,11 +56,9 @@ pub(crate) enum Verb {
     Completing,
     Aborting,
     Inspecting,
-    // The ListObjectsV2 call sites live in `list.rs`'s shared
-    // `ObjectPaginator`/`collect_objects` (used by mirror.rs, share.rs,
-    // findcmd.rs, main.rs alike) rather than in one dispatch-call-site
-    // owner, so this isn't wired to a `dispatch` call yet.
-    #[allow(dead_code)]
+    // Wired to `dispatch` from `list.rs`'s shared `ObjectPaginator`
+    // (`with_dispatch`) -- every standalone command's per-page
+    // ListObjectsV2 call routes through here.
     Listing,
     Removing,
 }
@@ -179,6 +177,17 @@ fn bar_width_for(cols: Option<u16>) -> usize {
             .saturating_sub(BAR_OVERHEAD)
             .clamp(MIN_BAR_WIDTH, MAX_BAR_WIDTH),
     }
+}
+
+/// Standalone commands' (ls/rm/stat/head/cat/du/tree/find/diff/mb/rb/mv...)
+/// equivalent of [`crate::messages::TransferSession::new`]'s bar-vs-lines
+/// decision: `Some` under the exact same predicate (stdout is a TTY, and
+/// none of `--quiet`/`--json`/`--no-color` is set), `None` otherwise so
+/// `dispatch` degrades to its noop task line and non-TTY/`--json`/`--quiet`
+/// stdout stays byte-identical.
+pub(crate) fn worker_ui() -> Option<ProgressUi> {
+    let out = crate::output::out();
+    (out.stdout_tty && !out.quiet && !out.json && !out.no_color).then(ProgressUi::new)
 }
 
 impl ProgressUi {
