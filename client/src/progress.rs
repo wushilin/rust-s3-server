@@ -294,10 +294,12 @@ fn ui_enabled() -> bool {
 /// [`ProgressUi::new_tasks_only`]) -- these commands print their own stdout
 /// lines, which a persistent bar would corrupt.
 ///
-/// No-arg compat shim defaulting to 5 lanes -- Task-2 removes this and
-/// threads the real `-P` value through from `main.rs`'s call sites.
-pub(crate) fn worker_ui() -> Option<ProgressUi> {
-    ui_enabled().then(|| ProgressUi::new_tasks_only(5))
+/// `parallel` is the caller's `-P`/internal worker count (see
+/// `docs/superpowers/specs/2026-07-31-rs3-worker-lanes-design.md`), which
+/// caps this mode's transient-bar concurrency via [`lane_count`] (no fixed
+/// grid here -- see [`ProgressUi::new_tasks_only`]'s doc for why).
+pub(crate) fn worker_ui(parallel: usize) -> Option<ProgressUi> {
+    ui_enabled().then(|| ProgressUi::new_tasks_only(parallel))
 }
 
 /// [`crate::messages::TransferSession`]'s bar-vs-lines decision: `Some`
@@ -305,10 +307,10 @@ pub(crate) fn worker_ui() -> Option<ProgressUi> {
 /// overall bar) -- transfer commands never print per-object stdout lines
 /// while the bar is active, so there's nothing for it to glue onto.
 ///
-/// No-arg compat shim defaulting to 5 lanes -- Task-2 removes this and
-/// threads the real `-P` value through from `messages.rs`'s call site.
-pub(crate) fn transfer_ui() -> Option<ProgressUi> {
-    ui_enabled().then(|| ProgressUi::new(5))
+/// `parallel` is the transfer command's `-P` value, sizing the fixed lane
+/// grid via [`lane_count`].
+pub(crate) fn transfer_ui(parallel: usize) -> Option<ProgressUi> {
+    ui_enabled().then(|| ProgressUi::new(parallel))
 }
 
 impl ProgressUi {

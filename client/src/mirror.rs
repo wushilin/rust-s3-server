@@ -277,7 +277,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     // unconditionally here even on the `--dry-run` path, which prints
     // PUT/DEL lines right after planning: a tasks-only `ProgressUi` never
     // leaves a persistent, unfinished line for those prints to glue onto.
-    let planning_ui = crate::progress::worker_ui();
+    let planning_ui = crate::progress::worker_ui(parallel);
     let dispatch_ctx = Some((&stream_budget, planning_ui.as_ref()));
     let source_entries = match &source {
         Side::Local(root) => {
@@ -382,7 +382,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     // `dispatch` call finishes synchronously before `collect_s3_entries`
     // returns), so there's nothing left on screen for a second, independent
     // `ProgressUi` to conflict with.
-    let session = TransferSession::new("mirror");
+    let session = TransferSession::new("mirror", parallel);
     for entry in &plan.copies {
         session.add_total(entry.size);
     }

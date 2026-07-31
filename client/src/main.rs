@@ -694,7 +694,7 @@ async fn ls(args: LsArgs) -> Result<()> {
     } else {
         args.targets
     };
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in targets {
         let parsed = parse_s3_url(&target)?;
@@ -1088,7 +1088,7 @@ async fn mb(args: MbArgs) -> Result<()> {
     if args.with_versioning {
         return Err(anyhow!("mb --with-versioning is not implemented yet"));
     }
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
@@ -1141,7 +1141,7 @@ async fn mb(args: MbArgs) -> Result<()> {
 
 async fn rb(args: RbArgs) -> Result<()> {
     let mut failures = 0u64;
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         let parsed = match parse_s3_url(target) {
@@ -1335,7 +1335,7 @@ async fn put(args: PutArgs) -> Result<()> {
         Some(spec) => attr::parse_attrs(spec)?,
         None => BTreeMap::new(),
     };
-    let session = TransferSession::new("put");
+    let session = TransferSession::new("put", args.parallel);
     let stream_budget = crate::budget::StreamBudget::new(args.parallel);
     let outcome = upload_file(
         &args.source,
@@ -1427,8 +1427,10 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
     // delegate to `run_mirror`, which builds its own session -- an eager
     // session here would leave a second, dead TOTAL bar parked above
     // mirror's live one for the whole run.
-    let session =
-        std::cell::LazyCell::new(|| TransferSession::new(if is_mv { "mv" } else { "cp" }));
+    let parallel = args.parallel;
+    let session = std::cell::LazyCell::new(|| {
+        TransferSession::new(if is_mv { "mv" } else { "cp" }, parallel)
+    });
     let stream_budget = crate::budget::StreamBudget::new(args.parallel);
     let mut used_session = false;
     for source in &args.paths[..args.paths.len() - 1] {
@@ -1886,13 +1888,13 @@ async fn get(args: GetArgs) -> Result<()> {
     if args.version_id.is_some() {
         return Err(anyhow!("get --version-id is not implemented yet"));
     }
-    let session = TransferSession::new("get");
     // GetArgs has no `--preserve` flag ([SEM] §2 lists it on cp/mirror/put
     // only), so `get` never preserves filesystem attributes. It also has no
     // `-P` flag, so the worker count is pinned to the same default the
     // `-P`-bearing commands use (5), and the budget is sized to match it
     // 1:1 since `get` transfers a single object.
     let parallel = 5;
+    let session = TransferSession::new("get", parallel);
     let stream_budget = crate::budget::StreamBudget::new(parallel);
     download_object(
         &args.source,
@@ -1930,7 +1932,7 @@ async fn cat(args: CatArgs) -> Result<()> {
             "You cannot use --part-number with --tail or --offset"
         ));
     }
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
@@ -2159,7 +2161,7 @@ async fn head(args: HeadArgs) -> Result<()> {
     // mc's own defensive reset: an explicit negative -n silently becomes
     // the default of 10 (the flag's own default already covers "unset").
     let lines = if args.lines < 0 { 10 } else { args.lines };
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
@@ -2219,7 +2221,7 @@ async fn rm(args: RmArgs) -> Result<()> {
         ));
     }
     let mut failures = 0u64;
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         if let Err(err) = rm_one_target(target, &args, &budget, ui.as_ref()).await {
@@ -2420,7 +2422,7 @@ async fn remove_prefix(
 /// quiet success (matches `ls`'s own empty-prefix behavior), not an error --
 /// only the non-recursive single-key path treats a miss as fatal.
 async fn stat(args: StatArgs) -> Result<()> {
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
         let parsed = parse_s3_url(&target)?;
@@ -2516,7 +2518,7 @@ async fn du(args: DuArgs) -> Result<()> {
         1
     };
     let mut first_err = None;
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         let parsed = parse_s3_url(target)?;
@@ -2936,7 +2938,7 @@ async fn tree(args: TreeArgs) -> Result<()> {
     if args.targets.is_empty() {
         return Err(anyhow!("tree: this command requires at least one argument"));
     }
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         let parsed = parse_s3_url(target)?;

@@ -473,9 +473,10 @@ pub(crate) struct TransferSession {
 impl TransferSession {
     /// `label` is reserved for a future bar prefix/caption; bar mode delegates
     /// to `crate::progress::ProgressUi` for multi-bar TTY-live display (the label
-    /// parameter is not yet used).
-    pub(crate) fn new(_label: &str) -> Self {
-        Self::from_ui(crate::progress::transfer_ui())
+    /// parameter is not yet used). `parallel` (`-P`, or the command's internal
+    /// worker count) sizes the fixed lane grid.
+    pub(crate) fn new(_label: &str, parallel: usize) -> Self {
+        Self::from_ui(crate::progress::transfer_ui(parallel))
     }
 
     /// Like [`Self::new`], but takes an already-decided `ui` directly --
@@ -968,7 +969,7 @@ mod tests {
     fn session_has_no_ui_outside_tty() {
         // out() falls back to non-TTY defaults in unit tests, so the bar UI
         // must be off and the message/AccountStat path must be taken.
-        let session = TransferSession::new("cp");
+        let session = TransferSession::new("cp", 5);
         assert!(session.ui().is_none());
     }
 }

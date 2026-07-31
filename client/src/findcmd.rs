@@ -408,7 +408,7 @@ pub(crate) async fn run_find(args: FindArgs) -> Result<()> {
     let root_with_slash = format!("{root_raw}/");
     let maxdepth = args.maxdepth.unwrap_or(0);
 
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     let objects =
         crate::list::collect_objects_with(&client, &bucket, &prefix, Some((&budget, ui.as_ref())))

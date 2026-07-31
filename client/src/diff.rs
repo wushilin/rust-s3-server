@@ -151,7 +151,7 @@ pub(crate) async fn run_diff(first: &str, second: &str) -> Result<()> {
     let source = resolve_side(first).await?;
     let target = resolve_side(second).await?;
 
-    let ui = crate::progress::worker_ui();
+    let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     let dispatch_ctx = Some((&budget, ui.as_ref()));
     let source_entries = collect_entries(&source, true, dispatch_ctx).await?;

@@ -176,24 +176,29 @@ binary itself):
   `etag`/`storageClass` but no presigned `url` or version-ordinal field --
   out of scope alongside the versioning/zip absence noted above.
 - **TTY progress display (deliberate):** during `cp`/`mv`/`put`/`get`/`mirror`
-  on a terminal, rs3 shows up to 10 per-unit progress bars (one per in-flight
-  multipart segment or small file) above an overall `TOTAL x/y objects` bar,
-  where mc shows a single aggregate bar. `-P` is a *global concurrent-stream
-  budget*, cooperatively shared between whole objects and multipart segments
-  (e.g. `-P 5` covers 5 small files in flight, or 2 large files whose
-  segments draw from the same 5 tokens) -- **default 5**. A per-unit bar is
-  visible exactly while its stream holds a budget token, so the number of
-  bars on screen at any moment *is* the live parallelism, never more than
-  `-P` (display is capped at 10 bars — with `-P` above 10, the extra streams still run and count toward the TOTAL bar, just without their own bar); this is a deliberate reduction from the old per-layer worst case of
-  up to `P` objects each running `P` segments (`P`\*`P` concurrent streams).
-  Bar labels are a verb plus the condensing path, e.g.
-  `Uploading asdf/a.img part 4/24` (long paths lose middle components, then
-  collapse to `…/name`, then trim from the left, to fit a fixed label
-  column), and the byte column shares one unit across the pair, e.g.
-  `123.3/256MiB`. Bytes tick live as they cross the wire; server-side S3→S3
-  copy parts tick on completion since no bytes cross the client. Non-TTY,
-  `--json`, and `--quiet` output is unaffected. `--no-color` disables the
-  bars.
+  on a terminal, rs3 renders a fixed gradle-style grid of worker lanes above
+  an overall `TOTAL x/y objects` bar, where mc shows a single aggregate bar.
+  `-P` is a *global concurrent-stream budget*, cooperatively shared between
+  whole objects and multipart segments (e.g. `-P 5` covers 5 small files in
+  flight, or 2 large files whose segments draw from the same 5 tokens) --
+  **default 5**. The grid always has `-P` lanes, capped only by what the
+  console can render (`min(-P, usable_rows)`, derived from the detected
+  terminal height; an undetectable height falls back to a 22-lane classic-
+  terminal cap); the lane count is fixed for the whole run, so the grid
+  never grows or shrinks mid-transfer. A lane claims a bar the moment its
+  stream holds a budget token and reverts to a dim `> IDLE` row the moment
+  it releases one -- so a lane visibly cycles bar → `> IDLE` → bar as work
+  recycles through it, and the number of *non-idle* lanes at any moment is
+  the live parallelism, never more than `-P`. This is a deliberate reduction
+  from the old per-layer worst case of up to `P` objects each running `P`
+  segments (`P`\*`P` concurrent streams). Bar labels are a verb plus the
+  condensing path, e.g. `Uploading asdf/a.img part 4/24` (long paths lose
+  middle components, then collapse to `…/name`, then trim from the left, to
+  fit a fixed label column), and the byte column shares one unit across the
+  pair, e.g. `123.3/256MiB`. Bytes tick live as they cross the wire;
+  server-side S3→S3 copy parts tick on completion since no bytes cross the
+  client. Non-TTY, `--json`, and `--quiet` output is unaffected. `--no-color`
+  disables the grid.
 
   Under the hood, *every* S3 operation -- including control-plane calls
   with no bytes of their own, like `CreateMultipartUpload`,
