@@ -17,10 +17,17 @@ render in this console")
    undetectable → fall back to `min(P, 22)` (a 24-row classic terminal).
 2. **An unoccupied lane shows an idle marker**, gradle-style: `> IDLE`,
    dim (the 240-gray already used for bar backgrounds).
-3. Uniform everywhere the TTY UI is active — transfer commands and
-   standalone commands alike (a sequential `ls` with budget 5 shows 4 idle
-   lanes; lanes clear when the command finishes, before stdout results
-   would need the space).
+3. ~~Uniform everywhere~~ **AMENDED after Task-1 review:** the fixed idle
+   grid applies to **transfer commands only** (bar mode — they are
+   stdout-silent while the UI is up, so persistent rows are safe).
+   Standalone printing commands (ls/rm/stat/…) keep their transient
+   spinner task lines: a persistent grid there re-introduces the
+   stdout-glue corruption fixed in e534ce7 (indicatif's cursor math cannot
+   coexist with interleaved `println!`; reproduced under a pty by the
+   reviewer). "Uniform everywhere" had been an assumption, not a
+   user-confirmed decision. A future full gradle-style console (log lines
+   routed through the renderer via `MultiProgress::suspend`) could unify
+   them; out of scope here.
 
 ## Design
 
