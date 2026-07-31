@@ -1422,7 +1422,13 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
         None => BTreeMap::new(),
     };
     let target = args.paths.last().unwrap().clone();
-    let session = TransferSession::new(if is_mv { "mv" } else { "cp" });
+    // Lazy: creating a `TransferSession` on a TTY immediately draws its
+    // idle `TOTAL 0/0 objects` bar, and the `--recursive` branches below
+    // delegate to `run_mirror`, which builds its own session -- an eager
+    // session here would leave a second, dead TOTAL bar parked above
+    // mirror's live one for the whole run.
+    let session =
+        std::cell::LazyCell::new(|| TransferSession::new(if is_mv { "mv" } else { "cp" }));
     let stream_budget = crate::budget::StreamBudget::new(args.parallel);
     let mut used_session = false;
     for source in &args.paths[..args.paths.len() - 1] {
