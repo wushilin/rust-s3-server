@@ -195,6 +195,30 @@ binary itself):
   `--json`, and `--quiet` output is unaffected. `--no-color` disables the
   bars.
 
+  Under the hood, *every* S3 operation -- including control-plane calls
+  with no bytes of their own, like `CreateMultipartUpload`,
+  `CompleteMultipartUpload`, `AbortMultipartUpload`, `HeadObject`,
+  `ListObjectsV2` (and its `ListBuckets`/`ListMultipartUploads`/`ListParts`
+  siblings), and `DeleteObject`/`DeleteObjects` -- is dispatched as a worker
+  task that consumes one `-P` token for its duration, the same budget the
+  transfer segments draw from. Byte-less ops render as a transient spinner
+  line, `<verb + path> <spinner> <ApiName>` (e.g.
+  `Listing bucket1 ⣹ ListObjectsV2`), that appears while the call is in
+  flight and disappears the instant it completes -- so a multipart `cp`
+  shows a `Creating ... ⣹ CreateMultipartUpload` line before its part bars
+  and a `Completing ... ⣹ CompleteMultipartUpload` line after them, and a
+  paginated `ls`/`rm -r`/`du`/`find`/etc. shows one such line per
+  `ListObjectsV2` page. Standalone commands with no byte transfer of their
+  own (`ls`, `rm`, `stat`, `du`, `tree`, `find`, `diff`, `cat`, `head`,
+  `mb`, `rb`) use a tasks-only UI on a TTY: transient spinner task lines
+  only, with **no** overall `TOTAL` bar, so their normal stdout output
+  (object listings, `stat` fields, file contents, ...) is never glued to a
+  persistent bar line. `cp`/`mv`/`put`/`get`/`mirror` keep the block bars
+  plus the overall `TOTAL` bar described above. As with the byte bars,
+  `--json`/`--quiet`/non-TTY output is completely unaffected -- this is a
+  TTY-only, stderr-only display detail with no mc equivalent (mc has no
+  spinner for control-plane calls at all).
+
 ## Refused and unsupported flags
 
 rs3 has two distinct refusal styles for `mc` flags it doesn't support,
