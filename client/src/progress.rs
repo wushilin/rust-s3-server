@@ -269,6 +269,7 @@ fn idle_style() -> Option<ProgressStyle> {
 /// assumption of `FALLBACK_LANES` usable rows. `p` is assumed already >= 1:
 /// `-P` is clamped by `StreamBudget::new` before it ever reaches here.
 fn lane_count(p: usize, term_rows: Option<u16>, reserved: usize) -> usize {
+    let p = p.max(1);
     match term_rows {
         Some(rows) => {
             let usable = (rows as usize).saturating_sub(reserved).max(1);
@@ -608,6 +609,10 @@ impl ProgressUi {
     /// Session end: detail bars are already gone (finished or dropped); the
     /// overall bar finishes in place and stays visible, like mc's. No-op in
     /// tasks-only mode (no overall bar to finish).
+    ///
+    /// Note: lane clearing relies on indicatif's default `ProgressFinish::AndClear`
+    /// firing when the lane bars drop (verified against indicatif 0.17.11), so
+    /// nobody later sets `on_finish` or defers the drop without realizing.
     pub(crate) fn finish_and_keep(&self) {
         let state = self.lock_state();
         self.refresh_msg(&state);
@@ -879,6 +884,7 @@ mod tests {
             1,
             "degenerate terminal still >= 1"
         );
+        assert_eq!(lane_count(0, Some(40), 2), 1);
     }
 
     #[test]

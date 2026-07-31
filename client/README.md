@@ -189,7 +189,9 @@ binary itself):
   stream holds a budget token and reverts to a dim `> IDLE` row the moment
   it releases one -- so a lane visibly cycles bar → `> IDLE` → bar as work
   recycles through it, and the number of *non-idle* lanes at any moment is
-  the live parallelism, never more than `-P`. This is a deliberate reduction
+  the live parallelism, never more than `-P`. When the console is too short
+  to show all `-P` lanes, the extra streams still run and count toward the
+  TOTAL bar, just without a lane of their own. This is a deliberate reduction
   from the old per-layer worst case of up to `P` objects each running `P`
   segments (`P`\*`P` concurrent streams). Bar labels are a verb plus the
   condensing path, e.g. `Uploading asdf/a.img part 4/24` (long paths lose
