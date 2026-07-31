@@ -177,7 +177,14 @@ pub(crate) async fn upload_file(
     if disable_multipart || file_meta.len() <= part_size {
         let _permit = budget.acquire().await;
         let unit = match progress {
-            Some(ui) => ui.unit(source_name.to_string(), file_meta.len()),
+            Some(ui) => ui.unit(
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Uploading,
+                    path: source.display().to_string(),
+                    part: None,
+                },
+                file_meta.len(),
+            ),
             None => crate::progress::UnitHandle::noop(),
         };
         let body = crate::progress::instrument_body(ByteStream::from_path(source).await?, &unit);
@@ -246,11 +253,7 @@ pub(crate) async fn multipart_upload(
     let part_numbers = 1..=part_count;
     let progress = progress.cloned();
     let budget = budget.clone();
-    let file_label = source
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("upload")
-        .to_string();
+    let source_label = source.display().to_string();
     let uploads = stream::iter(part_numbers.map(|part_index| {
         let client = client.clone();
         let source = source.to_path_buf();
@@ -259,13 +262,20 @@ pub(crate) async fn multipart_upload(
         let upload_id = upload_id.clone();
         let progress = progress.clone();
         let budget = budget.clone();
-        let file_label = file_label.clone();
+        let source_label = source_label.clone();
         async move {
             let _permit = budget.acquire().await;
             let offset = (part_index - 1) * part_size;
             let len = (total_size - offset).min(part_size);
             let unit = match &progress {
-                Some(ui) => ui.unit(format!("{file_label} part {part_index}/{part_count}"), len),
+                Some(ui) => ui.unit(
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Uploading,
+                        path: source_label,
+                        part: Some((part_index, part_count)),
+                    },
+                    len,
+                ),
                 None => crate::progress::UnitHandle::noop(),
             };
             let body = crate::progress::instrument_body(
@@ -564,11 +574,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     let part_count = total_size.div_ceil(part_size);
     let progress = progress.cloned();
     let budget = budget.clone();
-    let label = source_key
-        .rsplit('/')
-        .next()
-        .unwrap_or(source_key)
-        .to_string();
+    let source_key_label = source_key.to_string();
     let uploads = stream::iter((1..=part_count).map(|part_index| {
         let source_client = source_client.clone();
         let target_client = target_client.clone();
@@ -579,7 +585,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
         let upload_id = upload_id.clone();
         let progress = progress.clone();
         let budget = budget.clone();
-        let label = label.clone();
+        let source_key_label = source_key_label.clone();
         async move {
             let _permit = budget.acquire().await;
             let start = (part_index - 1) * part_size;
@@ -595,7 +601,11 @@ pub(crate) async fn multipart_copy_s3_to_s3(
                 .body;
             let unit = match &progress {
                 Some(ui) => ui.unit(
-                    format!("{label} part {part_index}/{part_count}"),
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Copying,
+                        path: source_key_label,
+                        part: Some((part_index, part_count)),
+                    },
                     end - start + 1,
                 ),
                 None => crate::progress::UnitHandle::noop(),
@@ -687,11 +697,11 @@ pub(crate) async fn transfer_object_between_s3(
             let _permit = budget.acquire().await;
             let unit = match progress {
                 Some(ui) => ui.unit(
-                    source_key
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(source_key)
-                        .to_string(),
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Copying,
+                        path: source_key.to_string(),
+                        part: None,
+                    },
                     size,
                 ),
                 None => crate::progress::UnitHandle::noop(),
@@ -741,11 +751,11 @@ pub(crate) async fn transfer_object_between_s3(
         let _permit = budget.acquire().await;
         let unit = match progress {
             Some(ui) => ui.unit(
-                source_key
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(source_key)
-                    .to_string(),
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Copying,
+                    path: source_key.to_string(),
+                    part: None,
+                },
                 size,
             ),
             None => crate::progress::UnitHandle::noop(),
@@ -840,11 +850,7 @@ async fn multipart_server_side_copy(
     let part_count = total_size.div_ceil(part_size);
     let progress = progress.cloned();
     let budget = budget.clone();
-    let label = source_key
-        .rsplit('/')
-        .next()
-        .unwrap_or(source_key)
-        .to_string();
+    let source_key_label = source_key.to_string();
     let uploads = stream::iter((1..=part_count).map(|part_index| {
         let client = target_client.clone();
         let copy_source = copy_source.clone();
@@ -853,14 +859,18 @@ async fn multipart_server_side_copy(
         let upload_id = upload_id.clone();
         let progress = progress.clone();
         let budget = budget.clone();
-        let label = label.clone();
+        let source_key_label = source_key_label.clone();
         async move {
             let _permit = budget.acquire().await;
             let start = (part_index - 1) * part_size;
             let end = (total_size - 1).min(start + part_size - 1);
             let unit = match &progress {
                 Some(ui) => ui.unit(
-                    format!("{label} part {part_index}/{part_count}"),
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Copying,
+                        path: source_key_label,
+                        part: Some((part_index, part_count)),
+                    },
                     end - start + 1,
                 ),
                 None => crate::progress::UnitHandle::noop(),
@@ -1085,11 +1095,17 @@ async fn download_to_temp(
     budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
-    let label = key.rsplit('/').next().unwrap_or(key).to_string();
     if size <= part_size {
         let _permit = budget.acquire().await;
         let unit = match progress {
-            Some(ui) => ui.unit(label.clone(), size),
+            Some(ui) => ui.unit(
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Downloading,
+                    path: key.to_string(),
+                    part: None,
+                },
+                size,
+            ),
             None => crate::progress::UnitHandle::noop(),
         };
         let resp = client.get_object().bucket(bucket).key(key).send().await?;
@@ -1115,6 +1131,7 @@ async fn download_to_temp(
     let part_count = size.div_ceil(part_size);
     let progress = progress.cloned();
     let budget = budget.clone();
+    let key_label = key.to_string();
     let downloads = stream::iter((0..part_count).map(|part_index| {
         let client = client.clone();
         let bucket = bucket.to_string();
@@ -1122,7 +1139,7 @@ async fn download_to_temp(
         let tmp = tmp.to_path_buf();
         let progress = progress.clone();
         let budget = budget.clone();
-        let label = label.clone();
+        let key_label = key_label.clone();
         async move {
             let _permit = budget.acquire().await;
             let start = part_index * part_size;
@@ -1130,7 +1147,11 @@ async fn download_to_temp(
             let expected = end - start + 1;
             let unit = match &progress {
                 Some(ui) => ui.unit(
-                    format!("{label} part {}/{part_count}", part_index + 1),
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Downloading,
+                        path: key_label,
+                        part: Some((part_index + 1, part_count)),
+                    },
                     expected,
                 ),
                 None => crate::progress::UnitHandle::noop(),

@@ -13,6 +13,85 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 const MAX_DETAIL_BARS: usize = 10;
 
+/// Fixed on-screen width for a bar's label: long labels condense (see
+/// [`TransferLabel::render`]), short ones are padded to this so bars don't
+/// jiggle horizontally as different-length labels rotate through a slot.
+pub(crate) const LABEL_WIDTH: usize = 40;
+
+/// What a transfer unit is doing, for the bar label -- distinct from the
+/// server-side S3 operation (e.g. same-endpoint `Copying` still issues a
+/// `CopyObject` or `UploadPartCopy`, not a GET+PUT).
+#[derive(Clone, Copy)]
+pub(crate) enum Verb {
+    Uploading,
+    Downloading,
+    Copying,
+}
+
+impl Verb {
+    fn as_str(self) -> &'static str {
+        match self {
+            Verb::Uploading => "Uploading",
+            Verb::Downloading => "Downloading",
+            Verb::Copying => "Copying",
+        }
+    }
+}
+
+/// A bar's label before rendering: verb, the path being transferred, and an
+/// optional `(part_index, part_count)` for multipart segments. Kept
+/// structured (rather than a pre-formatted `String`) so [`render`] can
+/// condense long paths to fit [`LABEL_WIDTH`] instead of truncating blindly.
+///
+/// [`render`]: TransferLabel::render
+pub(crate) struct TransferLabel {
+    pub(crate) verb: Verb,
+    pub(crate) path: String,
+    pub(crate) part: Option<(u64, u64)>,
+}
+
+impl TransferLabel {
+    /// Condense to `width` chars: full text first; then drop middle path
+    /// components (`a/…/z`); then `…/z`; last resort trim the filename
+    /// from the left. Verb and ` part i/n` suffix always survive.
+    pub(crate) fn render(&self, width: usize) -> String {
+        let verb = self.verb.as_str();
+        let suffix = match self.part {
+            Some((i, n)) => format!(" part {i}/{n}"),
+            None => String::new(),
+        };
+        let fit = |path: &str| -> Option<String> {
+            let s = format!("{verb} {path}{suffix}");
+            (s.chars().count() <= width).then_some(s)
+        };
+        if let Some(s) = fit(&self.path) {
+            return s;
+        }
+        let parts: Vec<&str> = self.path.split('/').collect();
+        if parts.len() > 2
+            && let Some(s) = fit(&format!("{}/…/{}", parts[0], parts[parts.len() - 1]))
+        {
+            return s;
+        }
+        let tail = parts[parts.len() - 1];
+        if let Some(s) = fit(&format!("…/{tail}")) {
+            return s;
+        }
+        // trim the filename from the left to whatever room remains
+        let overhead = format!("{verb} …{suffix}").chars().count();
+        let room = width.saturating_sub(overhead);
+        let kept: String = tail
+            .chars()
+            .rev()
+            .take(room)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{verb} …{kept}{suffix}")
+    }
+}
+
 struct UiState {
     objects_total: u64,
     objects_done: u64,
@@ -78,7 +157,7 @@ impl ProgressUi {
 
     /// One in-flight transfer unit. If all detail slots are busy the handle
     /// is silent: no bar, but its ticks still advance the overall bar.
-    pub(crate) fn unit(&self, label: String, len: u64) -> UnitHandle {
+    pub(crate) fn unit(&self, label: TransferLabel, len: u64) -> UnitHandle {
         let mut state = self.lock_state();
         let bar = if state.active_bars < MAX_DETAIL_BARS {
             state.active_bars += 1;
@@ -91,7 +170,12 @@ impl ProgressUi {
             ) {
                 pb.set_style(style.progress_chars("=> "));
             }
-            pb.set_message(label);
+            // Pad by char count, not byte count: `render` may emit a
+            // multi-byte `…`, and byte-length padding would under-pad.
+            let mut rendered = label.render(LABEL_WIDTH);
+            let padding = LABEL_WIDTH.saturating_sub(rendered.chars().count());
+            rendered.extend(std::iter::repeat_n(' ', padding));
+            pb.set_message(rendered);
             Some(pb)
         } else {
             None
@@ -309,7 +393,9 @@ mod tests {
     fn eleventh_concurrent_unit_is_silent_but_still_counts() {
         let ui = ProgressUi::hidden();
         ui.add_object(11 * 100);
-        let handles: Vec<UnitHandle> = (0..11).map(|i| ui.unit(format!("u{i}"), 100)).collect();
+        let handles: Vec<UnitHandle> = (0..11)
+            .map(|i| ui.unit(lbl(Verb::Uploading, &format!("u{i}"), None), 100))
+            .collect();
         assert_eq!(ui.active_detail_bars(), 10, "cap is 10");
         // the silent 11th unit still ticks the overall bar
         handles[10].inc(40);
@@ -319,11 +405,13 @@ mod tests {
     #[test]
     fn finish_frees_slot_for_next_unit() {
         let ui = ProgressUi::hidden();
-        let handles: Vec<UnitHandle> = (0..10).map(|i| ui.unit(format!("u{i}"), 10)).collect();
+        let handles: Vec<UnitHandle> = (0..10)
+            .map(|i| ui.unit(lbl(Verb::Uploading, &format!("u{i}"), None), 10))
+            .collect();
         assert_eq!(ui.active_detail_bars(), 10);
         handles[0].finish();
         assert_eq!(ui.active_detail_bars(), 9);
-        let _h = ui.unit("next".into(), 10);
+        let _h = ui.unit(lbl(Verb::Uploading, "next", None), 10);
         assert_eq!(ui.active_detail_bars(), 10);
     }
 
@@ -331,7 +419,7 @@ mod tests {
     fn finish_tops_up_to_len_exactly_once() {
         let ui = ProgressUi::hidden();
         ui.add_object(100);
-        let h = ui.unit("f".into(), 100);
+        let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
         h.inc(30);
         h.finish();
         assert_eq!(ui.overall_position(), 100, "topped up 30 -> 100");
@@ -343,7 +431,7 @@ mod tests {
     fn rewind_subtracts_progress_for_retry() {
         let ui = ProgressUi::hidden();
         ui.add_object(100);
-        let h = ui.unit("f".into(), 100);
+        let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
         h.inc(40);
         assert_eq!(ui.overall_position(), 40);
         h.rewind();
@@ -357,7 +445,7 @@ mod tests {
     fn drop_without_finish_frees_slot_but_does_not_top_up() {
         let ui = ProgressUi::hidden();
         ui.add_object(100);
-        let h = ui.unit("f".into(), 100);
+        let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
         h.inc(30);
         drop(h); // a failed part must not fake completion
         assert_eq!(ui.overall_position(), 30);
@@ -392,7 +480,7 @@ mod tests {
 
         let ui = ProgressUi::hidden();
         ui.add_object(10);
-        let unit = ui.unit("mem".into(), 10);
+        let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 10);
         let body = ByteStream::new(SdkBody::from("0123456789"));
         let wrapped = instrument_body(body, &unit);
         let data = wrapped.collect().await.expect("collect").into_bytes();
@@ -407,7 +495,7 @@ mod tests {
 
         let ui = ProgressUi::hidden();
         ui.add_object(10);
-        let unit = ui.unit("mem".into(), 10);
+        let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 10);
         let retryable = SdkBody::retryable(|| SdkBody::from("0123456789"));
         let wrapped = instrument_body(ByteStream::new(retryable), &unit);
         // The SDK's orchestrator clones a retryable body once per attempt;
@@ -453,7 +541,7 @@ mod tests {
 
         let ui = ProgressUi::hidden();
         ui.add_object(10);
-        let unit = ui.unit("part".into(), 10);
+        let unit = ui.unit(lbl(Verb::Uploading, "part", None), 10);
         let body = ByteStream::read_from()
             .path(file.path())
             .offset(2)
@@ -485,7 +573,7 @@ mod tests {
 
         let ui = ProgressUi::hidden();
         ui.add_object(3);
-        let unit = ui.unit("mem".into(), 3);
+        let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 3);
         let body = ByteStream::new(SdkBody::from("abc"));
         let wrapped = instrument_body(body, &unit).into_inner();
         assert!(
@@ -495,12 +583,72 @@ mod tests {
         assert_eq!(wrapped.bytes(), Some(b"abc".as_slice()));
     }
 
+    fn lbl(verb: Verb, path: &str, part: Option<(u64, u64)>) -> TransferLabel {
+        TransferLabel {
+            verb,
+            path: path.into(),
+            part,
+        }
+    }
+
+    #[test]
+    fn label_renders_full_when_it_fits() {
+        assert_eq!(
+            lbl(Verb::Uploading, "asdf/a.img", Some((4, 24))).render(40),
+            "Uploading asdf/a.img part 4/24"
+        );
+        assert_eq!(
+            lbl(Verb::Copying, "pics/x.jpg", None).render(40),
+            "Copying pics/x.jpg"
+        );
+    }
+
+    #[test]
+    fn label_condenses_middle_components_first() {
+        // full form is 47 chars: "Downloading backups/2026/07/31/big.iso part 1/8"
+        let l = lbl(
+            Verb::Downloading,
+            "backups/2026/07/31/big.iso",
+            Some((1, 8)),
+        );
+        assert_eq!(l.render(40), "Downloading backups/…/big.iso part 1/8");
+    }
+
+    #[test]
+    fn label_drops_to_ellipsis_slash_tail_then_trims_filename() {
+        let l = lbl(
+            Verb::Uploading,
+            "averyveryverylongdirectoryname/file.bin",
+            Some((2, 9)),
+        );
+        // "Uploading averyveryverylongdirectoryname/file.bin part 2/9" (58) -> first/…/tail == …/tail here
+        assert_eq!(l.render(30), "Uploading …/file.bin part 2/9");
+        // width too small even for the tail: trim filename from the left, keep verb + suffix
+        let tight = lbl(
+            Verb::Uploading,
+            "d/really-long-filename-here.bin",
+            Some((2, 9)),
+        );
+        let out = tight.render(24);
+        // `…` is one char via chars().count() but 3 bytes in UTF-8 -- the
+        // width contract (and the padding in `unit()`) is char-counted, so
+        // this assertion is too (str::len() is bytes and would over-count
+        // the ellipsis, failing at exactly the boundary this test targets).
+        assert!(
+            out.chars().count() <= 24,
+            "{out:?} too wide ({} chars)",
+            out.chars().count()
+        );
+        assert!(out.starts_with("Uploading …"), "{out:?}");
+        assert!(out.ends_with(" part 2/9"), "{out:?}");
+    }
+
     #[test]
     fn concurrent_rewind_does_not_lose_other_unit_progress() {
         let ui = ProgressUi::hidden();
         ui.add_object(100);
-        let h_a = ui.unit("a".into(), 50);
-        let h_b = ui.unit("b".into(), 50);
+        let h_a = ui.unit(lbl(Verb::Uploading, "a", None), 50);
+        let h_b = ui.unit(lbl(Verb::Uploading, "b", None), 50);
         // Unit A increments by 40
         h_a.inc(40);
         assert_eq!(ui.overall_position(), 40);
