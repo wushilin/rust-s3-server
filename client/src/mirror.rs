@@ -633,6 +633,7 @@ async fn copy_entry(
                 disable_multipart,
                 parallel,
                 preserve,
+                progress,
             )
             .await?;
             Ok((

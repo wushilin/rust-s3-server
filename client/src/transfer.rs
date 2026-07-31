@@ -527,6 +527,7 @@ where
     Ok((total, uploaded))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn multipart_copy_s3_to_s3(
     source_client: &Client,
     source_bucket: &str,
@@ -537,6 +538,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     total_size: u64,
     part_size: u64,
     parallel: usize,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
@@ -552,6 +554,12 @@ pub(crate) async fn multipart_copy_s3_to_s3(
         .ok_or_else(|| anyhow!("server did not return upload id"))?
         .to_string();
     let part_count = total_size.div_ceil(part_size);
+    let progress = progress.cloned();
+    let label = source_key
+        .rsplit('/')
+        .next()
+        .unwrap_or(source_key)
+        .to_string();
     let uploads = stream::iter((1..=part_count).map(|part_index| {
         let source_client = source_client.clone();
         let target_client = target_client.clone();
@@ -560,6 +568,8 @@ pub(crate) async fn multipart_copy_s3_to_s3(
         let target_bucket = target_bucket.to_string();
         let target_key = target_key.to_string();
         let upload_id = upload_id.clone();
+        let progress = progress.clone();
+        let label = label.clone();
         async move {
             let start = (part_index - 1) * part_size;
             let end = (total_size - 1).min(start + part_size - 1);
@@ -572,6 +582,14 @@ pub(crate) async fn multipart_copy_s3_to_s3(
                 .send()
                 .await?
                 .body;
+            let unit = match &progress {
+                Some(ui) => ui.unit(
+                    format!("{label} part {part_index}/{part_count}"),
+                    end - start + 1,
+                ),
+                None => crate::progress::UnitHandle::noop(),
+            };
+            let body = crate::progress::instrument_body(body, &unit);
             let part_number = part_index as i32;
             let resp = target_client
                 .upload_part()
@@ -582,6 +600,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
                 .body(body)
                 .send()
                 .await?;
+            unit.finish();
             Ok::<UploadedPart, anyhow::Error>(UploadedPart {
                 part_number,
                 etag: resp.e_tag().map(String::from),
@@ -641,7 +660,11 @@ pub(crate) async fn transfer_object_between_s3(
     disable_multipart: bool,
     parallel: usize,
     preserve: bool,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
+    if let Some(ui) = progress {
+        ui.add_object(size);
+    }
     if same_endpoint(source_alias, target_alias) {
         // Same-endpoint copies go through server-side CopyObject, whose
         // default `x-amz-metadata-directive: COPY` already carries the
@@ -649,6 +672,17 @@ pub(crate) async fn transfer_object_between_s3(
         // target -- nothing extra to do here for `--preserve` ([SEM] §2).
         let single_limit = part_size.min(MAX_SINGLE_COPY);
         if disable_multipart || size <= single_limit {
+            let unit = match progress {
+                Some(ui) => ui.unit(
+                    source_key
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(source_key)
+                        .to_string(),
+                    size,
+                ),
+                None => crate::progress::UnitHandle::noop(),
+            };
             target_client
                 .copy_object()
                 .bucket(target_bucket)
@@ -656,6 +690,7 @@ pub(crate) async fn transfer_object_between_s3(
                 .copy_source(encode_copy_source(source_bucket, source_key))
                 .send()
                 .await?;
+            unit.finish();
         } else {
             multipart_server_side_copy(
                 target_client,
@@ -666,6 +701,7 @@ pub(crate) async fn transfer_object_between_s3(
                 size,
                 part_size,
                 parallel,
+                progress,
             )
             .await?;
         }
@@ -686,20 +722,33 @@ pub(crate) async fn transfer_object_between_s3(
         eprintln!("rs3: falling back to streaming copy");
     }
     if disable_multipart || size <= part_size {
+        let unit = match progress {
+            Some(ui) => ui.unit(
+                source_key
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(source_key)
+                    .to_string(),
+                size,
+            ),
+            None => crate::progress::UnitHandle::noop(),
+        };
         let resp = source_client
             .get_object()
             .bucket(source_bucket)
             .key(source_key)
             .send()
             .await?;
+        let body = crate::progress::instrument_body(resp.body, &unit);
         target_client
             .put_object()
             .bucket(target_bucket)
             .key(target_key)
             .content_length(size as i64)
-            .body(resp.body)
+            .body(body)
             .send()
             .await?;
+        unit.finish();
     } else {
         multipart_copy_s3_to_s3(
             source_client,
@@ -711,12 +760,14 @@ pub(crate) async fn transfer_object_between_s3(
             size,
             part_size,
             parallel,
+            progress,
         )
         .await?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn multipart_server_side_copy(
     target_client: &Client,
     source_bucket: &str,
@@ -726,6 +777,7 @@ async fn multipart_server_side_copy(
     total_size: u64,
     part_size: u64,
     parallel: usize,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
@@ -767,15 +819,30 @@ async fn multipart_server_side_copy(
         .to_string();
     let copy_source = encode_copy_source(source_bucket, source_key);
     let part_count = total_size.div_ceil(part_size);
+    let progress = progress.cloned();
+    let label = source_key
+        .rsplit('/')
+        .next()
+        .unwrap_or(source_key)
+        .to_string();
     let uploads = stream::iter((1..=part_count).map(|part_index| {
         let client = target_client.clone();
         let copy_source = copy_source.clone();
         let target_bucket = target_bucket.to_string();
         let target_key = target_key.to_string();
         let upload_id = upload_id.clone();
+        let progress = progress.clone();
+        let label = label.clone();
         async move {
             let start = (part_index - 1) * part_size;
             let end = (total_size - 1).min(start + part_size - 1);
+            let unit = match &progress {
+                Some(ui) => ui.unit(
+                    format!("{label} part {part_index}/{part_count}"),
+                    end - start + 1,
+                ),
+                None => crate::progress::UnitHandle::noop(),
+            };
             let part_number = part_index as i32;
             let resp = client
                 .upload_part_copy()
@@ -787,6 +854,7 @@ async fn multipart_server_side_copy(
                 .copy_source_range(format!("bytes={start}-{end}"))
                 .send()
                 .await?;
+            unit.finish();
             Ok::<UploadedPart, anyhow::Error>(UploadedPart {
                 part_number,
                 etag: resp
@@ -898,6 +966,7 @@ mod tests {
             false,
             1,
             true,
+            None,
         ));
         assert!(
             result.is_err(),

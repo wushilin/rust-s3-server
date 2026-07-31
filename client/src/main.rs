@@ -1543,6 +1543,7 @@ async fn copy_s3_object_to_s3(
         disable_multipart,
         parallel,
         preserve,
+        session.ui(),
     )
     .await?;
     session.add_total(size);
