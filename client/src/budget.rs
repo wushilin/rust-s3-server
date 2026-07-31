@@ -144,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_releases_token_and_slot_on_ok_and_err() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         let budget = StreamBudget::new(1);
         let ok: Result<u32, anyhow::Error> = dispatch(
             &budget,

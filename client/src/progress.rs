@@ -1,9 +1,12 @@
-//! Multi-bar live progress for transfer commands: up to
-//! [`MAX_DETAIL_BARS`] per-unit bars (one multipart segment of a large
-//! file, or one whole small file) stacked above a persistent overall bar.
-//! Deliberate TTY-only divergence from mc's single aggregate bar — see
-//! README "Known divergences from mc". All bars draw to stderr; stdout
-//! (the mc-compat message contract) is never touched.
+//! Multi-bar live progress for transfer commands: a fixed gradle-style grid
+//! of `-P` worker lanes (one multipart segment of a large file, or one whole
+//! small file, or a byte-less spinner task line), stacked above a persistent
+//! overall bar. The grid is built once, sized to `-P` capped by the visible
+//! terminal rows (see [`lane_count`]); lanes are claimed/restyled on use and
+//! reverted to a dim idle row on release -- no bar is ever inserted or
+//! removed mid-run. Deliberate TTY-only divergence from mc's single
+//! aggregate bar — see README "Known divergences from mc". All bars draw to
+//! stderr; stdout (the mc-compat message contract) is never touched.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +14,9 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-const MAX_DETAIL_BARS: usize = 10;
+/// Classic-terminal fallback lane count when the terminal's row count can't
+/// be detected (e.g. a hidden test target, or a genuinely weird TTY).
+const FALLBACK_LANES: usize = 22;
 
 /// Fixed on-screen width for a bar's label: long labels condense (see
 /// [`TransferLabel::render`]), short ones are padded to this so bars don't
@@ -153,11 +158,19 @@ pub(crate) fn bucket_prefix_label(bucket: &str, prefix: &str) -> String {
 struct UiState {
     objects_total: u64,
     objects_done: u64,
-    active_bars: usize,
+    // Free lane indices, LIFO stack ordered so the *lowest* index is
+    // claimed first (initialized high-to-low, popped low-to-high) -- purely
+    // cosmetic (claims fill the grid top-down), no correctness dependency.
+    free: Vec<usize>,
 }
 
 struct UiInner {
     mp: MultiProgress,
+    // Fixed grid, sized once at construction (see `lane_count`): every
+    // entry exists for the life of this `ProgressUi`, in idle style until
+    // claimed by `unit`/`task`. Never grown, shrunk, inserted into, or
+    // removed from after construction -- only restyled in place.
+    lanes: Vec<ProgressBar>,
     // `None` in "tasks-only" mode (`ProgressUi::new_tasks_only`): standalone
     // commands print their own stdout lines interleaved with dispatch's
     // spinner task lines, and a *persistent* bar (one that outlives every
@@ -169,7 +182,9 @@ struct UiInner {
     // (`ProgressUi::new`, used by `TransferSession`) keeps the overall bar:
     // transfer commands never print per-object stdout lines while the bar
     // is active (bar-mode-silent, see `TransferSession::object_done`), so
-    // there is nothing for it to glue onto.
+    // there is nothing for it to glue onto. Always the last bar in `mp`,
+    // below every lane -- lanes are added first at construction, so this is
+    // naturally pinned at the bottom without ever needing `insert_before`.
     overall: Option<ProgressBar>,
     bar_width: usize,
     state: Mutex<UiState>,
@@ -203,6 +218,37 @@ fn bar_width_for(cols: Option<u16>) -> usize {
     }
 }
 
+/// Fixed template + message for an unclaimed lane: a plain message field
+/// (no bar, no spinner) styled dim via ANSI 256 color 240 -- the same dim
+/// used for the bars' unfilled fill -- so idle rows read as inactive at a
+/// glance. `None` (template compile failure, never expected in practice)
+/// leaves the lane in whatever style `indicatif` defaults to.
+const IDLE_MESSAGE: &str = "> IDLE";
+
+fn idle_style() -> Option<ProgressStyle> {
+    ProgressStyle::with_template("{msg:.240}").ok()
+}
+
+/// Pure sizing for the fixed lane grid: `P` worker lanes capped by how many
+/// rows the terminal can actually show. `reserved` rows are held back below
+/// the grid for other persistent content -- 2 for transfer mode (the TOTAL
+/// bar plus a margin row) or 1 for tasks-only mode (the margin row alone,
+/// no TOTAL bar) -- and the usable remainder is floored at 1 so a
+/// degenerate terminal still gets a grid, not an empty one. `term_rows` of
+/// `None` (size undetectable -- a hidden test target, or a genuinely weird
+/// TTY) skips the row math entirely and falls back to the classic-terminal
+/// assumption of `FALLBACK_LANES` usable rows. `p` is assumed already >= 1:
+/// `-P` is clamped by `StreamBudget::new` before it ever reaches here.
+fn lane_count(p: usize, term_rows: Option<u16>, reserved: usize) -> usize {
+    match term_rows {
+        Some(rows) => {
+            let usable = (rows as usize).saturating_sub(reserved).max(1);
+            p.min(usable)
+        }
+        None => p.min(FALLBACK_LANES),
+    }
+}
+
 /// Shared bar-vs-lines predicate for both [`worker_ui`] and
 /// [`crate::messages::TransferSession::new`]: stdout is a TTY, and none of
 /// `--quiet`/`--json`/`--no-color` is set.
@@ -218,48 +264,114 @@ fn ui_enabled() -> bool {
 /// stays byte-identical. Always **tasks-only** mode (see
 /// [`ProgressUi::new_tasks_only`]) -- these commands print their own stdout
 /// lines, which a persistent bar would corrupt.
+///
+/// No-arg compat shim defaulting to 5 lanes -- Task-2 removes this and
+/// threads the real `-P` value through from `main.rs`'s call sites.
 pub(crate) fn worker_ui() -> Option<ProgressUi> {
-    ui_enabled().then(ProgressUi::new_tasks_only)
+    ui_enabled().then(|| ProgressUi::new_tasks_only(5))
 }
 
 /// [`crate::messages::TransferSession`]'s bar-vs-lines decision: `Some`
 /// under the same [`ui_enabled`] predicate, full bar mode (persistent
 /// overall bar) -- transfer commands never print per-object stdout lines
 /// while the bar is active, so there's nothing for it to glue onto.
+///
+/// No-arg compat shim defaulting to 5 lanes -- Task-2 removes this and
+/// threads the real `-P` value through from `messages.rs`'s call site.
 pub(crate) fn transfer_ui() -> Option<ProgressUi> {
-    ui_enabled().then(ProgressUi::new)
+    ui_enabled().then(|| ProgressUi::new(5))
 }
 
 impl ProgressUi {
-    pub(crate) fn new() -> Self {
-        let cols = console::Term::stderr().size_checked().map(|(_, c)| c);
-        Self::with_target(ProgressDrawTarget::stderr(), bar_width_for(cols), true)
+    /// `parallel` (`-P`) sizes the fixed lane grid via [`lane_count`],
+    /// reserving 2 rows below it for the TOTAL bar plus a margin row.
+    pub(crate) fn new(parallel: usize) -> Self {
+        let (rows, cols) = Self::term_size();
+        Self::with_target(
+            ProgressDrawTarget::stderr(),
+            bar_width_for(cols),
+            true,
+            parallel,
+            rows,
+        )
     }
 
-    /// Spinner-task-only mode: no persistent overall bar. Used by
-    /// [`worker_ui`] for standalone commands, which print their own stdout
-    /// lines between dispatch calls -- see [`UiInner::overall`]'s doc for
-    /// why a persistent bar is unsafe there.
-    pub(crate) fn new_tasks_only() -> Self {
-        let cols = console::Term::stderr().size_checked().map(|(_, c)| c);
-        Self::with_target(ProgressDrawTarget::stderr(), bar_width_for(cols), false)
+    /// Spinner-task-only mode: no persistent overall bar, so only 1 row is
+    /// reserved below the grid (a margin row; there's no TOTAL bar to
+    /// reserve for). Used by [`worker_ui`] for standalone commands, which
+    /// print their own stdout lines between dispatch calls -- see
+    /// [`UiInner::overall`]'s doc for why a persistent bar is unsafe there.
+    pub(crate) fn new_tasks_only(parallel: usize) -> Self {
+        let (rows, cols) = Self::term_size();
+        Self::with_target(
+            ProgressDrawTarget::stderr(),
+            bar_width_for(cols),
+            false,
+            parallel,
+            rows,
+        )
     }
 
-    /// Hidden draw target for unit tests: full accounting, no rendering.
+    fn term_size() -> (Option<u16>, Option<u16>) {
+        match console::Term::stderr().size_checked() {
+            Some((rows, cols)) => (Some(rows), Some(cols)),
+            None => (None, None),
+        }
+    }
+
+    /// Hidden draw target for unit tests: full accounting, no rendering,
+    /// undetectable terminal size (`lane_count`'s [`FALLBACK_LANES`] path).
     #[cfg(test)]
-    pub(crate) fn hidden() -> Self {
-        Self::with_target(ProgressDrawTarget::hidden(), bar_width_for(None), true)
+    pub(crate) fn hidden(parallel: usize) -> Self {
+        Self::with_target(
+            ProgressDrawTarget::hidden(),
+            bar_width_for(None),
+            true,
+            parallel,
+            None,
+        )
     }
 
     /// Like [`Self::hidden`], but tasks-only (no overall bar) -- for tests
     /// exercising [`worker_ui`]'s mode specifically.
     #[cfg(test)]
-    pub(crate) fn hidden_tasks_only() -> Self {
-        Self::with_target(ProgressDrawTarget::hidden(), bar_width_for(None), false)
+    pub(crate) fn hidden_tasks_only(parallel: usize) -> Self {
+        Self::with_target(
+            ProgressDrawTarget::hidden(),
+            bar_width_for(None),
+            false,
+            parallel,
+            None,
+        )
     }
 
-    fn with_target(target: ProgressDrawTarget, bar_width: usize, with_overall: bool) -> Self {
+    /// Builds the fixed lane grid (all lanes in idle style, top to bottom)
+    /// and, in bar mode, the TOTAL bar below it -- lanes are added to `mp`
+    /// before TOTAL, so TOTAL stays naturally pinned at the bottom without
+    /// ever needing `insert_before`. No bar is added, removed, or
+    /// reinserted into `mp` after this point for the life of the `ProgressUi`.
+    fn with_target(
+        target: ProgressDrawTarget,
+        bar_width: usize,
+        with_overall: bool,
+        parallel: usize,
+        term_rows: Option<u16>,
+    ) -> Self {
+        // Transfer mode reserves 2 rows below the grid (TOTAL + a margin
+        // row); tasks-only mode reserves 1 (the margin row alone).
+        let reserved = if with_overall { 2 } else { 1 };
+        let lane_n = lane_count(parallel, term_rows, reserved);
         let mp = MultiProgress::with_draw_target(target);
+        let lanes: Vec<ProgressBar> = (0..lane_n)
+            .map(|_| {
+                let pb = mp.add(ProgressBar::new(0));
+                if let Some(style) = idle_style() {
+                    pb.set_style(style);
+                }
+                pb.set_message(IDLE_MESSAGE);
+                pb
+            })
+            .collect();
         let overall = with_overall.then(|| {
             let overall = mp.add(ProgressBar::new(0));
             if let Ok(style) = ProgressStyle::with_template(&format!(
@@ -274,15 +386,19 @@ impl ProgressUi {
             overall.set_message("0/0 objects");
             overall
         });
+        // Claim order is low-to-high (see `UiState::free`'s doc): initialize
+        // high-to-low so the first `pop()` returns lane 0.
+        let free = (0..lane_n).rev().collect();
         Self {
             inner: Arc::new(UiInner {
                 mp,
+                lanes,
                 overall,
                 bar_width,
                 state: Mutex::new(UiState {
                     objects_total: 0,
                     objects_done: 0,
-                    active_bars: 0,
+                    free,
                 }),
             }),
         }
@@ -303,23 +419,39 @@ impl ProgressUi {
         self.refresh_msg(&state);
     }
 
-    /// Inserts `pb` into the multi-bar stack: above the overall bar (so the
-    /// overall bar stays pinned at the bottom) in bar mode, or just appended
-    /// in tasks-only mode (there's no overall bar to stay pinned above).
-    fn insert_bar(&self, pb: ProgressBar) -> ProgressBar {
-        match &self.inner.overall {
-            Some(overall) => self.inner.mp.insert_before(overall, pb),
-            None => self.inner.mp.add(pb),
-        }
+    /// Claims a free lane index for exclusive use by a new `unit`/`task`
+    /// handle; `None` when the whole grid is busy (the caller's handle goes
+    /// silent -- no bar, but ticks still advance the overall bar -- rather
+    /// than growing the grid, which stays fixed for the life of this
+    /// `ProgressUi`).
+    fn claim_lane(&self) -> Option<usize> {
+        self.lock_state().free.pop()
     }
 
-    /// One in-flight transfer unit. If all detail slots are busy the handle
-    /// is silent: no bar, but its ticks still advance the overall bar.
+    /// Restyles lane `idx` back to its idle row (disabling any steady tick
+    /// left over from a spinner claim) and returns it to the free list.
+    /// Shared by `UnitHandle::finish` and `UnitInner`'s `Drop` -- the only
+    /// two release paths.
+    fn release_lane(&self, idx: usize) {
+        let pb = &self.inner.lanes[idx];
+        pb.disable_steady_tick();
+        if let Some(style) = idle_style() {
+            pb.set_style(style);
+        }
+        pb.set_length(0);
+        pb.set_position(0);
+        pb.set_message(IDLE_MESSAGE);
+        self.lock_state().free.push(idx);
+    }
+
+    /// One in-flight transfer unit. If every lane is claimed the handle is
+    /// silent: no bar, but its ticks still advance the overall bar.
     pub(crate) fn unit(&self, label: TransferLabel, len: u64) -> UnitHandle {
-        let mut state = self.lock_state();
-        let bar = if state.active_bars < MAX_DETAIL_BARS {
-            state.active_bars += 1;
-            let pb = self.insert_bar(ProgressBar::new(len));
+        let lane = self.claim_lane();
+        if let Some(idx) = lane {
+            let pb = &self.inner.lanes[idx];
+            pb.set_length(len);
+            pb.set_position(0);
             let bar_width = self.inner.bar_width;
             if let Ok(style) = ProgressStyle::with_template(&format!(
                 "{{msg}} [{{bar:{bar_width}.white/240}}] {{bytes_pair}} {{binary_bytes_per_sec}}",
@@ -336,14 +468,11 @@ impl ProgressUi {
             let padding = LABEL_WIDTH.saturating_sub(rendered.chars().count());
             rendered.extend(std::iter::repeat_n(' ', padding));
             pb.set_message(rendered);
-            Some(pb)
-        } else {
-            None
-        };
+        }
         UnitHandle {
             inner: Some(Arc::new(UnitInner {
                 ui: self.clone(),
-                bar,
+                lane,
                 len,
                 state: Mutex::new(UnitProgress {
                     pos: 0,
@@ -354,15 +483,14 @@ impl ProgressUi {
     }
 
     /// One in-flight byte-less S3 operation (HEAD, create/complete/abort
-    /// multipart, list, delete...): a spinner line sharing the same
-    /// cap-10 slot pool as [`unit`](Self::unit), contributing zero bytes
-    /// to the overall bar. Silent handle when slots are exhausted, same
-    /// as `unit`.
+    /// multipart, list, delete...): a spinner line sharing the same fixed
+    /// lane grid as [`unit`](Self::unit), contributing zero bytes to the
+    /// overall bar. Silent handle when every lane is claimed, same as
+    /// `unit`.
     pub(crate) fn task(&self, label: TransferLabel, api: &'static str) -> UnitHandle {
-        let mut state = self.lock_state();
-        let bar = if state.active_bars < MAX_DETAIL_BARS {
-            state.active_bars += 1;
-            let pb = self.insert_bar(ProgressBar::new_spinner());
+        let lane = self.claim_lane();
+        if let Some(idx) = lane {
+            let pb = &self.inner.lanes[idx];
             if let Ok(style) = ProgressStyle::with_template(&format!("{{msg}} {{spinner}} {api}")) {
                 pb.set_style(style);
             }
@@ -373,14 +501,11 @@ impl ProgressUi {
             let padding = LABEL_WIDTH.saturating_sub(rendered.chars().count());
             rendered.extend(std::iter::repeat_n(' ', padding));
             pb.set_message(rendered);
-            Some(pb)
-        } else {
-            None
-        };
+        }
         UnitHandle {
             inner: Some(Arc::new(UnitInner {
                 ui: self.clone(),
-                bar,
+                lane,
                 len: 0,
                 state: Mutex::new(UnitProgress {
                     pos: 0,
@@ -445,18 +570,17 @@ impl ProgressUi {
             .unwrap_or(0)
     }
 
+    /// Occupied lanes -- `lane_total() - free lanes`.
     #[allow(dead_code)]
     pub(crate) fn active_detail_bars(&self) -> usize {
-        self.lock_state().active_bars
+        self.inner.lanes.len() - self.lock_state().free.len()
     }
 
-    fn release_slot(&self, bar: &Option<ProgressBar>) {
-        if let Some(pb) = bar {
-            pb.finish_and_clear();
-            self.inner.mp.remove(pb);
-            let mut state = self.lock_state();
-            state.active_bars = state.active_bars.saturating_sub(1);
-        }
+    /// Fixed grid size, decided once at construction and never grown or
+    /// shrunk for the life of this `ProgressUi`.
+    #[allow(dead_code)]
+    pub(crate) fn lane_total(&self) -> usize {
+        self.inner.lanes.len()
     }
 }
 
@@ -467,9 +591,17 @@ struct UnitProgress {
 
 struct UnitInner {
     ui: ProgressUi,
-    bar: Option<ProgressBar>,
+    // Which lane this unit claimed, if any (`None` when the grid was full
+    // at claim time -- a silent handle, per `unit`/`task`'s docs).
+    lane: Option<usize>,
     len: u64,
     state: Mutex<UnitProgress>,
+}
+
+impl UnitInner {
+    fn bar(&self) -> Option<&ProgressBar> {
+        self.lane.map(|idx| &self.ui.inner.lanes[idx])
+    }
 }
 
 /// Cheap-clone handle for one transfer unit; safe to tick from concurrent
@@ -496,7 +628,7 @@ impl UnitHandle {
             return;
         }
         state.pos += n;
-        if let Some(bar) = &inner.bar {
+        if let Some(bar) = inner.bar() {
             bar.inc(n);
         }
         if let Some(overall) = &inner.ui.inner.overall {
@@ -513,7 +645,7 @@ impl UnitHandle {
             return;
         }
         let pos = std::mem::take(&mut state.pos);
-        if let Some(bar) = &inner.bar {
+        if let Some(bar) = inner.bar() {
             bar.set_position(0);
         }
         if let Some(overall) = &inner.ui.inner.overall {
@@ -521,8 +653,8 @@ impl UnitHandle {
         }
     }
 
-    /// Snap to 100% (top up any rounding shortfall exactly once), remove
-    /// the bar, free the slot. Idempotent.
+    /// Snap to 100% (top up any rounding shortfall exactly once), revert the
+    /// lane to its idle row, free it for reuse. Idempotent.
     pub(crate) fn finish(&self) {
         let Some(inner) = &self.inner else { return };
         let mut state = inner.state.lock().expect("UnitHandle state poisoned");
@@ -536,17 +668,19 @@ impl UnitHandle {
         if let Some(overall) = &inner.ui.inner.overall {
             overall.inc(shortfall);
         }
-        inner.ui.release_slot(&inner.bar);
+        if let Some(idx) = inner.lane {
+            inner.ui.release_lane(idx);
+        }
     }
 }
 
 impl Drop for UnitInner {
-    /// A dropped-unfinished unit (failed part) frees its slot but must not
+    /// A dropped-unfinished unit (failed part) frees its lane but must not
     /// fake completion by topping up bytes.
     fn drop(&mut self) {
         let finished = self.state.lock().map(|s| s.finished).unwrap_or(true);
-        if !finished {
-            self.ui.release_slot(&self.bar);
+        if !finished && let Some(idx) = self.lane {
+            self.ui.release_lane(idx);
         }
     }
 }
@@ -616,8 +750,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lane_count_is_p_capped_by_console_rows() {
+        assert_eq!(lane_count(5, Some(40), 2), 5, "plenty of rows -> P lanes");
+        assert_eq!(lane_count(32, Some(12), 2), 10, "capped by usable rows");
+        assert_eq!(
+            lane_count(32, None, 2),
+            22,
+            "undetectable -> classic-terminal fallback"
+        );
+        assert_eq!(lane_count(1, Some(40), 2), 1);
+        assert_eq!(
+            lane_count(8, Some(3), 2),
+            1,
+            "degenerate terminal still >= 1"
+        );
+    }
+
+    #[test]
+    fn grid_is_stable_and_lanes_recycle() {
+        let ui = ProgressUi::hidden(3);
+        assert_eq!(ui.lane_total(), 3);
+        assert_eq!(ui.active_detail_bars(), 0, "all idle at start");
+        let a = ui.unit(lbl(Verb::Uploading, "a", None), 10);
+        let t = ui.task(lbl(Verb::Listing, "b", None), "ListObjectsV2");
+        assert_eq!(ui.active_detail_bars(), 2);
+        assert_eq!(ui.lane_total(), 3, "grid never grows");
+        let c = ui.unit(lbl(Verb::Uploading, "c", None), 10);
+        let overflow = ui.unit(lbl(Verb::Uploading, "d", None), 10);
+        assert_eq!(ui.active_detail_bars(), 3, "4th is silent overflow");
+        overflow.inc(7);
+        a.finish();
+        assert_eq!(ui.active_detail_bars(), 2, "lane freed");
+        let e = ui.unit(lbl(Verb::Uploading, "e", None), 10);
+        assert_eq!(ui.active_detail_bars(), 3, "freed lane reclaimed");
+        assert_eq!(ui.lane_total(), 3, "grid never shrinks");
+        drop((t, c, e));
+        assert_eq!(ui.active_detail_bars(), 0, "drops release lanes");
+    }
+
+    #[test]
     fn eleventh_concurrent_unit_is_silent_but_still_counts() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(10);
         ui.add_object(11 * 100);
         let handles: Vec<UnitHandle> = (0..11)
             .map(|i| ui.unit(lbl(Verb::Uploading, &format!("u{i}"), None), 100))
@@ -630,7 +803,7 @@ mod tests {
 
     #[test]
     fn finish_frees_slot_for_next_unit() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(10);
         let handles: Vec<UnitHandle> = (0..10)
             .map(|i| ui.unit(lbl(Verb::Uploading, &format!("u{i}"), None), 10))
             .collect();
@@ -643,7 +816,7 @@ mod tests {
 
     #[test]
     fn finish_tops_up_to_len_exactly_once() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(100);
         let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
         h.inc(30);
@@ -655,7 +828,7 @@ mod tests {
 
     #[test]
     fn rewind_subtracts_progress_for_retry() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(100);
         let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
         h.inc(40);
@@ -669,7 +842,7 @@ mod tests {
 
     #[test]
     fn drop_without_finish_frees_slot_but_does_not_top_up() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(100);
         let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
         h.inc(30);
@@ -689,7 +862,7 @@ mod tests {
 
     #[test]
     fn add_object_grows_length_and_object_counts() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(50);
         ui.add_object(70);
         assert_eq!(ui.overall_length(), 120);
@@ -704,7 +877,7 @@ mod tests {
         use aws_smithy_types::body::SdkBody;
         use aws_smithy_types::byte_stream::ByteStream;
 
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(10);
         let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 10);
         let body = ByteStream::new(SdkBody::from("0123456789"));
@@ -719,7 +892,7 @@ mod tests {
         use aws_smithy_types::body::SdkBody;
         use aws_smithy_types::byte_stream::ByteStream;
 
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(10);
         let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 10);
         let retryable = SdkBody::retryable(|| SdkBody::from("0123456789"));
@@ -765,7 +938,7 @@ mod tests {
         file.write_all(b"0123456789abcdef").expect("write");
         file.flush().expect("flush");
 
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(10);
         let unit = ui.unit(lbl(Verb::Uploading, "part", None), 10);
         let body = ByteStream::read_from()
@@ -797,7 +970,7 @@ mod tests {
         use aws_smithy_types::body::SdkBody;
         use aws_smithy_types::byte_stream::ByteStream;
 
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(3);
         let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 3);
         let body = ByteStream::new(SdkBody::from("abc"));
@@ -909,7 +1082,7 @@ mod tests {
 
     #[test]
     fn task_lines_share_the_slot_pool_and_add_no_bytes() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(10);
         ui.add_object(100);
         let bars: Vec<UnitHandle> = (0..9)
             .map(|i| ui.unit(lbl(Verb::Uploading, "x", Some((i + 1, 9))), 10))
@@ -930,7 +1103,7 @@ mod tests {
 
     #[test]
     fn concurrent_rewind_does_not_lose_other_unit_progress() {
-        let ui = ProgressUi::hidden();
+        let ui = ProgressUi::hidden(5);
         ui.add_object(100);
         let h_a = ui.unit(lbl(Verb::Uploading, "a", None), 50);
         let h_b = ui.unit(lbl(Verb::Uploading, "b", None), 50);
@@ -961,14 +1134,14 @@ mod tests {
 
     #[test]
     fn tasks_only_mode_has_no_overall_position_or_length() {
-        let ui = ProgressUi::hidden_tasks_only();
+        let ui = ProgressUi::hidden_tasks_only(5);
         assert_eq!(ui.overall_position(), 0, "no overall bar: reads as 0");
         assert_eq!(ui.overall_length(), 0, "no overall bar: reads as 0");
     }
 
     #[test]
     fn tasks_only_mode_task_line_accounts_slots_but_not_bytes() {
-        let ui = ProgressUi::hidden_tasks_only();
+        let ui = ProgressUi::hidden_tasks_only(5);
         assert_eq!(ui.active_detail_bars(), 0);
         let t = ui.task(lbl(Verb::Listing, "bucket/p", None), "ListObjectsV2");
         assert_eq!(ui.active_detail_bars(), 1, "task line takes a slot");
@@ -983,7 +1156,7 @@ mod tests {
 
     #[test]
     fn tasks_only_mode_caps_at_ten_task_lines_like_bar_mode() {
-        let ui = ProgressUi::hidden_tasks_only();
+        let ui = ProgressUi::hidden_tasks_only(10);
         let tasks: Vec<UnitHandle> = (0..10)
             .map(|i| ui.task(lbl(Verb::Listing, &format!("b/{i}"), None), "ListObjectsV2"))
             .collect();
@@ -1004,7 +1177,7 @@ mod tests {
         // these), but `add_object`/`object_done`/`finish_and_keep` must
         // still degrade gracefully rather than unwrap a `None` overall bar,
         // in case a future caller reuses a tasks-only `ProgressUi` this way.
-        let ui = ProgressUi::hidden_tasks_only();
+        let ui = ProgressUi::hidden_tasks_only(5);
         ui.add_object(100);
         ui.add_object(50);
         ui.object_done();
@@ -1019,7 +1192,7 @@ mod tests {
         // `unit()` isn't used by any tasks-only-mode caller today (standalone
         // commands only ever call `task()` via `dispatch`), but the no-overall
         // guard in `UnitHandle::inc`/`rewind`/`finish` must hold for it too.
-        let ui = ProgressUi::hidden_tasks_only();
+        let ui = ProgressUi::hidden_tasks_only(5);
         let h = ui.unit(lbl(Verb::Downloading, "b/k", None), 10);
         h.inc(4);
         h.rewind();
