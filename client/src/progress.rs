@@ -284,15 +284,21 @@ impl http_body::Body for ProgressBody {
 }
 
 /// Wraps an upload body so every chunk sent ticks `unit`. Applied through
-/// `SdkBody::map`, which re-applies on each retry attempt's clone -- the
-/// closure rewinds first so a retried part never double-counts. No-op for
-/// noop handles (progress disabled).
+/// `SdkBody::map_preserve_contents` -- not plain `map` -- since this wrapper
+/// only observes byte counts and never alters the data: `map` would drop
+/// `bytes_contents`, which flips `body.bytes()` from `Some` to `None` and
+/// silently downgrades SigV4 signing from a signed payload to
+/// `UNSIGNED-PAYLOAD` for any in-memory body (aws-runtime's sigv4 only
+/// selects `SignableBody::Bytes` when `bytes()` is `Some`).
+/// `map_preserve_contents` re-applies on each retry attempt's clone just
+/// like `map` does -- the closure rewinds first so a retried part never
+/// double-counts. No-op for noop handles (progress disabled).
 pub(crate) fn instrument_body(body: ByteStream, unit: &UnitHandle) -> ByteStream {
     if unit.is_noop() {
         return body;
     }
     let unit = unit.clone();
-    ByteStream::new(body.into_inner().map(move |inner| {
+    ByteStream::new(body.into_inner().map_preserve_contents(move |inner| {
         unit.rewind();
         SdkBody::from_body_1_x(ProgressBody {
             inner,
@@ -440,6 +446,59 @@ mod tests {
         let wrapped = instrument_body(body, &UnitHandle::noop());
         let data = wrapped.collect().await.expect("collect").into_bytes();
         assert_eq!(&data[..], b"abc");
+    }
+
+    #[tokio::test]
+    async fn instrument_body_preserves_content_length_and_retryability_for_file_body() {
+        use aws_smithy_types::byte_stream::{ByteStream, Length};
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        file.write_all(b"0123456789abcdef").expect("write");
+        file.flush().expect("flush");
+
+        let ui = ProgressUi::hidden();
+        ui.add_object(10);
+        let unit = ui.unit("part".into(), 10);
+        let body = ByteStream::read_from()
+            .path(file.path())
+            .offset(2)
+            .length(Length::Exact(10))
+            .build()
+            .await
+            .expect("build file body");
+        let wrapped = instrument_body(body, &unit).into_inner();
+        // Content-Length must survive wrapping -- put_object/upload_part
+        // only set the header when this is `Some`.
+        assert_eq!(wrapped.content_length(), Some(10));
+        // Retryability must survive wrapping too, or a failed part could
+        // never be retried by the SDK's orchestrator.
+        assert!(
+            wrapped.try_clone().is_some(),
+            "file-backed body must remain retryable after instrument_body"
+        );
+    }
+
+    #[tokio::test]
+    async fn instrument_body_preserves_bytes_contents_for_in_memory_body() {
+        // Pins Finding 1: `instrument_body` must use
+        // `SdkBody::map_preserve_contents`, not plain `map` -- `map` drops
+        // `bytes_contents`, flipping `body.bytes()` from `Some` to `None`
+        // and silently downgrading SigV4 signing from a signed payload to
+        // `UNSIGNED-PAYLOAD` for in-memory bodies.
+        use aws_smithy_types::body::SdkBody;
+        use aws_smithy_types::byte_stream::ByteStream;
+
+        let ui = ProgressUi::hidden();
+        ui.add_object(3);
+        let unit = ui.unit("mem".into(), 3);
+        let body = ByteStream::new(SdkBody::from("abc"));
+        let wrapped = instrument_body(body, &unit).into_inner();
+        assert!(
+            wrapped.bytes().is_some(),
+            "wrapping must not drop bytes_contents (would downgrade SigV4 to UNSIGNED-PAYLOAD)"
+        );
+        assert_eq!(wrapped.bytes(), Some(b"abc".as_slice()));
     }
 
     #[test]
