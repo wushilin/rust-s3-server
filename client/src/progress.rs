@@ -214,8 +214,7 @@ impl UnitHandle {
         if let Some(bar) = &inner.bar {
             bar.set_position(0);
         }
-        let overall = &inner.ui.inner.overall;
-        overall.set_position(overall.position().saturating_sub(pos));
+        inner.ui.inner.overall.dec(pos);
     }
 
     /// Snap to 100% (top up any rounding shortfall exactly once), remove
@@ -328,5 +327,27 @@ mod tests {
         ui.object_done();
         ui.object_done(); // mirror delete events: done may pass adds
         // must not panic; display clamps total >= done internally
+    }
+
+    #[test]
+    fn concurrent_rewind_does_not_lose_other_unit_progress() {
+        let ui = ProgressUi::hidden();
+        ui.add_object(100);
+        let h_a = ui.unit("a".into(), 50);
+        let h_b = ui.unit("b".into(), 50);
+        // Unit A increments by 40
+        h_a.inc(40);
+        assert_eq!(ui.overall_position(), 40);
+        // Unit B increments by 25 (A's 40 + B's 25 = 65 total)
+        h_b.inc(25);
+        assert_eq!(ui.overall_position(), 65);
+        // Unit A rewinds (atomic dec, not racy read-modify-write)
+        h_a.rewind();
+        // Only B's 25 should remain; A's 40 is atomically subtracted
+        assert_eq!(
+            ui.overall_position(),
+            25,
+            "rewind must atomically subtract without losing concurrent increments"
+        );
     }
 }
