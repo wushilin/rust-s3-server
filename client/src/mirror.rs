@@ -246,6 +246,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     )?;
     let part_size = crate::urls::parse_size(&args.part_size)?;
     let parallel = args.parallel.max(1);
+    let stream_budget = crate::budget::StreamBudget::new(args.parallel);
     let dry_run = args.dry_run || args.fake;
     let attrs = match args.attr.as_deref() {
         Some(spec) => crate::attr::parse_attrs(spec)?,
@@ -370,6 +371,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         let target = &target;
         let session = &session;
         let attrs = &attrs;
+        let stream_budget = &stream_budget;
         async move {
             let result = copy_entry(
                 source,
@@ -380,6 +382,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 parallel,
                 attrs,
                 args.preserve,
+                stream_budget,
                 session.ui(),
             )
             .await;
@@ -549,6 +552,7 @@ async fn copy_entry(
     parallel: usize,
     attrs: &BTreeMap<String, String>,
     preserve: bool,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<(String, String)> {
     match (source, target) {
@@ -573,6 +577,7 @@ async fn copy_entry(
                 attrs,
                 false,
                 preserve,
+                budget,
                 progress,
             )
             .await?;
@@ -591,7 +596,7 @@ async fn copy_entry(
             let key = s3_key(prefix, &entry.rel);
             let output = dst_root.join(&entry.rel);
             crate::transfer::download_key_to_path(
-                client, bucket, &key, &output, part_size, parallel, preserve, progress,
+                client, bucket, &key, &output, part_size, parallel, preserve, budget, progress,
             )
             .await?;
             Ok((
@@ -633,6 +638,7 @@ async fn copy_entry(
                 disable_multipart,
                 parallel,
                 preserve,
+                budget,
                 progress,
             )
             .await?;

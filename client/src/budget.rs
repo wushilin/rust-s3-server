@@ -12,20 +12,17 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct StreamBudget {
     sem: Arc<Semaphore>,
 }
 
 impl StreamBudget {
-    #[allow(dead_code)]
     pub(crate) fn new(permits: usize) -> Self {
         Self {
             sem: Arc::new(Semaphore::new(permits.max(1))),
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn acquire(&self) -> StreamPermit {
         StreamPermit {
             _permit: self
@@ -39,7 +36,6 @@ impl StreamBudget {
 }
 
 /// RAII token: the stream slot is returned when this drops.
-#[allow(dead_code)]
 pub(crate) struct StreamPermit {
     _permit: OwnedSemaphorePermit,
 }

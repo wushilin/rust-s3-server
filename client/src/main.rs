@@ -301,7 +301,7 @@ struct RbArgs {
 
 #[derive(Args, Debug)]
 struct PutArgs {
-    #[arg(short = 'P', long, default_value_t = 4)]
+    #[arg(short = 'P', long, default_value_t = 5)]
     parallel: usize,
     #[arg(short = 's', long, default_value = "256MiB", help = "each part size")]
     part_size: String,
@@ -329,7 +329,7 @@ struct PutArgs {
 struct CpArgs {
     #[arg(short = 'r', long)]
     recursive: bool,
-    #[arg(short = 'P', long, default_value_t = 4)]
+    #[arg(short = 'P', long, default_value_t = 5)]
     parallel: usize,
     #[arg(short = 's', long, default_value = "256MiB", help = "each part size")]
     part_size: String,
@@ -355,7 +355,7 @@ struct CpArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct MirrorArgs {
-    #[arg(short = 'P', long, default_value_t = 4)]
+    #[arg(short = 'P', long, default_value_t = 5)]
     pub(crate) parallel: usize,
     #[arg(short = 's', long, default_value = "256MiB", help = "each part size")]
     pub(crate) part_size: String,
@@ -1177,6 +1177,7 @@ async fn put(args: PutArgs) -> Result<()> {
         None => BTreeMap::new(),
     };
     let session = TransferSession::new("put");
+    let stream_budget = crate::budget::StreamBudget::new(args.parallel);
     let outcome = upload_file(
         &args.source,
         &args.target,
@@ -1187,6 +1188,7 @@ async fn put(args: PutArgs) -> Result<()> {
         &metadata,
         args.if_not_exists,
         args.preserve,
+        &stream_budget,
         session.ui(),
     )
     .await?;
@@ -1262,6 +1264,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
     };
     let target = args.paths.last().unwrap().clone();
     let session = TransferSession::new(if is_mv { "mv" } else { "cp" });
+    let stream_budget = crate::budget::StreamBudget::new(args.parallel);
     let mut used_session = false;
     for source in &args.paths[..args.paths.len() - 1] {
         if is_s3_url(source) && is_s3_url(&target) {
@@ -1274,6 +1277,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                     part_size,
                     args.disable_multipart,
                     args.parallel,
+                    &stream_budget,
                     &session,
                     args.older_than.as_deref(),
                     args.newer_than.as_deref(),
@@ -1316,6 +1320,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         Some(PathBuf::from(&target)),
                         part_size,
                         args.parallel,
+                        &stream_budget,
                         &session,
                         args.preserve,
                     )
@@ -1366,6 +1371,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         &attrs,
                         false,
                         args.preserve,
+                        &stream_budget,
                         session.ui(),
                     )
                     .await?;
@@ -1481,6 +1487,7 @@ async fn copy_s3_object_to_s3(
     part_size: u64,
     disable_multipart: bool,
     parallel: usize,
+    budget: &crate::budget::StreamBudget,
     session: &TransferSession,
     older_than: Option<&str>,
     newer_than: Option<&str>,
@@ -1544,6 +1551,7 @@ async fn copy_s3_object_to_s3(
         disable_multipart,
         parallel,
         preserve,
+        budget,
         session.ui(),
     )
     .await?;
@@ -1683,12 +1691,17 @@ async fn get(args: GetArgs) -> Result<()> {
     }
     let session = TransferSession::new("get");
     // GetArgs has no `--preserve` flag ([SEM] §2 lists it on cp/mirror/put
-    // only), so `get` never preserves filesystem attributes.
+    // only), so `get` never preserves filesystem attributes. It also has no
+    // `-P` flag; the local worker count below (`4`) is unchanged by the `-P`
+    // default bump, and the budget is sized to match it 1:1 since `get`
+    // transfers a single object.
+    let stream_budget = crate::budget::StreamBudget::new(4);
     download_object(
         &args.source,
         args.target,
         DEFAULT_PART_SIZE,
         4,
+        &stream_budget,
         &session,
         false,
     )

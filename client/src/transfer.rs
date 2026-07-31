@@ -136,6 +136,7 @@ pub(crate) async fn upload_file(
     metadata: &BTreeMap<String, String>,
     if_not_exists: bool,
     preserve: bool,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<UploadOutcome> {
     #[cfg(not(unix))]
@@ -174,6 +175,7 @@ pub(crate) async fn upload_file(
     let metadata = &metadata;
     let (client, _) = client_for_alias(&parsed.alias).await?;
     if disable_multipart || file_meta.len() <= part_size {
+        let _permit = budget.acquire().await;
         let unit = match progress {
             Some(ui) => ui.unit(source_name.to_string(), file_meta.len()),
             None => crate::progress::UnitHandle::noop(),
@@ -201,6 +203,7 @@ pub(crate) async fn upload_file(
             storage_class,
             metadata,
             if_not_exists,
+            budget,
             progress,
         )
         .await?;
@@ -223,6 +226,7 @@ pub(crate) async fn multipart_upload(
     storage_class: Option<&str>,
     metadata: &BTreeMap<String, String>,
     if_not_exists: bool,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
@@ -241,6 +245,7 @@ pub(crate) async fn multipart_upload(
     let part_count = total_size.div_ceil(part_size);
     let part_numbers = 1..=part_count;
     let progress = progress.cloned();
+    let budget = budget.clone();
     let file_label = source
         .file_name()
         .and_then(|s| s.to_str())
@@ -253,8 +258,10 @@ pub(crate) async fn multipart_upload(
         let key = key.to_string();
         let upload_id = upload_id.clone();
         let progress = progress.clone();
+        let budget = budget.clone();
         let file_label = file_label.clone();
         async move {
+            let _permit = budget.acquire().await;
             let offset = (part_index - 1) * part_size;
             let len = (total_size - offset).min(part_size);
             let unit = match &progress {
@@ -538,6 +545,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     total_size: u64,
     part_size: u64,
     parallel: usize,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
@@ -555,6 +563,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
         .to_string();
     let part_count = total_size.div_ceil(part_size);
     let progress = progress.cloned();
+    let budget = budget.clone();
     let label = source_key
         .rsplit('/')
         .next()
@@ -569,8 +578,10 @@ pub(crate) async fn multipart_copy_s3_to_s3(
         let target_key = target_key.to_string();
         let upload_id = upload_id.clone();
         let progress = progress.clone();
+        let budget = budget.clone();
         let label = label.clone();
         async move {
+            let _permit = budget.acquire().await;
             let start = (part_index - 1) * part_size;
             let end = (total_size - 1).min(start + part_size - 1);
             let range = format!("bytes={start}-{end}");
@@ -660,6 +671,7 @@ pub(crate) async fn transfer_object_between_s3(
     disable_multipart: bool,
     parallel: usize,
     preserve: bool,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     if let Some(ui) = progress {
@@ -672,6 +684,7 @@ pub(crate) async fn transfer_object_between_s3(
         // target -- nothing extra to do here for `--preserve` ([SEM] §2).
         let single_limit = part_size.min(MAX_SINGLE_COPY);
         if disable_multipart || size <= single_limit {
+            let _permit = budget.acquire().await;
             let unit = match progress {
                 Some(ui) => ui.unit(
                     source_key
@@ -701,6 +714,7 @@ pub(crate) async fn transfer_object_between_s3(
                 size,
                 part_size,
                 parallel,
+                budget,
                 progress,
             )
             .await?;
@@ -722,6 +736,9 @@ pub(crate) async fn transfer_object_between_s3(
         eprintln!("rs3: falling back to streaming copy");
     }
     if disable_multipart || size <= part_size {
+        // One pipeline (GET streamed straight into the PUT body) = one
+        // permit, held across both calls -- not two acquisitions.
+        let _permit = budget.acquire().await;
         let unit = match progress {
             Some(ui) => ui.unit(
                 source_key
@@ -760,6 +777,7 @@ pub(crate) async fn transfer_object_between_s3(
             size,
             part_size,
             parallel,
+            budget,
             progress,
         )
         .await?;
@@ -777,6 +795,7 @@ async fn multipart_server_side_copy(
     total_size: u64,
     part_size: u64,
     parallel: usize,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
@@ -820,6 +839,7 @@ async fn multipart_server_side_copy(
     let copy_source = encode_copy_source(source_bucket, source_key);
     let part_count = total_size.div_ceil(part_size);
     let progress = progress.cloned();
+    let budget = budget.clone();
     let label = source_key
         .rsplit('/')
         .next()
@@ -832,8 +852,10 @@ async fn multipart_server_side_copy(
         let target_key = target_key.to_string();
         let upload_id = upload_id.clone();
         let progress = progress.clone();
+        let budget = budget.clone();
         let label = label.clone();
         async move {
+            let _permit = budget.acquire().await;
             let start = (part_index - 1) * part_size;
             let end = (total_size - 1).min(start + part_size - 1);
             let unit = match &progress {
@@ -966,6 +988,7 @@ mod tests {
             false,
             1,
             true,
+            &crate::budget::StreamBudget::new(1),
             None,
         ));
         assert!(
@@ -991,6 +1014,7 @@ pub(crate) async fn download_key_to_path(
     part_size: u64,
     parallel: usize,
     preserve: bool,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<u64> {
     #[cfg(not(unix))]
@@ -1019,7 +1043,7 @@ pub(crate) async fn download_key_to_path(
         output.with_file_name(name)
     };
     let result = download_to_temp(
-        client, bucket, key, &tmp, size, part_size, parallel, progress,
+        client, bucket, key, &tmp, size, part_size, parallel, budget, progress,
     )
     .await;
     match result {
@@ -1058,10 +1082,12 @@ async fn download_to_temp(
     size: u64,
     part_size: u64,
     parallel: usize,
+    budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     let label = key.rsplit('/').next().unwrap_or(key).to_string();
     if size <= part_size {
+        let _permit = budget.acquire().await;
         let unit = match progress {
             Some(ui) => ui.unit(label.clone(), size),
             None => crate::progress::UnitHandle::noop(),
@@ -1088,14 +1114,17 @@ async fn download_to_temp(
     drop(file);
     let part_count = size.div_ceil(part_size);
     let progress = progress.cloned();
+    let budget = budget.clone();
     let downloads = stream::iter((0..part_count).map(|part_index| {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
         let tmp = tmp.to_path_buf();
         let progress = progress.clone();
+        let budget = budget.clone();
         let label = label.clone();
         async move {
+            let _permit = budget.acquire().await;
             let start = part_index * part_size;
             let end = (size - 1).min(start + part_size - 1);
             let expected = end - start + 1;
@@ -1150,6 +1179,7 @@ pub(crate) async fn download_object(
     target: Option<PathBuf>,
     part_size: u64,
     parallel: usize,
+    budget: &crate::budget::StreamBudget,
     session: &crate::messages::TransferSession,
     preserve: bool,
 ) -> Result<()> {
@@ -1174,6 +1204,7 @@ pub(crate) async fn download_object(
         part_size,
         parallel,
         preserve,
+        budget,
         session.ui(),
     )
     .await?;
