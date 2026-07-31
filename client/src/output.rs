@@ -6,9 +6,9 @@
 //! `McMessage`/`print_msg`/`JsonStyle`/`humanize_ibytes`/`print_date` are now
 //! consumed by `messages.rs` and its callers in `main.rs` (task 2).
 //! `OutputOpts::quiet` now drives the transfer commands' bar-vs-lines
-//! decision (task 3, `messages::TransferSession::new`). `no_color` is still
-//! unread -- `--no-color` semantics are a later tier-2 task -- so it keeps a
-//! narrowly-scoped `allow` until that task lands.
+//! decision (task 3, `messages::TransferSession::new`). `no_color` is read
+//! by `TransferSession::new` to disable the progress bar when `--no-color`
+//! is set (task 2).
 
 use std::sync::OnceLock;
 
@@ -17,7 +17,6 @@ use std::sync::OnceLock;
 pub(crate) struct OutputOpts {
     pub json: bool,
     pub quiet: bool,
-    #[allow(dead_code)]
     pub no_color: bool,
     pub stdout_tty: bool,
 }

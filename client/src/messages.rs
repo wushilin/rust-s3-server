@@ -11,7 +11,6 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 
 use crate::output::{JsonStyle, McMessage, humanize_ibytes, out, print_date, print_msg};
@@ -466,7 +465,7 @@ struct SessionState {
 /// futures instead of threading `&mut` through them (which `buffer_unordered`
 /// can't express). Noted in the task report.
 pub(crate) struct TransferSession {
-    bar: Option<ProgressBar>,
+    ui: Option<crate::progress::ProgressUi>,
     state: Mutex<SessionState>,
     started: Instant,
 }
@@ -476,23 +475,17 @@ impl TransferSession {
     /// is intentionally plain for now since no e2e test observes it (bar
     /// mode requires a real TTY, which the test harness never provides).
     pub(crate) fn new(_label: &str) -> Self {
-        let use_bar = out().stdout_tty && !out().quiet && !out().json;
-        let bar = if use_bar {
-            let pb = ProgressBar::new(0);
-            if let Ok(style) = ProgressStyle::with_template(
-                "{bar:40.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})",
-            ) {
-                pb.set_style(style);
-            }
-            Some(pb)
-        } else {
-            None
-        };
+        let use_bar = out().stdout_tty && !out().quiet && !out().json && !out().no_color;
         Self {
-            bar,
+            ui: use_bar.then(crate::progress::ProgressUi::new),
             state: Mutex::new(SessionState::default()),
             started: Instant::now(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ui(&self) -> Option<&crate::progress::ProgressUi> {
+        self.ui.as_ref()
     }
 
     /// Register `bytes` of additional planned transfer for one more object
@@ -502,9 +495,6 @@ impl TransferSession {
         let mut state = self.state.lock().expect("TransferSession state poisoned");
         state.total_count += 1;
         state.total_size += bytes;
-        if let Some(bar) = &self.bar {
-            bar.inc_length(bytes);
-        }
     }
 
     /// Current running totals, for filling in a `CopyMessage`/
@@ -524,8 +514,10 @@ impl TransferSession {
             state.transferred_count += 1;
             state.transferred_size += size;
         }
-        match &self.bar {
-            Some(bar) => bar.inc(size),
+        match &self.ui {
+            // bytes come exclusively from UnitHandle ticks — counting them here
+            // too would double-count (spec §2)
+            Some(ui) => ui.object_done(),
             None => print_msg(msg),
         }
     }
@@ -534,8 +526,8 @@ impl TransferSession {
     /// otherwise prints a final [`AccountStat`] summary line (mc prints
     /// this even in `--quiet` mode -- research doc §4 point 3).
     pub(crate) fn finish(&self) {
-        if let Some(bar) = &self.bar {
-            bar.finish_and_clear();
+        if let Some(ui) = &self.ui {
+            ui.finish_and_keep();
             return;
         }
         let state = self.state.lock().expect("TransferSession state poisoned");
@@ -894,7 +886,7 @@ mod tests {
         // binary); construct the same Lines-mode shape directly instead so
         // this test is independent of init/ordering.
         let session = TransferSession {
-            bar: None,
+            ui: None,
             state: Mutex::new(SessionState::default()),
             started: Instant::now(),
         };
@@ -962,5 +954,13 @@ mod tests {
         };
         assert!(upload.human().contains("Content-Type: image/png\n"));
         assert_eq!(upload.json()["contentType"], "image/png");
+    }
+
+    #[test]
+    fn session_has_no_ui_outside_tty() {
+        // out() falls back to non-TTY defaults in unit tests, so the bar UI
+        // must be off and the message/AccountStat path must be taken.
+        let session = TransferSession::new("cp");
+        assert!(session.ui().is_none());
     }
 }
