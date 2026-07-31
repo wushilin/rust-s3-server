@@ -1186,6 +1186,7 @@ async fn put(args: PutArgs) -> Result<()> {
         &metadata,
         args.if_not_exists,
         args.preserve,
+        session.ui(),
     )
     .await?;
     session.add_total(outcome.size);
@@ -1364,6 +1365,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         &attrs,
                         false,
                         args.preserve,
+                        session.ui(),
                     )
                     .await?;
                     session.add_total(outcome.size);

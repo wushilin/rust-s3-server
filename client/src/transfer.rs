@@ -136,6 +136,7 @@ pub(crate) async fn upload_file(
     metadata: &BTreeMap<String, String>,
     if_not_exists: bool,
     preserve: bool,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<UploadOutcome> {
     #[cfg(not(unix))]
     if preserve {
@@ -158,6 +159,9 @@ pub(crate) async fn upload_file(
     let file_meta = fs::metadata(source)
         .await
         .with_context(|| format!("stat {}", source.display()))?;
+    if let Some(ui) = progress {
+        ui.add_object(file_meta.len());
+    }
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut metadata = metadata.clone();
     #[cfg(unix)]
@@ -170,11 +174,12 @@ pub(crate) async fn upload_file(
     let metadata = &metadata;
     let (client, _) = client_for_alias(&parsed.alias).await?;
     if disable_multipart || file_meta.len() <= part_size {
-        let mut req = client
-            .put_object()
-            .bucket(&bucket)
-            .key(&key)
-            .body(ByteStream::from_path(source).await?);
+        let unit = match progress {
+            Some(ui) => ui.unit(source_name.to_string(), file_meta.len()),
+            None => crate::progress::UnitHandle::noop(),
+        };
+        let body = crate::progress::instrument_body(ByteStream::from_path(source).await?, &unit);
+        let mut req = client.put_object().bucket(&bucket).key(&key).body(body);
         if let Some(sc) = storage_class {
             req = req.storage_class(aws_sdk_s3::types::StorageClass::from(sc));
         }
@@ -183,6 +188,7 @@ pub(crate) async fn upload_file(
             req = req.if_none_match("*");
         }
         req.send().await?;
+        unit.finish();
     } else {
         multipart_upload(
             &client,
@@ -195,6 +201,7 @@ pub(crate) async fn upload_file(
             storage_class,
             metadata,
             if_not_exists,
+            progress,
         )
         .await?;
     }
@@ -216,6 +223,7 @@ pub(crate) async fn multipart_upload(
     storage_class: Option<&str>,
     metadata: &BTreeMap<String, String>,
     if_not_exists: bool,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
@@ -232,21 +240,36 @@ pub(crate) async fn multipart_upload(
         .to_string();
     let part_count = total_size.div_ceil(part_size);
     let part_numbers = 1..=part_count;
+    let progress = progress.cloned();
+    let file_label = source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload")
+        .to_string();
     let uploads = stream::iter(part_numbers.map(|part_index| {
         let client = client.clone();
         let source = source.to_path_buf();
         let bucket = bucket.to_string();
         let key = key.to_string();
         let upload_id = upload_id.clone();
+        let progress = progress.clone();
+        let file_label = file_label.clone();
         async move {
             let offset = (part_index - 1) * part_size;
             let len = (total_size - offset).min(part_size);
-            let body = ByteStream::read_from()
-                .path(source)
-                .offset(offset)
-                .length(Length::Exact(len))
-                .build()
-                .await?;
+            let unit = match &progress {
+                Some(ui) => ui.unit(format!("{file_label} part {part_index}/{part_count}"), len),
+                None => crate::progress::UnitHandle::noop(),
+            };
+            let body = crate::progress::instrument_body(
+                ByteStream::read_from()
+                    .path(source)
+                    .offset(offset)
+                    .length(Length::Exact(len))
+                    .build()
+                    .await?,
+                &unit,
+            );
             let part_number = part_index as i32;
             let resp = client
                 .upload_part()
@@ -257,6 +280,7 @@ pub(crate) async fn multipart_upload(
                 .body(body)
                 .send()
                 .await?;
+            unit.finish();
             Ok::<UploadedPart, anyhow::Error>(UploadedPart {
                 part_number,
                 etag: resp.e_tag().map(String::from),

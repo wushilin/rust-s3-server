@@ -7,6 +7,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::byte_stream::ByteStream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 #[allow(dead_code)]
@@ -245,6 +247,60 @@ impl Drop for UnitInner {
     }
 }
 
+pin_project_lite::pin_project! {
+    /// Ticks a [`UnitHandle`] as each data frame is polled off the wire.
+    struct ProgressBody {
+        #[pin]
+        inner: SdkBody,
+        unit: UnitHandle,
+    }
+}
+
+impl http_body::Body for ProgressBody {
+    type Data = bytes::Bytes;
+    type Error = aws_smithy_types::body::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let poll = this.inner.poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &poll
+            && let Some(data) = frame.data_ref()
+        {
+            this.unit.inc(data.len() as u64);
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Wraps an upload body so every chunk sent ticks `unit`. Applied through
+/// `SdkBody::map`, which re-applies on each retry attempt's clone -- the
+/// closure rewinds first so a retried part never double-counts. No-op for
+/// noop handles (progress disabled).
+pub(crate) fn instrument_body(body: ByteStream, unit: &UnitHandle) -> ByteStream {
+    if unit.is_noop() {
+        return body;
+    }
+    let unit = unit.clone();
+    ByteStream::new(body.into_inner().map(move |inner| {
+        unit.rewind();
+        SdkBody::from_body_1_x(ProgressBody {
+            inner,
+            unit: unit.clone(),
+        })
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +383,63 @@ mod tests {
         ui.object_done();
         ui.object_done(); // mirror delete events: done may pass adds
         // must not panic; display clamps total >= done internally
+    }
+
+    #[tokio::test]
+    async fn progress_body_ticks_exact_len() {
+        use aws_smithy_types::body::SdkBody;
+        use aws_smithy_types::byte_stream::ByteStream;
+
+        let ui = ProgressUi::hidden();
+        ui.add_object(10);
+        let unit = ui.unit("mem".into(), 10);
+        let body = ByteStream::new(SdkBody::from("0123456789"));
+        let wrapped = instrument_body(body, &unit);
+        let data = wrapped.collect().await.expect("collect").into_bytes();
+        assert_eq!(&data[..], b"0123456789");
+        assert_eq!(ui.overall_position(), 10);
+    }
+
+    #[tokio::test]
+    async fn progress_body_retry_rewinds_instead_of_double_counting() {
+        use aws_smithy_types::body::SdkBody;
+        use aws_smithy_types::byte_stream::ByteStream;
+
+        let ui = ProgressUi::hidden();
+        ui.add_object(10);
+        let unit = ui.unit("mem".into(), 10);
+        let retryable = SdkBody::retryable(|| SdkBody::from("0123456789"));
+        let wrapped = instrument_body(ByteStream::new(retryable), &unit);
+        // The SDK's orchestrator clones a retryable body once per attempt;
+        // each clone re-applies the map, whose closure rewinds first.
+        let inner = wrapped.into_inner();
+        let attempt1 = inner.try_clone().expect("retryable clone");
+        let d1 = ByteStream::new(attempt1)
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(d1.len(), 10);
+        assert_eq!(ui.overall_position(), 10, "first attempt counted");
+        let attempt2 = inner.try_clone().expect("retryable clone");
+        let d2 = ByteStream::new(attempt2)
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(d2.len(), 10);
+        assert_eq!(ui.overall_position(), 10, "retry rewound: 10, not 20");
+    }
+
+    #[tokio::test]
+    async fn instrument_body_noop_passes_through() {
+        use aws_smithy_types::body::SdkBody;
+        use aws_smithy_types::byte_stream::ByteStream;
+
+        let body = ByteStream::new(SdkBody::from("abc"));
+        let wrapped = instrument_body(body, &UnitHandle::noop());
+        let data = wrapped.collect().await.expect("collect").into_bytes();
+        assert_eq!(&data[..], b"abc");
     }
 
     #[test]

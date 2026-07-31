@@ -380,6 +380,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 parallel,
                 attrs,
                 args.preserve,
+                session.ui(),
             )
             .await;
             match result {
@@ -548,6 +549,7 @@ async fn copy_entry(
     parallel: usize,
     attrs: &BTreeMap<String, String>,
     preserve: bool,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<(String, String)> {
     match (source, target) {
         (
@@ -571,6 +573,7 @@ async fn copy_entry(
                 attrs,
                 false,
                 preserve,
+                progress,
             )
             .await?;
             Ok((src.display().to_string(), target_url))

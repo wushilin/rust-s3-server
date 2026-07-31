@@ -483,7 +483,6 @@ impl TransferSession {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn ui(&self) -> Option<&crate::progress::ProgressUi> {
         self.ui.as_ref()
     }
