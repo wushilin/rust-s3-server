@@ -18,6 +18,36 @@ const MAX_DETAIL_BARS: usize = 10;
 /// jiggle horizontally as different-length labels rotate through a slot.
 pub(crate) const LABEL_WIDTH: usize = 40;
 
+const UNITS: [(&str, u64); 5] = [
+    ("TiB", 1 << 40),
+    ("GiB", 1 << 30),
+    ("MiB", 1 << 20),
+    ("KiB", 1 << 10),
+    ("B", 1),
+];
+
+/// `123.3/256MiB`: one shared unit, chosen from the total, printed once.
+/// Transferred keeps one decimal; the total drops a trailing `.0`; the
+/// bytes unit uses plain integers.
+pub(crate) fn format_bytes_pair(pos: u64, len: u64) -> String {
+    let (unit, div) = UNITS
+        .iter()
+        .find(|(_, div)| len >= *div)
+        .copied()
+        .unwrap_or(("B", 1));
+    if div == 1 {
+        return format!("{pos}/{len}{unit}");
+    }
+    let scale = |v: u64| v as f64 / div as f64;
+    let total = scale(len);
+    let total_s = if (total.fract()).abs() < 0.05 {
+        format!("{total:.0}")
+    } else {
+        format!("{total:.1}")
+    };
+    format!("{:.1}/{}{}", scale(pos), total_s, unit)
+}
+
 /// What a transfer unit is doing, for the bar label -- distinct from the
 /// server-side S3 operation (e.g. same-endpoint `Copying` still issues a
 /// `CopyObject` or `UploadPartCopy`, not a GET+PUT).
@@ -92,6 +122,11 @@ impl TransferLabel {
     }
 }
 
+/// `ProgressStyle::with_key` callback rendering the `{bytes_pair}` column.
+fn bytes_pair_key(state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write) {
+    let _ = w.write_str(&format_bytes_pair(state.pos(), state.len().unwrap_or(0)));
+}
+
 struct UiState {
     objects_total: u64,
     objects_done: u64,
@@ -124,9 +159,13 @@ impl ProgressUi {
         let mp = MultiProgress::with_draw_target(target);
         let overall = mp.add(ProgressBar::new(0));
         if let Ok(style) = ProgressStyle::with_template(
-            "TOTAL {msg} [{bar:30.green/240}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+            "TOTAL {msg} [{bar:30.green/240}] {bytes_pair} {binary_bytes_per_sec} eta {eta}",
         ) {
-            overall.set_style(style.progress_chars("=> "));
+            overall.set_style(
+                style
+                    .progress_chars("=> ")
+                    .with_key("bytes_pair", bytes_pair_key),
+            );
         }
         overall.set_message("0/0 objects");
         Self {
@@ -166,9 +205,13 @@ impl ProgressUi {
                 .mp
                 .insert_before(&self.inner.overall, ProgressBar::new(len));
             if let Ok(style) = ProgressStyle::with_template(
-                "{wide_msg} [{bar:30.cyan/240}] {bytes}/{total_bytes} {bytes_per_sec}",
+                "{msg} [{bar:30.cyan/240}] {bytes_pair} {binary_bytes_per_sec}",
             ) {
-                pb.set_style(style.progress_chars("=> "));
+                pb.set_style(
+                    style
+                        .progress_chars("=> ")
+                        .with_key("bytes_pair", bytes_pair_key),
+                );
             }
             // Pad by char count, not byte count: `render` may emit a
             // multi-byte `…`, and byte-length padding would under-pad.
@@ -641,6 +684,18 @@ mod tests {
         );
         assert!(out.starts_with("Uploading …"), "{out:?}");
         assert!(out.ends_with(" part 2/9"), "{out:?}");
+    }
+
+    #[test]
+    fn bytes_pair_shares_unit_from_total() {
+        assert_eq!(format_bytes_pair(129_248_805, 268_435_456), "123.3/256MiB");
+        assert_eq!(format_bytes_pair(0, 268_435_456), "0.0/256MiB");
+        assert_eq!(format_bytes_pair(268_435_456, 268_435_456), "256.0/256MiB");
+        assert_eq!(format_bytes_pair(5_400_000, 16_777_216), "5.1/16MiB");
+        assert_eq!(format_bytes_pair(512, 1000), "512/1000B");
+        assert_eq!(format_bytes_pair(0, 0), "0/0B");
+        // total with a fractional unit value keeps one decimal
+        assert_eq!(format_bytes_pair(1_048_576, 1_572_864), "1.0/1.5MiB");
     }
 
     #[test]
