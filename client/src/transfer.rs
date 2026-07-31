@@ -913,6 +913,7 @@ mod tests {
 /// Downloads `bucket/key` to `output`, returning the transferred size so
 /// callers can build their own `CopyMessage`/`MirrorMessage` (this module
 /// intentionally prints nothing itself -- see [`UploadOutcome`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_key_to_path(
     client: &Client,
     bucket: &str,
@@ -921,6 +922,7 @@ pub(crate) async fn download_key_to_path(
     part_size: u64,
     parallel: usize,
     preserve: bool,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<u64> {
     #[cfg(not(unix))]
     if preserve {
@@ -934,6 +936,9 @@ pub(crate) async fn download_key_to_path(
         .await
         .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
     let size = head.content_length().unwrap_or_default() as u64;
+    if let Some(ui) = progress {
+        ui.add_object(size);
+    }
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).await?;
@@ -944,7 +949,10 @@ pub(crate) async fn download_key_to_path(
         name.push(".rs3.part");
         output.with_file_name(name)
     };
-    let result = download_to_temp(client, bucket, key, &tmp, size, part_size, parallel).await;
+    let result = download_to_temp(
+        client, bucket, key, &tmp, size, part_size, parallel, progress,
+    )
+    .await;
     match result {
         Ok(()) => {
             fs::rename(&tmp, output).await?;
@@ -972,6 +980,7 @@ pub(crate) async fn download_key_to_path(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_to_temp(
     client: &Client,
     bucket: &str,
@@ -980,28 +989,54 @@ async fn download_to_temp(
     size: u64,
     part_size: u64,
     parallel: usize,
+    progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
+    let label = key.rsplit('/').next().unwrap_or(key).to_string();
     if size <= part_size {
+        let unit = match progress {
+            Some(ui) => ui.unit(label.clone(), size),
+            None => crate::progress::UnitHandle::noop(),
+        };
         let resp = client.get_object().bucket(bucket).key(key).send().await?;
         let mut reader = resp.body.into_async_read();
         let file = fs::File::create(tmp).await?;
         let mut writer = BufWriter::new(file);
-        tokio::io::copy(&mut reader, &mut writer).await?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await?;
+            unit.inc(n as u64);
+        }
         writer.flush().await?;
+        unit.finish();
         return Ok(());
     }
     let file = fs::File::create(tmp).await?;
     file.set_len(size).await?;
     drop(file);
     let part_count = size.div_ceil(part_size);
+    let progress = progress.cloned();
     let downloads = stream::iter((0..part_count).map(|part_index| {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
         let tmp = tmp.to_path_buf();
+        let progress = progress.clone();
+        let label = label.clone();
         async move {
             let start = part_index * part_size;
             let end = (size - 1).min(start + part_size - 1);
+            let expected = end - start + 1;
+            let unit = match &progress {
+                Some(ui) => ui.unit(
+                    format!("{label} part {}/{part_count}", part_index + 1),
+                    expected,
+                ),
+                None => crate::progress::UnitHandle::noop(),
+            };
             let resp = client
                 .get_object()
                 .bucket(bucket)
@@ -1012,14 +1047,24 @@ async fn download_to_temp(
             let mut file = fs::OpenOptions::new().write(true).open(&tmp).await?;
             file.seek(SeekFrom::Start(start)).await?;
             let mut reader = resp.body.into_async_read();
-            let copied = tokio::io::copy(&mut reader, &mut file).await?;
-            let expected = end - start + 1;
+            let mut copied = 0u64;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
+                copied += n as u64;
+                unit.inc(n as u64);
+            }
             if copied != expected {
                 return Err(anyhow!(
                     "short range read: got {copied} of {expected} bytes at offset {start}"
                 ));
             }
             file.flush().await?;
+            unit.finish();
             Ok::<(), anyhow::Error>(())
         }
     }))
@@ -1053,7 +1098,14 @@ pub(crate) async fn download_object(
         None => PathBuf::from(key.rsplit('/').next().unwrap_or(&key)),
     };
     let size = download_key_to_path(
-        &client, &bucket, &key, &output, part_size, parallel, preserve,
+        &client,
+        &bucket,
+        &key,
+        &output,
+        part_size,
+        parallel,
+        preserve,
+        session.ui(),
     )
     .await?;
     session.add_total(size);

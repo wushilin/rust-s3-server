@@ -591,7 +591,7 @@ async fn copy_entry(
             let key = s3_key(prefix, &entry.rel);
             let output = dst_root.join(&entry.rel);
             crate::transfer::download_key_to_path(
-                client, bucket, &key, &output, part_size, parallel, preserve,
+                client, bucket, &key, &output, part_size, parallel, preserve, progress,
             )
             .await?;
             Ok((
