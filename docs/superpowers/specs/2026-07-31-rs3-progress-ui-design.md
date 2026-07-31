@@ -36,7 +36,13 @@ reporting is missing.
 
 - **Overall bar** pinned at the bottom. Template:
   `TOTAL {x}/{y} objects [bar] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}`.
-  Length grows via the session's `add_total`.
+  Length grows via `ProgressUi::add_object(bytes)`, called by the transfer
+  functions the moment each object's size is known (stat/HEAD) — *not* via
+  the session's `add_total`, which today fires only after an object
+  completes and would leave the bar length at 0 during the first (or only)
+  object. On session finish the overall bar is finished in place and stays
+  visible (like mc's completed bar); detail bars are removed as they
+  complete.
 - **Detail-bar pool, cap 10.** `unit(label, len) -> UnitHandle`. If a slot is
   free, a bar is inserted above the overall bar; if all 10 are busy the
   handle is *silent* — no bar, but its bytes still tick the overall bar.
@@ -56,7 +62,12 @@ reporting is missing.
 - Replace the single `bar: Option<ProgressBar>` with `ui: Option<ProgressUi>`.
 - **Activation predicate unchanged:** `stdout_tty && !quiet && !json`, and the
   existing global disable-progress-bar flag also disables the new UI.
-- `add_total` extends the overall bar length and object count, as today.
+- `add_total` keeps feeding only the printed-message totals (its Mutex
+  bookkeeping); the overall bar's length comes from `add_object` inside the
+  transfer functions (see §1) so it is registered *before* bytes tick.
+  Mirror delete events never pass through a transfer function, so
+  `object_done` clamps the displayed object total to at least the done
+  count.
 - **No double counting:** in bar mode `object_done` advances only the `x/y`
   object counter; bytes come exclusively from `UnitHandle` ticks. (Today it
   does `bar.inc(size)` — that line's behavior moves to the handles.)
