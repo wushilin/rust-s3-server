@@ -453,8 +453,8 @@ struct SessionState {
 /// Tracks one `cp`/`put`/`get`/`mirror` invocation's progress and owns the
 /// choice between an animated byte-progress bar and printing a message per
 /// object. Per `docs/superpowers/research/mc-research-output.md` §5, the
-/// bar is shown iff stdout is a TTY and neither `--quiet` nor `--json` is
-/// set; otherwise every object completion is a printed
+/// bar is shown iff stdout is a TTY and neither `--quiet`, `--json`, nor
+/// `--no-color` is set; otherwise every object completion is a printed
 /// `CopyMessage`/`MirrorMessage` and a final `AccountStat` line closes the
 /// session (mc's "`--quiet` is not silence" behavior, §4).
 ///
@@ -471,9 +471,9 @@ pub(crate) struct TransferSession {
 }
 
 impl TransferSession {
-    /// `label` is reserved for a future bar prefix/caption; the bar itself
-    /// is intentionally plain for now since no e2e test observes it (bar
-    /// mode requires a real TTY, which the test harness never provides).
+    /// `label` is reserved for a future bar prefix/caption; bar mode delegates
+    /// to `crate::progress::ProgressUi` for multi-bar TTY-live display (the label
+    /// parameter is not yet used).
     pub(crate) fn new(_label: &str) -> Self {
         let use_bar = out().stdout_tty && !out().quiet && !out().json && !out().no_color;
         Self {
@@ -505,8 +505,9 @@ impl TransferSession {
 
     /// Mark one object's transfer complete (`size` bytes moved -- `0` for
     /// a delete event, which carries no transferred payload). In Bar mode
-    /// this ticks the bar and prints nothing; otherwise it prints `msg` via
-    /// [`print_msg`].
+    /// this advances the object counter only; byte progress comes from
+    /// UnitHandle ticks in the transfer functions. Otherwise it prints `msg`
+    /// via [`print_msg`].
     pub(crate) fn object_done(&self, msg: &dyn McMessage, size: u64) {
         {
             let mut state = self.state.lock().expect("TransferSession state poisoned");
@@ -521,9 +522,10 @@ impl TransferSession {
         }
     }
 
-    /// Close the session: Bar mode clears the bar and prints nothing;
-    /// otherwise prints a final [`AccountStat`] summary line (mc prints
-    /// this even in `--quiet` mode -- research doc §4 point 3).
+    /// Close the session: Bar mode detail bars are already gone; the overall
+    /// bar finishes in place and stays visible. Otherwise prints a final
+    /// [`AccountStat`] summary line (mc prints this even in `--quiet` mode --
+    /// research doc §4 point 3).
     pub(crate) fn finish(&self) {
         if let Some(ui) = &self.ui {
             ui.finish_and_keep();

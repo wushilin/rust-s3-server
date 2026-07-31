@@ -11,17 +11,14 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-#[allow(dead_code)]
 const MAX_DETAIL_BARS: usize = 10;
 
-#[allow(dead_code)]
 struct UiState {
     objects_total: u64,
     objects_done: u64,
     active_bars: usize,
 }
 
-#[allow(dead_code)]
 struct UiInner {
     mp: MultiProgress,
     overall: ProgressBar,
@@ -29,12 +26,10 @@ struct UiInner {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct ProgressUi {
     inner: Arc<UiInner>,
 }
 
-#[allow(dead_code)]
 impl ProgressUi {
     pub(crate) fn new() -> Self {
         Self::with_target(ProgressDrawTarget::stderr())
@@ -136,14 +131,17 @@ impl ProgressUi {
         self.inner.state.lock().expect("ProgressUi state poisoned")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn overall_position(&self) -> u64 {
         self.inner.overall.position()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn overall_length(&self) -> u64 {
         self.inner.overall.length().unwrap_or(0)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn active_detail_bars(&self) -> usize {
         self.lock_state().active_bars
     }
@@ -158,13 +156,11 @@ impl ProgressUi {
     }
 }
 
-#[allow(dead_code)]
 struct UnitProgress {
     pos: u64,
     finished: bool,
 }
 
-#[allow(dead_code)]
 struct UnitInner {
     ui: ProgressUi,
     bar: Option<ProgressBar>,
@@ -175,14 +171,12 @@ struct UnitInner {
 /// Cheap-clone handle for one transfer unit; safe to tick from concurrent
 /// futures and from inside a retryable-body closure.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct UnitHandle {
     inner: Option<Arc<UnitInner>>,
 }
 
-#[allow(dead_code)]
 impl UnitHandle {
-    /// Inert handle for when progress is disabled (non-TTY/--json/--quiet).
+    /// Inert handle for when progress is disabled (non-TTY/--json/--quiet/--no-color).
     pub(crate) fn noop() -> Self {
         Self { inner: None }
     }
@@ -248,7 +242,7 @@ impl Drop for UnitInner {
 }
 
 pin_project_lite::pin_project! {
-    /// Ticks a [`UnitHandle`] as each data frame is polled off the wire.
+    /// Ticks a [`UnitHandle`] as each data frame is polled onto the wire.
     struct ProgressBody {
         #[pin]
         inner: SdkBody,
