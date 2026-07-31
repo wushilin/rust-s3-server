@@ -6,6 +6,7 @@ mod list;
 mod messages;
 mod mirror;
 mod output;
+mod progress;
 mod share;
 mod timefilter;
 mod transfer;
