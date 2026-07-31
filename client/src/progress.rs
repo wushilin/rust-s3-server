@@ -1,12 +1,26 @@
-//! Multi-bar live progress for transfer commands: a fixed gradle-style grid
-//! of `-P` worker lanes (one multipart segment of a large file, or one whole
-//! small file, or a byte-less spinner task line), stacked above a persistent
-//! overall bar. The grid is built once, sized to `-P` capped by the visible
-//! terminal rows (see [`lane_count`]); lanes are claimed/restyled on use and
+//! Multi-bar live progress: two different display strategies depending on
+//! mode, both sized off `-P` worker lanes via [`lane_count`].
+//!
+//! **Transfer (bar) mode** (`ProgressUi::new`, used by `TransferSession`):
+//! a fixed gradle-style grid of `-P` lanes (one multipart segment of a
+//! large file, or one whole small file), stacked above a persistent overall
+//! bar. The grid is built once; lanes are claimed/restyled on use and
 //! reverted to a dim idle row on release -- no bar is ever inserted or
-//! removed mid-run. Deliberate TTY-only divergence from mc's single
-//! aggregate bar — see README "Known divergences from mc". All bars draw to
-//! stderr; stdout (the mc-compat message contract) is never touched.
+//! removed mid-run. Safe because transfer commands never print interleaved
+//! stdout while the bar is up (see [`UiInner::overall`]'s doc).
+//!
+//! **Tasks-only mode** (`ProgressUi::new_tasks_only`, used by [`worker_ui`]
+//! for standalone commands): no persistent grid -- a transient spinner
+//! bar is inserted on claim and fully removed on release, capped at the
+//! same `-P`-derived count. A persistent idle row here would re-introduce
+//! the stdout-glue bug e534ce7 fixed: standalone commands interleave their
+//! own `println!`s with dispatch's task lines, and a bar that outlives its
+//! own draw parks the cursor for the next print to glue onto (amended spec,
+//! decision 3 -- see `docs/superpowers/specs/2026-07-31-rs3-worker-lanes-design.md`).
+//!
+//! Deliberate TTY-only divergence from mc's single aggregate bar — see
+//! README "Known divergences from mc". All bars draw to stderr; stdout (the
+//! mc-compat message contract) is never touched.
 
 use std::sync::{Arc, Mutex};
 
@@ -158,19 +172,34 @@ pub(crate) fn bucket_prefix_label(bucket: &str, prefix: &str) -> String {
 struct UiState {
     objects_total: u64,
     objects_done: u64,
-    // Free lane indices, LIFO stack ordered so the *lowest* index is
-    // claimed first (initialized high-to-low, popped low-to-high) -- purely
-    // cosmetic (claims fill the grid top-down), no correctness dependency.
+    // Transfer (bar) mode: free lane indices into `UiInner::lanes`, a LIFO
+    // stack ordered so the *lowest* index is claimed first (initialized
+    // high-to-low, popped low-to-high) -- purely cosmetic (claims fill the
+    // grid top-down), no correctness dependency. Unused in tasks-only mode
+    // (`UiInner::lanes` is always empty there).
     free: Vec<usize>,
+    // Tasks-only mode: count of live transient task/spinner bars, capped at
+    // `UiInner::cap`. Unused in transfer (bar) mode (occupied count there
+    // is `lanes.len() - free.len()`).
+    active: usize,
 }
 
 struct UiInner {
     mp: MultiProgress,
-    // Fixed grid, sized once at construction (see `lane_count`): every
-    // entry exists for the life of this `ProgressUi`, in idle style until
-    // claimed by `unit`/`task`. Never grown, shrunk, inserted into, or
-    // removed from after construction -- only restyled in place.
+    // Transfer (bar) mode: the fixed grid, sized once at construction (see
+    // `lane_count`) -- every entry exists for the life of this `ProgressUi`,
+    // in idle style until claimed by `unit`/`task`, never grown, shrunk,
+    // inserted into, or removed from after construction, only restyled in
+    // place. **Empty in tasks-only mode** -- that mode has no persistent
+    // grid at all (see the module doc's "Tasks-only mode" section); `unit`/
+    // `task` there insert-and-remove a transient bar per claim instead, via
+    // `ProgressUi::claim`/`release_claim`. `lanes.is_empty()` is the single
+    // source of truth for which mode a given `ProgressUi` is in.
     lanes: Vec<ProgressBar>,
+    // Concurrency cap, computed once via `lane_count`. In transfer mode
+    // this equals `lanes.len()` (the grid size); in tasks-only mode it caps
+    // `UiState::active` transient bars, since there's no grid to size against.
+    cap: usize,
     // `None` in "tasks-only" mode (`ProgressUi::new_tasks_only`): standalone
     // commands print their own stdout lines interleaved with dispatch's
     // spinner task lines, and a *persistent* bar (one that outlives every
@@ -345,11 +374,13 @@ impl ProgressUi {
         )
     }
 
-    /// Builds the fixed lane grid (all lanes in idle style, top to bottom)
-    /// and, in bar mode, the TOTAL bar below it -- lanes are added to `mp`
-    /// before TOTAL, so TOTAL stays naturally pinned at the bottom without
-    /// ever needing `insert_before`. No bar is added, removed, or
-    /// reinserted into `mp` after this point for the life of the `ProgressUi`.
+    /// Transfer (bar) mode builds the fixed lane grid (all lanes in idle
+    /// style, top to bottom) and the TOTAL bar below it -- lanes are added
+    /// to `mp` before TOTAL, so TOTAL stays naturally pinned at the bottom
+    /// without ever needing `insert_before`; no bar is added, removed, or
+    /// reinserted into `mp` after this point for the life of the
+    /// `ProgressUi`. Tasks-only mode builds no grid at all (`lanes` stays
+    /// empty) -- see the module doc's "Tasks-only mode" section for why.
     fn with_target(
         target: ProgressDrawTarget,
         bar_width: usize,
@@ -362,16 +393,20 @@ impl ProgressUi {
         let reserved = if with_overall { 2 } else { 1 };
         let lane_n = lane_count(parallel, term_rows, reserved);
         let mp = MultiProgress::with_draw_target(target);
-        let lanes: Vec<ProgressBar> = (0..lane_n)
-            .map(|_| {
-                let pb = mp.add(ProgressBar::new(0));
-                if let Some(style) = idle_style() {
-                    pb.set_style(style);
-                }
-                pb.set_message(IDLE_MESSAGE);
-                pb
-            })
-            .collect();
+        let lanes: Vec<ProgressBar> = if with_overall {
+            (0..lane_n)
+                .map(|_| {
+                    let pb = mp.add(ProgressBar::new(0));
+                    if let Some(style) = idle_style() {
+                        pb.set_style(style);
+                    }
+                    pb.set_message(IDLE_MESSAGE);
+                    pb
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let overall = with_overall.then(|| {
             let overall = mp.add(ProgressBar::new(0));
             if let Ok(style) = ProgressStyle::with_template(&format!(
@@ -387,18 +422,21 @@ impl ProgressUi {
             overall
         });
         // Claim order is low-to-high (see `UiState::free`'s doc): initialize
-        // high-to-low so the first `pop()` returns lane 0.
-        let free = (0..lane_n).rev().collect();
+        // high-to-low so the first `pop()` returns lane 0. Empty in
+        // tasks-only mode (`lanes` is empty, nothing to index).
+        let free = (0..lanes.len()).rev().collect();
         Self {
             inner: Arc::new(UiInner {
                 mp,
                 lanes,
+                cap: lane_n,
                 overall,
                 bar_width,
                 state: Mutex::new(UiState {
                     objects_total: 0,
                     objects_done: 0,
                     free,
+                    active: 0,
                 }),
             }),
         }
@@ -419,19 +457,58 @@ impl ProgressUi {
         self.refresh_msg(&state);
     }
 
-    /// Claims a free lane index for exclusive use by a new `unit`/`task`
-    /// handle; `None` when the whole grid is busy (the caller's handle goes
-    /// silent -- no bar, but ticks still advance the overall bar -- rather
-    /// than growing the grid, which stays fixed for the life of this
-    /// `ProgressUi`).
+    /// Claims a slot for a new `unit`/`task` handle. Transfer (bar) mode
+    /// (`lanes` non-empty) claims a free index into the fixed grid;
+    /// tasks-only mode (`lanes` empty) inserts a brand-new transient bar
+    /// instead (see the module doc's "Tasks-only mode" section). `None` in
+    /// either mode means the caller's handle goes silent -- no bar, but
+    /// ticks still advance the overall bar in transfer mode (tasks-only has
+    /// none) -- rather than exceeding the concurrency cap.
+    fn claim(&self, spinner: bool, len: u64) -> Option<Claim> {
+        if self.inner.lanes.is_empty() {
+            self.claim_transient(spinner, len)
+        } else {
+            self.claim_lane().map(Claim::Lane)
+        }
+    }
+
+    /// Transfer-mode claim: pops a free index into the fixed grid.
     fn claim_lane(&self) -> Option<usize> {
         self.lock_state().free.pop()
     }
 
+    /// Tasks-only-mode claim: inserts a fresh transient bar, capped at
+    /// `UiInner::cap` concurrent lines -- the pre-grid behavior e534ce7
+    /// fixed stdout-glue with, restored here per the amended spec (decision
+    /// 3): a persistent idle row is unsafe in this mode because standalone
+    /// commands interleave `println!` with the UI.
+    fn claim_transient(&self, spinner: bool, len: u64) -> Option<Claim> {
+        let mut state = self.lock_state();
+        if state.active >= self.inner.cap {
+            return None;
+        }
+        state.active += 1;
+        drop(state);
+        let pb = self.inner.mp.add(if spinner {
+            ProgressBar::new_spinner()
+        } else {
+            ProgressBar::new(len)
+        });
+        Some(Claim::Transient(pb))
+    }
+
+    /// Releases `claim`, however it was obtained. Shared by
+    /// `UnitHandle::finish` and `UnitInner`'s `Drop` -- the only two
+    /// release paths.
+    fn release_claim(&self, claim: &Claim) {
+        match claim {
+            Claim::Lane(idx) => self.release_lane(*idx),
+            Claim::Transient(pb) => self.release_transient(pb),
+        }
+    }
+
     /// Restyles lane `idx` back to its idle row (disabling any steady tick
     /// left over from a spinner claim) and returns it to the free list.
-    /// Shared by `UnitHandle::finish` and `UnitInner`'s `Drop` -- the only
-    /// two release paths.
     fn release_lane(&self, idx: usize) {
         let pb = &self.inner.lanes[idx];
         pb.disable_steady_tick();
@@ -444,12 +521,23 @@ impl ProgressUi {
         self.lock_state().free.push(idx);
     }
 
-    /// One in-flight transfer unit. If every lane is claimed the handle is
+    /// Removes a transient bar entirely (finish + clear + remove from
+    /// `mp`), restoring the pre-grid tasks-only behavior: no trace left on
+    /// screen, unlike a grid lane which reverts to idle instead of vanishing.
+    fn release_transient(&self, pb: &ProgressBar) {
+        pb.disable_steady_tick();
+        pb.finish_and_clear();
+        self.inner.mp.remove(pb);
+        let mut state = self.lock_state();
+        state.active = state.active.saturating_sub(1);
+    }
+
+    /// One in-flight transfer unit. If every slot is claimed the handle is
     /// silent: no bar, but its ticks still advance the overall bar.
     pub(crate) fn unit(&self, label: TransferLabel, len: u64) -> UnitHandle {
-        let lane = self.claim_lane();
-        if let Some(idx) = lane {
-            let pb = &self.inner.lanes[idx];
+        let claim = self.claim(false, len);
+        if let Some(claim) = &claim {
+            let pb = claim.bar(&self.inner.lanes);
             pb.set_length(len);
             pb.set_position(0);
             let bar_width = self.inner.bar_width;
@@ -472,7 +560,7 @@ impl ProgressUi {
         UnitHandle {
             inner: Some(Arc::new(UnitInner {
                 ui: self.clone(),
-                lane,
+                claim,
                 len,
                 state: Mutex::new(UnitProgress {
                     pos: 0,
@@ -483,14 +571,14 @@ impl ProgressUi {
     }
 
     /// One in-flight byte-less S3 operation (HEAD, create/complete/abort
-    /// multipart, list, delete...): a spinner line sharing the same fixed
-    /// lane grid as [`unit`](Self::unit), contributing zero bytes to the
-    /// overall bar. Silent handle when every lane is claimed, same as
+    /// multipart, list, delete...): a spinner line sharing the same
+    /// concurrency cap as [`unit`](Self::unit), contributing zero bytes to
+    /// the overall bar. Silent handle when every slot is claimed, same as
     /// `unit`.
     pub(crate) fn task(&self, label: TransferLabel, api: &'static str) -> UnitHandle {
-        let lane = self.claim_lane();
-        if let Some(idx) = lane {
-            let pb = &self.inner.lanes[idx];
+        let claim = self.claim(true, 0);
+        if let Some(claim) = &claim {
+            let pb = claim.bar(&self.inner.lanes);
             if let Ok(style) = ProgressStyle::with_template(&format!("{{msg}} {{spinner}} {api}")) {
                 pb.set_style(style);
             }
@@ -505,7 +593,7 @@ impl ProgressUi {
         UnitHandle {
             inner: Some(Arc::new(UnitInner {
                 ui: self.clone(),
-                lane,
+                claim,
                 len: 0,
                 state: Mutex::new(UnitProgress {
                     pos: 0,
@@ -570,14 +658,21 @@ impl ProgressUi {
             .unwrap_or(0)
     }
 
-    /// Occupied lanes -- `lane_total() - free lanes`.
+    /// Occupied slots: `lane_total() - free lanes` in transfer mode, the
+    /// live transient-bar count in tasks-only mode.
     #[allow(dead_code)]
     pub(crate) fn active_detail_bars(&self) -> usize {
-        self.inner.lanes.len() - self.lock_state().free.len()
+        if self.inner.lanes.is_empty() {
+            self.lock_state().active
+        } else {
+            self.inner.lanes.len() - self.lock_state().free.len()
+        }
     }
 
-    /// Fixed grid size, decided once at construction and never grown or
-    /// shrunk for the life of this `ProgressUi`.
+    /// Fixed grid size: decided once at construction and never grown or
+    /// shrunk for the life of this `ProgressUi` in transfer mode; always
+    /// `0` in tasks-only mode, which has no persistent grid at all (see the
+    /// module doc's "Tasks-only mode" section).
     #[allow(dead_code)]
     pub(crate) fn lane_total(&self) -> usize {
         self.inner.lanes.len()
@@ -589,18 +684,35 @@ struct UnitProgress {
     finished: bool,
 }
 
+/// What `ProgressUi::claim` handed back: either an index into the fixed
+/// grid (transfer mode) or a standalone bar inserted just for this claim
+/// (tasks-only mode). See the module doc's "Tasks-only mode" section.
+enum Claim {
+    Lane(usize),
+    Transient(ProgressBar),
+}
+
+impl Claim {
+    fn bar<'a>(&'a self, lanes: &'a [ProgressBar]) -> &'a ProgressBar {
+        match self {
+            Claim::Lane(idx) => &lanes[*idx],
+            Claim::Transient(pb) => pb,
+        }
+    }
+}
+
 struct UnitInner {
     ui: ProgressUi,
-    // Which lane this unit claimed, if any (`None` when the grid was full
+    // What this unit claimed, if anything (`None` when every slot was busy
     // at claim time -- a silent handle, per `unit`/`task`'s docs).
-    lane: Option<usize>,
+    claim: Option<Claim>,
     len: u64,
     state: Mutex<UnitProgress>,
 }
 
 impl UnitInner {
     fn bar(&self) -> Option<&ProgressBar> {
-        self.lane.map(|idx| &self.ui.inner.lanes[idx])
+        self.claim.as_ref().map(|c| c.bar(&self.ui.inner.lanes))
     }
 }
 
@@ -653,8 +765,9 @@ impl UnitHandle {
         }
     }
 
-    /// Snap to 100% (top up any rounding shortfall exactly once), revert the
-    /// lane to its idle row, free it for reuse. Idempotent.
+    /// Snap to 100% (top up any rounding shortfall exactly once), release
+    /// the claimed slot -- reverted to idle in transfer mode, removed
+    /// entirely in tasks-only mode. Idempotent.
     pub(crate) fn finish(&self) {
         let Some(inner) = &self.inner else { return };
         let mut state = inner.state.lock().expect("UnitHandle state poisoned");
@@ -668,19 +781,19 @@ impl UnitHandle {
         if let Some(overall) = &inner.ui.inner.overall {
             overall.inc(shortfall);
         }
-        if let Some(idx) = inner.lane {
-            inner.ui.release_lane(idx);
+        if let Some(claim) = &inner.claim {
+            inner.ui.release_claim(claim);
         }
     }
 }
 
 impl Drop for UnitInner {
-    /// A dropped-unfinished unit (failed part) frees its lane but must not
-    /// fake completion by topping up bytes.
+    /// A dropped-unfinished unit (failed part) releases its slot but must
+    /// not fake completion by topping up bytes.
     fn drop(&mut self) {
         let finished = self.state.lock().map(|s| s.finished).unwrap_or(true);
-        if !finished && let Some(idx) = self.lane {
-            self.ui.release_lane(idx);
+        if !finished && let Some(claim) = &self.claim {
+            self.ui.release_claim(claim);
         }
     }
 }
@@ -1137,6 +1250,30 @@ mod tests {
         let ui = ProgressUi::hidden_tasks_only(5);
         assert_eq!(ui.overall_position(), 0, "no overall bar: reads as 0");
         assert_eq!(ui.overall_length(), 0, "no overall bar: reads as 0");
+    }
+
+    // Regression guard for the amended spec (decision 3): a persistent idle
+    // grid in tasks-only mode re-introduces the stdout-glue bug e534ce7
+    // fixed (standalone commands interleave `println!` with dispatch's
+    // task lines; a persistent bar parks the cursor for the next print to
+    // glue onto). Tasks-only mode must build zero persistent rows -- only
+    // transient bars inserted on claim and fully removed on release.
+    #[test]
+    fn tasks_only_mode_has_no_persistent_grid() {
+        let ui = ProgressUi::hidden_tasks_only(5);
+        assert_eq!(
+            ui.lane_total(),
+            0,
+            "tasks-only mode must not build a persistent lane grid"
+        );
+        let t = ui.task(lbl(Verb::Listing, "bucket/p", None), "ListObjectsV2");
+        assert_eq!(
+            ui.lane_total(),
+            0,
+            "grid stays empty even while a transient task line is active"
+        );
+        t.finish();
+        assert_eq!(ui.active_detail_bars(), 0, "finished task line is gone");
     }
 
     #[test]
