@@ -1,4 +1,5 @@
 mod attr;
+mod budget;
 mod config;
 mod diff;
 mod findcmd;
