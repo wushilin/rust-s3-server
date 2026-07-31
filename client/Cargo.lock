@@ -2015,6 +2015,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "console",
  "dirs",
  "flate2",
  "futures",

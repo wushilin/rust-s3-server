@@ -13,6 +13,7 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }
+console = "0.15"
 dirs = "6"
 flate2 = "1"
 futures = "0.3"

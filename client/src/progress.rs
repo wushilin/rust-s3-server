@@ -132,6 +132,7 @@ struct UiState {
 struct UiInner {
     mp: MultiProgress,
     overall: ProgressBar,
+    bar_width: usize,
     state: Mutex<UiState>,
 }
 
@@ -140,26 +141,50 @@ pub(crate) struct ProgressUi {
     inner: Arc<UiInner>,
 }
 
+/// Solid-block fill for the bars: full block, then eighth-width partial
+/// blocks (widest to narrowest) so progress advances in sub-cell steps,
+/// then a space for the unfilled remainder. No arrow heads.
+const BAR_CHARS: &str = "█▉▊▋▌▍▎▏ ";
+
+/// Non-bar columns around the `{bar}` field, worst case: 40-char label,
+/// bracket pairs, `1023.9/1024KiB`-style byte pair, a speed column, and
+/// the TOTAL row's `eta` tail. The bar gets whatever width remains.
+const BAR_OVERHEAD: usize = 80;
+const MIN_BAR_WIDTH: usize = 10;
+const MAX_BAR_WIDTH: usize = 60;
+
+/// Bar width for a terminal `cols` wide; `None` (width undetectable —
+/// e.g. hidden test target) keeps the historical fixed 30.
+fn bar_width_for(cols: Option<u16>) -> usize {
+    match cols {
+        None => 30,
+        Some(c) => (c as usize)
+            .saturating_sub(BAR_OVERHEAD)
+            .clamp(MIN_BAR_WIDTH, MAX_BAR_WIDTH),
+    }
+}
+
 impl ProgressUi {
     pub(crate) fn new() -> Self {
-        Self::with_target(ProgressDrawTarget::stderr())
+        let cols = console::Term::stderr().size_checked().map(|(_, c)| c);
+        Self::with_target(ProgressDrawTarget::stderr(), bar_width_for(cols))
     }
 
     /// Hidden draw target for unit tests: full accounting, no rendering.
     #[cfg(test)]
     pub(crate) fn hidden() -> Self {
-        Self::with_target(ProgressDrawTarget::hidden())
+        Self::with_target(ProgressDrawTarget::hidden(), bar_width_for(None))
     }
 
-    fn with_target(target: ProgressDrawTarget) -> Self {
+    fn with_target(target: ProgressDrawTarget, bar_width: usize) -> Self {
         let mp = MultiProgress::with_draw_target(target);
         let overall = mp.add(ProgressBar::new(0));
-        if let Ok(style) = ProgressStyle::with_template(
-            "TOTAL {msg} [{bar:30.green/240}] {bytes_pair} {binary_bytes_per_sec} eta {eta}",
-        ) {
+        if let Ok(style) = ProgressStyle::with_template(&format!(
+            "TOTAL {{msg}} [{{bar:{bar_width}.white/240}}] {{bytes_pair}} {{binary_bytes_per_sec}} eta {{eta}}",
+        )) {
             overall.set_style(
                 style
-                    .progress_chars("=> ")
+                    .progress_chars(BAR_CHARS)
                     .with_key("bytes_pair", bytes_pair_key),
             );
         }
@@ -168,6 +193,7 @@ impl ProgressUi {
             inner: Arc::new(UiInner {
                 mp,
                 overall,
+                bar_width,
                 state: Mutex::new(UiState {
                     objects_total: 0,
                     objects_done: 0,
@@ -200,12 +226,13 @@ impl ProgressUi {
                 .inner
                 .mp
                 .insert_before(&self.inner.overall, ProgressBar::new(len));
-            if let Ok(style) = ProgressStyle::with_template(
-                "{msg} [{bar:30.cyan/240}] {bytes_pair} {binary_bytes_per_sec}",
-            ) {
+            let bar_width = self.inner.bar_width;
+            if let Ok(style) = ProgressStyle::with_template(&format!(
+                "{{msg}} [{{bar:{bar_width}.white/240}}] {{bytes_pair}} {{binary_bytes_per_sec}}",
+            )) {
                 pb.set_style(
                     style
-                        .progress_chars("=> ")
+                        .progress_chars(BAR_CHARS)
                         .with_key("bytes_pair", bytes_pair_key),
                 );
             }
@@ -701,6 +728,23 @@ mod tests {
         // next whole number at `{:.1}` -- reintroducing a trailing `.0`.
         assert_eq!(format_bytes_pair(1_048_575, 1_048_575), "1024.0/1024KiB");
         assert_eq!(format_bytes_pair(2_097_100, 2_097_100), "2.0/2MiB");
+    }
+
+    #[test]
+    fn bar_width_adapts_to_terminal_and_clamps() {
+        assert_eq!(
+            bar_width_for(None),
+            30,
+            "undetectable width keeps old fixed 30"
+        );
+        assert_eq!(bar_width_for(Some(120)), 40, "120 cols - 80 overhead");
+        assert_eq!(bar_width_for(Some(200)), 60, "capped at MAX_BAR_WIDTH");
+        assert_eq!(bar_width_for(Some(60)), 10, "floored at MIN_BAR_WIDTH");
+        assert_eq!(
+            bar_width_for(Some(0)),
+            10,
+            "degenerate terminal still floors"
+        );
     }
 
     #[test]
