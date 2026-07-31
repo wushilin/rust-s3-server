@@ -175,6 +175,13 @@ binary itself):
   `ContentMessage`'s JSON has `status`/`type`/`lastModified`/`size`/`key`/
   `etag`/`storageClass` but no presigned `url` or version-ordinal field --
   out of scope alongside the versioning/zip absence noted above.
+- **TTY progress display (deliberate):** during `cp`/`mv`/`put`/`get`/`mirror`
+  on a terminal, rs3 shows up to 10 per-unit progress bars (one per in-flight
+  multipart segment or small file) above an overall `TOTAL x/y objects` bar,
+  where mc shows a single aggregate bar. Bytes tick live as they cross the
+  wire; server-side S3→S3 copy parts tick on completion since no bytes cross
+  the client. Non-TTY, `--json`, and `--quiet` output is unaffected.
+  `--no-color` disables the bars.
 
 ## Refused and unsupported flags
 
