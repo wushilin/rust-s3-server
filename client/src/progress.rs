@@ -39,13 +39,9 @@ pub(crate) fn format_bytes_pair(pos: u64, len: u64) -> String {
         return format!("{pos}/{len}{unit}");
     }
     let scale = |v: u64| v as f64 / div as f64;
-    let total = scale(len);
-    let total_s = if (total.fract()).abs() < 0.05 {
-        format!("{total:.0}")
-    } else {
-        format!("{total:.1}")
-    };
-    format!("{:.1}/{}{}", scale(pos), total_s, unit)
+    let total = format!("{:.1}", scale(len));
+    let total = total.strip_suffix(".0").unwrap_or(&total);
+    format!("{:.1}/{}{}", scale(pos), total, unit)
 }
 
 /// What a transfer unit is doing, for the bar label -- distinct from the
@@ -696,6 +692,15 @@ mod tests {
         assert_eq!(format_bytes_pair(0, 0), "0/0B");
         // total with a fractional unit value keeps one decimal
         assert_eq!(format_bytes_pair(1_048_576, 1_572_864), "1.0/1.5MiB");
+    }
+
+    #[test]
+    fn bytes_pair_total_never_shows_trailing_point_zero_after_rounding_up() {
+        // Regression: the old pre-rounding fract() check only caught
+        // fractions near 0, not fractions near 1 that round *up* to the
+        // next whole number at `{:.1}` -- reintroducing a trailing `.0`.
+        assert_eq!(format_bytes_pair(1_048_575, 1_048_575), "1024.0/1024KiB");
+        assert_eq!(format_bytes_pair(2_097_100, 2_097_100), "2.0/2MiB");
     }
 
     #[test]
