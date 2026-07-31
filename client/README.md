@@ -178,10 +178,22 @@ binary itself):
 - **TTY progress display (deliberate):** during `cp`/`mv`/`put`/`get`/`mirror`
   on a terminal, rs3 shows up to 10 per-unit progress bars (one per in-flight
   multipart segment or small file) above an overall `TOTAL x/y objects` bar,
-  where mc shows a single aggregate bar. Bytes tick live as they cross the
-  wire; server-side S3→S3 copy parts tick on completion since no bytes cross
-  the client. Non-TTY, `--json`, and `--quiet` output is unaffected.
-  `--no-color` disables the bars.
+  where mc shows a single aggregate bar. `-P` is a *global concurrent-stream
+  budget*, cooperatively shared between whole objects and multipart segments
+  (e.g. `-P 5` covers 5 small files in flight, or 2 large files whose
+  segments draw from the same 5 tokens) -- **default 5**. A per-unit bar is
+  visible exactly while its stream holds a budget token, so the number of
+  bars on screen at any moment *is* the live parallelism, never more than
+  `-P`; this is a deliberate reduction from the old per-layer worst case of
+  up to `P` objects each running `P` segments (`P`\*`P` concurrent streams).
+  Bar labels are a verb plus the condensing path, e.g.
+  `Uploading asdf/a.img part 4/24` (long paths lose middle components, then
+  collapse to `…/name`, then trim from the left, to fit a fixed label
+  column), and the byte column shares one unit across the pair, e.g.
+  `123.3/256MiB`. Bytes tick live as they cross the wire; server-side S3→S3
+  copy parts tick on completion since no bytes cross the client. Non-TTY,
+  `--json`, and `--quiet` output is unaffected. `--no-color` disables the
+  bars.
 
 ## Refused and unsupported flags
 
