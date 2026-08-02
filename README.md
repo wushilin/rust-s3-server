@@ -33,6 +33,15 @@ docker run -d --name rusts3 \
 - **S3 API** → `http://127.0.0.1:8002` (point the AWS CLI/SDKs, `mc`, `s3cmd`, rclone here)
 - **Console** → `http://127.0.0.1:8003` (username/password login)
 
+The image also ships `rs3`, the bundled high-performance CLI client
+(see [`client/README.md`](client/README.md)), so a running container can be
+driven without installing anything else:
+
+```bash
+docker exec -e MC_HOST_LOCAL=http://myaccesskey:mysecretkey@127.0.0.1:8002 \
+  rusts3 rs3 ls --recursive local/
+```
+
 ## The two surfaces
 
 rusts3 exposes two independent HTTP surfaces from one binary:

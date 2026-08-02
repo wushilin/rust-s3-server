@@ -26,10 +26,16 @@ fi
 
 echo ">> Building rusts3 ${VERSION}"
 
-# The binary is built on the host (not in the container) so the slow RocksDB
+# The binaries are built on the host (not in the container) so the slow RocksDB
 # compile reuses the warm cargo cache instead of running on every image build.
 cargo build --release --bin rusts3
 strip target/release/rusts3
+
+# The CLI client is a separate crate under client/ (not a workspace member), so
+# it needs its own build. It ships in the image alongside the server.
+echo ">> Building rs3 client"
+cargo build --release --manifest-path client/Cargo.toml
+strip client/target/release/rs3
 
 echo ">> Building image ${IMAGE}:${VERSION} (and :latest)"
 # --format docker so the Dockerfile's HEALTHCHECK is preserved (OCI drops it).

@@ -70,7 +70,7 @@ ui:
   bind_address: "{{RUSTS3_UI_BIND_ADDRESS:0.0.0.0}}"
   bind_port: {{RUSTS3_UI_PORT:8003}}
   public_hostname: "{{RUSTS3_UI_PUBLIC_HOSTNAME:}}"
-  public_scheme: {{RUSTS3_UI_PUBLIC_SCHEME:http}}
+  public_scheme: "{{RUSTS3_UI_PUBLIC_SCHEME:http}}"
 
 stats:
   # Runtime Stats dashboard: samples CPU/memory/disk-IO and S3 throughput into a

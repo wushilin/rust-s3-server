@@ -217,17 +217,17 @@ pub(crate) fn apply_fs_attrs(path: &std::path::Path, encoded: &str) -> Result<()
 
     let atime = fields.get("atime").and_then(|v| parse_sec_nsec(v));
     let mtime = fields.get("mtime").and_then(|v| parse_sec_nsec(v));
-    if atime.is_some() || mtime.is_some() {
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
-            let mut times = std::fs::FileTimes::new();
-            if let Some(t) = atime {
-                times = times.set_accessed(t);
-            }
-            if let Some(t) = mtime {
-                times = times.set_modified(t);
-            }
-            let _ = file.set_times(times);
+    if (atime.is_some() || mtime.is_some())
+        && let Ok(file) = std::fs::OpenOptions::new().write(true).open(path)
+    {
+        let mut times = std::fs::FileTimes::new();
+        if let Some(t) = atime {
+            times = times.set_accessed(t);
         }
+        if let Some(t) = mtime {
+            times = times.set_modified(t);
+        }
+        let _ = file.set_times(times);
     }
 
     if let Some(mode) = fields.get("mode").and_then(|v| parse_uint_auto(v)) {

@@ -190,8 +190,6 @@ enum AliasCommand {
     Remove { alias: String },
     #[command(about = "export configuration info to stdout")]
     Export { alias: Option<String> },
-    #[command(about = "import configuration info from stdin")]
-    Import,
 }
 
 #[derive(Args, Debug)]
@@ -260,10 +258,6 @@ pub(crate) struct ShareListArgs {
 
 #[derive(Args, Debug)]
 struct LsArgs {
-    #[arg(long)]
-    rewind: Option<String>,
-    #[arg(long)]
-    versions: bool,
     #[arg(short = 'r', long)]
     recursive: bool,
     #[arg(short = 'I', long)]
@@ -272,8 +266,6 @@ struct LsArgs {
     summarize: bool,
     #[arg(long = "storage-class", visible_alias = "sc")]
     storage_class: Option<String>,
-    #[arg(long)]
-    zip: bool,
     targets: Vec<String>,
 }
 
@@ -283,10 +275,6 @@ struct MbArgs {
     region: String,
     #[arg(short = 'p', long)]
     ignore_existing: bool,
-    #[arg(short = 'l', long)]
-    with_lock: bool,
-    #[arg(long)]
-    with_versioning: bool,
     targets: Vec<String>,
 }
 
@@ -367,8 +355,6 @@ pub(crate) struct MirrorArgs {
     pub(crate) dry_run: bool,
     #[arg(long, alias = "fake")]
     pub(crate) fake: bool,
-    #[arg(short = 'w', long)]
-    pub(crate) watch: bool,
     #[arg(long)]
     pub(crate) disable_multipart: bool,
     #[arg(long)]
@@ -395,8 +381,6 @@ pub(crate) struct MirrorArgs {
 
 #[derive(Args, Debug)]
 struct GetArgs {
-    #[arg(long = "version-id", visible_alias = "vid")]
-    version_id: Option<String>,
     source: String,
     target: Option<PathBuf>,
 }
@@ -430,10 +414,6 @@ struct RmArgs {
     recursive: bool,
     #[arg(long)]
     force: bool,
-    #[arg(long)]
-    versions: bool,
-    #[arg(long = "version-id", visible_alias = "vid")]
-    version_id: Option<String>,
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
@@ -668,20 +648,10 @@ async fn alias(args: AliasArgs) -> Result<()> {
             }
             Ok(())
         }
-        AliasCommand::Import => Err(anyhow!("alias import is not implemented yet")),
     }
 }
 
 async fn ls(args: LsArgs) -> Result<()> {
-    if args.rewind.is_some() {
-        return Err(anyhow!("ls --rewind is not implemented yet"));
-    }
-    if args.versions {
-        return Err(anyhow!("ls --versions is not implemented yet"));
-    }
-    if args.zip {
-        return Err(anyhow!("ls --zip is not implemented yet"));
-    }
     // Client-side post-filter: an object with an *empty* storage class is
     // never excluded, even when a specific class was requested; "*" (or
     // no flag at all) disables filtering entirely ([SEM] §11).
@@ -911,10 +881,11 @@ async fn ls(args: LsArgs) -> Result<()> {
                             .storage_class()
                             .map(|s| s.as_str().to_string())
                             .unwrap_or_default();
-                        if let Some(filter) = storage_filter {
-                            if !storage_class.is_empty() && storage_class != filter {
-                                continue;
-                            }
+                        if let Some(filter) = storage_filter
+                            && !storage_class.is_empty()
+                            && storage_class != filter
+                        {
+                            continue;
                         }
                         if args.summarize {
                             total_objects += 1;
@@ -1082,12 +1053,6 @@ async fn incomplete_upload_size(
 }
 
 async fn mb(args: MbArgs) -> Result<()> {
-    if args.with_lock {
-        return Err(anyhow!("mb --with-lock is not implemented yet"));
-    }
-    if args.with_versioning {
-        return Err(anyhow!("mb --with-versioning is not implemented yet"));
-    }
     let ui = crate::progress::worker_ui(5);
     let budget = crate::budget::StreamBudget::new(5);
     for target in args.targets {
@@ -1564,10 +1529,8 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         total_size,
                     };
                     session.object_done(&msg, outcome.size);
-                    if is_mv {
-                        if let Err(err) = fs::remove_file(source_path).await {
-                            eprintln!("mv: remove `{}` failed: {err}", source_path.display());
-                        }
+                    if is_mv && let Err(err) = fs::remove_file(source_path).await {
+                        eprintln!("mv: remove `{}` failed: {err}", source_path.display());
                     }
                 }
                 used_session = true;
@@ -1611,7 +1574,6 @@ async fn cp_or_mv_recursive(source: &str, target: &str, args: &CpArgs, is_mv: bo
         remove: false,
         dry_run: false,
         fake: false,
-        watch: false,
         disable_multipart: args.disable_multipart,
         older_than: args.older_than.clone(),
         newer_than: args.newer_than.clone(),
@@ -1641,10 +1603,10 @@ async fn prune_empty_dirs(root: &Path) {
             continue;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(metadata) = entry.metadata().await {
-                if metadata.is_dir() {
-                    stack.push(entry.path());
-                }
+            if let Ok(metadata) = entry.metadata().await
+                && metadata.is_dir()
+            {
+                stack.push(entry.path());
             }
         }
         dirs.push(dir);
@@ -1833,10 +1795,8 @@ async fn copy_local_path(
                         total_size,
                     };
                     session.object_done(&msg, size);
-                    if delete_after {
-                        if let Err(err) = fs::remove_file(&path).await {
-                            eprintln!("mv: remove `{}` failed: {err}", path.display());
-                        }
+                    if delete_after && let Err(err) = fs::remove_file(&path).await {
+                        eprintln!("mv: remove `{}` failed: {err}", path.display());
                     }
                 }
             }
@@ -1858,10 +1818,10 @@ async fn copy_local_path(
         } else {
             target.to_path_buf()
         };
-        if let Some(parent) = output.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).await?;
-            }
+        if let Some(parent) = output.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).await?;
         }
         fs::copy(source, &output).await?;
         let size = metadata.len();
@@ -1875,19 +1835,14 @@ async fn copy_local_path(
             total_size,
         };
         session.object_done(&msg, size);
-        if delete_after {
-            if let Err(err) = fs::remove_file(source).await {
-                eprintln!("mv: remove `{}` failed: {err}", source.display());
-            }
+        if delete_after && let Err(err) = fs::remove_file(source).await {
+            eprintln!("mv: remove `{}` failed: {err}", source.display());
         }
     }
     Ok(())
 }
 
 async fn get(args: GetArgs) -> Result<()> {
-    if args.version_id.is_some() {
-        return Err(anyhow!("get --version-id is not implemented yet"));
-    }
     // GetArgs has no `--preserve` flag ([SEM] §2 lists it on cp/mirror/put
     // only), so `get` never preserves filesystem attributes. It also has no
     // `-P` flag, so the worker count is pinned to the same default the
@@ -1945,23 +1900,23 @@ async fn cat(args: CatArgs) -> Result<()> {
         let (client, _) = client_for_alias(&parsed.alias).await?;
 
         let mut start = args.offset.unwrap_or(0);
-        if let Some(tail) = args.tail {
-            if tail > 0 {
-                let head = crate::budget::dispatch(
-                    &budget,
-                    ui.as_ref(),
-                    crate::progress::TransferLabel {
-                        verb: crate::progress::Verb::Inspecting,
-                        path: format!("{bucket}/{key}"),
-                        part: None,
-                    },
-                    "HeadObject",
-                    client.head_object().bucket(&bucket).key(&key).send(),
-                )
-                .await?;
-                let size = head.content_length().unwrap_or(0);
-                start = (size - tail).max(0);
-            }
+        if let Some(tail) = args.tail
+            && tail > 0
+        {
+            let head = crate::budget::dispatch(
+                &budget,
+                ui.as_ref(),
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Inspecting,
+                    path: format!("{bucket}/{key}"),
+                    part: None,
+                },
+                "HeadObject",
+                client.head_object().bucket(&bucket).key(&key).send(),
+            )
+            .await?;
+            let size = head.content_length().unwrap_or(0);
+            start = (size - tail).max(0);
         }
 
         let mut req = client.get_object().bucket(&bucket).key(&key);
@@ -2211,9 +2166,6 @@ async fn head(args: HeadArgs) -> Result<()> {
 }
 
 async fn rm(args: RmArgs) -> Result<()> {
-    if args.versions || args.version_id.is_some() {
-        return Err(anyhow!("rm --versions/--version-id is not implemented yet"));
-    }
     timefilter::validate_time_filters(args.older_than.as_deref(), args.newer_than.as_deref())?;
     if args.recursive && !args.force && !args.dry_run {
         return Err(anyhow!(
@@ -2396,7 +2348,7 @@ async fn remove_prefix(
                 client.delete_objects().bucket(bucket).delete(delete).send(),
             )
             .await?;
-            for err in resp.errors() {
+            if let Some(err) = resp.errors().first() {
                 return Err(anyhow!(
                     "delete failed for `{}`: {}",
                     err.key().unwrap_or("?"),
@@ -2548,6 +2500,10 @@ async fn du(args: DuArgs) -> Result<()> {
     }
 }
 
+/// A boxed, borrow-carrying future. Recursive `async fn`s can't name their own
+/// future type (it would have to contain itself), so they return this instead.
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
 /// Recursive walk mirroring mc's `du()` (`cmd/du-main.go`, [SEM] §5): a
 /// `depth` of exactly `1` does one flat recursive listing and sums it into a
 /// single number -- the terminal/leaf case, "no more per-level breakdown
@@ -2571,7 +2527,7 @@ fn du_walk<'a>(
     depth: i32,
     budget: &'a crate::budget::StreamBudget,
     ui: Option<&'a crate::progress::ProgressUi>,
-) -> Pin<Box<dyn Future<Output = Result<(u64, u64)>> + 'a>> {
+) -> BoxFuture<'a, Result<(u64, u64)>> {
     Box::pin(async move {
         let mut size = 0u64;
         let mut objects = 0u64;
@@ -2833,7 +2789,7 @@ fn tree_print_entries<'a>(
     continuation: String,
     budget: &'a crate::budget::StreamBudget,
     ui: Option<&'a crate::progress::ProgressUi>,
-) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
         let last_idx = entries.len().checked_sub(1);
         for (i, entry) in entries.into_iter().enumerate() {
@@ -2924,13 +2880,10 @@ async fn tree(args: TreeArgs) -> Result<()> {
     }
     if out().json {
         return ls(LsArgs {
-            rewind: None,
-            versions: false,
             recursive: true,
             incomplete: false,
             summarize: false,
             storage_class: None,
-            zip: false,
             targets: args.targets,
         })
         .await;

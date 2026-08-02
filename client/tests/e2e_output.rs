@@ -192,7 +192,7 @@ fn ls_summarize_and_human_format() {
     // human per-object line: "[YYYY-MM-DD HH:MM:SS +ZZ:ZZ]  1.0KiB a.bin"
     let re =
         regex_lite("\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2} [^\\]]+\\] +1\\.0KiB a\\.bin");
-    assert!(out.lines().any(|l| re(l)), "out: {out}");
+    assert!(out.lines().any(re), "out: {out}");
 }
 
 #[test]
@@ -300,7 +300,7 @@ fn errors_are_mc_shaped() {
     let v: serde_json::Value = serde_json::from_str(line.trim()).expect("valid json");
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["type"], "fatal");
-    assert!(v["error"]["message"].as_str().unwrap().len() > 0);
+    assert!(!v["error"]["message"].as_str().unwrap().is_empty());
     assert!(
         !line.trim().contains('\n'),
         "must be single-line when piped"

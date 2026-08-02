@@ -1,12 +1,17 @@
 # rusts3 container image — runtime only, no in-container compile.
 #
-# The binary is built on the host and copied in. librocksdb-sys compiles
-# RocksDB from source, which is slow, so we do it once locally against a warm
-# cargo cache instead of on every image build:
+# Two binaries ship: the server (rusts3) and its CLI client (rs3), so a running
+# container can be driven from inside without pulling a second image. Both are
+# built on the host and copied in. librocksdb-sys compiles RocksDB from source,
+# which is slow, so we do it once locally against a warm cargo cache instead of
+# on every image build:
 #
 #   cargo build --release --bin rusts3 && strip target/release/rusts3
+#   cargo build --release --manifest-path client/Cargo.toml && strip client/target/release/rs3
 #   podman build -t rusts3:latest .
 #   podman run -d -p 8002:8002 -p 8003:8003 -v rusts3-data:/data rusts3:latest
+#
+# (build-and-publish-docker.sh does all of that for you.)
 #
 # Base is Debian trixie (glibc 2.41), pinned by digest. The host-built binary
 # is dynamically linked against glibc; trixie's libc is newer than typical
@@ -29,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R rusts3:rusts3 /data
 
 COPY target/release/rusts3 /usr/local/bin/rusts3
+COPY client/target/release/rs3 /usr/local/bin/rs3
 COPY config.docker.yaml /etc/rusts3/config.yaml
 
 # Everything durable lives here: buckets, the IAM database, scan history, logs.

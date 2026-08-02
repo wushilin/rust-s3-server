@@ -129,78 +129,14 @@ pub(crate) async fn collect_s3_entries(
     Ok(entries)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    fn entry(rel: &str, size: u64, ts: Option<i64>) -> Entry {
-        Entry {
-            rel: rel.into(),
-            size,
-            modified: ts.map(|t| Utc.timestamp_opt(t, 0).unwrap()),
-        }
-    }
-
-    #[test]
-    fn copies_missing_targets() {
-        let plan = plan_mirror(&[entry("a", 1, Some(100))], &[], false, false);
-        assert_eq!(plan.copies.len(), 1);
-        assert!(plan.deletes.is_empty());
-    }
-
-    #[test]
-    fn skips_same_size_older_or_equal_source() {
-        let src = [entry("a", 5, Some(100))];
-        let dst = [entry("a", 5, Some(100))];
-        assert!(plan_mirror(&src, &dst, false, false).copies.is_empty());
-        let dst_newer = [entry("a", 5, Some(200))];
-        assert!(
-            plan_mirror(&src, &dst_newer, false, false)
-                .copies
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn copies_when_size_differs_or_source_newer() {
-        let dst = [entry("a", 5, Some(100)), entry("b", 9, Some(100))];
-        let src = [entry("a", 6, Some(100)), entry("b", 9, Some(150))];
-        let plan = plan_mirror(&src, &dst, false, false);
-        let rels: Vec<_> = plan.copies.iter().map(|e| e.rel.as_str()).collect();
-        assert_eq!(rels, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn copies_when_timestamps_missing() {
-        let src = [entry("a", 5, None)];
-        let dst = [entry("a", 5, Some(100))];
-        assert_eq!(plan_mirror(&src, &dst, false, false).copies.len(), 1);
-    }
-
-    #[test]
-    fn overwrite_copies_everything() {
-        let src = [entry("a", 5, Some(100))];
-        let dst = [entry("a", 5, Some(200))];
-        assert_eq!(plan_mirror(&src, &dst, true, false).copies.len(), 1);
-    }
-
-    #[test]
-    fn remove_deletes_extraneous_targets_only_when_asked() {
-        let src = [entry("a", 1, Some(100))];
-        let dst = [entry("a", 1, Some(100)), entry("stale", 2, Some(50))];
-        assert!(plan_mirror(&src, &dst, false, false).deletes.is_empty());
-        assert_eq!(
-            plan_mirror(&src, &dst, false, true).deletes,
-            vec!["stale".to_string()]
-        );
-    }
-}
-
 /// Resolved local-vs-S3 identity for one side of a `mirror`/`diff` operand.
 /// `pub(crate)` so `diff.rs` can reuse `resolve_side`'s exists()/`is_s3_url`
 /// disambiguation and the same display-URL fields (`alias_name`/`bucket`/
 /// `prefix`) instead of re-parsing the operand itself.
+// The S3 variant is the larger one by ~248 bytes (it carries a resolved
+// `Alias`), but exactly two of these are constructed per invocation -- one per
+// operand -- so boxing would trade a pointer chase for no measurable saving.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Side {
     Local(std::path::PathBuf),
     S3 {
@@ -239,9 +175,6 @@ fn s3_key(prefix: &str, rel: &str) -> String {
 pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     use futures::stream::{self, StreamExt};
 
-    if args.watch {
-        return Err(anyhow!("mirror --watch is not implemented yet"));
-    }
     // Validate filter grammar up front, so a bad spec is fatal before any
     // listing/transfer/delete work starts (matches cp/rm).
     crate::timefilter::validate_time_filters(
@@ -698,5 +631,73 @@ async fn copy_entry(
         (Side::Local(_), Side::Local(_)) => {
             Err(anyhow!("mirror between two local paths is not supported"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn entry(rel: &str, size: u64, ts: Option<i64>) -> Entry {
+        Entry {
+            rel: rel.into(),
+            size,
+            modified: ts.map(|t| Utc.timestamp_opt(t, 0).unwrap()),
+        }
+    }
+
+    #[test]
+    fn copies_missing_targets() {
+        let plan = plan_mirror(&[entry("a", 1, Some(100))], &[], false, false);
+        assert_eq!(plan.copies.len(), 1);
+        assert!(plan.deletes.is_empty());
+    }
+
+    #[test]
+    fn skips_same_size_older_or_equal_source() {
+        let src = [entry("a", 5, Some(100))];
+        let dst = [entry("a", 5, Some(100))];
+        assert!(plan_mirror(&src, &dst, false, false).copies.is_empty());
+        let dst_newer = [entry("a", 5, Some(200))];
+        assert!(
+            plan_mirror(&src, &dst_newer, false, false)
+                .copies
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn copies_when_size_differs_or_source_newer() {
+        let dst = [entry("a", 5, Some(100)), entry("b", 9, Some(100))];
+        let src = [entry("a", 6, Some(100)), entry("b", 9, Some(150))];
+        let plan = plan_mirror(&src, &dst, false, false);
+        let rels: Vec<_> = plan.copies.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn copies_when_timestamps_missing() {
+        let src = [entry("a", 5, None)];
+        let dst = [entry("a", 5, Some(100))];
+        assert_eq!(plan_mirror(&src, &dst, false, false).copies.len(), 1);
+    }
+
+    #[test]
+    fn overwrite_copies_everything() {
+        let src = [entry("a", 5, Some(100))];
+        let dst = [entry("a", 5, Some(200))];
+        assert_eq!(plan_mirror(&src, &dst, true, false).copies.len(), 1);
+    }
+
+    #[test]
+    fn remove_deletes_extraneous_targets_only_when_asked() {
+        let src = [entry("a", 1, Some(100))];
+        let dst = [entry("a", 1, Some(100)), entry("stale", 2, Some(50))];
+        assert!(plan_mirror(&src, &dst, false, false).deletes.is_empty());
+        assert_eq!(
+            plan_mirror(&src, &dst, false, true).deletes,
+            vec!["stale".to_string()]
+        );
     }
 }

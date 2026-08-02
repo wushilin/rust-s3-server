@@ -116,10 +116,10 @@ pub(crate) fn parse_time_ref(s: &str) -> Result<TimeRef> {
     if let Ok(d) = parse_mc_duration(s) {
         return Ok(TimeRef::Duration(d));
     }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y.%m.%d") {
-        if let Some(naive) = date.and_hms_opt(0, 0, 0) {
-            return Ok(TimeRef::Absolute(naive.and_utc()));
-        }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y.%m.%d")
+        && let Some(naive) = date.and_hms_opt(0, 0, 0)
+    {
+        return Ok(TimeRef::Absolute(naive.and_utc()));
     }
     for fmt in ABSOLUTE_DATETIME_FORMATS {
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
@@ -196,15 +196,15 @@ pub(crate) fn passes_filters(
     let Some(t) = object_time else {
         return Ok(true);
     };
-    if let Some(spec) = older_than {
-        if !include_older_than(t, spec)? {
-            return Ok(false);
-        }
+    if let Some(spec) = older_than
+        && !include_older_than(t, spec)?
+    {
+        return Ok(false);
     }
-    if let Some(spec) = newer_than {
-        if !include_newer_than(t, spec)? {
-            return Ok(false);
-        }
+    if let Some(spec) = newer_than
+        && !include_newer_than(t, spec)?
+    {
+        return Ok(false);
     }
     Ok(true)
 }
