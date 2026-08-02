@@ -88,6 +88,11 @@ fn pretty_with_indent(v: &serde_json::Value, indent: &[u8]) -> String {
 
 /// Print `msg` to stdout: human text if `!out().json`, else JSON per
 /// `msg.json_style()`. Mirrors mc's `printMsg` choke point.
+///
+/// Written through [`crate::progress::suspend_bars`] so a command that
+/// prints while a progress display is live (any standalone command's
+/// tasks-only spinner lines) lands above the bars rather than corrupting
+/// their redraw accounting.
 pub(crate) fn print_msg(msg: &dyn McMessage) {
     let opts = out();
     let line = if !opts.json {
@@ -96,7 +101,7 @@ pub(crate) fn print_msg(msg: &dyn McMessage) {
         let v = msg.json();
         render_json(&v, msg.json_style(), opts.stdout_tty)
     };
-    println!("{line}");
+    crate::progress::suspend_bars(|| println!("{line}"));
 }
 
 /// mc's punctuation rule for joining an error's context message with its
@@ -141,7 +146,7 @@ pub(crate) fn print_error(context_msg: &str, cause: &str, fatal: bool) {
                     .map(|f| f.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| "rs3".to_string());
-        eprintln!("{prog}: <ERROR> {text}");
+        crate::progress::ui_eprintln!("{prog}: <ERROR> {text}");
     } else {
         let envelope = serde_json::json!({
             "status": "error",
@@ -155,7 +160,7 @@ pub(crate) fn print_error(context_msg: &str, cause: &str, fatal: bool) {
             }
         });
         let line = render_json(&envelope, JsonStyle::Standard, opts.stdout_tty);
-        println!("{line}");
+        crate::progress::suspend_bars(|| println!("{line}"));
     }
 }
 

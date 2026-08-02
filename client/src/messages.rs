@@ -514,7 +514,7 @@ impl TransferSession {
     /// Mark one object's transfer complete (`size` bytes moved -- `0` for
     /// a delete event, which carries no transferred payload). In Bar mode
     /// this advances the object counter only; byte progress comes from
-    /// UnitHandle ticks in the transfer functions. Otherwise it prints `msg`
+    /// `ProgressNotifier` reports in the transfer functions. Otherwise it prints `msg`
     /// via [`print_msg`].
     pub(crate) fn object_done(&self, msg: &dyn McMessage, size: u64) {
         {
@@ -523,7 +523,7 @@ impl TransferSession {
             state.transferred_size += size;
         }
         match &self.ui {
-            // bytes come exclusively from UnitHandle ticks — counting them here
+            // bytes come exclusively from ProgressNotifier reports — counting them here
             // too would double-count (spec §2)
             Some(ui) => ui.object_done(),
             None => print_msg(msg),

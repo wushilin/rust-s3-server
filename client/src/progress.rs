@@ -1,32 +1,119 @@
-//! Multi-bar live progress: two different display strategies depending on
-//! mode, both sized off `-P` worker lanes via [`lane_count`].
+//! Multi-bar live progress. One display model, two invariants:
 //!
-//! **Transfer (bar) mode** (`ProgressUi::new`, used by `TransferSession`):
-//! a fixed gradle-style grid of `-P` lanes (one multipart segment of a
-//! large file, or one whole small file), stacked above a persistent overall
-//! bar. The grid is built once; lanes are claimed/restyled on use and
-//! reverted to a dim idle row on release -- no bar is ever inserted or
-//! removed mid-run. Safe because transfer commands never print interleaved
-//! stdout while the bar is up (see [`UiInner::overall`]'s doc).
+//! **1. The screen is a fixed set of slots.** A `ProgressUi` builds a
+//! gradle-style grid of `-P` lanes ([`lane_count`]) once, at construction.
+//! Every in-flight unit of work -- a whole small file, one multipart
+//! segment of a large one, or a byte-less control-plane call like a
+//! `ListObjectsV2` page -- claims one slot ([`ProgressUi::unit`] /
+//! [`ProgressUi::task`]), owns it exclusively for its whole life, and
+//! returns it to a dim `> IDLE` row on release. Work that finds every slot
+//! taken runs *silently* rather than growing the grid: no row is ever
+//! inserted, removed, or reordered after construction, so the block of
+//! lines the terminal has to redraw never changes height or meaning.
+//! The one optional row is a persistent `TOTAL` bar below the grid
+//! ([`UiInner::overall`]), for commands that have a knowable total.
 //!
-//! **Tasks-only mode** (`ProgressUi::new_tasks_only`, used by [`worker_ui`]
-//! for standalone commands): no persistent grid -- a transient spinner
-//! bar is inserted on claim and fully removed on release, capped at the
-//! same `-P`-derived count. A persistent idle row here would re-introduce
-//! the stdout-glue bug e534ce7 fixed: standalone commands interleave their
-//! own `println!`s with dispatch's task lines, and a bar that outlives its
-//! own draw parks the cursor for the next print to glue onto (amended spec,
-//! decision 3 -- see `docs/superpowers/specs/2026-07-31-rs3-worker-lanes-design.md`).
+//! **2. Nothing else writes to the terminal.** A `MultiProgress` redraws by
+//! walking the cursor back up over the block it painted last time; a single
+//! stray `println!` invalidates that and the grid starts duplicating itself
+//! down the screen. Every print in this crate therefore goes through
+//! [`suspend_bars`] (directly, or via [`ui_println`]/[`ui_eprintln`]/
+//! `output::print_msg`), which lifts the bars, writes, and repaints. That
+//! is what lets the grid above be persistent even for commands that
+//! interleave their own stdout with it -- it supersedes the earlier
+//! workaround of giving standalone commands a gridless, insert-and-remove
+//! display so there'd be no persistent row for their output to collide with
+//! (`docs/superpowers/specs/2026-07-31-rs3-worker-lanes-design.md`,
+//! decision 3), which cured the collision by having nothing stable on
+//! screen rather than by making writes safe.
 //!
 //! Deliberate TTY-only divergence from mc's single aggregate bar — see
 //! README "Known divergences from mc". All bars draw to stderr; stdout (the
 //! mc-compat message contract) is never touched.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+/// Every `MultiProgress` that currently exists, newest last, each paired
+/// with the id its owning [`UiInner`] deregisters itself by on drop.
+///
+/// A `MultiProgress` redraws by moving the cursor up over the block of rows
+/// it painted last time and rewriting them in place. That accounting is
+/// invalidated by *any* other write to the terminal: a raw `eprintln!` from
+/// a failure path scrolls the block down by a line, the next redraw then
+/// repaints the grid one row lower without erasing the old one, and the
+/// terminal fills with stale copies of the lane grid -- while the message
+/// that caused it scrolls away unread. [`suspend_bars`] is the choke point
+/// that prevents it; this registry is what lets a print site far from any
+/// `ProgressUi` handle (`output::print_error`, `mirror`'s per-object
+/// failure line) reach the live bars without threading one through.
+///
+/// Registration is unconditional, including hidden (test) draw targets:
+/// suspending a hidden `MultiProgress` just runs the closure.
+static LIVE_BARS: Mutex<Vec<(u64, MultiProgress)>> = Mutex::new(Vec::new());
+static NEXT_BARS_ID: AtomicU64 = AtomicU64::new(0);
+
+fn lock_live_bars() -> std::sync::MutexGuard<'static, Vec<(u64, MultiProgress)>> {
+    // A panic while the registry lock is held would otherwise poison every
+    // later print; the data is a plain list, so recovering it is safe.
+    LIVE_BARS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `f` with every live progress display cleared off the terminal,
+/// restoring them afterwards -- so anything `f` prints lands above the bars
+/// instead of shredding their cursor accounting (see [`LIVE_BARS`]).
+/// A no-op wrapper when no `ProgressUi` exists (non-TTY, `--json`,
+/// `--quiet`, or simply before/after the UI's lifetime), which is why call
+/// sites can use it unconditionally.
+pub(crate) fn suspend_bars<R>(f: impl FnOnce() -> R) -> R {
+    // Clone the handles out and release the registry lock before running
+    // `f`: `f` is arbitrary caller code and may construct or drop a
+    // `ProgressUi` of its own.
+    let bars: Vec<MultiProgress> = lock_live_bars().iter().map(|(_, mp)| mp.clone()).collect();
+    let mut f = Some(f);
+    let mut result = None;
+    suspend_all(&bars, &mut || {
+        result = Some(f.take().expect("suspend_all runs the closure once")());
+    });
+    result.expect("suspend_all always runs the closure")
+}
+
+/// Nests `MultiProgress::suspend` over every handle in `bars`. Deliberately
+/// **not** generic over the closure: a generic recursive call would ask the
+/// compiler to monomorphize one closure type per possible depth, which is a
+/// recursion-limit error rather than a compiling program.
+fn suspend_all(bars: &[MultiProgress], f: &mut dyn FnMut()) {
+    match bars.split_first() {
+        None => f(),
+        Some((head, rest)) => head.suspend(|| suspend_all(rest, f)),
+    }
+}
+
+/// `eprintln!` that is safe to call while the live progress UI is painting:
+/// the bars are lifted, the line is written, the bars are put back. Every
+/// `eprintln!` in this crate should be this instead -- see [`LIVE_BARS`] for
+/// what a raw one does to the display.
+macro_rules! ui_eprintln {
+    ($($arg:tt)*) => {
+        $crate::progress::suspend_bars(|| eprintln!($($arg)*))
+    };
+}
+pub(crate) use ui_eprintln;
+
+/// [`ui_eprintln`] for stdout. `output::print_msg` already suspends, so this
+/// is only for the handful of sites that print a bare line without going
+/// through the message contract (`find --print`'s rendered template, `rm`'s
+/// zero-match notice).
+macro_rules! ui_println {
+    ($($arg:tt)*) => {
+        $crate::progress::suspend_bars(|| println!($($arg)*))
+    };
+}
+pub(crate) use ui_println;
 
 /// Classic-terminal fallback lane count when the terminal's row count can't
 /// be detected (e.g. a hidden test target, or a genuinely weird TTY).
@@ -80,6 +167,9 @@ pub(crate) enum Verb {
     // ListObjectsV2 call routes through here.
     Listing,
     Removing,
+    // Local filesystem tree walk (mirror/diff's local side) -- not an S3
+    // operation at all, but it occupies a slot like one.
+    Scanning,
 }
 
 impl Verb {
@@ -94,6 +184,7 @@ impl Verb {
             Verb::Inspecting => "Inspecting",
             Verb::Listing => "Listing",
             Verb::Removing => "Removing",
+            Verb::Scanning => "Scanning",
         }
     }
 }
@@ -172,51 +263,45 @@ pub(crate) fn bucket_prefix_label(bucket: &str, prefix: &str) -> String {
 struct UiState {
     objects_total: u64,
     objects_done: u64,
-    // Transfer (bar) mode: free lane indices into `UiInner::lanes`, a LIFO
-    // stack ordered so the *lowest* index is claimed first (initialized
-    // high-to-low, popped low-to-high) -- purely cosmetic (claims fill the
-    // grid top-down), no correctness dependency. Unused in tasks-only mode
-    // (`UiInner::lanes` is always empty there).
+    // Free slot indices into `UiInner::lanes`, a LIFO stack ordered so the
+    // *lowest* index is claimed first (initialized high-to-low, popped
+    // low-to-high) -- purely cosmetic (claims fill the grid top-down), no
+    // correctness dependency. Its length is the whole occupancy model: a
+    // slot is either here or owned by exactly one live `ProgressNotifier`.
     free: Vec<usize>,
-    // Tasks-only mode: count of live transient task/spinner bars, capped at
-    // `UiInner::cap`. Unused in transfer (bar) mode (occupied count there
-    // is `lanes.len() - free.len()`).
-    active: usize,
 }
 
 struct UiInner {
     mp: MultiProgress,
-    // Transfer (bar) mode: the fixed grid, sized once at construction (see
-    // `lane_count`) -- every entry exists for the life of this `ProgressUi`,
-    // in idle style until claimed by `unit`/`task`, never grown, shrunk,
-    // inserted into, or removed from after construction, only restyled in
-    // place. **Empty in tasks-only mode** -- that mode has no persistent
-    // grid at all (see the module doc's "Tasks-only mode" section); `unit`/
-    // `task` there insert-and-remove a transient bar per claim instead, via
-    // `ProgressUi::claim`/`release_claim`. `lanes.is_empty()` is the single
-    // source of truth for which mode a given `ProgressUi` is in.
+    // The fixed slot grid, sized once at construction (see `lane_count`).
+    // Every entry exists for the life of this `ProgressUi`, in idle style
+    // until claimed by `unit`/`task`, and is never grown, shrunk, inserted
+    // into, removed from, or reordered afterwards -- only restyled in place
+    // by whichever handle currently owns it. That fixed height is what
+    // keeps the `MultiProgress` redraw stable (module doc, invariant 1).
     lanes: Vec<ProgressBar>,
-    // Concurrency cap, computed once via `lane_count`. In transfer mode
-    // this equals `lanes.len()` (the grid size); in tasks-only mode it caps
-    // `UiState::active` transient bars, since there's no grid to size against.
-    cap: usize,
-    // `None` in "tasks-only" mode (`ProgressUi::new_tasks_only`): standalone
-    // commands print their own stdout lines interleaved with dispatch's
-    // spinner task lines, and a *persistent* bar (one that outlives every
-    // individual draw, unlike a task line that's removed the moment its
-    // dispatch call resolves) parks the terminal cursor at the end of its
-    // own line with no trailing newline -- the next `println!` then glues
-    // onto it instead of starting a fresh line (reproduced under a pty:
-    // `TOTAL 0/0 objects [...] ... [2026-07-31 ...] 14B f1.txt`). Bar mode
-    // (`ProgressUi::new`, used by `TransferSession`) keeps the overall bar:
-    // transfer commands never print per-object stdout lines while the bar
-    // is active (bar-mode-silent, see `TransferSession::object_done`), so
-    // there is nothing for it to glue onto. Always the last bar in `mp`,
-    // below every lane -- lanes are added first at construction, so this is
-    // naturally pinned at the bottom without ever needing `insert_before`.
+    // The optional persistent total row, for commands whose total is
+    // knowable up front (`TransferSession`'s). `None` leaves the grid
+    // alone on screen with nothing below it -- what standalone commands
+    // (ls/rm/find/...) use, since they have no meaningful total, not
+    // because a persistent row would be unsafe there: `suspend_bars`
+    // (module doc, invariant 2) makes their interleaved stdout safe against
+    // any persistent row, including the lanes themselves.
+    //
+    // Always the last bar in `mp`, below every lane -- lanes are added
+    // first at construction, so this is naturally pinned at the bottom
+    // without ever needing `insert_before`.
     overall: Option<ProgressBar>,
     bar_width: usize,
     state: Mutex<UiState>,
+    // This UI's slot in the `LIVE_BARS` registry, released on drop.
+    bars_id: u64,
+}
+
+impl Drop for UiInner {
+    fn drop(&mut self) {
+        lock_live_bars().retain(|(id, _)| *id != self.bars_id);
+    }
 }
 
 #[derive(Clone)]
@@ -255,7 +340,23 @@ fn bar_width_for(cols: Option<u16>) -> usize {
 const IDLE_MESSAGE: &str = "> IDLE";
 
 fn idle_style() -> Option<ProgressStyle> {
-    ProgressStyle::with_template("{msg:.240}").ok()
+    ProgressStyle::with_template("{prefix:.240}{msg:.240}").ok()
+}
+
+/// Puts a slot back into (or leaves it in) its unclaimed state: no spinner
+/// tick, no bar, no leftover label or detail text from whichever task last
+/// held it. The single definition of "idle", used both to build the grid
+/// and to release a slot -- so a released slot is byte-for-byte a
+/// never-used one, and stale text can't survive a handover.
+fn reset_to_idle(slot: &ProgressBar) {
+    slot.disable_steady_tick();
+    if let Some(style) = idle_style() {
+        slot.set_style(style);
+    }
+    slot.set_length(0);
+    slot.set_position(0);
+    slot.set_prefix(IDLE_MESSAGE);
+    slot.set_message("");
 }
 
 /// Pure sizing for the fixed lane grid: `P` worker lanes capped by how many
@@ -288,36 +389,257 @@ fn ui_enabled() -> bool {
 }
 
 /// Standalone commands' (ls/rm/stat/head/cat/du/tree/find/diff/mb/rb/mv...)
-/// equivalent of [`crate::messages::TransferSession::new`]'s bar-vs-lines
-/// decision: `Some` under [`ui_enabled`], `None` otherwise so `dispatch`
-/// degrades to its noop task line and non-TTY/`--json`/`--quiet` stdout
-/// stays byte-identical. Always **tasks-only** mode (see
-/// [`ProgressUi::new_tasks_only`]) -- these commands print their own stdout
-/// lines, which a persistent bar would corrupt.
+/// equivalent of [`crate::messages::TransferSession::new`]'s display
+/// decision: `Some` under [`ui_enabled`], `None` otherwise, so `dispatch`
+/// degrades to a noop notifier and non-TTY/`--json`/`--quiet` stdout stays
+/// byte-identical.
+///
+/// No `TOTAL` row -- these commands have no total worth showing -- but the
+/// same fixed slot grid as a transfer. Their interleaved stdout is safe
+/// against it because every print in the crate goes through
+/// [`suspend_bars`] (module doc, invariant 2).
 ///
 /// `parallel` is the caller's `-P`/internal worker count (see
 /// `docs/superpowers/specs/2026-07-31-rs3-worker-lanes-design.md`), which
-/// caps this mode's transient-bar concurrency via [`lane_count`] (no fixed
-/// grid here -- see [`ProgressUi::new_tasks_only`]'s doc for why).
+/// sizes the grid via [`lane_count`].
 pub(crate) fn worker_ui(parallel: usize) -> Option<ProgressUi> {
-    ui_enabled().then(|| ProgressUi::new_tasks_only(parallel))
+    ui_enabled().then(|| ProgressUi::without_total(parallel))
 }
 
-/// [`crate::messages::TransferSession`]'s bar-vs-lines decision: `Some`
-/// under the same [`ui_enabled`] predicate, full bar mode (persistent
-/// overall bar) -- transfer commands never print per-object stdout lines
-/// while the bar is active, so there's nothing for it to glue onto.
-///
-/// `parallel` is the transfer command's `-P` value, sizing the fixed lane
-/// grid via [`lane_count`].
+/// [`crate::messages::TransferSession`]'s display decision: `Some` under
+/// the same [`ui_enabled`] predicate, with the persistent `TOTAL` row below
+/// the grid. `parallel` is the transfer command's `-P` value.
 pub(crate) fn transfer_ui(parallel: usize) -> Option<ProgressUi> {
-    ui_enabled().then(|| ProgressUi::new(parallel))
+    ui_enabled().then(|| ProgressUi::with_total(parallel))
+}
+
+// ===================== the task abstraction =====================
+//
+// Two kinds of work can own a slot, and they differ in exactly one way:
+// whether the work can say how far along it is.
+//
+//   ProgressAwareTask  -- can. Renders a bar plus a readout, and reports
+//                         through `advance`/`set_done`/`set_fraction`.
+//   ProgressOpaqueTask -- can't. Renders a spinner, and reports only the
+//                         lifecycle transitions in `TaskState`.
+//
+// Everything else -- claiming a slot, owning it exclusively, handing it
+// back to idle -- is common, lives in `ProgressUi::begin`, and neither kind
+// gets to override it.
+
+/// Internal full-scale value for [`Measure::Percent`]. Finer than 100 so a
+/// bar drawn 60 cells wide still advances smoothly.
+const PERCENT_SCALE: u64 = 1000;
+
+/// How a [`ProgressAwareTask`] counts, and therefore how its slot renders
+/// the readout between the bar and the right-hand detail text.
+pub(crate) enum Measure {
+    /// Bytes moved out of bytes planned: `123.3/256MiB 11.9 MiB/s`. The
+    /// only flavor that is byte-shaped, i.e. that feeds the `TOTAL` row's
+    /// byte bar -- see [`ProgressTask::byte_shaped`].
+    Bytes { total: u64 },
+    /// A count of discrete things, rendered through a caller-supplied
+    /// template: `"{done}/{total} obj"`, `"{done}/{total} files"`. Both
+    /// placeholders are optional and may repeat.
+    Count { total: u64, template: &'static str },
+    /// A bare fraction with no natural unit: `42%`. Reported with
+    /// [`ProgressNotifier::set_fraction`]; the position is kept internally
+    /// on a 0..=[`PERCENT_SCALE`] axis.
+    #[allow(dead_code)] // no caller yet; the flavor completes the set
+    Percent,
+}
+
+impl Measure {
+    /// Full-scale value on this measure's own axis.
+    fn span(&self) -> u64 {
+        match self {
+            Measure::Bytes { total } | Measure::Count { total, .. } => *total,
+            Measure::Percent => PERCENT_SCALE,
+        }
+    }
+
+    /// The template fragment rendered immediately right of the bar. The
+    /// `Count` flavor defers to the `readout` key installed by [`style`].
+    ///
+    /// [`style`]: Measure::style
+    fn readout(&self) -> &'static str {
+        match self {
+            Measure::Bytes { .. } => "{bytes_pair} {binary_bytes_per_sec}",
+            Measure::Count { .. } => "{readout}",
+            Measure::Percent => "{percent:>3}%",
+        }
+    }
+
+    /// `{prefix} [bar] {readout} {msg}` -- label left, caller detail right.
+    fn style(&self, bar_width: usize) -> Option<ProgressStyle> {
+        let template = format!(
+            "{{prefix}} [{{bar:{bar_width}.white/240}}] {} {{msg}}",
+            self.readout()
+        );
+        let style = ProgressStyle::with_template(&template)
+            .ok()?
+            .progress_chars(BAR_CHARS)
+            .with_key("bytes_pair", bytes_pair_key);
+        Some(match self {
+            Measure::Count { template, .. } => {
+                let template = *template;
+                style.with_key(
+                    "readout",
+                    move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                        let _ = w.write_str(
+                            &template
+                                .replace("{done}", &state.pos().to_string())
+                                .replace("{total}", &state.len().unwrap_or(0).to_string()),
+                        );
+                    },
+                )
+            }
+            _ => style,
+        })
+    }
+}
+
+/// Where a task is in its life. An opaque task has nothing else to report,
+/// so for it this *is* the progress model; an aware task reports position
+/// as well, and uses these only to pick a style.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TaskState {
+    /// Owns a slot but hasn't begun -- queued behind the stream budget.
+    /// Renders dim and still, so a waiting task is visibly distinct from a
+    /// working one.
+    NotStarted,
+    /// In flight.
+    Running,
+    /// Terminal. The slot has gone back to idle, so this is never rendered.
+    Completed,
+}
+
+/// A unit of work that can own a display slot. Implementors describe *what*
+/// is happening and how to paint it; they never claim, release, or reach
+/// past their own slot.
+pub(crate) trait ProgressTask: Send + Sync {
+    /// Full-scale value on the notifier's axis: what `advance` counts up to
+    /// and what [`ProgressNotifier::finish`] snaps to.
+    fn span(&self) -> u64;
+
+    /// Whether this task's axis is bytes on the wire, and so should feed
+    /// the session's `TOTAL` row. False for count/percent work and for
+    /// control-plane calls alike, so neither can inflate transfer totals.
+    fn byte_shaped(&self) -> bool {
+        false
+    }
+
+    /// Paint `slot` for `state`. Called once when the slot is claimed and
+    /// again on every lifecycle transition, always on the slot this task
+    /// exclusively owns.
+    fn dress(&self, slot: &ProgressBar, bar_width: usize, state: TaskState);
+}
+
+/// Left-aligned label column: condensed to fit and padded to
+/// [`LABEL_WIDTH`] so bars don't jiggle horizontally as different-length
+/// labels rotate through a slot. Padded by char count, not byte count --
+/// `render` may emit a multi-byte `…`, which byte-length padding under-pads.
+fn label_column(label: &TransferLabel) -> String {
+    let mut rendered = label.render(LABEL_WIDTH);
+    let padding = LABEL_WIDTH.saturating_sub(rendered.chars().count());
+    rendered.extend(std::iter::repeat_n(' ', padding));
+    rendered
+}
+
+/// Work whose extent is known, so it can be drawn as a filling bar: a whole
+/// small file, one multipart segment, a directory walk counting entries.
+pub(crate) struct ProgressAwareTask {
+    label: TransferLabel,
+    measure: Measure,
+}
+
+impl ProgressAwareTask {
+    /// Byte-shaped work -- the flavor that feeds the `TOTAL` row.
+    pub(crate) fn bytes(label: TransferLabel, total: u64) -> Self {
+        Self {
+            label,
+            measure: Measure::Bytes { total },
+        }
+    }
+
+    /// Count-shaped work, rendered through a `{done}`/`{total}` template.
+    pub(crate) fn count(label: TransferLabel, total: u64, template: &'static str) -> Self {
+        Self {
+            label,
+            measure: Measure::Count { total, template },
+        }
+    }
+}
+
+impl ProgressTask for ProgressAwareTask {
+    fn span(&self) -> u64 {
+        self.measure.span()
+    }
+
+    fn byte_shaped(&self) -> bool {
+        matches!(self.measure, Measure::Bytes { .. })
+    }
+
+    fn dress(&self, slot: &ProgressBar, bar_width: usize, state: TaskState) {
+        if state == TaskState::NotStarted {
+            // Queued: the label alone, dim, with no bar to imply motion.
+            if let Some(style) = idle_style() {
+                slot.set_style(style);
+            }
+        } else if let Some(style) = self.measure.style(bar_width) {
+            slot.set_style(style);
+        }
+        slot.set_length(self.measure.span());
+        slot.set_position(0);
+        slot.set_prefix(label_column(&self.label));
+        slot.set_message("");
+    }
+}
+
+/// Work with no measurable extent: a byte-less S3 control-plane call (HEAD,
+/// create/complete/abort multipart, a `ListObjectsV2` page, a batch delete).
+/// All it can report is [`TaskState`], so it renders a spinner and the API
+/// name rather than a bar.
+pub(crate) struct ProgressOpaqueTask {
+    label: TransferLabel,
+    api: &'static str,
+}
+
+impl ProgressOpaqueTask {
+    pub(crate) fn new(label: TransferLabel, api: &'static str) -> Self {
+        Self { label, api }
+    }
+}
+
+impl ProgressTask for ProgressOpaqueTask {
+    fn span(&self) -> u64 {
+        0
+    }
+
+    fn dress(&self, slot: &ProgressBar, _bar_width: usize, state: TaskState) {
+        let api = self.api;
+        let template = match state {
+            // Dim, and no spinner: a queued call must not look like a
+            // working one.
+            TaskState::NotStarted => format!("{{prefix:.240}} {api} queued{{msg:.240}}"),
+            _ => format!("{{prefix}} {{spinner}} {api}{{msg}}"),
+        };
+        if let Ok(style) = ProgressStyle::with_template(&template) {
+            slot.set_style(style);
+        }
+        match state {
+            TaskState::Running => slot.enable_steady_tick(std::time::Duration::from_millis(80)),
+            _ => slot.disable_steady_tick(),
+        }
+        slot.set_prefix(label_column(&self.label));
+        slot.set_message("");
+    }
 }
 
 impl ProgressUi {
-    /// `parallel` (`-P`) sizes the fixed lane grid via [`lane_count`],
+    /// `parallel` (`-P`) sizes the fixed slot grid via [`lane_count`],
     /// reserving 2 rows below it for the TOTAL bar plus a margin row.
-    pub(crate) fn new(parallel: usize) -> Self {
+    pub(crate) fn with_total(parallel: usize) -> Self {
         let (rows, cols) = Self::term_size();
         Self::with_target(
             ProgressDrawTarget::stderr(),
@@ -328,12 +650,10 @@ impl ProgressUi {
         )
     }
 
-    /// Spinner-task-only mode: no persistent overall bar, so only 1 row is
-    /// reserved below the grid (a margin row; there's no TOTAL bar to
-    /// reserve for). Used by [`worker_ui`] for standalone commands, which
-    /// print their own stdout lines between dispatch calls -- see
-    /// [`UiInner::overall`]'s doc for why a persistent bar is unsafe there.
-    pub(crate) fn new_tasks_only(parallel: usize) -> Self {
+    /// The same grid without the persistent TOTAL row, so only 1 row is
+    /// reserved below it (the margin row alone). Used by [`worker_ui`] for
+    /// standalone commands, which have no total worth showing.
+    pub(crate) fn without_total(parallel: usize) -> Self {
         let (rows, cols) = Self::term_size();
         Self::with_target(
             ProgressDrawTarget::stderr(),
@@ -364,10 +684,10 @@ impl ProgressUi {
         )
     }
 
-    /// Like [`Self::hidden`], but tasks-only (no overall bar) -- for tests
-    /// exercising [`worker_ui`]'s mode specifically.
+    /// Like [`Self::hidden`], but without the TOTAL row -- for tests
+    /// exercising [`worker_ui`]'s shape specifically.
     #[cfg(test)]
-    pub(crate) fn hidden_tasks_only(parallel: usize) -> Self {
+    pub(crate) fn hidden_without_total(parallel: usize) -> Self {
         Self::with_target(
             ProgressDrawTarget::hidden(),
             bar_width_for(None),
@@ -377,13 +697,12 @@ impl ProgressUi {
         )
     }
 
-    /// Transfer (bar) mode builds the fixed lane grid (all lanes in idle
-    /// style, top to bottom) and the TOTAL bar below it -- lanes are added
-    /// to `mp` before TOTAL, so TOTAL stays naturally pinned at the bottom
-    /// without ever needing `insert_before`; no bar is added, removed, or
-    /// reinserted into `mp` after this point for the life of the
-    /// `ProgressUi`. Tasks-only mode builds no grid at all (`lanes` stays
-    /// empty) -- see the module doc's "Tasks-only mode" section for why.
+    /// Builds the whole display, once: the fixed slot grid (every slot in
+    /// idle style, top to bottom) and, if asked, the TOTAL bar below it.
+    /// Slots are added to `mp` before TOTAL, so TOTAL stays naturally
+    /// pinned at the bottom without ever needing `insert_before`. No bar is
+    /// added, removed, or reordered after this point for the life of the
+    /// `ProgressUi` -- the fixed-height invariant the module doc opens with.
     fn with_target(
         target: ProgressDrawTarget,
         bar_width: usize,
@@ -391,25 +710,30 @@ impl ProgressUi {
         parallel: usize,
         term_rows: Option<u16>,
     ) -> Self {
-        // Transfer mode reserves 2 rows below the grid (TOTAL + a margin
-        // row); tasks-only mode reserves 1 (the margin row alone).
+        // With a TOTAL row, reserve 2 rows below the grid (TOTAL + a margin
+        // row); without one, reserve 1 (the margin row alone).
         let reserved = if with_overall { 2 } else { 1 };
         let lane_n = lane_count(parallel, term_rows, reserved);
-        let mp = MultiProgress::with_draw_target(target);
-        let lanes: Vec<ProgressBar> = if with_overall {
-            (0..lane_n)
-                .map(|_| {
-                    let pb = mp.add(ProgressBar::new(0));
-                    if let Some(style) = idle_style() {
-                        pb.set_style(style);
-                    }
-                    pb.set_message(IDLE_MESSAGE);
-                    pb
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Assemble against a hidden target and attach the real one at the
+        // end. indicatif's draw target rate-limits to 20/s with a burst
+        // budget of 20 draws, and *every* state-setter here (style, length,
+        // position, prefix, message, per slot) counts as a draw attempt --
+        // enough to drain the whole budget before the command has done any
+        // work. A control-plane call that then completes in a millisecond,
+        // like the `CreateMultipartUpload` opening a multipart upload,
+        // would claim its slot, run, and release it entirely inside the
+        // resulting 50ms blackout, never painting a single frame. Building
+        // blind costs nothing and leaves the budget for real work; it also
+        // means the grid first appears with a task already in it, rather
+        // than flashing an all-idle frame first.
+        let mp = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let lanes: Vec<ProgressBar> = (0..lane_n)
+            .map(|_| {
+                let pb = mp.add(ProgressBar::new(0));
+                reset_to_idle(&pb);
+                pb
+            })
+            .collect();
         let overall = with_overall.then(|| {
             let overall = mp.add(ProgressBar::new(0));
             if let Ok(style) = ProgressStyle::with_template(&format!(
@@ -424,23 +748,26 @@ impl ProgressUi {
             overall.set_message("0/0 objects");
             overall
         });
+        // Fully assembled: connect it to the terminal, with a full draw
+        // budget and nothing left to do but paint real work.
+        mp.set_draw_target(target);
         // Claim order is low-to-high (see `UiState::free`'s doc): initialize
-        // high-to-low so the first `pop()` returns lane 0. Empty in
-        // tasks-only mode (`lanes` is empty, nothing to index).
+        // high-to-low so the first `pop()` returns slot 0.
         let free = (0..lanes.len()).rev().collect();
+        let bars_id = NEXT_BARS_ID.fetch_add(1, Ordering::Relaxed);
+        lock_live_bars().push((bars_id, mp.clone()));
         Self {
             inner: Arc::new(UiInner {
                 mp,
                 lanes,
-                cap: lane_n,
                 overall,
                 bar_width,
                 state: Mutex::new(UiState {
                     objects_total: 0,
                     objects_done: 0,
                     free,
-                    active: 0,
                 }),
+                bars_id,
             }),
         }
     }
@@ -460,158 +787,58 @@ impl ProgressUi {
         self.refresh_msg(&state);
     }
 
-    /// Claims a slot for a new `unit`/`task` handle. Transfer (bar) mode
-    /// (`lanes` non-empty) claims a free index into the fixed grid;
-    /// tasks-only mode (`lanes` empty) inserts a brand-new transient bar
-    /// instead (see the module doc's "Tasks-only mode" section). `None` in
-    /// either mode means the caller's handle goes silent -- no bar, but
-    /// ticks still advance the overall bar in transfer mode (tasks-only has
-    /// none) -- rather than exceeding the concurrency cap.
-    fn claim(&self, spinner: bool, len: u64) -> Option<Claim> {
-        if self.inner.lanes.is_empty() {
-            self.claim_transient(spinner, len)
-        } else {
-            self.claim_lane().map(Claim::Lane)
+    /// Starts `task` already running: claims a slot, dresses it, and hands
+    /// back the [`ProgressNotifier`] that owns it until `finish`.
+    ///
+    /// When every slot is taken the notifier is **silent** -- it owns no
+    /// slot and paints nothing -- rather than the grid growing a row for
+    /// it. Its byte accounting still reaches the `TOTAL` row, so a silent
+    /// task is invisible but never uncounted.
+    pub(crate) fn start(&self, task: impl ProgressTask + 'static) -> ProgressNotifier {
+        self.begin(Box::new(task), TaskState::Running)
+    }
+
+    /// Like [`start`](Self::start), but the task is queued rather than
+    /// running: it takes its slot immediately (so waiting work is visible)
+    /// and renders as [`TaskState::NotStarted`] until the caller reports
+    /// [`ProgressNotifier::started`].
+    pub(crate) fn enqueue(&self, task: impl ProgressTask + 'static) -> ProgressNotifier {
+        self.begin(Box::new(task), TaskState::NotStarted)
+    }
+
+    fn begin(&self, task: Box<dyn ProgressTask>, life: TaskState) -> ProgressNotifier {
+        // Pop a free slot index; `None` means every slot is busy and this
+        // task runs silently. Slots are never created on demand.
+        let slot = self.lock_state().free.pop();
+        if let Some(idx) = slot {
+            task.dress(&self.inner.lanes[idx], self.inner.bar_width, life);
+        }
+        let span = task.span();
+        ProgressNotifier {
+            inner: Some(Arc::new(NotifierInner {
+                ui: self.clone(),
+                slot,
+                byte_shaped: task.byte_shaped(),
+                task,
+                state: Mutex::new(NotifierState { pos: 0, span, life }),
+            })),
         }
     }
 
-    /// Transfer-mode claim: pops a free index into the fixed grid.
-    fn claim_lane(&self) -> Option<usize> {
-        self.lock_state().free.pop()
-    }
-
-    /// Tasks-only-mode claim: inserts a fresh transient bar, capped at
-    /// `UiInner::cap` concurrent lines -- the pre-grid behavior e534ce7
-    /// fixed stdout-glue with, restored here per the amended spec (decision
-    /// 3): a persistent idle row is unsafe in this mode because standalone
-    /// commands interleave `println!` with the UI.
-    fn claim_transient(&self, spinner: bool, len: u64) -> Option<Claim> {
-        let mut state = self.lock_state();
-        if state.active >= self.inner.cap {
-            return None;
-        }
-        state.active += 1;
-        drop(state);
-        let pb = self.inner.mp.add(if spinner {
-            ProgressBar::new_spinner()
-        } else {
-            ProgressBar::new(len)
-        });
-        Some(Claim::Transient(pb))
-    }
-
-    /// Releases `claim`, however it was obtained. Shared by
-    /// `UnitHandle::finish` and `UnitInner`'s `Drop` -- the only two
-    /// release paths.
-    fn release_claim(&self, claim: &Claim) {
-        match claim {
-            Claim::Lane(idx) => self.release_lane(*idx),
-            Claim::Transient(pb) => self.release_transient(pb),
-        }
-    }
-
-    /// Restyles lane `idx` back to its idle row (disabling any steady tick
-    /// left over from a spinner claim) and returns it to the free list.
-    fn release_lane(&self, idx: usize) {
-        let pb = &self.inner.lanes[idx];
-        pb.disable_steady_tick();
-        if let Some(style) = idle_style() {
-            pb.set_style(style);
-        }
-        pb.set_length(0);
-        pb.set_position(0);
-        pb.set_message(IDLE_MESSAGE);
+    /// Hands slot `idx` back: reset to its dim `> IDLE` row and returned to
+    /// the free list. The only release path, shared by
+    /// [`ProgressNotifier::finish`] and `NotifierInner`'s `Drop`.
+    fn release_slot(&self, idx: usize) {
+        reset_to_idle(&self.inner.lanes[idx]);
         self.lock_state().free.push(idx);
     }
 
-    /// Removes a transient bar entirely (finish + clear + remove from
-    /// `mp`), restoring the pre-grid tasks-only behavior: no trace left on
-    /// screen, unlike a grid lane which reverts to idle instead of vanishing.
-    fn release_transient(&self, pb: &ProgressBar) {
-        pb.disable_steady_tick();
-        pb.finish_and_clear();
-        self.inner.mp.remove(pb);
-        let mut state = self.lock_state();
-        state.active = state.active.saturating_sub(1);
-    }
-
-    /// One in-flight transfer unit. If every slot is claimed the handle is
-    /// silent: no bar, but its ticks still advance the overall bar.
-    pub(crate) fn unit(&self, label: TransferLabel, len: u64) -> UnitHandle {
-        let claim = self.claim(false, len);
-        if let Some(claim) = &claim {
-            let pb = claim.bar(&self.inner.lanes);
-            pb.set_length(len);
-            pb.set_position(0);
-            let bar_width = self.inner.bar_width;
-            if let Ok(style) = ProgressStyle::with_template(&format!(
-                "{{msg}} [{{bar:{bar_width}.white/240}}] {{bytes_pair}} {{binary_bytes_per_sec}}",
-            )) {
-                pb.set_style(
-                    style
-                        .progress_chars(BAR_CHARS)
-                        .with_key("bytes_pair", bytes_pair_key),
-                );
-            }
-            // Pad by char count, not byte count: `render` may emit a
-            // multi-byte `…`, and byte-length padding would under-pad.
-            let mut rendered = label.render(LABEL_WIDTH);
-            let padding = LABEL_WIDTH.saturating_sub(rendered.chars().count());
-            rendered.extend(std::iter::repeat_n(' ', padding));
-            pb.set_message(rendered);
-        }
-        UnitHandle {
-            inner: Some(Arc::new(UnitInner {
-                ui: self.clone(),
-                claim,
-                len,
-                state: Mutex::new(UnitProgress {
-                    pos: 0,
-                    finished: false,
-                }),
-            })),
-        }
-    }
-
-    /// One in-flight byte-less S3 operation (HEAD, create/complete/abort
-    /// multipart, list, delete...): a spinner line sharing the same
-    /// concurrency cap as [`unit`](Self::unit), contributing zero bytes to
-    /// the overall bar. Silent handle when every slot is claimed, same as
-    /// `unit`.
-    pub(crate) fn task(&self, label: TransferLabel, api: &'static str) -> UnitHandle {
-        let claim = self.claim(true, 0);
-        if let Some(claim) = &claim {
-            let pb = claim.bar(&self.inner.lanes);
-            if let Ok(style) = ProgressStyle::with_template(&format!("{{msg}} {{spinner}} {api}")) {
-                pb.set_style(style);
-            }
-            pb.enable_steady_tick(std::time::Duration::from_millis(80));
-            // Pad by char count, not byte count: `render` may emit a
-            // multi-byte `…`, and byte-length padding would under-pad.
-            let mut rendered = label.render(LABEL_WIDTH);
-            let padding = LABEL_WIDTH.saturating_sub(rendered.chars().count());
-            rendered.extend(std::iter::repeat_n(' ', padding));
-            pb.set_message(rendered);
-        }
-        UnitHandle {
-            inner: Some(Arc::new(UnitInner {
-                ui: self.clone(),
-                claim,
-                len: 0,
-                state: Mutex::new(UnitProgress {
-                    pos: 0,
-                    finished: false,
-                }),
-            })),
-        }
-    }
-
-    /// Session end: detail bars are already gone (finished or dropped); the
-    /// overall bar finishes in place and stays visible, like mc's. No-op in
-    /// tasks-only mode (no overall bar to finish).
+    /// Session end: slots are already back to idle (finished or dropped);
+    /// the overall bar finishes in place and stays visible, like mc's.
+    /// No-op when there is no TOTAL row.
     ///
-    /// Note: lane clearing relies on indicatif's default `ProgressFinish::AndClear`
-    /// firing when the lane bars drop (verified against indicatif 0.17.11), so
+    /// Note: slot clearing relies on indicatif's default `ProgressFinish::AndClear`
+    /// firing when the slot bars drop (verified against indicatif 0.17.11), so
     /// nobody later sets `on_finish` or defers the drop without realizing.
     pub(crate) fn finish_and_keep(&self) {
         let state = self.lock_state();
@@ -665,73 +892,132 @@ impl ProgressUi {
             .unwrap_or(0)
     }
 
-    /// Occupied slots: `lane_total() - free lanes` in transfer mode, the
-    /// live transient-bar count in tasks-only mode.
+    /// Slots currently owned by a task: the grid size minus the free list.
     #[allow(dead_code)]
-    pub(crate) fn active_detail_bars(&self) -> usize {
-        if self.inner.lanes.is_empty() {
-            self.lock_state().active
-        } else {
-            self.inner.lanes.len() - self.lock_state().free.len()
-        }
+    pub(crate) fn active_slots(&self) -> usize {
+        self.inner.lanes.len() - self.lock_state().free.len()
     }
 
     /// Fixed grid size: decided once at construction and never grown or
-    /// shrunk for the life of this `ProgressUi` in transfer mode; always
-    /// `0` in tasks-only mode, which has no persistent grid at all (see the
-    /// module doc's "Tasks-only mode" section).
+    /// shrunk for the life of this `ProgressUi`.
     #[allow(dead_code)]
-    pub(crate) fn lane_total(&self) -> usize {
+    pub(crate) fn slot_total(&self) -> usize {
         self.inner.lanes.len()
     }
 }
 
-struct UnitProgress {
+struct NotifierState {
+    /// Position on the task's own axis (bytes, items, or 0..PERCENT_SCALE).
     pos: u64,
-    finished: bool,
+    /// Full-scale value. Starts at `ProgressTask::span` and moves with
+    /// [`ProgressNotifier::set_total`].
+    span: u64,
+    life: TaskState,
 }
 
-/// What `ProgressUi::claim` handed back: either an index into the fixed
-/// grid (transfer mode) or a standalone bar inserted just for this claim
-/// (tasks-only mode). See the module doc's "Tasks-only mode" section.
-enum Claim {
-    Lane(usize),
-    Transient(ProgressBar),
+struct NotifierInner {
+    ui: ProgressUi,
+    /// The slot this task owns exclusively until release, or `None` if it
+    /// found every slot taken and is running silently.
+    slot: Option<usize>,
+    /// Cached `task.byte_shaped()`: whether reports here also move the
+    /// `TOTAL` row.
+    byte_shaped: bool,
+    task: Box<dyn ProgressTask>,
+    state: Mutex<NotifierState>,
 }
 
-impl Claim {
-    fn bar<'a>(&'a self, lanes: &'a [ProgressBar]) -> &'a ProgressBar {
-        match self {
-            Claim::Lane(idx) => &lanes[*idx],
-            Claim::Transient(pb) => pb,
+impl NotifierInner {
+    fn bar(&self) -> Option<&ProgressBar> {
+        self.slot.map(|idx| &self.ui.inner.lanes[idx])
+    }
+
+    fn overall(&self) -> Option<&ProgressBar> {
+        self.ui.inner.overall.as_ref()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, NotifierState> {
+        self.state.lock().expect("ProgressNotifier state poisoned")
+    }
+
+    /// Runs one report: drops it if the task is already completed,
+    /// otherwise applies `f` to the bookkeeping and the slot together.
+    ///
+    /// Every public reporting method funnels through here, and `f` runs
+    /// with the lock **held across the writes to the slot** -- that is the
+    /// exclusivity guarantee, not mere tidiness. A slot is handed back the
+    /// instant `finish` runs and can be re-claimed by an unrelated task
+    /// immediately, so a report that checked "am I still running?",
+    /// released the lock, and only then touched the bar would be a write
+    /// into somebody else's row. Holding the lock makes
+    /// check-and-write one step, and `finish` takes the same lock, so the
+    /// two serialize.
+    ///
+    /// Safe to hold across those writes because the lock order has no
+    /// cycle: this lock is only ever taken first, indicatif's internals
+    /// never call back into a `NotifierState`, and `ProgressUi::begin`
+    /// releases the grid's own lock before dressing the slot it claimed.
+    fn report(&self, f: impl FnOnce(&Self, &mut NotifierState)) {
+        let mut state = self.lock();
+        if state.life == TaskState::Completed {
+            return;
+        }
+        f(self, &mut state);
+    }
+
+    /// Moves the task forward by `n` on its own axis, and the `TOTAL` row
+    /// with it when the axis is bytes.
+    fn credit(&self, state: &mut NotifierState, n: u64) {
+        state.pos += n;
+        if let Some(bar) = self.bar() {
+            bar.inc(n);
+        }
+        if self.byte_shaped
+            && let Some(overall) = self.overall()
+        {
+            overall.inc(n);
+        }
+    }
+
+    /// The inverse: un-counts `n` (clamped at zero), including from the
+    /// `TOTAL` row, for a retry that re-streams from the start.
+    fn debit(&self, state: &mut NotifierState, n: u64) {
+        let n = n.min(state.pos);
+        state.pos -= n;
+        if let Some(bar) = self.bar() {
+            bar.set_position(state.pos);
+        }
+        if self.byte_shaped
+            && let Some(overall) = self.overall()
+        {
+            overall.dec(n);
+        }
+    }
+
+    fn seek(&self, state: &mut NotifierState, done: u64) {
+        match done.checked_sub(state.pos) {
+            Some(delta) => self.credit(state, delta),
+            None => self.debit(state, state.pos - done),
         }
     }
 }
 
-struct UnitInner {
-    ui: ProgressUi,
-    // What this unit claimed, if anything (`None` when every slot was busy
-    // at claim time -- a silent handle, per `unit`/`task`'s docs).
-    claim: Option<Claim>,
-    len: u64,
-    state: Mutex<UnitProgress>,
-}
-
-impl UnitInner {
-    fn bar(&self) -> Option<&ProgressBar> {
-        self.claim.as_ref().map(|c| c.bar(&self.ui.inner.lanes))
-    }
-}
-
-/// Cheap-clone handle for one transfer unit; safe to tick from concurrent
-/// futures and from inside a retryable-body closure.
+/// The only channel from running work to the screen. Operation code holds
+/// one of these and never touches a `ProgressBar` or the grid: it reports
+/// what it did, and the notifier drives whichever slot its task owns.
+///
+/// Cheap to clone and safe to report from concurrent futures and from
+/// inside a retryable-body closure. Every method is inert on a
+/// [`noop`](Self::noop) notifier (progress disabled) and on a silent one
+/// (no slot was free), so callers never branch on whether a UI exists.
 #[derive(Clone)]
-pub(crate) struct UnitHandle {
-    inner: Option<Arc<UnitInner>>,
+pub(crate) struct ProgressNotifier {
+    inner: Option<Arc<NotifierInner>>,
 }
 
-impl UnitHandle {
-    /// Inert handle for when progress is disabled (non-TTY/--json/--quiet/--no-color).
+impl ProgressNotifier {
+    /// Inert notifier for when progress is disabled (non-TTY/--json/
+    /// --quiet/--no-color).
     pub(crate) fn noop() -> Self {
         Self { inner: None }
     }
@@ -740,77 +1026,145 @@ impl UnitHandle {
         self.inner.is_none()
     }
 
-    pub(crate) fn inc(&self, n: u64) {
+    /// [`TaskState::NotStarted`] -> [`TaskState::Running`]: the work this
+    /// task was queued for has begun. Idempotent, and a no-op for a task
+    /// that started running immediately.
+    pub(crate) fn started(&self) {
         let Some(inner) = &self.inner else { return };
-        let mut state = inner.state.lock().expect("UnitHandle state poisoned");
-        if state.finished {
-            return;
-        }
-        state.pos += n;
-        if let Some(bar) = inner.bar() {
-            bar.inc(n);
-        }
-        if let Some(overall) = &inner.ui.inner.overall {
-            overall.inc(n);
-        }
+        inner.report(|inner, state| {
+            if state.life != TaskState::NotStarted {
+                return;
+            }
+            state.life = TaskState::Running;
+            if let Some(bar) = inner.bar() {
+                inner
+                    .task
+                    .dress(bar, inner.ui.inner.bar_width, TaskState::Running);
+            }
+        });
     }
 
-    /// Reset to the unit's start (an upload part retry re-streams from
-    /// offset 0) — subtracts already-counted bytes from the overall bar.
+    /// Report `n` more units done on the task's own axis. For a byte-shaped
+    /// task this is also `n` more bytes on the `TOTAL` row.
+    pub(crate) fn advance(&self, n: u64) {
+        let Some(inner) = &self.inner else { return };
+        inner.report(|inner, state| inner.credit(state, n));
+    }
+
+    /// Absolute form of [`advance`](Self::advance), for work that knows its
+    /// running total rather than its increments. Moving backwards is
+    /// allowed (and is what [`rewind`](Self::rewind) is built on).
+    #[allow(dead_code)] // set_fraction is the caller today; kept as the general form
+    pub(crate) fn set_done(&self, done: u64) {
+        let Some(inner) = &self.inner else { return };
+        inner.report(|inner, state| inner.seek(state, done));
+    }
+
+    /// Absolute progress as a 0.0..=1.0 fraction -- the natural report for
+    /// a [`Measure::Percent`] task, and valid for any other flavor too.
+    #[allow(dead_code)] // no Percent-flavored caller yet
+    pub(crate) fn set_fraction(&self, fraction: f64) {
+        let Some(inner) = &self.inner else { return };
+        inner.report(|inner, state| {
+            let done = (state.span as f64 * fraction.clamp(0.0, 1.0)).round() as u64;
+            inner.seek(state, done);
+        });
+    }
+
+    /// Re-scale the task mid-flight, for work that discovers more (or less)
+    /// to do than it was created with -- a directory walk that finds
+    /// another thousand files, a listing that turns out to have more pages.
+    ///
+    /// Deliberately does **not** touch the `TOTAL` row's length even for a
+    /// byte-shaped task: that total is owned by
+    /// [`add_object`](ProgressUi::add_object), which counts whole objects,
+    /// and a per-part rescale here would double-count against it.
+    pub(crate) fn set_total(&self, total: u64) {
+        let Some(inner) = &self.inner else { return };
+        inner.report(|inner, state| {
+            state.span = total;
+            if let Some(bar) = inner.bar() {
+                bar.set_length(total);
+            }
+        });
+    }
+
+    /// Free-text status shown to the right of the readout -- whatever the
+    /// operation wants to say that the numbers can't ("retrying", the
+    /// current sub-path). Empty string clears it.
+    pub(crate) fn set_detail(&self, detail: impl Into<std::borrow::Cow<'static, str>>) {
+        let Some(inner) = &self.inner else { return };
+        inner.report(|inner, _state| {
+            if let Some(bar) = inner.bar() {
+                bar.set_message(detail);
+            }
+        });
+    }
+
+    /// Back to the start of this task (an upload part retry re-streams from
+    /// offset 0) -- un-counting whatever it had already reported, including
+    /// from the `TOTAL` row.
     pub(crate) fn rewind(&self) {
         let Some(inner) = &self.inner else { return };
-        let mut state = inner.state.lock().expect("UnitHandle state poisoned");
-        if state.finished {
-            return;
-        }
-        let pos = std::mem::take(&mut state.pos);
-        if let Some(bar) = inner.bar() {
-            bar.set_position(0);
-        }
-        if let Some(overall) = &inner.ui.inner.overall {
-            overall.dec(pos);
-        }
+        inner.report(|inner, state| inner.debit(state, state.pos));
     }
 
-    /// Snap to 100% (top up any rounding shortfall exactly once), release
-    /// the claimed slot -- reverted to idle in transfer mode, removed
-    /// entirely in tasks-only mode. Idempotent.
+    /// [`TaskState::Completed`]: hand the slot back to idle. Idempotent.
+    ///
+    /// A byte-shaped task also settles up, topping the `TOTAL` row by
+    /// whatever it never got round to reporting -- a body that ticks
+    /// slightly under its content length must not leave the total short.
+    /// Count and percent work is left exactly where it got to instead:
+    /// there is no rounding to settle, and snapping would overstate what
+    /// happened (a half-failed delete phase reading as complete).
     pub(crate) fn finish(&self) {
         let Some(inner) = &self.inner else { return };
-        let mut state = inner.state.lock().expect("UnitHandle state poisoned");
-        if state.finished {
-            return;
-        }
-        state.finished = true;
-        let shortfall = inner.len.saturating_sub(state.pos);
-        state.pos = inner.len;
-        drop(state);
-        if let Some(overall) = &inner.ui.inner.overall {
-            overall.inc(shortfall);
-        }
-        if let Some(claim) = &inner.claim {
-            inner.ui.release_claim(claim);
-        }
+        // Marking completed and releasing the slot happen under the same
+        // lock every report takes, so no in-flight report can still be
+        // between its check and its write when the slot goes back.
+        inner.report(|inner, state| {
+            state.life = TaskState::Completed;
+            if inner.byte_shaped {
+                let shortfall = state.span.saturating_sub(state.pos);
+                state.pos = state.span;
+                if let Some(overall) = inner.overall() {
+                    overall.inc(shortfall);
+                }
+            }
+            if let Some(idx) = inner.slot {
+                inner.ui.release_slot(idx);
+            }
+        });
     }
 }
 
-impl Drop for UnitInner {
-    /// A dropped-unfinished unit (failed part) releases its slot but must
-    /// not fake completion by topping up bytes.
+impl Drop for NotifierInner {
+    /// A task dropped without finishing (a failed part) hands its slot back
+    /// but must not fake completion by topping up the `TOTAL` row.
+    ///
+    /// Recovers a poisoned lock rather than bailing out: the alternative is
+    /// a slot that no task owns and no task can ever claim, which shrinks
+    /// the usable grid for the rest of the run. Reading through the poison
+    /// is safe here because the flag it checks is exactly what decides
+    /// between releasing once and not at all -- it can never double-release
+    /// a slot `finish` already returned.
     fn drop(&mut self) {
-        let finished = self.state.lock().map(|s| s.finished).unwrap_or(true);
-        if !finished && let Some(claim) = &self.claim {
-            self.ui.release_claim(claim);
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let unfinished = state.life != TaskState::Completed;
+        drop(state);
+        if unfinished && let Some(idx) = self.slot {
+            self.ui.release_slot(idx);
         }
     }
 }
 
 pin_project_lite::pin_project! {
-    /// Ticks a [`UnitHandle`] as each data frame is polled onto the wire.
+    /// Reports to a [`ProgressNotifier`] as each data frame is polled onto
+    /// the wire.
     struct ProgressBody {
         #[pin]
         inner: SdkBody,
-        unit: UnitHandle,
+        notifier: ProgressNotifier,
     }
 }
 
@@ -827,7 +1181,7 @@ impl http_body::Body for ProgressBody {
         if let std::task::Poll::Ready(Some(Ok(frame))) = &poll
             && let Some(data) = frame.data_ref()
         {
-            this.unit.inc(data.len() as u64);
+            this.notifier.advance(data.len() as u64);
         }
         poll
     }
@@ -841,7 +1195,7 @@ impl http_body::Body for ProgressBody {
     }
 }
 
-/// Wraps an upload body so every chunk sent ticks `unit`. Applied through
+/// Wraps an upload body so every chunk sent is reported to `notifier`. Applied through
 /// `SdkBody::map_preserve_contents` -- not plain `map` -- since this wrapper
 /// only observes byte counts and never alters the data: `map` would drop
 /// `bytes_contents`, which flips `body.bytes()` from `Some` to `None` and
@@ -850,17 +1204,17 @@ impl http_body::Body for ProgressBody {
 /// selects `SignableBody::Bytes` when `bytes()` is `Some`).
 /// `map_preserve_contents` re-applies on each retry attempt's clone just
 /// like `map` does -- the closure rewinds first so a retried part never
-/// double-counts. No-op for noop handles (progress disabled).
-pub(crate) fn instrument_body(body: ByteStream, unit: &UnitHandle) -> ByteStream {
-    if unit.is_noop() {
+/// double-counts. No-op for noop notifiers (progress disabled).
+pub(crate) fn instrument_body(body: ByteStream, notifier: &ProgressNotifier) -> ByteStream {
+    if notifier.is_noop() {
         return body;
     }
-    let unit = unit.clone();
+    let notifier = notifier.clone();
     ByteStream::new(body.into_inner().map_preserve_contents(move |inner| {
-        unit.rewind();
+        notifier.rewind();
         SdkBody::from_body_1_x(ProgressBody {
             inner,
-            unit: unit.clone(),
+            notifier: notifier.clone(),
         })
     }))
 }
@@ -869,9 +1223,25 @@ pub(crate) fn instrument_body(body: ByteStream, unit: &UnitHandle) -> ByteStream
 mod tests {
     use super::*;
 
+    fn lbl(verb: Verb, path: &str, part: Option<(u64, u64)>) -> TransferLabel {
+        TransferLabel {
+            verb,
+            path: path.into(),
+            part,
+        }
+    }
+
+    fn bytes_task(path: &str, len: u64) -> ProgressAwareTask {
+        ProgressAwareTask::bytes(lbl(Verb::Uploading, path, None), len)
+    }
+
+    fn opaque_task(path: &str, api: &'static str) -> ProgressOpaqueTask {
+        ProgressOpaqueTask::new(lbl(Verb::Listing, path, None), api)
+    }
+
     #[test]
     fn lane_count_is_p_capped_by_console_rows() {
-        assert_eq!(lane_count(5, Some(40), 2), 5, "plenty of rows -> P lanes");
+        assert_eq!(lane_count(5, Some(40), 2), 5, "plenty of rows -> P slots");
         assert_eq!(lane_count(32, Some(12), 2), 10, "capped by usable rows");
         assert_eq!(
             lane_count(32, None, 2),
@@ -887,60 +1257,332 @@ mod tests {
         assert_eq!(lane_count(0, Some(40), 2), 1);
     }
 
+    // --- the slot model: fixed grid, exclusive ownership, back to idle ---
+
     #[test]
-    fn grid_is_stable_and_lanes_recycle() {
+    fn grid_is_stable_and_slots_recycle() {
         let ui = ProgressUi::hidden(3);
-        assert_eq!(ui.lane_total(), 3);
-        assert_eq!(ui.active_detail_bars(), 0, "all idle at start");
-        let a = ui.unit(lbl(Verb::Uploading, "a", None), 10);
-        let t = ui.task(lbl(Verb::Listing, "b", None), "ListObjectsV2");
-        assert_eq!(ui.active_detail_bars(), 2);
-        assert_eq!(ui.lane_total(), 3, "grid never grows");
-        let c = ui.unit(lbl(Verb::Uploading, "c", None), 10);
-        let overflow = ui.unit(lbl(Verb::Uploading, "d", None), 10);
-        assert_eq!(ui.active_detail_bars(), 3, "4th is silent overflow");
-        overflow.inc(7);
+        assert_eq!(ui.slot_total(), 3);
+        assert_eq!(ui.active_slots(), 0, "all idle at start");
+        let a = ui.start(bytes_task("a", 10));
+        let t = ui.start(opaque_task("b", "ListObjectsV2"));
+        assert_eq!(ui.active_slots(), 2);
+        assert_eq!(ui.slot_total(), 3, "grid never grows");
+        let c = ui.start(bytes_task("c", 10));
+        let overflow = ui.start(bytes_task("d", 10));
+        assert_eq!(ui.active_slots(), 3, "4th is silent overflow");
+        overflow.advance(7);
         a.finish();
-        assert_eq!(ui.active_detail_bars(), 2, "lane freed");
-        let e = ui.unit(lbl(Verb::Uploading, "e", None), 10);
-        assert_eq!(ui.active_detail_bars(), 3, "freed lane reclaimed");
-        assert_eq!(ui.lane_total(), 3, "grid never shrinks");
+        assert_eq!(ui.active_slots(), 2, "slot freed");
+        let e = ui.start(bytes_task("e", 10));
+        assert_eq!(ui.active_slots(), 3, "freed slot reclaimed");
+        assert_eq!(ui.slot_total(), 3, "grid never shrinks");
         drop((t, c, e));
-        assert_eq!(ui.active_detail_bars(), 0, "drops release lanes");
+        assert_eq!(ui.active_slots(), 0, "drops release slots");
+    }
+
+    /// Both task kinds draw from the same pool, and neither can add a row
+    /// to escape it -- the invariant that keeps the drawn block a fixed
+    /// height no matter how much work is in flight.
+    #[test]
+    fn both_task_kinds_share_one_fixed_pool() {
+        let ui = ProgressUi::hidden(10);
+        ui.add_object(100);
+        let bars: Vec<ProgressNotifier> = (0..9)
+            .map(|i| {
+                ui.start(ProgressAwareTask::bytes(
+                    lbl(Verb::Uploading, "x", Some((i + 1, 9))),
+                    10,
+                ))
+            })
+            .collect();
+        let t1 = ui.start(ProgressOpaqueTask::new(
+            lbl(Verb::Creating, "asdf/a.img", None),
+            "CreateMultipartUpload",
+        ));
+        assert_eq!(ui.active_slots(), 10, "opaque task takes the 10th slot");
+        let t2 = ui.start(opaque_task("bucket/p", "ListObjectsV2"));
+        assert_eq!(ui.active_slots(), 10, "11th is silent");
+        assert_eq!(ui.slot_total(), 10, "and the grid did not grow for it");
+        t1.finish();
+        t2.finish();
+        assert_eq!(ui.active_slots(), 9);
+        assert_eq!(ui.overall_position(), 0, "opaque tasks contribute no bytes");
+        drop(bars);
     }
 
     #[test]
-    fn eleventh_concurrent_unit_is_silent_but_still_counts() {
+    fn eleventh_concurrent_task_is_silent_but_still_counts() {
         let ui = ProgressUi::hidden(10);
         ui.add_object(11 * 100);
-        let handles: Vec<UnitHandle> = (0..11)
-            .map(|i| ui.unit(lbl(Verb::Uploading, &format!("u{i}"), None), 100))
+        let handles: Vec<ProgressNotifier> = (0..11)
+            .map(|i| ui.start(bytes_task(&format!("u{i}"), 100)))
             .collect();
-        assert_eq!(ui.active_detail_bars(), 10, "cap is 10");
-        // the silent 11th unit still ticks the overall bar
-        handles[10].inc(40);
+        assert_eq!(ui.active_slots(), 10, "cap is 10");
+        // the silent 11th task still reaches the overall bar
+        handles[10].advance(40);
         assert_eq!(ui.overall_position(), 40);
     }
 
     #[test]
-    fn finish_frees_slot_for_next_unit() {
+    fn finish_frees_slot_for_next_task() {
         let ui = ProgressUi::hidden(10);
-        let handles: Vec<UnitHandle> = (0..10)
-            .map(|i| ui.unit(lbl(Verb::Uploading, &format!("u{i}"), None), 10))
+        let handles: Vec<ProgressNotifier> = (0..10)
+            .map(|i| ui.start(bytes_task(&format!("u{i}"), 10)))
             .collect();
-        assert_eq!(ui.active_detail_bars(), 10);
+        assert_eq!(ui.active_slots(), 10);
         handles[0].finish();
-        assert_eq!(ui.active_detail_bars(), 9);
-        let _h = ui.unit(lbl(Verb::Uploading, "next", None), 10);
-        assert_eq!(ui.active_detail_bars(), 10);
+        assert_eq!(ui.active_slots(), 9);
+        let _h = ui.start(bytes_task("next", 10));
+        assert_eq!(ui.active_slots(), 10);
+    }
+
+    // --- ProgressOpaqueTask: the lifecycle IS its progress model ---
+
+    #[test]
+    fn enqueued_opaque_task_holds_its_slot_from_before_it_starts() {
+        // `dispatch` enqueues before acquiring a budget token so queued
+        // work is visible; the slot must be owned across that whole window,
+        // not claimed at the moment work begins.
+        let ui = ProgressUi::hidden(2);
+        let t = ui.enqueue(opaque_task("bucket/p", "ListObjectsV2"));
+        assert_eq!(ui.active_slots(), 1, "queued task already owns a slot");
+        t.started();
+        assert_eq!(ui.active_slots(), 1, "and keeps the same one when running");
+        t.started(); // idempotent
+        assert_eq!(ui.active_slots(), 1);
+        t.finish();
+        assert_eq!(ui.active_slots(), 0, "completed: slot back to idle");
     }
 
     #[test]
-    fn finish_tops_up_to_len_exactly_once() {
+    fn started_after_finish_does_not_resurrect_a_completed_task() {
+        let ui = ProgressUi::hidden(2);
+        let t = ui.enqueue(opaque_task("bucket/p", "ListObjectsV2"));
+        t.finish();
+        assert_eq!(ui.active_slots(), 0);
+        t.started();
+        t.advance(5);
+        assert_eq!(ui.active_slots(), 0, "terminal state stays terminal");
+    }
+
+    // --- render exclusivity: one slot, one owner, no stale writes ---
+
+    #[test]
+    fn a_stale_notifier_cannot_write_into_a_reassigned_slot() {
+        // A `ProgressNotifier` is `Clone` and outlives its slot: `finish`
+        // hands the slot straight back, and the very next task can own it.
+        // Every report must therefore be inert after completion -- not just
+        // the counting ones. `set_detail` originally checked nothing and
+        // would paint one task's text into another task's row.
+        let ui = ProgressUi::hidden(1); // exactly one slot: b is guaranteed a's
+        let a = ui.start(bytes_task("a", 100));
+        a.advance(10);
+        let stale = a.clone();
+        a.finish();
+
+        let b = ui.start(ProgressAwareTask::count(
+            lbl(Verb::Removing, "b", None),
+            8,
+            "{done}/{total} obj",
+        ));
+        b.advance(3);
+        b.set_detail("b's text");
+
+        stale.started();
+        stale.advance(50);
+        stale.set_done(90);
+        stale.set_fraction(1.0);
+        stale.set_total(999);
+        stale.set_detail("a's text");
+        stale.rewind();
+        stale.finish();
+
+        let slot = &ui.inner.lanes[0];
+        assert_eq!(slot.message(), "b's text", "stale write reached the slot");
+        assert_eq!(slot.length(), Some(8), "stale set_total resized the slot");
+        assert_eq!(slot.position(), 3, "stale counting reached the slot");
+        assert_eq!(ui.active_slots(), 1, "and b still owns it");
+        // a was byte-shaped and finished at 100; nothing after that counts.
+        assert_eq!(ui.overall_position(), 100);
+        b.finish();
+        assert_eq!(ui.active_slots(), 0);
+    }
+
+    #[test]
+    fn a_released_slot_carries_nothing_over_to_its_next_owner() {
+        let ui = ProgressUi::hidden(1);
+        let a = ui.start(bytes_task("averylongpath/a.bin", 100));
+        a.advance(60);
+        a.set_detail("halfway");
+        a.finish();
+        let slot = &ui.inner.lanes[0];
+        assert_eq!(slot.position(), 0, "released slot keeps no position");
+        assert_eq!(slot.length(), Some(0), "released slot keeps no length");
+        assert_eq!(slot.message(), "", "released slot keeps no detail text");
+        assert_eq!(slot.prefix(), IDLE_MESSAGE, "released slot reads as idle");
+    }
+
+    #[test]
+    fn slots_are_conserved_across_churn_of_both_task_kinds() {
+        // The failure this guards is a slot leaked (released zero times) or
+        // double-released (pushed twice, handing one row to two owners).
+        // Either shows up as the free list not returning to its full size.
+        let ui = ProgressUi::hidden(4);
+        for round in 0..50u64 {
+            let a = ui.start(bytes_task("a", 10));
+            let b = ui.start(opaque_task("b", "ListObjectsV2"));
+            let c = ui.enqueue(opaque_task("c", "HeadObject"));
+            c.started();
+            let d = ui.start(ProgressAwareTask::count(
+                lbl(Verb::Removing, "d", None),
+                4,
+                "{done}/{total} obj",
+            ));
+            let overflow = ui.start(bytes_task("e", 10)); // no slot left
+            assert_eq!(ui.active_slots(), 4, "round {round}");
+            a.advance(4);
+            match round % 3 {
+                // finished explicitly
+                0 => {
+                    a.finish();
+                    b.finish();
+                    c.finish();
+                    d.finish();
+                }
+                // dropped without finishing (the failed-part path)
+                1 => drop((a, b, c, d)),
+                // a mix, plus a double finish that must not double-release
+                _ => {
+                    a.finish();
+                    a.finish();
+                    drop((b, c));
+                    d.finish();
+                    drop(a);
+                }
+            }
+            drop(overflow);
+            assert_eq!(ui.active_slots(), 0, "every slot returned, round {round}");
+            assert_eq!(ui.slot_total(), 4, "grid unchanged, round {round}");
+        }
+    }
+
+    #[test]
+    fn concurrent_churn_never_hands_one_slot_to_two_owners() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Threads racing claim against release: if a slot were ever handed
+        // out twice, the peak occupancy would exceed the grid size, and if
+        // one leaked, the final count would not return to zero.
+        let ui = ProgressUi::hidden(4);
+        let peak = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let ui = ui.clone();
+                let peak = Arc::clone(&peak);
+                s.spawn(move || {
+                    for i in 0..200u64 {
+                        let h = ui.start(bytes_task(&format!("t{t}-{i}"), 10));
+                        peak.fetch_max(ui.active_slots(), Ordering::SeqCst);
+                        h.advance(5);
+                        if i % 2 == 0 { h.finish() } else { drop(h) }
+                    }
+                });
+            }
+        });
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "peak occupancy {} exceeded the {} slots in the grid",
+            peak.load(Ordering::SeqCst),
+            ui.slot_total()
+        );
+        assert_eq!(ui.active_slots(), 0, "no slot leaked");
+    }
+
+    // --- ProgressAwareTask: the measures ---
+
+    #[test]
+    fn only_byte_shaped_work_reaches_the_total_row() {
         let ui = ProgressUi::hidden(5);
         ui.add_object(100);
-        let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
-        h.inc(30);
+        let counted = ui.start(ProgressAwareTask::count(
+            lbl(Verb::Removing, "bucket/p", None),
+            8,
+            "{done}/{total} obj",
+        ));
+        counted.advance(3);
+        assert_eq!(
+            ui.overall_position(),
+            0,
+            "a count-shaped task must not move the byte total"
+        );
+        counted.finish();
+        assert_eq!(ui.overall_position(), 0, "not on finish either");
+        let moved = ui.start(bytes_task("f", 100));
+        moved.advance(30);
+        assert_eq!(ui.overall_position(), 30);
+    }
+
+    #[test]
+    fn set_total_rescales_mid_flight_without_touching_the_byte_total() {
+        // A directory walk that discovers more work (mirror's local scan).
+        let ui = ProgressUi::hidden(5);
+        ui.add_object(100);
+        let scan = ui.start(ProgressAwareTask::count(
+            lbl(Verb::Scanning, ".", None),
+            1,
+            "{done}/{total} dirs",
+        ));
+        scan.advance(1);
+        scan.set_total(4); // found three more directories
+        scan.advance(2);
+        scan.finish();
+        assert_eq!(
+            ui.overall_position(),
+            0,
+            "rescaling a count task must not credit the byte total"
+        );
+        assert_eq!(ui.overall_length(), 100, "nor change its length");
+    }
+
+    #[test]
+    fn byte_task_set_total_leaves_the_total_row_to_add_object() {
+        // `add_object` owns the TOTAL length; a per-part rescale must not
+        // also move it, or the two would double-count each other.
+        let ui = ProgressUi::hidden(5);
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.set_total(60);
+        assert_eq!(ui.overall_length(), 100);
+        h.advance(60);
+        h.finish();
+        assert_eq!(ui.overall_position(), 60, "finish tops up to the new span");
+    }
+
+    #[test]
+    fn set_done_and_set_fraction_move_absolutely_in_both_directions() {
+        let ui = ProgressUi::hidden(5);
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.set_done(40);
+        assert_eq!(ui.overall_position(), 40);
+        h.set_done(70);
+        assert_eq!(ui.overall_position(), 70, "forward is a delta advance");
+        h.set_done(25);
+        assert_eq!(ui.overall_position(), 25, "backward un-counts the delta");
+        h.set_fraction(0.5);
+        assert_eq!(ui.overall_position(), 50);
+        h.set_fraction(3.0);
+        assert_eq!(ui.overall_position(), 100, "clamped to full scale");
+        h.set_fraction(-1.0);
+        assert_eq!(ui.overall_position(), 0, "clamped to zero");
+    }
+
+    #[test]
+    fn finish_tops_up_bytes_to_span_exactly_once() {
+        let ui = ProgressUi::hidden(5);
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(30);
         h.finish();
         assert_eq!(ui.overall_position(), 100, "topped up 30 -> 100");
         h.finish(); // idempotent
@@ -951,12 +1593,12 @@ mod tests {
     fn rewind_subtracts_progress_for_retry() {
         let ui = ProgressUi::hidden(5);
         ui.add_object(100);
-        let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
-        h.inc(40);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(40);
         assert_eq!(ui.overall_position(), 40);
         h.rewind();
         assert_eq!(ui.overall_position(), 0);
-        h.inc(100);
+        h.advance(100);
         h.finish();
         assert_eq!(ui.overall_position(), 100);
     }
@@ -965,18 +1607,23 @@ mod tests {
     fn drop_without_finish_frees_slot_but_does_not_top_up() {
         let ui = ProgressUi::hidden(5);
         ui.add_object(100);
-        let h = ui.unit(lbl(Verb::Uploading, "f", None), 100);
-        h.inc(30);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(30);
         drop(h); // a failed part must not fake completion
         assert_eq!(ui.overall_position(), 30);
-        assert_eq!(ui.active_detail_bars(), 0);
+        assert_eq!(ui.active_slots(), 0);
     }
 
     #[test]
-    fn noop_handle_is_inert() {
-        let h = UnitHandle::noop();
+    fn noop_notifier_is_inert() {
+        let h = ProgressNotifier::noop();
         assert!(h.is_noop());
-        h.inc(5);
+        h.started();
+        h.advance(5);
+        h.set_done(3);
+        h.set_fraction(0.5);
+        h.set_total(9);
+        h.set_detail("x");
         h.rewind();
         h.finish(); // must not panic
     }
@@ -993,16 +1640,228 @@ mod tests {
         // must not panic; display clamps total >= done internally
     }
 
+    #[test]
+    fn concurrent_rewind_does_not_lose_other_task_progress() {
+        let ui = ProgressUi::hidden(5);
+        ui.add_object(100);
+        let h_a = ui.start(bytes_task("a", 50));
+        let h_b = ui.start(bytes_task("b", 50));
+        h_a.advance(40);
+        assert_eq!(ui.overall_position(), 40);
+        h_b.advance(25);
+        assert_eq!(ui.overall_position(), 65);
+        // Unit A rewinds (atomic dec, not racy read-modify-write)
+        h_a.rewind();
+        assert_eq!(
+            ui.overall_position(),
+            25,
+            "rewind must atomically subtract without losing concurrent increments"
+        );
+    }
+
+    // --- the no-TOTAL-row shape (`worker_ui`'s) ---
+    // Standalone commands get the same grid, just without the TOTAL row.
+    // These pin that the missing row is well-defined rather than a panic
+    // waiting to happen, and that the grid itself is still there -- the
+    // structural change from the old "tasks-only" mode, which had no
+    // persistent rows at all because raw stdout writes would have collided
+    // with them (now handled by `suspend_bars`).
+
+    #[test]
+    fn without_total_still_builds_the_same_fixed_grid() {
+        let ui = ProgressUi::hidden_without_total(5);
+        assert_eq!(ui.slot_total(), 5, "the grid is not the TOTAL row's job");
+        let t = ui.start(opaque_task("bucket/p", "ListObjectsV2"));
+        assert_eq!(ui.active_slots(), 1, "task line takes a slot");
+        assert_eq!(ui.slot_total(), 5, "and the grid is unchanged by it");
+        t.finish();
+        assert_eq!(ui.active_slots(), 0, "finish frees the slot");
+    }
+
+    #[test]
+    fn without_total_reads_position_and_length_as_zero() {
+        let ui = ProgressUi::hidden_without_total(5);
+        assert_eq!(ui.overall_position(), 0, "no TOTAL row: reads as 0");
+        assert_eq!(ui.overall_length(), 0, "no TOTAL row: reads as 0");
+    }
+
+    #[test]
+    fn without_total_caps_at_the_same_slot_count() {
+        let ui = ProgressUi::hidden_without_total(10);
+        let tasks: Vec<ProgressNotifier> = (0..10)
+            .map(|i| ui.start(opaque_task(&format!("b/{i}"), "ListObjectsV2")))
+            .collect();
+        assert_eq!(ui.active_slots(), 10);
+        let eleventh = ui.start(opaque_task("b/x", "ListObjectsV2"));
+        assert_eq!(ui.active_slots(), 10, "11th is silent, same cap");
+        eleventh.finish();
+        drop(tasks);
+    }
+
+    #[test]
+    fn without_total_session_calls_do_not_panic() {
+        // A standalone command never calls these, but they must degrade
+        // gracefully rather than unwrap a `None` TOTAL row.
+        let ui = ProgressUi::hidden_without_total(5);
+        ui.add_object(100);
+        ui.add_object(50);
+        ui.object_done();
+        ui.object_done();
+        ui.object_done(); // more done than added: must not panic
+        ui.finish_and_keep(); // no TOTAL row to finish: must not panic
+        ui.clear(); // no bars left: must not panic or error
+    }
+
+    #[test]
+    fn without_total_byte_task_reports_harmlessly() {
+        let ui = ProgressUi::hidden_without_total(5);
+        let h = ui.start(ProgressAwareTask::bytes(
+            lbl(Verb::Downloading, "b/k", None),
+            10,
+        ));
+        h.advance(4);
+        h.rewind();
+        h.advance(10);
+        h.finish();
+        assert_eq!(ui.overall_position(), 0, "still reads as 0: no TOTAL row");
+    }
+
+    // --- `suspend_bars` / the `LIVE_BARS` registry ---
+    // Every terminal write that isn't a bar redraw has to go through
+    // `suspend_bars`, or it scrolls the block the `MultiProgress` is about to
+    // redraw in place and the grid starts duplicating itself down the screen
+    // (see `LIVE_BARS`'s doc). These pin the registry that makes that
+    // possible from print sites with no `ProgressUi` handle of their own.
+    //
+    // They deliberately do not assert the *global* registry is empty at any
+    // point: the whole test binary shares it, and the other tests in this
+    // module hold live `ProgressUi`s concurrently. Each asserts only about
+    // the ids it created itself.
+
+    fn registry_contains(id: u64) -> bool {
+        lock_live_bars().iter().any(|(other, _)| *other == id)
+    }
+
+    #[test]
+    fn live_ui_registers_and_deregisters_on_drop() {
+        let ui = ProgressUi::hidden(3);
+        let id = ui.inner.bars_id;
+        assert!(registry_contains(id), "a live UI must be suspendable");
+        // A clone shares the `Arc`, so the registry entry outlives it.
+        let clone = ui.clone();
+        drop(ui);
+        assert!(registry_contains(id), "still live through the clone");
+        drop(clone);
+        assert!(!registry_contains(id), "last handle gone: entry released");
+    }
+
+    #[test]
+    fn suspend_bars_runs_the_closure_exactly_once() {
+        // No bars at all (the non-TTY/--json/--quiet case, and every moment
+        // before or after a UI exists): still runs, still returns the value.
+        let mut calls = 0;
+        let out = suspend_bars(|| {
+            calls += 1;
+            "value"
+        });
+        assert_eq!((calls, out), (1, "value"));
+
+        // One live display.
+        let ui = ProgressUi::hidden(2);
+        let mut calls = 0;
+        let out = suspend_bars(|| {
+            calls += 1;
+            7u32
+        });
+        assert_eq!((calls, out), (1, 7));
+
+        // Two: `suspend_all` nests over both rather than picking one.
+        let other = ProgressUi::hidden_without_total(2);
+        let mut calls = 0;
+        suspend_bars(|| calls += 1);
+        assert_eq!(calls, 1, "nested suspend must not re-run the closure");
+        drop((ui, other));
+    }
+
+    #[test]
+    fn suspend_bars_is_reentrant_safe_for_a_ui_built_inside_the_closure() {
+        // `suspend_bars` clones the handles out and drops the registry lock
+        // before running the closure, so caller code that happens to build
+        // or tear down a `ProgressUi` can't deadlock against it.
+        let outer = ProgressUi::hidden(2);
+        let id = suspend_bars(|| {
+            let inner = ProgressUi::hidden_without_total(1);
+            let id = inner.inner.bars_id;
+            assert!(registry_contains(id));
+            id
+        });
+        assert!(
+            !registry_contains(id),
+            "inner UI dropped inside the closure"
+        );
+        drop(outer);
+    }
+
+    /// Source-level guard for the invariant `suspend_bars` exists to keep:
+    /// a bare `println!`/`eprintln!` anywhere in the crate is a write that
+    /// bypasses the choke point, and the failure it causes (a duplicated,
+    /// endlessly-growing slot grid, with the message that triggered it
+    /// scrolled away) only reproduces under a real TTY with a live UI --
+    /// i.e. in front of a user, not in CI. Cheaper to forbid the call than
+    /// to reason at each new site about whether a UI can be up.
+    ///
+    /// `progress.rs` (the macros' own bodies) and `output.rs` (which calls
+    /// `suspend_bars` directly, closing over the raw macro) are the two
+    /// definitions of the choke point, so they are the two exemptions.
+    #[test]
+    fn no_terminal_write_bypasses_suspend_bars() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src).expect("read src/") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if path.extension().is_none_or(|e| e != "rs")
+                || name == "progress.rs"
+                || name == "output.rs"
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            // `eprintln!(` contains `println!(` as a substring, so one scan
+            // finds both; walk back over the identifier to recover which.
+            for (idx, _) in text.match_indices("println!(") {
+                let start = text[..idx]
+                    .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+                    .map_or(0, |i| i + 1);
+                let macro_name = &text[start..idx + "println!".len()];
+                if macro_name != "ui_println!" && macro_name != "ui_eprintln!" {
+                    let line = text[..idx].lines().count();
+                    offenders.push(format!("{name}:{line}: {macro_name}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use ui_println!/ui_eprintln! (see `LIVE_BARS`) instead of:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    // --- body instrumentation ---
+
     #[tokio::test]
-    async fn progress_body_ticks_exact_len() {
+    async fn progress_body_reports_exact_len() {
         use aws_smithy_types::body::SdkBody;
         use aws_smithy_types::byte_stream::ByteStream;
 
         let ui = ProgressUi::hidden(5);
         ui.add_object(10);
-        let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 10);
+        let notifier = ui.start(ProgressAwareTask::bytes(
+            lbl(Verb::Uploading, "mem", None),
+            10,
+        ));
         let body = ByteStream::new(SdkBody::from("0123456789"));
-        let wrapped = instrument_body(body, &unit);
+        let wrapped = instrument_body(body, &notifier);
         let data = wrapped.collect().await.expect("collect").into_bytes();
         assert_eq!(&data[..], b"0123456789");
         assert_eq!(ui.overall_position(), 10);
@@ -1015,9 +1874,12 @@ mod tests {
 
         let ui = ProgressUi::hidden(5);
         ui.add_object(10);
-        let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 10);
+        let notifier = ui.start(ProgressAwareTask::bytes(
+            lbl(Verb::Uploading, "mem", None),
+            10,
+        ));
         let retryable = SdkBody::retryable(|| SdkBody::from("0123456789"));
-        let wrapped = instrument_body(ByteStream::new(retryable), &unit);
+        let wrapped = instrument_body(ByteStream::new(retryable), &notifier);
         // The SDK's orchestrator clones a retryable body once per attempt;
         // each clone re-applies the map, whose closure rewinds first.
         let inner = wrapped.into_inner();
@@ -1045,7 +1907,7 @@ mod tests {
         use aws_smithy_types::byte_stream::ByteStream;
 
         let body = ByteStream::new(SdkBody::from("abc"));
-        let wrapped = instrument_body(body, &UnitHandle::noop());
+        let wrapped = instrument_body(body, &ProgressNotifier::noop());
         let data = wrapped.collect().await.expect("collect").into_bytes();
         assert_eq!(&data[..], b"abc");
     }
@@ -1061,7 +1923,10 @@ mod tests {
 
         let ui = ProgressUi::hidden(5);
         ui.add_object(10);
-        let unit = ui.unit(lbl(Verb::Uploading, "part", None), 10);
+        let notifier = ui.start(ProgressAwareTask::bytes(
+            lbl(Verb::Uploading, "part", None),
+            10,
+        ));
         let body = ByteStream::read_from()
             .path(file.path())
             .offset(2)
@@ -1069,7 +1934,7 @@ mod tests {
             .build()
             .await
             .expect("build file body");
-        let wrapped = instrument_body(body, &unit).into_inner();
+        let wrapped = instrument_body(body, &notifier).into_inner();
         // Content-Length must survive wrapping -- put_object/upload_part
         // only set the header when this is `Some`.
         assert_eq!(wrapped.content_length(), Some(10));
@@ -1093,9 +1958,12 @@ mod tests {
 
         let ui = ProgressUi::hidden(5);
         ui.add_object(3);
-        let unit = ui.unit(lbl(Verb::Uploading, "mem", None), 3);
+        let notifier = ui.start(ProgressAwareTask::bytes(
+            lbl(Verb::Uploading, "mem", None),
+            3,
+        ));
         let body = ByteStream::new(SdkBody::from("abc"));
-        let wrapped = instrument_body(body, &unit).into_inner();
+        let wrapped = instrument_body(body, &notifier).into_inner();
         assert!(
             wrapped.bytes().is_some(),
             "wrapping must not drop bytes_contents (would downgrade SigV4 to UNSIGNED-PAYLOAD)"
@@ -1103,13 +1971,7 @@ mod tests {
         assert_eq!(wrapped.bytes(), Some(b"abc".as_slice()));
     }
 
-    fn lbl(verb: Verb, path: &str, part: Option<(u64, u64)>) -> TransferLabel {
-        TransferLabel {
-            verb,
-            path: path.into(),
-            part,
-        }
-    }
+    // --- pure formatting ---
 
     #[test]
     fn label_renders_full_when_it_fits() {
@@ -1151,9 +2013,10 @@ mod tests {
         );
         let out = tight.render(24);
         // `…` is one char via chars().count() but 3 bytes in UTF-8 -- the
-        // width contract (and the padding in `unit()`) is char-counted, so
-        // this assertion is too (str::len() is bytes and would over-count
-        // the ellipsis, failing at exactly the boundary this test targets).
+        // width contract (and the padding in `label_column`) is
+        // char-counted, so this assertion is too (str::len() is bytes and
+        // would over-count the ellipsis, failing at exactly the boundary
+        // this test targets).
         assert!(
             out.chars().count() <= 24,
             "{out:?} too wide ({} chars)",
@@ -1161,6 +2024,20 @@ mod tests {
         );
         assert!(out.starts_with("Uploading …"), "{out:?}");
         assert!(out.ends_with(" part 2/9"), "{out:?}");
+    }
+
+    #[test]
+    fn label_column_pads_to_a_fixed_width_by_chars() {
+        let short = label_column(&lbl(Verb::Copying, "a.txt", None));
+        assert_eq!(short.chars().count(), LABEL_WIDTH);
+        // A condensed label carries a multi-byte `…`; padding is by chars,
+        // so the column is still exactly LABEL_WIDTH wide on screen.
+        let long = label_column(&lbl(
+            Verb::Downloading,
+            "backups/2026/07/31/big.iso",
+            Some((1, 8)),
+        ));
+        assert_eq!(long.chars().count(), LABEL_WIDTH);
     }
 
     #[test]
@@ -1202,148 +2079,29 @@ mod tests {
     }
 
     #[test]
-    fn task_lines_share_the_slot_pool_and_add_no_bytes() {
-        let ui = ProgressUi::hidden(10);
-        ui.add_object(100);
-        let bars: Vec<UnitHandle> = (0..9)
-            .map(|i| ui.unit(lbl(Verb::Uploading, "x", Some((i + 1, 9))), 10))
-            .collect();
-        let t1 = ui.task(
-            lbl(Verb::Creating, "asdf/a.img", None),
-            "CreateMultipartUpload",
+    fn every_measure_compiles_a_style_and_spans_correctly() {
+        // A measure whose template fails to compile would silently leave a
+        // claimed slot rendering in whatever style the previous task left.
+        assert!(Measure::Bytes { total: 10 }.style(30).is_some());
+        assert!(
+            Measure::Count {
+                total: 10,
+                template: "{done}/{total} obj",
+            }
+            .style(30)
+            .is_some()
         );
-        assert_eq!(ui.active_detail_bars(), 10, "task takes the 10th slot");
-        let t2 = ui.task(lbl(Verb::Listing, "bucket/p", None), "ListObjectsV2");
-        assert_eq!(ui.active_detail_bars(), 10, "11th is silent");
-        t1.finish();
-        t2.finish();
-        assert_eq!(ui.active_detail_bars(), 9);
-        assert_eq!(ui.overall_position(), 0, "tasks contribute no bytes");
-        drop(bars);
-    }
-
-    #[test]
-    fn concurrent_rewind_does_not_lose_other_unit_progress() {
-        let ui = ProgressUi::hidden(5);
-        ui.add_object(100);
-        let h_a = ui.unit(lbl(Verb::Uploading, "a", None), 50);
-        let h_b = ui.unit(lbl(Verb::Uploading, "b", None), 50);
-        // Unit A increments by 40
-        h_a.inc(40);
-        assert_eq!(ui.overall_position(), 40);
-        // Unit B increments by 25 (A's 40 + B's 25 = 65 total)
-        h_b.inc(25);
-        assert_eq!(ui.overall_position(), 65);
-        // Unit A rewinds (atomic dec, not racy read-modify-write)
-        h_a.rewind();
-        // Only B's 25 should remain; A's 40 is atomically subtracted
+        assert!(Measure::Percent.style(30).is_some());
+        assert_eq!(Measure::Bytes { total: 10 }.span(), 10);
         assert_eq!(
-            ui.overall_position(),
-            25,
-            "rewind must atomically subtract without losing concurrent increments"
+            Measure::Count {
+                total: 7,
+                template: "{done}/{total} obj",
+            }
+            .span(),
+            7
         );
-    }
-
-    // --- tasks-only mode (`worker_ui`'s `ProgressUi::new_tasks_only`) ---
-    // F1 fix: standalone commands print their own stdout lines, so their
-    // `ProgressUi` must have no persistent overall bar (see `UiInner::overall`'s
-    // doc) or those prints glue onto it. These pin the resulting no-overall-bar
-    // contract: `overall_position`/`overall_length` read as a well-defined `0`
-    // rather than panicking, slot accounting still works, and `add_object`/
-    // `object_done` (which a plain standalone command never calls, but which
-    // must stay harmless if one did) don't panic either.
-
-    #[test]
-    fn tasks_only_mode_has_no_overall_position_or_length() {
-        let ui = ProgressUi::hidden_tasks_only(5);
-        assert_eq!(ui.overall_position(), 0, "no overall bar: reads as 0");
-        assert_eq!(ui.overall_length(), 0, "no overall bar: reads as 0");
-    }
-
-    // Regression guard for the amended spec (decision 3): a persistent idle
-    // grid in tasks-only mode re-introduces the stdout-glue bug e534ce7
-    // fixed (standalone commands interleave `println!` with dispatch's
-    // task lines; a persistent bar parks the cursor for the next print to
-    // glue onto). Tasks-only mode must build zero persistent rows -- only
-    // transient bars inserted on claim and fully removed on release.
-    #[test]
-    fn tasks_only_mode_has_no_persistent_grid() {
-        let ui = ProgressUi::hidden_tasks_only(5);
-        assert_eq!(
-            ui.lane_total(),
-            0,
-            "tasks-only mode must not build a persistent lane grid"
-        );
-        let t = ui.task(lbl(Verb::Listing, "bucket/p", None), "ListObjectsV2");
-        assert_eq!(
-            ui.lane_total(),
-            0,
-            "grid stays empty even while a transient task line is active"
-        );
-        t.finish();
-        assert_eq!(ui.active_detail_bars(), 0, "finished task line is gone");
-    }
-
-    #[test]
-    fn tasks_only_mode_task_line_accounts_slots_but_not_bytes() {
-        let ui = ProgressUi::hidden_tasks_only(5);
-        assert_eq!(ui.active_detail_bars(), 0);
-        let t = ui.task(lbl(Verb::Listing, "bucket/p", None), "ListObjectsV2");
-        assert_eq!(ui.active_detail_bars(), 1, "task line takes a slot");
-        assert_eq!(
-            ui.overall_position(),
-            0,
-            "no overall bar to tick even while a task is active"
-        );
-        t.finish();
-        assert_eq!(ui.active_detail_bars(), 0, "finish frees the slot");
-    }
-
-    #[test]
-    fn tasks_only_mode_caps_at_ten_task_lines_like_bar_mode() {
-        let ui = ProgressUi::hidden_tasks_only(10);
-        let tasks: Vec<UnitHandle> = (0..10)
-            .map(|i| ui.task(lbl(Verb::Listing, &format!("b/{i}"), None), "ListObjectsV2"))
-            .collect();
-        assert_eq!(ui.active_detail_bars(), 10);
-        let eleventh = ui.task(lbl(Verb::Listing, "b/x", None), "ListObjectsV2");
-        assert_eq!(
-            ui.active_detail_bars(),
-            10,
-            "11th is silent, same cap as bar mode"
-        );
-        eleventh.finish();
-        drop(tasks);
-    }
-
-    #[test]
-    fn tasks_only_mode_add_object_and_object_done_do_not_panic() {
-        // Not part of any standalone command's real usage (they never call
-        // these), but `add_object`/`object_done`/`finish_and_keep` must
-        // still degrade gracefully rather than unwrap a `None` overall bar,
-        // in case a future caller reuses a tasks-only `ProgressUi` this way.
-        let ui = ProgressUi::hidden_tasks_only(5);
-        ui.add_object(100);
-        ui.add_object(50);
-        ui.object_done();
-        ui.object_done();
-        ui.object_done(); // more done than added: must not panic (bar mode clamps too)
-        ui.finish_and_keep(); // no overall bar to finish: must not panic
-        ui.clear(); // no bars left: must not panic or error
-    }
-
-    #[test]
-    fn tasks_only_mode_unit_finish_does_not_panic_without_overall_bar() {
-        // `unit()` isn't used by any tasks-only-mode caller today (standalone
-        // commands only ever call `task()` via `dispatch`), but the no-overall
-        // guard in `UnitHandle::inc`/`rewind`/`finish` must hold for it too.
-        let ui = ProgressUi::hidden_tasks_only(5);
-        let h = ui.unit(lbl(Verb::Downloading, "b/k", None), 10);
-        h.inc(4);
-        h.rewind();
-        h.inc(10);
-        h.finish();
-        assert_eq!(ui.overall_position(), 0, "still reads as 0: no overall bar");
+        assert_eq!(Measure::Percent.span(), PERCENT_SCALE);
     }
 
     #[test]

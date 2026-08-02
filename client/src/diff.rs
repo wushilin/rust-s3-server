@@ -95,7 +95,26 @@ async fn collect_entries(
     match side {
         Side::Local(root) => {
             if root.is_dir() {
-                collect_local_entries(root).await
+                {
+                    // Same slot grid the S3 side's listing dispatches into:
+                    // a local tree walk is work the user is waiting on, so
+                    // it is a task like any other rather than dead air.
+                    let scan = match dispatch_ctx.and_then(|(_, ui)| ui) {
+                        Some(ui) => ui.start(crate::progress::ProgressAwareTask::count(
+                            crate::progress::TransferLabel {
+                                verb: crate::progress::Verb::Scanning,
+                                path: root.display().to_string(),
+                                part: None,
+                            },
+                            0,
+                            "{done}/{total} dirs",
+                        )),
+                        None => crate::progress::ProgressNotifier::noop(),
+                    };
+                    let entries = collect_local_entries(root, &scan).await;
+                    scan.finish();
+                    entries
+                }
             } else if required {
                 Err(anyhow!("`{}` is not a folder.", root.display()))
             } else {

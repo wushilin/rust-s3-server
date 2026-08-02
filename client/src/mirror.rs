@@ -6,6 +6,7 @@ use aws_sdk_s3::Client;
 use chrono::{DateTime, Utc};
 
 use crate::messages::{MirrorMessage, TransferSession};
+use crate::progress::{ui_eprintln, ui_println};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Entry {
@@ -59,10 +60,30 @@ pub(crate) fn plan_mirror(
     MirrorPlan { copies, deletes }
 }
 
-pub(crate) async fn collect_local_entries(root: &Path) -> Result<Vec<Entry>> {
+/// Walks `root` for files to mirror.
+///
+/// Reports to `scan` on two axes, because the walk knows two different
+/// things:
+///
+/// - **The bar counts directories.** It is breadth-first over a queue, so
+///   at any moment "total" is every directory discovered so far and "done"
+///   is every one already read -- and finding a subdirectory grows the
+///   total mid-walk, which is what [`ProgressNotifier::set_total`] is for.
+///   Directories are the only axis with a real denominator here.
+/// - **The detail text counts matched files**, the number the user actually
+///   cares about, which has no knowable total until the walk ends.
+///
+/// Pass [`ProgressNotifier::noop`](crate::progress::ProgressNotifier::noop)
+/// to walk silently.
+pub(crate) async fn collect_local_entries(
+    root: &Path,
+    scan: &crate::progress::ProgressNotifier,
+) -> Result<Vec<Entry>> {
     use std::collections::VecDeque;
     let mut entries = Vec::new();
     let mut dirs = VecDeque::from([root.to_path_buf()]);
+    let mut discovered = 1u64;
+    scan.set_total(discovered);
     while let Some(dir) = dirs.pop_front() {
         let mut rd = tokio::fs::read_dir(&dir)
             .await
@@ -72,6 +93,8 @@ pub(crate) async fn collect_local_entries(root: &Path) -> Result<Vec<Entry>> {
             let meta = item.metadata().await?;
             if meta.is_dir() {
                 dirs.push_back(path);
+                discovered += 1;
+                scan.set_total(discovered);
             } else if meta.is_file() {
                 let rel = path
                     .strip_prefix(root)?
@@ -84,6 +107,8 @@ pub(crate) async fn collect_local_entries(root: &Path) -> Result<Vec<Entry>> {
                 });
             }
         }
+        scan.advance(1);
+        scan.set_detail(format!("{} files", entries.len()));
     }
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(entries)
@@ -203,15 +228,27 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         return Err(anyhow!("--attr for S3-to-S3 copies is not implemented yet"));
     }
 
-    // Decided here (rather than at the usual post-planning `TransferSession`
-    // spot below) so the planning listing calls can dispatch through it too.
-    // `worker_ui()` is always tasks-only mode (no persistent overall bar --
-    // see `ProgressUi::new_tasks_only`'s doc), so it's safe to use
-    // unconditionally here even on the `--dry-run` path, which prints
-    // PUT/DEL lines right after planning: a tasks-only `ProgressUi` never
-    // leaves a persistent, unfinished line for those prints to glue onto.
-    let planning_ui = crate::progress::worker_ui(parallel);
-    let dispatch_ctx = Some((&stream_budget, planning_ui.as_ref()));
+    // ONE display for the whole invocation -- built here, before planning,
+    // and handed to the `TransferSession` below rather than replaced by a
+    // second one. Planning's listing/scan tasks and the transfers that
+    // follow claim slots from the same fixed grid, so the block of rows on
+    // screen never changes shape between phases; a second `ProgressUi`
+    // would mean a second `MultiProgress` building a fresh grid under the
+    // first one's cursor accounting.
+    let ui = crate::progress::transfer_ui(parallel);
+    let dispatch_ctx = Some((&stream_budget, ui.as_ref()));
+    let scan_task = |root: &Path| match &ui {
+        Some(ui) => ui.start(crate::progress::ProgressAwareTask::count(
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Scanning,
+                path: root.display().to_string(),
+                part: None,
+            },
+            0,
+            "{done}/{total} dirs",
+        )),
+        None => crate::progress::ProgressNotifier::noop(),
+    };
     let source_entries = match &source {
         Side::Local(root) => {
             if !root.is_dir() {
@@ -220,7 +257,10 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                     root.display()
                 ));
             }
-            collect_local_entries(root).await?
+            let scan = scan_task(root);
+            let entries = collect_local_entries(root, &scan).await?;
+            scan.finish();
+            entries
         }
         Side::S3 {
             client,
@@ -232,7 +272,10 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     let target_entries = match &target {
         Side::Local(root) => {
             if root.exists() {
-                collect_local_entries(root).await?
+                let scan = scan_task(root);
+                let entries = collect_local_entries(root, &scan).await?;
+                scan.finish();
+                entries
             } else {
                 Vec::new()
             }
@@ -244,7 +287,6 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
             ..
         } => collect_s3_entries(client, bucket, prefix, dispatch_ctx).await?,
     };
-
     // Deletes must be computed from *true* source presence: mc's own
     // isOlder/isNewer are applied per diff-URL, after planning, and only
     // skip COPIES (`cmd/mirror-main.go:826-838`) -- they never affect
@@ -283,7 +325,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         // divergences).
         if !crate::output::out().json {
             for entry in &plan.copies {
-                println!(
+                ui_println!(
                     "PUT {}/{} -> {}/{}",
                     args.source.trim_end_matches('/'),
                     entry.rel,
@@ -292,9 +334,9 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 );
             }
             for rel in &plan.deletes {
-                println!("DEL {}/{}", args.target.trim_end_matches('/'), rel);
+                ui_println!("DEL {}/{}", args.target.trim_end_matches('/'), rel);
             }
-            println!(
+            ui_println!(
                 "Planned {} put(s), {} delete(s).",
                 plan.copies.len(),
                 plan.deletes.len()
@@ -308,14 +350,9 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     // starting any transfer -- matches mc's copyMessage/mirrorMessage
     // totalCount/totalSize, which reflect the whole session's planned
     // work, not a running tally.
-    // A fresh `TransferSession` (bar mode, its own persistent overall bar)
-    // rather than reusing `planning_ui`: the planning listing above used a
-    // tasks-only `ProgressUi` (spinner lines only), and by this point every
-    // one of its task lines has already finished and been removed (each
-    // `dispatch` call finishes synchronously before `collect_s3_entries`
-    // returns), so there's nothing left on screen for a second, independent
-    // `ProgressUi` to conflict with.
-    let session = TransferSession::new("mirror", parallel);
+    // The session wraps the display planning already used, rather than
+    // building a second one -- see `ui`'s comment above.
+    let session = TransferSession::from_ui(ui);
     for entry in &plan.copies {
         session.add_total(entry.size);
     }
@@ -361,7 +398,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                     0u64
                 }
                 Err(err) => {
-                    eprintln!("mirror: `{}` failed: {err:#}", entry.rel);
+                    ui_eprintln!("mirror: `{}` failed: {err:#}", entry.rel);
                     1u64
                 }
             }
@@ -380,12 +417,28 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     // exactly like the copy path.
     let mut delete_failures = 0u64;
     if !plan.deletes.is_empty() {
+        // The delete plan's size is known exactly here, and neither branch
+        // below moves any bytes -- a count-shaped task is what actually
+        // describes this phase, where a byte bar would sit at 0/0.
+        let removing = match session.ui() {
+            Some(ui) => ui.start(crate::progress::ProgressAwareTask::count(
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Removing,
+                    path: args.target.trim_end_matches('/').to_string(),
+                    part: None,
+                },
+                plan.deletes.len() as u64,
+                "{done}/{total} obj",
+            )),
+            None => crate::progress::ProgressNotifier::noop(),
+        };
         match &target {
             Side::Local(root) => {
                 for rel in &plan.deletes {
                     let path = root.join(rel);
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => {
+                            removing.advance(1);
                             let (total_count, total_size) = session.totals();
                             let msg = MirrorMessage {
                                 source: String::new(),
@@ -398,7 +451,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                             session.object_done(&msg, 0);
                         }
                         Err(err) => {
-                            eprintln!("mirror: remove `{}` failed: {err}", path.display());
+                            ui_eprintln!("mirror: remove `{}` failed: {err}", path.display());
                             delete_failures += 1;
                         }
                     }
@@ -442,7 +495,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                     let failed_keys: HashSet<&str> =
                         resp.errors().iter().filter_map(|err| err.key()).collect();
                     for err in resp.errors() {
-                        eprintln!(
+                        ui_eprintln!(
                             "mirror: remove `{}` failed: {}",
                             err.key().unwrap_or("?"),
                             err.message().unwrap_or("unknown")
@@ -451,6 +504,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                     for rel in chunk {
                         let key = s3_key(prefix, rel);
                         if !failed_keys.contains(key.as_str()) {
+                            removing.advance(1);
                             let (total_count, total_size) = session.totals();
                             let msg = MirrorMessage {
                                 source: String::new(),
@@ -466,6 +520,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 }
             }
         }
+        removing.finish();
     }
 
     session.finish();
@@ -515,7 +570,7 @@ async fn delete_source_entry(
         }
     };
     if let Err(err) = result {
-        eprintln!("mv: remove `{}` failed: {err:#}", entry.rel);
+        ui_eprintln!("mv: remove `{}` failed: {err:#}", entry.rel);
     }
 }
 

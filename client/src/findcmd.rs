@@ -492,7 +492,7 @@ pub(crate) async fn run_find(args: FindArgs) -> Result<()> {
             } else {
                 let rendered =
                     substitute_tokens(print_template, &effective_key, relative, obj.size, time);
-                println!("{rendered}");
+                crate::progress::ui_println!("{rendered}");
             }
         } else {
             print_msg(&FindMessage(to_content_message(

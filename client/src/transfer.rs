@@ -16,6 +16,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 
 use crate::config::client_for_alias;
+use crate::progress::ui_eprintln;
 use crate::urls::parse_s3_url;
 
 /// A handful of PutObject/CreateMultipartUpload builder methods that
@@ -177,15 +178,15 @@ pub(crate) async fn upload_file(
     if disable_multipart || file_meta.len() <= part_size {
         let _permit = budget.acquire().await;
         let unit = match progress {
-            Some(ui) => ui.unit(
+            Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                 crate::progress::TransferLabel {
                     verb: crate::progress::Verb::Uploading,
                     path: source.display().to_string(),
                     part: None,
                 },
                 file_meta.len(),
-            ),
-            None => crate::progress::UnitHandle::noop(),
+            )),
+            None => crate::progress::ProgressNotifier::noop(),
         };
         let body = crate::progress::instrument_body(ByteStream::from_path(source).await?, &unit);
         let mut req = client.put_object().bucket(&bucket).key(&key).body(body);
@@ -279,15 +280,15 @@ pub(crate) async fn multipart_upload(
             let offset = (part_index - 1) * part_size;
             let len = (total_size - offset).min(part_size);
             let unit = match &progress {
-                Some(ui) => ui.unit(
+                Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Uploading,
                         path: source_label,
                         part: Some((part_index, part_count)),
                     },
                     len,
-                ),
-                None => crate::progress::UnitHandle::noop(),
+                )),
+                None => crate::progress::ProgressNotifier::noop(),
             };
             let body = crate::progress::instrument_body(
                 ByteStream::read_from()
@@ -645,15 +646,15 @@ pub(crate) async fn multipart_copy_s3_to_s3(
                 .await?
                 .body;
             let unit = match &progress {
-                Some(ui) => ui.unit(
+                Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Copying,
                         path: source_key_label,
                         part: Some((part_index, part_count)),
                     },
                     end - start + 1,
-                ),
-                None => crate::progress::UnitHandle::noop(),
+                )),
+                None => crate::progress::ProgressNotifier::noop(),
             };
             let body = crate::progress::instrument_body(body, &unit);
             let part_number = part_index as i32;
@@ -761,15 +762,15 @@ pub(crate) async fn transfer_object_between_s3(
         if disable_multipart || size <= single_limit {
             let _permit = budget.acquire().await;
             let unit = match progress {
-                Some(ui) => ui.unit(
+                Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Copying,
                         path: source_key.to_string(),
                         part: None,
                     },
                     size,
-                ),
-                None => crate::progress::UnitHandle::noop(),
+                )),
+                None => crate::progress::ProgressNotifier::noop(),
             };
             target_client
                 .copy_object()
@@ -808,22 +809,22 @@ pub(crate) async fn transfer_object_between_s3(
         ));
     }
     if std::env::var("RS3_DEBUG_COPY").is_ok() {
-        eprintln!("rs3: falling back to streaming copy");
+        ui_eprintln!("rs3: falling back to streaming copy");
     }
     if disable_multipart || size <= part_size {
         // One pipeline (GET streamed straight into the PUT body) = one
         // permit, held across both calls -- not two acquisitions.
         let _permit = budget.acquire().await;
         let unit = match progress {
-            Some(ui) => ui.unit(
+            Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                 crate::progress::TransferLabel {
                     verb: crate::progress::Verb::Copying,
                     path: source_key.to_string(),
                     part: None,
                 },
                 size,
-            ),
-            None => crate::progress::UnitHandle::noop(),
+            )),
+            None => crate::progress::ProgressNotifier::noop(),
         };
         let resp = source_client
             .get_object()
@@ -951,15 +952,15 @@ async fn multipart_server_side_copy(
             let start = (part_index - 1) * part_size;
             let end = (total_size - 1).min(start + part_size - 1);
             let unit = match &progress {
-                Some(ui) => ui.unit(
+                Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Copying,
                         path: source_key_label,
                         part: Some((part_index, part_count)),
                     },
                     end - start + 1,
-                ),
-                None => crate::progress::UnitHandle::noop(),
+                )),
+                None => crate::progress::ProgressNotifier::noop(),
             };
             let part_number = part_index as i32;
             let resp = client
@@ -1101,7 +1102,7 @@ pub(crate) async fn download_key_to_path(
                     .map(|(_, v)| v)
                 && let Err(err) = crate::attr::apply_fs_attrs(output, encoded)
             {
-                eprintln!(
+                ui_eprintln!(
                     "rs3: warning: could not preserve attributes for `{}`: {err:#}",
                     output.display()
                 );
@@ -1130,15 +1131,15 @@ async fn download_to_temp(
     if size <= part_size {
         let _permit = budget.acquire().await;
         let unit = match progress {
-            Some(ui) => ui.unit(
+            Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                 crate::progress::TransferLabel {
                     verb: crate::progress::Verb::Downloading,
                     path: key.to_string(),
                     part: None,
                 },
                 size,
-            ),
-            None => crate::progress::UnitHandle::noop(),
+            )),
+            None => crate::progress::ProgressNotifier::noop(),
         };
         let resp = client.get_object().bucket(bucket).key(key).send().await?;
         let mut reader = resp.body.into_async_read();
@@ -1151,7 +1152,7 @@ async fn download_to_temp(
                 break;
             }
             tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await?;
-            unit.inc(n as u64);
+            unit.advance(n as u64);
         }
         writer.flush().await?;
         unit.finish();
@@ -1178,15 +1179,15 @@ async fn download_to_temp(
             let end = (size - 1).min(start + part_size - 1);
             let expected = end - start + 1;
             let unit = match &progress {
-                Some(ui) => ui.unit(
+                Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Downloading,
                         path: key_label,
                         part: Some((part_index + 1, part_count)),
                     },
                     expected,
-                ),
-                None => crate::progress::UnitHandle::noop(),
+                )),
+                None => crate::progress::ProgressNotifier::noop(),
             };
             let resp = client
                 .get_object()
@@ -1207,7 +1208,7 @@ async fn download_to_temp(
                 }
                 tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
                 copied += n as u64;
-                unit.inc(n as u64);
+                unit.advance(n as u64);
             }
             if copied != expected {
                 return Err(anyhow!(

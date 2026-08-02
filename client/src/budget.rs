@@ -41,11 +41,15 @@ pub(crate) struct StreamPermit {
 }
 
 /// Runs a byte-less S3 operation (HEAD, create/complete/abort multipart,
-/// list, delete...) under the stream budget, with a spinner task line for
-/// the duration. The token is acquired *before* the task line is created,
-/// so a visible line always means a held token; the line is finished on
-/// both the `Ok` and `Err` paths, and the permit drops (returning the
-/// token) when this function returns.
+/// list, delete...) under the stream budget, as a
+/// [`ProgressOpaqueTask`](crate::progress::ProgressOpaqueTask) occupying a
+/// display slot for its duration.
+///
+/// The task takes its slot *before* the budget token is acquired and is
+/// reported `started` once it has one, so time spent queued behind `-P` is
+/// visible as a `NotStarted` row rather than as nothing at all. It is
+/// finished on both the `Ok` and `Err` paths -- handing the slot back --
+/// and the permit drops when this function returns.
 pub(crate) async fn dispatch<T, F: std::future::Future<Output = T>>(
     budget: &StreamBudget,
     ui: Option<&crate::progress::ProgressUi>,
@@ -53,11 +57,12 @@ pub(crate) async fn dispatch<T, F: std::future::Future<Output = T>>(
     api: &'static str,
     fut: F,
 ) -> T {
-    let _permit = budget.acquire().await;
     let task = match ui {
-        Some(ui) => ui.task(label, api),
-        None => crate::progress::UnitHandle::noop(),
+        Some(ui) => ui.enqueue(crate::progress::ProgressOpaqueTask::new(label, api)),
+        None => crate::progress::ProgressNotifier::noop(),
     };
+    let _permit = budget.acquire().await;
+    task.started();
     let result = fut.await;
     task.finish();
     result
@@ -174,6 +179,6 @@ mod tests {
         )
         .await;
         assert_eq!(again.unwrap(), 1);
-        assert_eq!(ui.active_detail_bars(), 0, "all task lines cleared");
+        assert_eq!(ui.active_slots(), 0, "all task lines cleared");
     }
 }

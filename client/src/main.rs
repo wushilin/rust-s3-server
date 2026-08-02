@@ -35,6 +35,7 @@ use messages::{
     ContentMessage, CopyMessage, DuMessage, MakeBucketMessage, PipeMessage, RemoveBucketMessage,
     RmMessage, StatMessage, SummaryMessage, TransferSession, TreeMessage,
 };
+use progress::{ui_eprintln, ui_println};
 use transfer::{download_object, transfer_object_between_s3, upload_file, upload_stream};
 use urls::{DEFAULT_PART_SIZE, is_s3_url, parse_s3_url, parse_size};
 
@@ -616,13 +617,13 @@ async fn alias(args: AliasArgs) -> Result<()> {
                 },
             );
             save_config(&cfg).await?;
-            println!("Added `{alias}` successfully.");
+            ui_println!("Added `{alias}` successfully.");
             Ok(())
         }
         AliasCommand::List => {
             let cfg = load_config().await?;
             for (name, alias) in cfg.aliases {
-                println!("{:<16} {}", name, alias.url);
+                ui_println!("{:<16} {}", name, alias.url);
             }
             Ok(())
         }
@@ -632,7 +633,7 @@ async fn alias(args: AliasArgs) -> Result<()> {
                 return Err(anyhow!("alias `{alias}` not found"));
             }
             save_config(&cfg).await?;
-            println!("Removed `{alias}` successfully.");
+            ui_println!("Removed `{alias}` successfully.");
             Ok(())
         }
         AliasCommand::Export { alias } => {
@@ -642,9 +643,11 @@ async fn alias(args: AliasArgs) -> Result<()> {
                     .aliases
                     .get(&alias)
                     .ok_or_else(|| anyhow!("alias `{alias}` not found"))?;
-                println!("{}", serde_json::to_string_pretty(item)?);
+                let rendered = serde_json::to_string_pretty(item)?;
+                ui_println!("{rendered}");
             } else {
-                println!("{}", serde_json::to_string_pretty(&cfg)?);
+                let rendered = serde_json::to_string_pretty(&cfg)?;
+                ui_println!("{rendered}");
             }
             Ok(())
         }
@@ -1093,7 +1096,7 @@ async fn mb(args: MbArgs) -> Result<()> {
                     // message structs, so it must not corrupt a --json
                     // stream (bare prose on stdout wouldn't parse as JSON).
                     if !out().json {
-                        println!("Bucket `{target}` already exists.");
+                        ui_println!("Bucket `{target}` already exists.");
                     }
                 } else {
                     return Err(err.into());
@@ -1112,7 +1115,7 @@ async fn rb(args: RbArgs) -> Result<()> {
         let parsed = match parse_s3_url(target) {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("rb: {target}: {err:#}");
+                ui_eprintln!("rb: {target}: {err:#}");
                 failures += 1;
                 continue;
             }
@@ -1163,7 +1166,7 @@ async fn rb(args: RbArgs) -> Result<()> {
                         )
                         .await
                         {
-                            eprintln!("rb: {}/{name}: {err:#}", parsed.alias);
+                            ui_eprintln!("rb: {}/{name}: {err:#}", parsed.alias);
                             bucket_failures += 1;
                         }
                     }
@@ -1176,7 +1179,7 @@ async fn rb(args: RbArgs) -> Result<()> {
         }
         .await;
         if let Err(err) = result {
-            eprintln!("rb: {target}: {err:#}");
+            ui_eprintln!("rb: {target}: {err:#}");
             failures += 1;
         }
     }
@@ -1480,7 +1483,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         )
                         .await
                         {
-                            eprintln!("mv: remove `{bucket}/{key}` failed: {err}");
+                            ui_eprintln!("mv: remove `{bucket}/{key}` failed: {err}");
                         }
                     }
                 }
@@ -1530,7 +1533,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                     };
                     session.object_done(&msg, outcome.size);
                     if is_mv && let Err(err) = fs::remove_file(source_path).await {
-                        eprintln!("mv: remove `{}` failed: {err}", source_path.display());
+                        ui_eprintln!("mv: remove `{}` failed: {err}", source_path.display());
                     }
                 }
                 used_session = true;
@@ -1736,7 +1739,7 @@ async fn copy_s3_object_to_s3(
         )
         .await
         {
-            eprintln!(
+            ui_eprintln!(
                 "mv: remove `{}/{source_bucket}/{source_key}` failed: {err}",
                 source_url.alias
             );
@@ -1796,7 +1799,7 @@ async fn copy_local_path(
                     };
                     session.object_done(&msg, size);
                     if delete_after && let Err(err) = fs::remove_file(&path).await {
-                        eprintln!("mv: remove `{}` failed: {err}", path.display());
+                        ui_eprintln!("mv: remove `{}` failed: {err}", path.display());
                     }
                 }
             }
@@ -1836,7 +1839,7 @@ async fn copy_local_path(
         };
         session.object_done(&msg, size);
         if delete_after && let Err(err) = fs::remove_file(source).await {
-            eprintln!("mv: remove `{}` failed: {err}", source.display());
+            ui_eprintln!("mv: remove `{}` failed: {err}", source.display());
         }
     }
     Ok(())
@@ -2177,7 +2180,7 @@ async fn rm(args: RmArgs) -> Result<()> {
     let budget = crate::budget::StreamBudget::new(5);
     for target in &args.targets {
         if let Err(err) = rm_one_target(target, &args, &budget, ui.as_ref()).await {
-            eprintln!("rm: {target}: {err:#}");
+            ui_eprintln!("rm: {target}: {err:#}");
             failures += 1;
         }
     }
@@ -2218,7 +2221,7 @@ async fn rm_one_target(
         // covers a filtered-to-zero `--older-than`/`--newer-than` match --
         // that's success too, just with nothing left to report.
         if removed == 0 && !out().json {
-            println!("Nothing to remove under `{target}`.");
+            ui_println!("Nothing to remove under `{target}`.");
         }
         Ok(())
     } else {
