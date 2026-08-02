@@ -1083,11 +1083,14 @@ pub(crate) async fn download_key_to_path(
     {
         fs::create_dir_all(parent).await?;
     }
-    let tmp = {
-        let mut name = output.file_name().unwrap_or_default().to_os_string();
-        name.push(".rs3.part");
-        output.with_file_name(name)
-    };
+    // Stage in a directory of our own beside the destination, under the
+    // object's real name -- see `is_staging_dir_name`. Same parent, so the
+    // publishing rename stays on one filesystem and is therefore atomic.
+    let staging = staging_dir_for(output);
+    fs::create_dir_all(&staging)
+        .await
+        .with_context(|| format!("create staging dir {}", staging.display()))?;
+    let tmp = staging.join(output.file_name().unwrap_or_default());
     let result = download_to_temp(
         client,
         bucket,
@@ -1101,9 +1104,14 @@ pub(crate) async fn download_key_to_path(
         progress,
     )
     .await;
+    // Either way the staging directory goes: on success it is empty once the
+    // file is renamed out, on failure it still holds the partial object, and
+    // neither is anything a later run may trust.
     match result {
         Ok(()) => {
-            fs::rename(&tmp, output).await?;
+            let renamed = fs::rename(&tmp, output).await;
+            let _ = fs::remove_dir_all(&staging).await;
+            renamed?;
             #[cfg(unix)]
             if preserve
                 && let Some(encoded) = head
@@ -1120,9 +1128,157 @@ pub(crate) async fn download_key_to_path(
             Ok(size)
         }
         Err(err) => {
-            let _ = fs::remove_file(&tmp).await;
+            let _ = fs::remove_dir_all(&staging).await;
             Err(err)
         }
+    }
+}
+
+/// Directory-name prefix for a download's staging area.
+///
+/// A download writes under `<parent>/__rs3_staging_<unique>/<final name>`
+/// and renames the finished file out into `<parent>/`, then removes the
+/// directory. Staging beside the destination -- rather than in a temp dir
+/// elsewhere -- keeps the rename on one filesystem, which is what makes the
+/// publish atomic.
+pub(crate) const STAGING_PREFIX: &str = "__rs3_staging_";
+
+/// Is `name` one of rs3's staging directories rather than user data?
+///
+/// Every local tree walk has to ask, because staging is not content: it
+/// holds a partial object, made full-size and sparse by `set_len`, sitting
+/// in a directory rs3 may also be asked to mirror, diff or copy. Treated as
+/// content it is actively harmful -- a local-to-S3 mirror would upload an
+/// interrupted 50GiB download as a 50GiB object of mostly zeros.
+///
+/// A directory is the right unit for this. A suffix on the file itself
+/// (`foo.bin.rs3.part`) is a name a user may legitimately own, so skipping
+/// by suffix can silently refuse to mirror real data; and a fixed name is
+/// shared, so two rs3 processes downloading the same object to the same
+/// path would write over each other. A prefixed directory with a unique
+/// suffix is neither: it is a shape nothing else creates, the remote side
+/// has no equivalent to collide with, and every download gets its own.
+///
+/// Skipping them also means a `--remove` mirror does not delete them. That
+/// is deliberate: deleting one is only correct when no download owns it,
+/// and nothing here can tell an orphan from staging that a concurrent rs3
+/// is writing into right now.
+pub(crate) fn is_staging_dir_name(name: &str) -> bool {
+    name.starts_with(STAGING_PREFIX)
+}
+
+/// This host's name, or `None` if it cannot be established.
+///
+/// A destination on a shared filesystem (NFS) can hold staging created by a
+/// different machine, whose pid means nothing here -- so reclaiming is only
+/// ever attempted on directories this host created. `None` therefore means
+/// "ownership is unprovable", and reclaiming must not happen at all.
+fn resolve_host() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .ok()?;
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The host field to stamp into a new staging name. Naming always needs
+/// *some* value; only reclaiming needs a provable one.
+fn staging_host_tag() -> String {
+    resolve_host().unwrap_or_else(|| "unknown".to_string())
+}
+
+/// A per-download staging directory: `__rs3_staging_<host>_<pid>_<ns>_<seq>`.
+///
+/// Not a random name -- rs3 takes no RNG dependency, and this only has to
+/// avoid collision, not be unguessable. The counter separates downloads
+/// started by one process inside a single clock tick, the pid separates
+/// concurrent processes, and the host separates machines sharing a mount.
+/// The last two are also what makes an abandoned directory *identifiable*
+/// later: see [`reclaim_staging_dir`].
+fn staging_dir_for(output: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let parent = output.parent().unwrap_or(Path::new("."));
+    parent.join(format!(
+        "{STAGING_PREFIX}{}_{}_{nanos:x}_{:x}",
+        staging_host_tag(),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Splits `<host>_<pid>_<ns>_<seq>` back out of a staging directory name.
+/// Parsed from the right, since a hostname may itself contain `_`.
+fn parse_staging_owner(name: &str) -> Option<(String, u32)> {
+    let rest = name.strip_prefix(STAGING_PREFIX)?;
+    let parts: Vec<&str> = rest.rsplitn(4, '_').collect();
+    let [_seq, _ns, pid, host] = parts[..] else {
+        return None;
+    };
+    Some((host.to_string(), pid.parse().ok()?))
+}
+
+/// Is process `pid` still running? `None` means "cannot tell", which callers
+/// must treat as "assume it is".
+#[cfg(target_os = "linux")]
+fn owner_alive(pid: u32) -> Option<bool> {
+    // Prove the mechanism before trusting it. Without `/proc` mounted --
+    // some minimal containers -- every pid reads as dead, and a liveness
+    // check that answers "dead" for everything is precisely the input that
+    // would make this delete live staging.
+    if !Path::new("/proc/self").exists() {
+        return None;
+    }
+    Some(Path::new(&format!("/proc/{pid}")).exists())
+}
+#[cfg(not(target_os = "linux"))]
+fn owner_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
+/// Removes an *abandoned* staging directory found during a local walk.
+///
+/// Abandoned means: this host created it, and the process that did is gone.
+/// Anything else is left strictly alone -- staging that a concurrent rs3 is
+/// still writing into, or that another machine owns on a shared mount.
+/// Refusing to reclaim costs some disk until the next run; reclaiming a live
+/// one destroys someone else's in-flight download, so every uncertain case
+/// resolves to "leave it".
+///
+/// Pid reuse can only cause a miss, never a wrong delete: a recycled pid
+/// reads as alive, so the directory simply survives to be reconsidered later.
+pub(crate) async fn reclaim_staging_dir(path: &Path, name: &str) {
+    let Some((host, pid)) = parse_staging_owner(name) else {
+        return; // not a name this wrote: not ours to delete
+    };
+    // Unprovable ownership is not ownership.
+    let Some(me) = resolve_host() else { return };
+    if host != me || owner_alive(pid) != Some(false) {
+        return;
+    }
+    // Only ever a real directory. `remove_dir_all` through a symlink planted
+    // under a staging-shaped name would delete whatever it points at, and
+    // the walk's own `is_dir` check follows links.
+    if !matches!(fs::symlink_metadata(path).await, Ok(m) if m.is_dir()) {
+        return;
+    }
+    match fs::remove_dir_all(path).await {
+        Ok(()) => ui_eprintln!(
+            "rs3: reclaimed abandoned staging directory `{}`",
+            path.display()
+        ),
+        Err(err) => ui_eprintln!(
+            "rs3: warning: could not reclaim `{}`: {err}",
+            path.display()
+        ),
     }
 }
 
@@ -1389,6 +1545,52 @@ pub(crate) async fn download_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `staging_dir_for` writes, `parse_staging_owner` must read back --
+    /// this round trip is the whole basis on which a directory is deleted.
+    #[test]
+    fn staging_name_round_trips_its_owner() {
+        let dir = staging_dir_for(Path::new("/tmp/some/file.bin"));
+        assert_eq!(dir.parent().unwrap(), Path::new("/tmp/some"));
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(is_staging_dir_name(name), "{name}");
+        let (host, pid) = parse_staging_owner(name).expect("own name must parse");
+        assert_eq!(host, staging_host_tag());
+        assert_eq!(pid, std::process::id());
+    }
+
+    /// Two downloads never share a staging directory, even in one process
+    /// within a single clock tick -- that is what the sequence field is for.
+    #[test]
+    fn staging_names_are_unique_per_download() {
+        let a = staging_dir_for(Path::new("/tmp/x/f.bin"));
+        let b = staging_dir_for(Path::new("/tmp/x/f.bin"));
+        assert_ne!(a, b);
+    }
+
+    /// Anything this did not write must fail to resolve an owner, because an
+    /// unresolvable owner is what stops `reclaim_staging_dir` from deleting.
+    #[test]
+    fn foreign_names_resolve_to_no_owner() {
+        for name in [
+            "__rs3_staging_",                 // prefix alone
+            "__rs3_staging_host",             // no pid/ns/seq
+            "__rs3_staging_host_notapid_a_0", // pid not a number
+            "notes.rs3.part",                 // the old suffix: real data now
+            "regular_dir",
+        ] {
+            assert!(
+                parse_staging_owner(name).is_none(),
+                "must not resolve an owner: {name}"
+            );
+        }
+        // A hostname containing underscores still parses, since the fields
+        // are taken from the right.
+        let (host, pid) =
+            parse_staging_owner("__rs3_staging_my_odd_host_4242_beef_0").expect("should parse");
+        assert_eq!(host, "my_odd_host");
+        assert_eq!(pid, 4242);
+    }
 
     #[test]
     fn copy_source_encodes_specials_keeps_slashes() {

@@ -1800,6 +1800,16 @@ async fn copy_local_path(
                 let path = entry.path();
                 let metadata = entry.metadata().await?;
                 if metadata.is_dir() {
+                    // rs3's own download staging is not content, and never
+                    // descended into -- see `is_staging_dir_name`. A `cp`
+                    // already writes, so it also reclaims the abandoned ones.
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && crate::transfer::is_staging_dir_name(name)
+                    {
+                        let name = name.to_string();
+                        crate::transfer::reclaim_staging_dir(&path, &name).await;
+                        continue;
+                    }
                     dirs.push_back(path);
                     dirs_seen += 1;
                     scan.set_total(dirs_seen);

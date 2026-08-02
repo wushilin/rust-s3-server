@@ -75,9 +75,15 @@ pub(crate) fn plan_mirror(
 ///
 /// Pass [`ProgressNotifier::noop`](crate::progress::ProgressNotifier::noop)
 /// to walk silently.
+///
+/// `reclaim` lets a walk delete abandoned staging directories as it passes
+/// them ([`reclaim_staging_dir`](crate::transfer::reclaim_staging_dir)).
+/// Only commands that already write should pass `true` -- `diff` reads, and
+/// a read must not have side effects on the tree it is reporting about.
 pub(crate) async fn collect_local_entries(
     root: &Path,
     scan: &crate::progress::ProgressNotifier,
+    reclaim: bool,
 ) -> Result<Vec<Entry>> {
     use std::collections::VecDeque;
     let mut entries = Vec::new();
@@ -92,6 +98,20 @@ pub(crate) async fn collect_local_entries(
             let path = item.path();
             let meta = item.metadata().await?;
             if meta.is_dir() {
+                // rs3's own download staging is not content, and never
+                // descended into -- see `is_staging_dir_name`. A walk that
+                // is allowed to write also reclaims the abandoned ones,
+                // which is the only garbage collection they ever get.
+                let name = item.file_name();
+                if name
+                    .to_str()
+                    .is_some_and(crate::transfer::is_staging_dir_name)
+                {
+                    if reclaim {
+                        crate::transfer::reclaim_staging_dir(&path, &name.to_string_lossy()).await;
+                    }
+                    continue;
+                }
                 dirs.push_back(path);
                 discovered += 1;
                 scan.set_total(discovered);
@@ -258,7 +278,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 ));
             }
             let scan = scan_task(root);
-            let entries = collect_local_entries(root, &scan).await?;
+            let entries = collect_local_entries(root, &scan, true).await?;
             scan.finish();
             entries
         }
@@ -273,7 +293,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         Side::Local(root) => {
             if root.exists() {
                 let scan = scan_task(root);
-                let entries = collect_local_entries(root, &scan).await?;
+                let entries = collect_local_entries(root, &scan, true).await?;
                 scan.finish();
                 entries
             } else {

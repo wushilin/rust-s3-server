@@ -50,6 +50,99 @@ fn mirror_remove_deletes_extraneous() {
     assert!(!listing.contains("drop.txt"), "listing: {listing}");
 }
 
+/// A download's staging directory is not content. Left unfiltered a
+/// local-to-S3 mirror uploads what is inside it -- and since `set_len` makes
+/// the partial object full-size and sparse, an interrupted large download
+/// would upload its whole nominal size as mostly zeros.
+///
+/// The file inside carries the object's *real* name, which is the point of
+/// staging by directory: there is no suffix to key off, and a file that
+/// merely looks like scratch (`notes.rs3.part` here) is real data that must
+/// still be mirrored.
+#[test]
+fn mirror_never_uploads_download_staging() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/mbscr"]);
+    let src = server.dir.path().join("srcstaging");
+    write(&src, "real.txt", b"real");
+    write(&src, "notes.rs3.part", b"a real file that looks like scratch");
+    write(&src, "__rs3_staging_1234_abc_0/big.bin", b"half a download");
+    write(&src, "sub/__rs3_staging_9_def_1/other.bin", b"another");
+
+    server.rs3_ok(&["mirror", src.to_str().unwrap(), "test/mbscr/p"]);
+    let listing = server.rs3_ok(&["ls", "--recursive", "test/mbscr"]);
+    assert!(listing.contains("real.txt"), "listing: {listing}");
+    assert!(
+        listing.contains("notes.rs3.part"),
+        "a real file must not be skipped for looking like scratch: {listing}"
+    );
+    assert!(
+        !listing.contains("staging"),
+        "staging was uploaded: {listing}"
+    );
+    assert!(
+        !listing.contains("big.bin") && !listing.contains("other.bin"),
+        "staged contents were uploaded: {listing}"
+    );
+}
+
+/// This host's name, formatted the way `staging_dir_for` stamps it.
+fn host() -> String {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .unwrap_or_default();
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".into()
+    } else {
+        cleaned
+    }
+}
+
+/// Abandoned staging is collected by the next writing walk, but only when it
+/// is provably abandoned: our host, and an owning pid that is gone. Staging
+/// owned by a live process -- a concurrent rs3 mid-download -- must survive,
+/// because unlinking it breaks that download at its final rename.
+#[test]
+fn mirror_reclaims_dead_staging_but_spares_live() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/mbscr2"]);
+    let src = server.dir.path().join("srcstaging2");
+    write(&src, "a.txt", b"a");
+    server.rs3_ok(&["mirror", src.to_str().unwrap(), "test/mbscr2/p"]);
+
+    let dest = server.dir.path().join("deststaging2");
+    // pid 1 exists on any running system; this process is alive by definition.
+    let live = format!("__rs3_staging_{}_{}_beef_0", host(), std::process::id());
+    // A pid that cannot be running: above the kernel's own ceiling.
+    let dead = format!("__rs3_staging_{}_4294967290_beef_1", host());
+    // Another machine's staging: its pid means nothing here, so hands off.
+    let remote = "__rs3_staging_someotherhost_4294967290_beef_2".to_string();
+    write(&dest, &format!("{live}/live.bin"), b"in flight");
+    write(&dest, &format!("{dead}/orphan.bin"), b"abandoned");
+    write(&dest, &format!("{remote}/theirs.bin"), b"not ours");
+
+    server.rs3_ok(&["mirror", "test/mbscr2/p", dest.to_str().unwrap()]);
+
+    assert!(
+        dest.join(&live).exists(),
+        "a live process's staging must survive"
+    );
+    assert!(
+        !dest.join(&dead).exists(),
+        "abandoned staging should have been reclaimed"
+    );
+    assert!(
+        dest.join(&remote).exists(),
+        "another host's staging must survive"
+    );
+    assert!(dest.join("a.txt").exists(), "the mirror itself still ran");
+}
+
 #[test]
 fn mirror_dry_run_prints_plan_and_does_nothing() {
     let server = TestServer::start();

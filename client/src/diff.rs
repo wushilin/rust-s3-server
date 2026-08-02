@@ -111,7 +111,8 @@ async fn collect_entries(
                         )),
                         None => crate::progress::ProgressNotifier::noop(),
                     };
-                    let entries = collect_local_entries(root, &scan).await;
+                    // `diff` reports, it does not modify: no staging reclaim here.
+                    let entries = collect_local_entries(root, &scan, false).await;
                     scan.finish();
                     entries
                 }
