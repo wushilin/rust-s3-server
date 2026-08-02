@@ -1,8 +1,15 @@
-# target/ is huge; the image build only needs the one prebuilt binary from it.
+# target/ is huge; the image build only needs the prebuilt binaries from it.
+# The server (rusts3) and the CLI client (rs3) both ship in the image, so both
+# are punched back in. client/target is excluded the same way — without this it
+# would be dragged into the build context whole.
 target/*
 !target/release
 target/release/*
 !target/release/rusts3
+client/target/*
+!client/target/release
+client/target/release/*
+!client/target/release/rs3
 .git/
 rusts3-data/
 logs/
