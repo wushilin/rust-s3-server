@@ -1768,7 +1768,32 @@ async fn copy_local_path(
                 source.display()
             ));
         }
+        // Walk the whole tree before copying any of it. Interleaving the
+        // two means the TOTAL row only ever learns of a file at the moment
+        // it copies it, so the denominator can never lead the numerator --
+        // it reads `n/n objects` for the entire run, which tells the user
+        // nothing. The mirror-backed paths plan for the same reason; this
+        // is the one recursive copy that does not go through them.
+        //
+        // Filters are applied during the walk, so the declared total is the
+        // work that will actually happen rather than everything on disk.
+        let scan = match session.ui() {
+            Some(ui) => ui.start(crate::progress::ProgressAwareTask::count(
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Scanning,
+                    path: source.display().to_string(),
+                    part: None,
+                },
+                0,
+                "{done}/{total} dirs",
+            )),
+            None => crate::progress::ProgressNotifier::noop(),
+        };
+        let mut planned: Vec<(PathBuf, u64)> = Vec::new();
+        let mut planned_bytes = 0u64;
         let mut dirs = VecDeque::from([source.to_path_buf()]);
+        let mut dirs_seen = 1u64;
+        scan.set_total(dirs_seen);
         while let Some(dir) = dirs.pop_front() {
             let mut entries = fs::read_dir(&dir).await?;
             while let Some(entry) = entries.next_entry().await? {
@@ -1776,32 +1801,60 @@ async fn copy_local_path(
                 let metadata = entry.metadata().await?;
                 if metadata.is_dir() {
                     dirs.push_back(path);
+                    dirs_seen += 1;
+                    scan.set_total(dirs_seen);
                 } else if metadata.is_file() {
                     let object_time = metadata.modified().ok().map(DateTime::<Utc>::from);
                     if !timefilter::passes_filters(object_time, older_than, newer_than)? {
                         continue;
                     }
-                    let rel = path.strip_prefix(source)?;
-                    let output = target.join(rel);
-                    if let Some(parent) = output.parent() {
-                        fs::create_dir_all(parent).await?;
-                    }
-                    fs::copy(&path, &output).await?;
-                    let size = metadata.len();
-                    session.add_total(size);
-                    let (total_count, total_size) = session.totals();
-                    let msg = CopyMessage {
-                        source: path.display().to_string(),
-                        target: output.display().to_string(),
-                        size,
-                        total_count,
-                        total_size,
-                    };
-                    session.object_done(&msg, size);
-                    if delete_after && let Err(err) = fs::remove_file(&path).await {
-                        ui_eprintln!("mv: remove `{}` failed: {err}", path.display());
-                    }
+                    planned_bytes += metadata.len();
+                    planned.push((path, metadata.len()));
                 }
+            }
+            scan.advance(1);
+        }
+        scan.finish();
+        if let Some(ui) = session.ui() {
+            ui.declare_total(planned.len() as u64, planned_bytes);
+        }
+        for (path, size) in planned {
+            let rel = path.strip_prefix(source)?;
+            let output = target.join(rel);
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            // `fs::copy` is opaque -- it reports nothing until it returns --
+            // so the lane row exists to name the file in flight, and its
+            // bytes land on the overall bar in one step at the end. Without
+            // this the TOTAL bar would have a declared length that nothing
+            // ever advances, leaving it pinned at 0% with a nonsense ETA.
+            let unit = match session.ui() {
+                Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
+                    crate::progress::TransferLabel {
+                        verb: crate::progress::Verb::Copying,
+                        path: path.display().to_string(),
+                        part: None,
+                    },
+                    size,
+                )),
+                None => crate::progress::ProgressNotifier::noop(),
+            };
+            fs::copy(&path, &output).await?;
+            unit.advance(size);
+            unit.finish();
+            session.add_total(size);
+            let (total_count, total_size) = session.totals();
+            let msg = CopyMessage {
+                source: path.display().to_string(),
+                target: output.display().to_string(),
+                size,
+                total_count,
+                total_size,
+            };
+            session.object_done(&msg, size);
+            if delete_after && let Err(err) = fs::remove_file(&path).await {
+                ui_eprintln!("mv: remove `{}` failed: {err}", path.display());
             }
         }
         if delete_after {

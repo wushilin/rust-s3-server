@@ -235,6 +235,56 @@ fn transfer_on_a_tty_renders_worker_lanes_idle_rows_and_total() {
     }
 }
 
+/// Every `x/y objects` denominator the TOTAL row ever painted, in order.
+fn total_denominators(painted: &str) -> Vec<u64> {
+    painted
+        .match_indices(" objects")
+        .filter_map(|(at, _)| {
+            let pair = painted[..at].rsplit(|c: char| c.is_whitespace()).next()?;
+            pair.split_once('/')?.1.parse().ok()
+        })
+        .collect()
+}
+
+/// A recursive `cp` plans before it copies, so the TOTAL row must know the
+/// whole workload from its first frame -- the denominator leads the work
+/// rather than trailing it.
+///
+/// Regression guard: the total used to accrete one object at a time from
+/// inside the transfer functions, which pinned it to `done + parallel`. With
+/// `-P 2` over 8 objects that painted `0/2`, `1/3`, `2/4` ... and the run
+/// never showed its real size until it was over. Asserting on the whole
+/// sequence of denominators (rather than catching one lucky frame) keeps
+/// this independent of how many frames the transfer happens to span.
+#[test]
+fn recursive_cp_declares_its_whole_total_before_transferring() {
+    if !script_available() {
+        eprintln!("skipping: script(1) not available");
+        return;
+    }
+    let server = TestServer::start();
+    // Big enough to span many draw frames, so a regressed denominator would
+    // have every opportunity to be caught mid-climb.
+    let dir = sized_objects(&server, "plan", 8, 4 * 1024 * 1024);
+
+    let painted = run_in_pty(
+        &server,
+        &["cp", "-r", "-P", "2", dir.to_str().unwrap(), "test/plan/dest"],
+    );
+
+    let denominators = total_denominators(&painted);
+    assert!(
+        denominators.contains(&8),
+        "expected the full 8-object total on the TOTAL row:\n{painted}"
+    );
+    // 0 is the idle `0/0 objects` row painted while the plan is still being
+    // built; anything else between 1 and 7 is the total trailing the work.
+    assert!(
+        denominators.iter().all(|&d| d == 0 || d == 8),
+        "TOTAL denominator climbed instead of leading: {denominators:?}\n{painted}"
+    );
+}
+
 #[test]
 fn multipart_upload_on_a_tty_shows_control_plane_spinner_lines() {
     if !script_available() {

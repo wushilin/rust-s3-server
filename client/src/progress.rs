@@ -263,6 +263,12 @@ pub(crate) fn bucket_prefix_label(bucket: &str, prefix: &str) -> String {
 struct UiState {
     objects_total: u64,
     objects_done: u64,
+    // Set once a caller has handed over a known-complete total via
+    // [`ProgressUi::declare_total`]. From then on `add_object` is inert:
+    // the declared figure is the whole session's work, and letting
+    // per-object calls keep incrementing on top of it would double-count
+    // every object as its transfer starts.
+    declared: bool,
     // Free slot indices into `UiInner::lanes`, a LIFO stack ordered so the
     // *lowest* index is claimed first (initialized high-to-low, popped
     // low-to-high) -- purely cosmetic (claims fill the grid top-down), no
@@ -765,6 +771,7 @@ impl ProgressUi {
                 state: Mutex::new(UiState {
                     objects_total: 0,
                     objects_done: 0,
+                    declared: false,
                     free,
                 }),
                 bars_id,
@@ -772,8 +779,41 @@ impl ProgressUi {
         }
     }
 
+    /// Declares the session's *entire* workload up front: `objects` objects
+    /// carrying `bytes` in total.
+    ///
+    /// Callers that plan before they transfer (mirror, and so `cp -r`/`mv -r`
+    /// through it) know both figures exactly before the first byte moves, and
+    /// must say so here. The alternative -- leaving the total to accrete one
+    /// object at a time through [`add_object`] -- pins the denominator to
+    /// `done + parallel`, because the only thing that grows it is a transfer
+    /// starting and only `parallel` of those exist at once. The row then reads
+    /// `12/18 objects` on a 2847-object mirror, and the bar, whose length is
+    /// likewise only the bytes of objects already started, sits near full with
+    /// `eta 0s` for the whole run: it tracks the last few objects rather than
+    /// the transfer.
+    ///
+    /// Idempotent-ish by design: the first call wins and later `add_object`
+    /// calls go quiet, so a planned session can share the same transfer
+    /// functions as an unplanned one-object `cp` without double-counting.
+    pub(crate) fn declare_total(&self, objects: u64, bytes: u64) {
+        let mut state = self.lock_state();
+        state.objects_total = objects;
+        state.declared = true;
+        if let Some(overall) = &self.inner.overall {
+            overall.set_length(bytes);
+        }
+        self.refresh_msg(&state);
+    }
+
+    /// Adds one object to the total, for sessions with no plan to declare
+    /// (a single-object `cp`/`put`/`get`). Inert once [`declare_total`] has
+    /// been called -- see there for why.
     pub(crate) fn add_object(&self, bytes: u64) {
         let mut state = self.lock_state();
+        if state.declared {
+            return;
+        }
         state.objects_total += 1;
         if let Some(overall) = &self.inner.overall {
             overall.inc_length(bytes);
@@ -883,6 +923,18 @@ impl ProgressUi {
             .unwrap_or(0)
     }
 
+    /// The object counter as rendered: `"12/2847 objects"`.
+    #[allow(dead_code)]
+    pub(crate) fn overall_message(&self) -> String {
+        self.inner
+            .overall
+            .as_ref()
+            .map(|o| o.message())
+            .unwrap_or_default()
+    }
+
+    /// The overall bar's span: the denominator of `1.1/4.7GiB`, and what
+    /// its percentage and ETA are computed against.
     #[allow(dead_code)]
     pub(crate) fn overall_length(&self) -> u64 {
         self.inner
@@ -1309,6 +1361,55 @@ mod tests {
         assert_eq!(ui.active_slots(), 9);
         assert_eq!(ui.overall_position(), 0, "opaque tasks contribute no bytes");
         drop(bars);
+    }
+
+    /// A session that plans (mirror, and so `cp -r`/`mv -r`) hands over its
+    /// whole workload at once. The transfer functions it shares with the
+    /// unplanned paths still call `add_object` as each object starts, and
+    /// those must not pile on top of the declared figure.
+    #[test]
+    fn declared_total_is_final_and_add_object_stops_counting() {
+        let ui = ProgressUi::hidden(4);
+        ui.declare_total(2847, 4_000_000);
+        assert_eq!(ui.overall_length(), 4_000_000);
+        assert_eq!(ui.overall_message(), "0/2847 objects");
+        // What upload_file/download_object do as each object starts.
+        for _ in 0..6 {
+            ui.add_object(1000);
+        }
+        assert_eq!(ui.overall_length(), 4_000_000, "declared span is final");
+        assert_eq!(
+            ui.overall_message(),
+            "0/2847 objects",
+            "and so is the declared count"
+        );
+    }
+
+    /// The denominator has to lead the work, not trail it: that is the
+    /// entire point of declaring. Before this, the total was only ever
+    /// `done + parallel`, so the row read `1/2 objects` here.
+    #[test]
+    fn declared_total_leads_the_work_it_describes() {
+        let ui = ProgressUi::hidden(4);
+        ui.declare_total(500, 500_000);
+        let one = ui.start(bytes_task("a", 1000));
+        one.advance(1000);
+        one.finish();
+        ui.object_done();
+        assert_eq!(ui.overall_message(), "1/500 objects");
+        assert_eq!(ui.overall_position(), 1000);
+        assert_eq!(ui.overall_length(), 500_000);
+    }
+
+    /// No declaration, no plan: a single-object `cp`/`put`/`get` still
+    /// grows its total one object at a time, which is correct there.
+    #[test]
+    fn undeclared_total_still_accretes_per_object() {
+        let ui = ProgressUi::hidden(4);
+        ui.add_object(500);
+        ui.add_object(500);
+        assert_eq!(ui.overall_length(), 1000);
+        assert_eq!(ui.overall_message(), "0/2 objects");
     }
 
     #[test]

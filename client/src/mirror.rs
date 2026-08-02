@@ -353,8 +353,26 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
     // The session wraps the display planning already used, rather than
     // building a second one -- see `ui`'s comment above.
     let session = TransferSession::from_ui(ui);
+    let mut planned_bytes = 0u64;
     for entry in &plan.copies {
         session.add_total(entry.size);
+        planned_bytes += entry.size;
+    }
+    // `add_total` above feeds the *message* totals only. The display keeps
+    // its own, which otherwise accretes one object at a time from inside
+    // the transfer functions and so can never lead the work in progress --
+    // see `ProgressUi::declare_total`. Everything is known here, so say it
+    // once and the TOTAL row is honest from its first frame.
+    //
+    // Deletes are in the object count but not the byte count: they move no
+    // payload (hence their exclusion from `add_total`), yet each one still
+    // reports through `object_done`, so omitting them would walk the
+    // numerator past the total on a `--remove` run.
+    if let Some(ui) = session.ui() {
+        ui.declare_total(
+            (plan.copies.len() + plan.deletes.len()) as u64,
+            planned_bytes,
+        );
     }
     let failures = stream::iter(plan.copies.iter().map(|entry| {
         let source = &source;
