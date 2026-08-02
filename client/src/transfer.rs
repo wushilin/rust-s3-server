@@ -510,6 +510,9 @@ where
 /// `concurrent == 1` this degenerates to plain sequential read-then-upload
 /// without any special-cased branch, since a single already-outstanding
 /// upload always blocks the next read.
+// Every parameter is an independent input to one multipart stream; bundling
+// them into a struct would only move the same list one level away.
+#[allow(clippy::too_many_arguments)]
 async fn stream_parts<R>(
     client: &Client,
     reader: &mut R,
@@ -1037,84 +1040,6 @@ async fn multipart_server_side_copy(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn copy_source_encodes_specials_keeps_slashes() {
-        assert_eq!(
-            encode_copy_source("bkt", "dir/obj name+x.bin"),
-            "bkt/dir/obj%20name%2Bx.bin"
-        );
-    }
-
-    fn dummy_client(endpoint: &str) -> Client {
-        let cfg = aws_sdk_s3::Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "k", "s", None, None, "test",
-            ))
-            .endpoint_url(endpoint)
-            .force_path_style(true)
-            .build();
-        Client::from_conf(cfg)
-    }
-
-    fn dummy_alias(url: &str) -> crate::config::Alias {
-        crate::config::Alias {
-            url: url.to_string(),
-            access_key: "k".to_string(),
-            secret_key: "s".to_string(),
-            api: "s3v4".to_string(),
-            path: "auto".to_string(),
-            region: None,
-            extra: std::collections::BTreeMap::new(),
-        }
-    }
-
-    // [SEM] §2: same-endpoint S3-to-S3 copies preserve metadata for free via
-    // server-side CopyObject's default COPY directive, but the streaming
-    // cross-endpoint fallback has no equivalent carry-over, so `--preserve`
-    // is hard-rejected there rather than silently dropped. This must be
-    // checked before any network I/O -- both aliases here point at
-    // unreachable endpoints, so a hang/timeout would mean the check ran too
-    // late (or not at all).
-    #[test]
-    fn preserve_is_rejected_for_cross_endpoint_s3_to_s3_before_any_io() {
-        let source_client = dummy_client("http://127.0.0.1:1");
-        let source_alias = dummy_alias("http://127.0.0.1:1");
-        let target_client = dummy_client("http://127.0.0.1:2");
-        let target_alias = dummy_alias("http://127.0.0.1:2");
-        let result = futures::executor::block_on(transfer_object_between_s3(
-            &source_client,
-            &source_alias,
-            "bkt",
-            "key",
-            &target_client,
-            &target_alias,
-            "bkt",
-            "key",
-            1,
-            5 * 1024 * 1024,
-            false,
-            1,
-            true,
-            &crate::budget::StreamBudget::new(1),
-            None,
-        ));
-        assert!(
-            result.is_err(),
-            "cross-endpoint --preserve must be rejected"
-        );
-        assert!(
-            result.unwrap_err().to_string().contains("not implemented"),
-            "error should say the feature is unimplemented"
-        );
-    }
-}
-
 /// Downloads `bucket/key` to `output`, returning the transferred size so
 /// callers can build their own `CopyMessage`/`MirrorMessage` (this module
 /// intentionally prints nothing itself -- see [`UploadOutcome`]).
@@ -1151,10 +1076,10 @@ pub(crate) async fn download_key_to_path(
     if let Some(ui) = progress {
         ui.add_object(size);
     }
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).await?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).await?;
     }
     let tmp = {
         let mut name = output.file_name().unwrap_or_default().to_os_string();
@@ -1169,19 +1094,17 @@ pub(crate) async fn download_key_to_path(
         Ok(()) => {
             fs::rename(&tmp, output).await?;
             #[cfg(unix)]
-            if preserve {
-                if let Some(encoded) = head
+            if preserve
+                && let Some(encoded) = head
                     .metadata()
                     .and_then(|m| m.iter().find(|(k, _)| k.eq_ignore_ascii_case("mc-attrs")))
                     .map(|(_, v)| v)
-                {
-                    if let Err(err) = crate::attr::apply_fs_attrs(output, encoded) {
-                        eprintln!(
-                            "rs3: warning: could not preserve attributes for `{}`: {err:#}",
-                            output.display()
-                        );
-                    }
-                }
+                && let Err(err) = crate::attr::apply_fs_attrs(output, encoded)
+            {
+                eprintln!(
+                    "rs3: warning: could not preserve attributes for `{}`: {err:#}",
+                    output.display()
+                );
             }
             Ok(size)
         }
@@ -1349,4 +1272,82 @@ pub(crate) async fn download_object(
     };
     session.object_done(&msg, size);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_source_encodes_specials_keeps_slashes() {
+        assert_eq!(
+            encode_copy_source("bkt", "dir/obj name+x.bin"),
+            "bkt/dir/obj%20name%2Bx.bin"
+        );
+    }
+
+    fn dummy_client(endpoint: &str) -> Client {
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "k", "s", None, None, "test",
+            ))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build();
+        Client::from_conf(cfg)
+    }
+
+    fn dummy_alias(url: &str) -> crate::config::Alias {
+        crate::config::Alias {
+            url: url.to_string(),
+            access_key: "k".to_string(),
+            secret_key: "s".to_string(),
+            api: "s3v4".to_string(),
+            path: "auto".to_string(),
+            region: None,
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    // [SEM] §2: same-endpoint S3-to-S3 copies preserve metadata for free via
+    // server-side CopyObject's default COPY directive, but the streaming
+    // cross-endpoint fallback has no equivalent carry-over, so `--preserve`
+    // is hard-rejected there rather than silently dropped. This must be
+    // checked before any network I/O -- both aliases here point at
+    // unreachable endpoints, so a hang/timeout would mean the check ran too
+    // late (or not at all).
+    #[test]
+    fn preserve_is_rejected_for_cross_endpoint_s3_to_s3_before_any_io() {
+        let source_client = dummy_client("http://127.0.0.1:1");
+        let source_alias = dummy_alias("http://127.0.0.1:1");
+        let target_client = dummy_client("http://127.0.0.1:2");
+        let target_alias = dummy_alias("http://127.0.0.1:2");
+        let result = futures::executor::block_on(transfer_object_between_s3(
+            &source_client,
+            &source_alias,
+            "bkt",
+            "key",
+            &target_client,
+            &target_alias,
+            "bkt",
+            "key",
+            1,
+            5 * 1024 * 1024,
+            false,
+            1,
+            true,
+            &crate::budget::StreamBudget::new(1),
+            None,
+        ));
+        assert!(
+            result.is_err(),
+            "cross-endpoint --preserve must be rejected"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("not implemented"),
+            "error should say the feature is unimplemented"
+        );
+    }
 }

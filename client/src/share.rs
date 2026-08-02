@@ -528,7 +528,7 @@ async fn load_db(kind: ShareKind) -> Result<ShareDb> {
     if data.is_empty() {
         return Ok(ShareDb::default());
     }
-    Ok(serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?)
+    serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))
 }
 
 /// The share DB holds live presigned URLs (GET presigns and POST-policy

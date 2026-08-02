@@ -120,7 +120,7 @@ pub(crate) async fn load_config() -> Result<McConfig> {
         return Ok(McConfig::default());
     }
     let data = fs::read(&path).await?;
-    Ok(serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?)
+    serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))
 }
 
 pub(crate) async fn save_config(cfg: &McConfig) -> Result<()> {
