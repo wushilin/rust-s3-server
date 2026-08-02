@@ -874,4 +874,73 @@ mod tests {
         assert!(config.validate().is_ok());
         assert!(config.auth.users[0].api_keys.is_empty());
     }
+
+    fn docker_config_text() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.docker.yaml");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The image ships this file and expands it at startup, so a typo in it is
+    /// a broken container — not something a unit test elsewhere would catch.
+    #[test]
+    fn the_shipped_docker_config_loads_with_every_variable_unset() {
+        let expanded = super::super::template::expand_with(&docker_config_text(), |_| None)
+            .expect("every placeholder in config.docker.yaml must carry a default");
+        let mut config: AppConfig = serde_yaml::from_str(&expanded).expect("docker config parses");
+        config.normalize();
+        config.validate().expect("docker config is valid");
+        assert_eq!(config.server.bind_port, 8002);
+        assert_eq!(config.ui.bind_port, 8003);
+        assert_eq!(config.ui.public_scheme, PublicScheme::Http);
+    }
+
+    /// Placeholder expansion is textual and runs *before* the YAML parser (see
+    /// `template.rs`) — that is what lets a bare `bind_port: {{VAR:8002}}`
+    /// template a number at all. The flip side is that an unquoted placeholder
+    /// splices its value in as raw YAML *syntax*: set such a variable to
+    /// anything containing `#`, `: `, a leading `[`/`{`/`*`/`&`, or a newline
+    /// and the document either fails to parse or silently changes shape.
+    ///
+    /// So every placeholder standing in for a *string* must be quoted in the
+    /// template. Nothing in the expander can enforce that — by the time it
+    /// runs, there is no schema — so it is enforced here instead.
+    #[test]
+    fn every_string_valued_placeholder_in_the_docker_config_is_quoted() {
+        let text = docker_config_text();
+        let mut unquoted: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || !trimmed.contains("{{") {
+                continue;
+            }
+            // The value is whatever follows the first `: ` (or `- ` for a list
+            // entry). A quoted value is already safe.
+            let Some(value) = trimmed
+                .split_once(": ")
+                .map(|(_, v)| v)
+                .or_else(|| trimmed.strip_prefix("- "))
+            else {
+                continue;
+            };
+            let value = value.trim();
+            if value.starts_with('"') || value.starts_with('\'') {
+                continue;
+            }
+            // Unquoted is fine only when the value is genuinely not a string:
+            // a number or a boolean, which is the case quoting would break.
+            let expanded = super::super::template::expand_with(value, |_| None)
+                .expect("placeholder has a default");
+            let scalar = expanded.trim();
+            let is_non_string = scalar.parse::<i64>().is_ok() || matches!(scalar, "true" | "false");
+            if !is_non_string {
+                unquoted.push(format!("{}  (expands to {scalar:?})", trimmed));
+            }
+        }
+        assert!(
+            unquoted.is_empty(),
+            "these config.docker.yaml placeholders expand to strings but are unquoted, so a \
+             value containing YAML metacharacters would corrupt the document:\n  {}",
+            unquoted.join("\n  ")
+        );
+    }
 }
