@@ -86,6 +86,50 @@ fn cp_multipart_completes_with_p1() {
     assert!(!server.dir.path().join("p1.out.rs3.part").exists());
 }
 
+/// An object smaller than one part still goes through the ranged path (one
+/// range, no part label), rather than the plain unranged GET it used to get.
+#[test]
+fn single_range_download_is_byte_exact() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/dl1r"]);
+    let src = server.dir.path().join("small.bin");
+    // Well under the 5 MiB part size below: exactly one range.
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    std::fs::write(&src, &data).unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/dl1r/small.bin"]);
+
+    let dst = server.dir.path().join("small.out");
+    server.rs3_ok(&[
+        "cp",
+        "--part-size",
+        "5MiB",
+        "test/dl1r/small.bin",
+        dst.to_str().unwrap(),
+    ]);
+    assert_eq!(std::fs::read(&dst).unwrap(), data);
+    assert!(!server.dir.path().join("small.out.rs3.part").exists());
+}
+
+/// A zero-byte object has no range to ask for -- `bytes=0--1` is not
+/// expressible -- so it short-circuits to creating the empty file. Left
+/// unguarded this underflows the range arithmetic.
+#[test]
+fn empty_object_downloads_as_an_empty_file() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/dl0b"]);
+    let src = server.dir.path().join("empty.bin");
+    std::fs::write(&src, b"").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/dl0b/empty.bin"]);
+
+    let dst = server.dir.path().join("empty.out");
+    server.rs3_ok(&["get", "test/dl0b/empty.bin", dst.to_str().unwrap()]);
+    assert!(dst.exists(), "empty object must still produce a file");
+    assert_eq!(std::fs::read(&dst).unwrap(), Vec::<u8>::new());
+    assert!(!server.dir.path().join("empty.out.rs3.part").exists());
+}
+
 #[test]
 fn failed_download_leaves_no_partial_output() {
     let server = TestServer::start();

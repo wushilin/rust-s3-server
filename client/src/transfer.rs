@@ -10,10 +10,11 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::Length;
 use aws_smithy_types::date_time::Format as DateTimeFormat;
+use futures::TryStreamExt;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::config::client_for_alias;
 use crate::progress::ui_eprintln;
@@ -1088,7 +1089,16 @@ pub(crate) async fn download_key_to_path(
         output.with_file_name(name)
     };
     let result = download_to_temp(
-        client, bucket, key, &tmp, size, part_size, parallel, budget, progress,
+        client,
+        bucket,
+        key,
+        &tmp,
+        size,
+        part_size,
+        parallel,
+        head.e_tag(),
+        budget,
+        progress,
     )
     .await;
     match result {
@@ -1116,6 +1126,141 @@ pub(crate) async fn download_key_to_path(
     }
 }
 
+/// Consecutive attempts one range may make *without gaining a byte* before
+/// the download gives up on it. Attempts that do gain ground reset this: a
+/// link that is moving, however badly, is worth staying with.
+const RANGE_MAX_STALLED_ATTEMPTS: u32 = 3;
+/// Hard ceiling on attempts for a single range, so a connection that
+/// delivers a trickle and then dies every time still terminates.
+const RANGE_MAX_ATTEMPTS: u32 = 12;
+
+/// One attempt at `bytes=from-end`, writing at offset `from` and adding
+/// whatever it manages to `written` -- including on the error path, which is
+/// what makes resumption possible.
+#[allow(clippy::too_many_arguments)]
+async fn stream_range_into(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    etag: Option<&str>,
+    tmp: &Path,
+    from: u64,
+    end: u64,
+    unit: &crate::progress::ProgressNotifier,
+    written: &mut u64,
+) -> Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).open(tmp).await?;
+    file.seek(SeekFrom::Start(from)).await?;
+    let mut req = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(format!("bytes={from}-{end}"));
+    // Pins the object version for the life of the download. Without it, a
+    // replacement between two ranged GETs -- of the same range across a
+    // retry, or simply of two different parts fetched minutes apart -- would
+    // splice two objects into one file, and the result would pass every
+    // check we make on it.
+    if let Some(etag) = etag {
+        req = req.if_match(etag);
+    }
+    let resp = req.send().await?;
+    let mut reader = resp.body.into_async_read();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
+        *written += n as u64;
+        unit.advance(n as u64);
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+/// Streams `bytes=start-end` into `tmp` at offset `start`, resuming from
+/// wherever it got to if the body breaks part-way.
+///
+/// The SDK's own retry stops at `send()`: a response body cannot be rewound,
+/// so a connection that dies at 80% of a range is a hard error to it. Uploads
+/// never had this problem -- a file-backed *request* body is retryable, so the
+/// orchestrator re-streams it -- and this closes the same gap on the download
+/// side.
+///
+/// Resumption is exact rather than a re-fetch. Every byte already written came
+/// from this same range, in this same process, at a known offset, so the next
+/// attempt asks only for `start + written ..= end`. Nothing is re-downloaded,
+/// and the progress notifier is deliberately *not* rewound -- unlike an upload
+/// retry, nothing it has already counted is about to be counted again.
+///
+/// This is in-session only. The `.rs3.part` file records nothing about which
+/// ranges landed, and is deleted on failure, so a later run cannot trust it
+/// and starts over.
+#[allow(clippy::too_many_arguments)]
+async fn download_range_resumable(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    etag: Option<&str>,
+    tmp: &Path,
+    start: u64,
+    end: u64,
+    unit: &crate::progress::ProgressNotifier,
+) -> Result<()> {
+    let expected = end - start + 1;
+    let mut written = 0u64;
+    let mut attempt = 1u32;
+    let mut stalled = 0u32;
+    loop {
+        let before = written;
+        let result = stream_range_into(
+            client,
+            bucket,
+            key,
+            etag,
+            tmp,
+            start + written,
+            end,
+            unit,
+            &mut written,
+        )
+        .await;
+        if result.is_ok() && written >= expected {
+            return Ok(());
+        }
+        // A body that ended clean but short is as much a failure as an error,
+        // and resumes identically -- the sparse file would otherwise keep a
+        // hole that reads back as zeros.
+        let reason = match result {
+            Err(err) => format!("{err:#}"),
+            Ok(()) => format!("body ended {} bytes short", expected - written),
+        };
+        if written > before {
+            stalled = 0;
+        } else {
+            stalled += 1;
+        }
+        if stalled >= RANGE_MAX_STALLED_ATTEMPTS || attempt >= RANGE_MAX_ATTEMPTS {
+            return Err(anyhow!(
+                "`{bucket}/{key}` bytes {start}-{end}: gave up after {attempt} attempt(s) \
+                 with {written} of {expected} bytes: {reason}"
+            ));
+        }
+        ui_eprintln!(
+            "rs3: `{bucket}/{key}` bytes {start}-{end}: resuming at {} after: {reason}",
+            start + written
+        );
+        // The SDK's own backoff shape: 1s doubling to a 16s ceiling.
+        tokio::time::sleep(std::time::Duration::from_secs(
+            1u64 << (attempt - 1).min(4),
+        ))
+        .await;
+        attempt += 1;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_to_temp(
     client: &Client,
@@ -1125,46 +1270,26 @@ async fn download_to_temp(
     size: u64,
     part_size: u64,
     parallel: usize,
+    etag: Option<&str>,
     budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
-    if size <= part_size {
-        let _permit = budget.acquire().await;
-        let unit = match progress {
-            Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
-                crate::progress::TransferLabel {
-                    verb: crate::progress::Verb::Downloading,
-                    path: key.to_string(),
-                    part: None,
-                },
-                size,
-            )),
-            None => crate::progress::ProgressNotifier::noop(),
-        };
-        let resp = client.get_object().bucket(bucket).key(key).send().await?;
-        let mut reader = resp.body.into_async_read();
-        let file = fs::File::create(tmp).await?;
-        let mut writer = BufWriter::new(file);
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await?;
-            unit.advance(n as u64);
-        }
-        writer.flush().await?;
-        unit.finish();
+    if size == 0 {
+        // No range to ask for -- `bytes=0-` on an empty object is not a
+        // request any of this can express.
+        fs::File::create(tmp).await?;
         return Ok(());
     }
     let file = fs::File::create(tmp).await?;
     file.set_len(size).await?;
     drop(file);
+    // One range when the object fits in a part, N when it doesn't -- the
+    // single-range case is the same code path, just without a part label.
     let part_count = size.div_ceil(part_size);
     let progress = progress.cloned();
     let budget = budget.clone();
     let key_label = key.to_string();
+    let etag = etag.map(str::to_string);
     let downloads = stream::iter((0..part_count).map(|part_index| {
         let client = client.clone();
         let bucket = bucket.to_string();
@@ -1173,58 +1298,44 @@ async fn download_to_temp(
         let progress = progress.clone();
         let budget = budget.clone();
         let key_label = key_label.clone();
+        let etag = etag.clone();
         async move {
             let _permit = budget.acquire().await;
             let start = part_index * part_size;
             let end = (size - 1).min(start + part_size - 1);
-            let expected = end - start + 1;
             let unit = match &progress {
                 Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Downloading,
                         path: key_label,
-                        part: Some((part_index + 1, part_count)),
+                        part: (part_count > 1).then_some((part_index + 1, part_count)),
                     },
-                    expected,
+                    end - start + 1,
                 )),
                 None => crate::progress::ProgressNotifier::noop(),
             };
-            let resp = client
-                .get_object()
-                .bucket(bucket)
-                .key(key)
-                .range(format!("bytes={start}-{end}"))
-                .send()
-                .await?;
-            let mut file = fs::OpenOptions::new().write(true).open(&tmp).await?;
-            file.seek(SeekFrom::Start(start)).await?;
-            let mut reader = resp.body.into_async_read();
-            let mut copied = 0u64;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
-                copied += n as u64;
-                unit.advance(n as u64);
-            }
-            if copied != expected {
-                return Err(anyhow!(
-                    "short range read: got {copied} of {expected} bytes at offset {start}"
-                ));
-            }
-            file.flush().await?;
+            download_range_resumable(
+                &client,
+                &bucket,
+                &key,
+                etag.as_deref(),
+                &tmp,
+                start,
+                end,
+                &unit,
+            )
+            .await?;
             unit.finish();
             Ok::<(), anyhow::Error>(())
         }
     }))
     .buffer_unordered(parallel.max(1));
-    let results = downloads.collect::<Vec<_>>().await;
-    for result in results {
-        result?;
-    }
+    // Fail fast. `collect()` here would drain the whole stream first, so a
+    // range that died early still cost the full bandwidth of every other
+    // range before anyone was told -- and then the temp file was deleted
+    // anyway. `try_collect` drops the stream on the first error, cancelling
+    // whatever is still in flight.
+    downloads.try_collect::<Vec<_>>().await?;
     Ok(())
 }
 
