@@ -27,12 +27,23 @@
 //! decision 3), which cured the collision by having nothing stable on
 //! screen rather than by making writes safe.
 //!
+//! **3. Counting and painting are separate rates.** Work reports as finely
+//! as it likes -- a download calls [`ProgressNotifier::advance`] once per
+//! 64KiB read -- and every report is counted the instant it arrives. What
+//! is paced is handing that count to `indicatif`, once per
+//! [`PAINT_INTERVAL`] per task, because that side costs a shared lock and
+//! an ioctl per call whether or not a frame results. A row that changed is
+//! drawn within the interval whether or not its task is still reporting
+//! (a stalled stream still has its last bytes shown); a row that didn't
+//! change is not drawn at all. See [`PAINT_INTERVAL`] and [`REFRESH_HZ`].
+//!
 //! Deliberate TTY-only divergence from mc's single aggregate bar — see
 //! README "Known divergences from mc". All bars draw to stderr; stdout (the
 //! mc-compat message contract) is never touched.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
@@ -123,6 +134,45 @@ const FALLBACK_LANES: usize = 22;
 /// [`TransferLabel::render`]), short ones are padded to this so bars don't
 /// jiggle horizontally as different-length labels rotate through a slot.
 pub(crate) const LABEL_WIDTH: usize = 40;
+
+/// Smallest gap between two pushes from one [`ProgressNotifier`] into
+/// `indicatif`. Reports are *always* accepted and counted; this only paces
+/// how often the counted position is handed over to be drawn.
+///
+/// The gate has to live here, on our side of the API, because `indicatif`'s
+/// own rate limiting sits too late to help. Every `inc`/`set_position` on a
+/// `MultiProgress` member takes the *shared* `MultiState` write lock, asks
+/// the terminal for its width (a `TIOCGWINSZ` ioctl), and allocates, all
+/// before the rate limiter is consulted and the draw is discarded. So the
+/// cost is paid per report rather than per frame, and it is paid on a lock
+/// every lane and the `TOTAL` row contend for. A download loop reporting
+/// each 64KiB read (`transfer::download_range`) turns a fast object into
+/// tens of thousands of ioctls a second through one global lock -- the
+/// display then genuinely does throttle the transfer it is describing.
+///
+/// Coalescing here means one push per notifier per interval no matter how
+/// finely the work reports, so the hot path is a `u64` add under a
+/// per-notifier lock nobody else holds. `finish`, `rewind` and drop bypass
+/// the gate (see [`NotifierInner::paint`]), so nothing buffered is ever
+/// lost from the `TOTAL` row's accounting.
+///
+/// A gate driven only by reports would leave a *stalled* task showing a
+/// stale figure for as long as the stall lasts, since the flush rides on
+/// the very reports that stopped arriving. So the same interval also drives
+/// a ticker ([`ProgressUi::spawn_stall_ticker`]) that pushes any task whose
+/// counted position has moved since it was last painted, and skips the rest
+/// -- making this a floor on how often a changed row is drawn as well as a
+/// ceiling on how often an active one is.
+const PAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Terminal repaint ceiling, in frames per second: the second half of the
+/// same 100ms budget. [`PAINT_INTERVAL`] caps how often *one* notifier
+/// hands work over; with `-P 32` lanes each doing that independently the
+/// `MultiProgress` would still be asked to redraw far more often than it
+/// needs to, and `indicatif`'s default is 20/s. Matching the two means at
+/// most one actual write to the terminal per interval -- which is what
+/// costs over ssh, where the grid is tens of lines of cursor motion.
+const REFRESH_HZ: u8 = 10;
 
 const UNITS: [(&str, u64); 5] = [
     ("TiB", 1 << 40),
@@ -275,6 +325,17 @@ struct UiState {
     // correctness dependency. Its length is the whole occupancy model: a
     // slot is either here or owned by exactly one live `ProgressNotifier`.
     free: Vec<usize>,
+    // Parallel to `UiInner::lanes`: the notifier currently occupying each
+    // slot, for [`ProgressUi::repaint_stale`] to reach. Indexed by slot
+    // rather than kept as a growing list precisely because the grid is a
+    // fixed set of slots -- one entry per lane, set on claim, cleared on
+    // release, so it never needs pruning however many tasks a run gets
+    // through.
+    //
+    // Weak, so a notifier's own drop is what ends its life; a stale entry
+    // here just fails to upgrade. Silent (slotless) tasks are deliberately
+    // absent -- they paint nothing to go stale.
+    watch: Vec<Option<std::sync::Weak<NotifierInner>>>,
 }
 
 struct UiInner {
@@ -299,6 +360,11 @@ struct UiInner {
     // without ever needing `insert_before`.
     overall: Option<ProgressBar>,
     bar_width: usize,
+    /// [`PAINT_INTERVAL`] for a real display. Tests build with `ZERO`, which
+    /// makes every report paint immediately -- so they can assert on
+    /// accounting a line after producing it, without the wall clock
+    /// deciding whether the assertion holds.
+    paint_interval: Duration,
     state: Mutex<UiState>,
     // This UI's slot in the `LIVE_BARS` registry, released on drop.
     bars_id: u64,
@@ -648,11 +714,12 @@ impl ProgressUi {
     pub(crate) fn with_total(parallel: usize) -> Self {
         let (rows, cols) = Self::term_size();
         Self::with_target(
-            ProgressDrawTarget::stderr(),
+            ProgressDrawTarget::stderr_with_hz(REFRESH_HZ),
             bar_width_for(cols),
             true,
             parallel,
             rows,
+            PAINT_INTERVAL,
         )
     }
 
@@ -662,11 +729,12 @@ impl ProgressUi {
     pub(crate) fn without_total(parallel: usize) -> Self {
         let (rows, cols) = Self::term_size();
         Self::with_target(
-            ProgressDrawTarget::stderr(),
+            ProgressDrawTarget::stderr_with_hz(REFRESH_HZ),
             bar_width_for(cols),
             false,
             parallel,
             rows,
+            PAINT_INTERVAL,
         )
     }
 
@@ -679,6 +747,9 @@ impl ProgressUi {
 
     /// Hidden draw target for unit tests: full accounting, no rendering,
     /// undetectable terminal size (`lane_count`'s [`FALLBACK_LANES`] path).
+    /// Unpaced (`paint_interval` `ZERO`) so every report lands immediately
+    /// -- these tests are about what gets counted, not about when it is
+    /// drawn; [`Self::hidden_paced`] is for the latter.
     #[cfg(test)]
     pub(crate) fn hidden(parallel: usize) -> Self {
         Self::with_target(
@@ -687,6 +758,7 @@ impl ProgressUi {
             true,
             parallel,
             None,
+            Duration::ZERO,
         )
     }
 
@@ -700,6 +772,22 @@ impl ProgressUi {
             false,
             parallel,
             None,
+            Duration::ZERO,
+        )
+    }
+
+    /// [`Self::hidden`] with the paint gate actually engaged, for the tests
+    /// that pin the gate's own behavior: that reports are counted while
+    /// withheld, and that the paths which must not lose bytes flush anyway.
+    #[cfg(test)]
+    pub(crate) fn hidden_paced(parallel: usize, paint_interval: Duration) -> Self {
+        Self::with_target(
+            ProgressDrawTarget::hidden(),
+            bar_width_for(None),
+            true,
+            parallel,
+            None,
+            paint_interval,
         )
     }
 
@@ -715,14 +803,15 @@ impl ProgressUi {
         with_overall: bool,
         parallel: usize,
         term_rows: Option<u16>,
+        paint_interval: Duration,
     ) -> Self {
         // With a TOTAL row, reserve 2 rows below the grid (TOTAL + a margin
         // row); without one, reserve 1 (the margin row alone).
         let reserved = if with_overall { 2 } else { 1 };
         let lane_n = lane_count(parallel, term_rows, reserved);
         // Assemble against a hidden target and attach the real one at the
-        // end. indicatif's draw target rate-limits to 20/s with a burst
-        // budget of 20 draws, and *every* state-setter here (style, length,
+        // end. indicatif's draw target rate-limits to `REFRESH_HZ` with a
+        // burst budget of 20 draws, and *every* state-setter here (style, length,
         // position, prefix, message, per slot) counts as a draw attempt --
         // enough to drain the whole budget before the command has done any
         // work. A control-plane call that then completes in a millisecond,
@@ -762,20 +851,85 @@ impl ProgressUi {
         let free = (0..lanes.len()).rev().collect();
         let bars_id = NEXT_BARS_ID.fetch_add(1, Ordering::Relaxed);
         lock_live_bars().push((bars_id, mp.clone()));
-        Self {
+        let watch = vec![None; lanes.len()];
+        let ui = Self {
             inner: Arc::new(UiInner {
                 mp,
                 lanes,
                 overall,
                 bar_width,
+                paint_interval,
                 state: Mutex::new(UiState {
                     objects_total: 0,
                     objects_done: 0,
                     declared: false,
                     free,
+                    watch,
                 }),
                 bars_id,
             }),
+        };
+        ui.spawn_stall_ticker();
+        ui
+    }
+
+    /// Starts the thread that keeps a stalled task's row honest.
+    ///
+    /// The paint gate is driven by reports, so a task whose bytes stop
+    /// arriving leaves whatever it last buffered unshown for as long as the
+    /// stall lasts -- exactly when a user is staring at the row wondering
+    /// what it is doing. This wakes every [`PAINT_INTERVAL`] and pushes any
+    /// task whose counted position has moved since it was last painted.
+    ///
+    /// Unpaced UIs (tests, `paint_interval` `ZERO`) get no thread: with the
+    /// gate open there is never anything buffered to flush.
+    ///
+    /// Holds only a `Weak`, and re-upgrades it each pass: the thread is a
+    /// refresher for the display, not an owner of it, so the UI's lifetime
+    /// stays exactly what its handles say it is and the thread retires on
+    /// the first tick after the last one goes. Failing to spawn is ignored
+    /// -- a missing refresher costs freshness during a stall, which is not
+    /// worth failing a transfer over.
+    fn spawn_stall_ticker(&self) {
+        let interval = self.inner.paint_interval;
+        if interval.is_zero() {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let _ = std::thread::Builder::new()
+            .name("rs3-progress".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    match weak.upgrade() {
+                        Some(inner) => ProgressUi { inner }.repaint_stale(),
+                        None => return,
+                    }
+                }
+            });
+    }
+
+    /// One ticker pass: hands over every slot whose counted position has
+    /// moved since its last paint, and leaves the rest alone. The "leaves
+    /// the rest alone" half is [`NotifierInner::paint`]'s own no-change
+    /// check, so an idle grid costs a walk over `watch` and nothing else --
+    /// no lock on the `MultiProgress`, no terminal write.
+    fn repaint_stale(&self) {
+        // Collect the live notifiers and drop the grid lock *before*
+        // painting any of them. `ProgressNotifier::finish` runs the two
+        // locks the other way round -- notifier first, then the grid via
+        // `release_slot` -- so holding both here would be the one lock cycle
+        // in this module.
+        let live: Vec<Arc<NotifierInner>> = {
+            let state = self.lock_state();
+            state
+                .watch
+                .iter()
+                .filter_map(|slot| slot.as_ref()?.upgrade())
+                .collect()
+        };
+        for notifier in live {
+            notifier.report(|inner, state| inner.paint(state, true));
         }
     }
 
@@ -854,15 +1008,35 @@ impl ProgressUi {
             task.dress(&self.inner.lanes[idx], self.inner.bar_width, life);
         }
         let span = task.span();
-        ProgressNotifier {
-            inner: Some(Arc::new(NotifierInner {
-                ui: self.clone(),
-                slot,
-                byte_shaped: task.byte_shaped(),
-                task,
-                state: Mutex::new(NotifierState { pos: 0, span, life }),
-            })),
+        // Backdated a full interval so the *first* report paints on arrival:
+        // the gate is there to thin out a stream of reports, and a task that
+        // only ever makes one (or finishes inside the first interval) should
+        // still show something rather than sit at zero until it ends.
+        let now = Instant::now();
+        let last_paint = now.checked_sub(self.inner.paint_interval).unwrap_or(now);
+        let inner = Arc::new(NotifierInner {
+            ui: self.clone(),
+            slot,
+            byte_shaped: task.byte_shaped(),
+            task,
+            state: Mutex::new(NotifierState {
+                pos: 0,
+                painted: 0,
+                last_paint,
+                span,
+                life,
+            }),
+        });
+        // Hand the stall ticker a way to reach this task for as long as it
+        // holds the slot. Safe to do after the `Arc` exists rather than
+        // atomically with the claim: nobody else can reach this notifier
+        // yet, and the slot is already ours.
+        if let Some(idx) = slot
+            && !self.inner.paint_interval.is_zero()
+        {
+            self.lock_state().watch[idx] = Some(Arc::downgrade(&inner));
         }
+        ProgressNotifier { inner: Some(inner) }
     }
 
     /// Hands slot `idx` back: reset to its dim `> IDLE` row and returned to
@@ -870,7 +1044,11 @@ impl ProgressUi {
     /// [`ProgressNotifier::finish`] and `NotifierInner`'s `Drop`.
     fn release_slot(&self, idx: usize) {
         reset_to_idle(&self.inner.lanes[idx]);
-        self.lock_state().free.push(idx);
+        let mut state = self.lock_state();
+        // Drop the ticker's handle in the same breath as the slot itself, so
+        // it can never paint into a row its task no longer owns.
+        state.watch[idx] = None;
+        state.free.push(idx);
     }
 
     /// Session end: slots are already back to idle (finished or dropped);
@@ -960,7 +1138,17 @@ impl ProgressUi {
 
 struct NotifierState {
     /// Position on the task's own axis (bytes, items, or 0..PERCENT_SCALE).
+    /// The truth: every report lands here immediately, whatever the paint
+    /// gate does about showing it.
     pos: u64,
+    /// How much of `pos` the bars have actually been told about. Lags `pos`
+    /// by up to [`PAINT_INTERVAL`]; the difference is what the next
+    /// [`NotifierInner::paint`] hands over. Tracked as an absolute rather
+    /// than a pending delta so a backwards move ([`ProgressNotifier::rewind`])
+    /// is the same subtraction as any other.
+    painted: u64,
+    /// When `painted` last caught up, i.e. what the gate measures against.
+    last_paint: Instant,
     /// Full-scale value. Starts at `ProgressTask::span` and moves with
     /// [`ProgressNotifier::set_total`].
     span: u64,
@@ -1017,39 +1205,68 @@ impl NotifierInner {
         f(self, &mut state);
     }
 
-    /// Moves the task forward by `n` on its own axis, and the `TOTAL` row
-    /// with it when the axis is bytes.
-    fn credit(&self, state: &mut NotifierState, n: u64) {
-        state.pos += n;
-        if let Some(bar) = self.bar() {
-            bar.inc(n);
+    /// Hands the gap between `painted` and `pos` over to this task's slot
+    /// and, for byte-shaped work, to the `TOTAL` row -- but only if
+    /// [`PAINT_INTERVAL`] has passed since the last time, unless `force`.
+    ///
+    /// This is the whole throttle. The slot takes an absolute
+    /// `set_position`, so a withheld report costs nothing but freshness;
+    /// the `TOTAL` row is shared and takes the *delta*, so that it stays
+    /// exactly the sum of every task's painted position rather than being
+    /// overwritten by whichever lane reported last.
+    ///
+    /// `force` is for the paths where withholding would be a lie rather
+    /// than a lag: [`ProgressNotifier::rewind`] (leaving already-debited
+    /// bytes on the `TOTAL` row would overcount a retry that is about to
+    /// re-send them), [`ProgressNotifier::finish`], and `Drop`.
+    fn paint(&self, state: &mut NotifierState, force: bool) {
+        // Nothing has moved since the last paint, so there is nothing to
+        // draw: the bars already say what we would tell them. Checked first
+        // so a ticker pass over an idle grid touches neither the clock nor
+        // the `MultiProgress`, and so that a no-op pass doesn't reset the
+        // gate's clock and delay the next real report by a whole interval.
+        if state.painted == state.pos {
+            return;
         }
-        if self.byte_shaped
-            && let Some(overall) = self.overall()
-        {
-            overall.inc(n);
+        let now = Instant::now();
+        if !force && now.duration_since(state.last_paint) < self.ui.inner.paint_interval {
+            return;
         }
-    }
-
-    /// The inverse: un-counts `n` (clamped at zero), including from the
-    /// `TOTAL` row, for a retry that re-streams from the start.
-    fn debit(&self, state: &mut NotifierState, n: u64) {
-        let n = n.min(state.pos);
-        state.pos -= n;
+        state.last_paint = now;
         if let Some(bar) = self.bar() {
             bar.set_position(state.pos);
         }
         if self.byte_shaped
             && let Some(overall) = self.overall()
         {
-            overall.dec(n);
+            match state.pos.checked_sub(state.painted) {
+                Some(delta) => overall.inc(delta),
+                None => overall.dec(state.painted - state.pos),
+            }
         }
+        state.painted = state.pos;
+    }
+
+    /// Moves the task forward by `n` on its own axis, and the `TOTAL` row
+    /// with it when the axis is bytes. The hot path -- a download reports
+    /// here once per 64KiB read -- so it goes through the gate.
+    fn credit(&self, state: &mut NotifierState, n: u64) {
+        state.pos += n;
+        self.paint(state, false);
+    }
+
+    /// The inverse: un-counts `n` (clamped at zero), including from the
+    /// `TOTAL` row, for a retry that re-streams from the start. Forced
+    /// through the gate -- see [`paint`](Self::paint).
+    fn debit(&self, state: &mut NotifierState, n: u64) {
+        state.pos -= n.min(state.pos);
+        self.paint(state, true);
     }
 
     fn seek(&self, state: &mut NotifierState, done: u64) {
-        match done.checked_sub(state.pos) {
-            Some(delta) => self.credit(state, delta),
-            None => self.debit(state, state.pos - done),
+        match done < state.pos {
+            true => self.debit(state, state.pos - done),
+            false => self.credit(state, done - state.pos),
         }
     }
 }
@@ -1177,12 +1394,12 @@ impl ProgressNotifier {
         inner.report(|inner, state| {
             state.life = TaskState::Completed;
             if inner.byte_shaped {
-                let shortfall = state.span.saturating_sub(state.pos);
-                state.pos = state.span;
-                if let Some(overall) = inner.overall() {
-                    overall.inc(shortfall);
-                }
+                state.pos = state.pos.max(state.span);
             }
+            // Forced: whatever the gate was still holding back settles up
+            // here, along with the top-up above, so a task's contribution to
+            // the `TOTAL` row is complete the moment it completes.
+            inner.paint(state, true);
             if let Some(idx) = inner.slot {
                 inner.ui.release_slot(idx);
             }
@@ -1201,8 +1418,16 @@ impl Drop for NotifierInner {
     /// between releasing once and not at all -- it can never double-release
     /// a slot `finish` already returned.
     fn drop(&mut self) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let unfinished = state.life != TaskState::Completed;
+        if unfinished {
+            // Settle whatever the paint gate is still holding. A failed part
+            // must not fake completion (that is `finish`'s top-up, and it
+            // stays out of here), but the bytes it really did move were
+            // counted before this change and must go on being counted: the
+            // gate is a display delay, not a discard.
+            self.paint(&mut state, true);
+        }
         drop(state);
         if unfinished && let Some(idx) = self.slot {
             self.ui.release_slot(idx);
@@ -1713,6 +1938,149 @@ mod tests {
         drop(h); // a failed part must not fake completion
         assert_eq!(ui.overall_position(), 30);
         assert_eq!(ui.active_slots(), 0);
+    }
+
+    // --- the paint gate ---
+    // Reports are always counted; handing them to indicatif is what gets
+    // paced, because that side is a shared lock plus an ioctl per call (see
+    // `PAINT_INTERVAL`). These use a deliberately huge interval so "the gate
+    // is shut" is a fact about the test, not a race with the wall clock.
+
+    const SHUT: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn gate_withholds_mid_stream_reports_but_never_drops_them() {
+        let ui = ProgressUi::hidden_paced(5, SHUT);
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        // First report paints on arrival: a task that reports once must not
+        // sit at zero for an interval.
+        h.advance(10);
+        assert_eq!(ui.overall_position(), 10, "first report is not withheld");
+        h.advance(20);
+        h.advance(30);
+        assert_eq!(
+            ui.overall_position(),
+            10,
+            "the interval has not passed: later reports are counted, not shown"
+        );
+        // ...and finishing settles every withheld byte, plus the top-up.
+        h.finish();
+        assert_eq!(ui.overall_position(), 100);
+    }
+
+    #[test]
+    fn gate_settles_on_rewind_so_a_retry_cannot_overcount() {
+        let ui = ProgressUi::hidden_paced(5, SHUT);
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(40);
+        h.advance(35); // withheld
+        h.rewind();
+        assert_eq!(
+            ui.overall_position(),
+            0,
+            "rewind is forced through: bytes about to be re-sent must go now"
+        );
+        h.advance(100);
+        h.finish();
+        assert_eq!(ui.overall_position(), 100, "and the retry counts once");
+    }
+
+    #[test]
+    fn gate_settles_on_drop_without_faking_completion() {
+        let ui = ProgressUi::hidden_paced(5, SHUT);
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(10);
+        h.advance(20); // withheld
+        drop(h);
+        assert_eq!(
+            ui.overall_position(),
+            30,
+            "a failed part still reports the bytes it moved, and only those"
+        );
+        assert_eq!(ui.active_slots(), 0);
+    }
+
+    #[test]
+    fn ticker_flushes_a_task_that_stopped_reporting() {
+        let ui = ProgressUi::hidden_paced(5, Duration::from_millis(50));
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(10); // first report paints on arrival
+        h.advance(20); // withheld, and then the stream stalls
+        assert_eq!(ui.overall_position(), 10);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            ui.overall_position(),
+            30,
+            "a stall must not park the row on a stale figure"
+        );
+        drop(h);
+    }
+
+    #[test]
+    fn ticker_stops_at_the_slot_it_was_registered_for() {
+        let ui = ProgressUi::hidden_paced(2, Duration::from_millis(20));
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(10);
+        h.finish();
+        assert_eq!(ui.active_slots(), 0, "slot released");
+        // The ticker keeps running against a grid whose slots are all idle;
+        // it must find nothing to do rather than paint through a released
+        // handle.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(ui.overall_position(), 100, "finish's figure stands");
+    }
+
+    /// The ticker takes the grid lock and then a notifier's; `finish` takes
+    /// them the other way round. This churns both against each other on a
+    /// deliberately tiny tick so the two are constantly interleaved -- a
+    /// lock cycle would hang here rather than in front of a user. The
+    /// accounting assertions are the same ones the unpaced churn test
+    /// makes, since the ticker must not perturb them either.
+    #[test]
+    fn ticker_racing_claim_and_release_neither_deadlocks_nor_miscounts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ui = ProgressUi::hidden_paced(4, Duration::from_millis(1));
+        let peak = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let ui = ui.clone();
+                let peak = Arc::clone(&peak);
+                s.spawn(move || {
+                    for i in 0..200u64 {
+                        let h = ui.start(bytes_task(&format!("t{t}-{i}"), 10));
+                        peak.fetch_max(ui.active_slots(), Ordering::SeqCst);
+                        h.advance(5);
+                        if i % 2 == 0 { h.finish() } else { drop(h) }
+                    }
+                });
+            }
+        });
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "a slot was handed out twice"
+        );
+        assert_eq!(ui.active_slots(), 0, "no slot leaked");
+        // 8 threads x 200 tasks of 10 bytes, half finished and half dropped:
+        // the finished ones top up to 10, the dropped ones stop at the 5
+        // they moved. Exact regardless of how many of those pushes the
+        // ticker made rather than the worker that produced them.
+        assert_eq!(ui.overall_position(), 800 * 10 + 800 * 5);
+    }
+
+    #[test]
+    fn gate_opens_once_the_interval_passes() {
+        let ui = ProgressUi::hidden_paced(5, Duration::from_millis(1));
+        ui.add_object(100);
+        let h = ui.start(bytes_task("f", 100));
+        h.advance(10);
+        std::thread::sleep(Duration::from_millis(5));
+        h.advance(20);
+        assert_eq!(ui.overall_position(), 30, "interval elapsed: caught up");
     }
 
     #[test]
