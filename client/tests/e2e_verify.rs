@@ -214,3 +214,79 @@ fn verified_download_costs_no_extra_request_for_a_small_object() {
     assert_eq!(std::fs::read(&dst).unwrap(), data);
     assert_eq!(format!("{:x}", Md5::digest(&data)).len(), 32);
 }
+
+#[test]
+fn a_stale_inherited_etag_is_recovered_by_restating_the_object() {
+    // Inheriting size and ETag from the listing saves a request per object,
+    // but the object can be replaced before the transfer starts. `If-Match`
+    // turns that into a 412 rather than a spliced file; this proves the 412 is
+    // then recovered instead of surfacing as a failure.
+    //
+    // The race cannot be provoked from outside the process, so the test hook
+    // makes the inherited ETag unmatchable -- the same condition a real
+    // replacement produces.
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/vfystale"]);
+    let dir = server.dir.path().join("tree");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = payload(12 * 1024 * 1024);
+    std::fs::write(dir.join("big.bin"), &data).unwrap();
+    std::fs::write(dir.join("small.bin"), payload(4096)).unwrap();
+    server.rs3_ok(&[
+        "mirror",
+        "--part-size",
+        "5MiB",
+        dir.to_str().unwrap(),
+        "test/vfystale",
+    ]);
+
+    let back = server.dir.path().join("back");
+    let out = server.rs3_env(
+        &["mirror", "test/vfystale", back.to_str().unwrap()],
+        &[("RS3_TEST_STALE_INHERITED_ETAG", "1")],
+    );
+    assert!(
+        out.status.success(),
+        "a replaced object must be recovered, not fail:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("changed after it was listed"),
+        "expected the refetch to be reported, got: {stderr}"
+    );
+    // Recovered means *correct*, not merely non-failing: the refetch must
+    // still be verified against the object's real ETag.
+    assert_eq!(std::fs::read(back.join("big.bin")).unwrap(), data);
+    assert_eq!(
+        std::fs::read(back.join("small.bin")).unwrap(),
+        payload(4096)
+    );
+}
+
+#[test]
+fn a_single_object_command_does_not_absorb_a_precondition_failure() {
+    // A plan built from this process's own HeadObject was current a moment
+    // ago. A 412 against it means something is rewriting the key continuously,
+    // which is worth reporting rather than retrying around.
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/vfynoinherit"]);
+    let src = server.dir.path().join("one.bin");
+    std::fs::write(&src, payload(4096)).unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/vfynoinherit/one.bin"]);
+
+    let dst = server.dir.path().join("one.out");
+    // `cp` of a single object passes no listed facts, so the hook cannot make
+    // its ETag stale and the download simply succeeds.
+    let out = server.rs3_env(
+        &["cp", "test/vfynoinherit/one.bin", dst.to_str().unwrap()],
+        &[("RS3_TEST_STALE_INHERITED_ETAG", "1")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&dst).unwrap(), payload(4096));
+}

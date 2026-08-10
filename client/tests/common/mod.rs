@@ -170,6 +170,19 @@ impl TestServer {
         }
     }
 
+    /// `rs3` with extra environment variables, for tests that need to reach a
+    /// code path the CLI has no flag for.
+    pub fn rs3_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rs3"));
+        cmd.args(args)
+            .env("MC_HOST_TEST", self.mc_host())
+            .env("MC_CONFIG_DIR", self.dir.path().join("mc-config"));
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("run rs3")
+    }
+
     pub fn rs3(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rs3"))
             .args(args)

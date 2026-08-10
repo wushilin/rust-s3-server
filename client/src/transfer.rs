@@ -1045,6 +1045,35 @@ async fn multipart_server_side_copy(
 /// Downloads `bucket/key` to `output`, returning the transferred size so
 /// callers can build their own `CopyMessage`/`MirrorMessage` (this module
 /// intentionally prints nothing itself -- see [`UploadOutcome`]).
+/// The object changed between the listing that described it and the transfer
+/// that tried to fetch it.
+///
+/// Every ranged GET carries `If-Match` on the ETag the download was planned
+/// against, so a replacement mid-transfer produces a 412 rather than a file
+/// spliced from two generations of the object. That protection is why the
+/// condition is worth naming: it is the one failure that is *expected* to be
+/// recoverable, by re-stating the key and starting over against what is there
+/// now.
+///
+/// Carried as a typed error rather than a matched string because it has to
+/// survive two layers of wrapping -- the per-range retry loop and
+/// `anyhow::Context` -- and still be recognisable at the top.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ObjectChanged;
+
+impl std::fmt::Display for ObjectChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the object changed while it was being read")
+    }
+}
+
+impl std::error::Error for ObjectChanged {}
+
+/// Does this error chain contain an [`ObjectChanged`]?
+fn is_object_changed(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<ObjectChanged>())
+}
+
 /// What a listing already told the caller about an object.
 ///
 /// `ListObjectsV2` returns a key's size and ETag, which is everything the
@@ -1113,6 +1142,21 @@ pub(crate) async fn download_key_to_path(
         (None, Some(head)) => head.e_tag().map(str::to_string),
         (None, None) => None,
     };
+    // Test hook: forces the inherited ETag to be one the server cannot match,
+    // so the 412 recovery below runs on demand. The race it models -- an
+    // object replaced between the listing and the transfer -- cannot be
+    // provoked deterministically from outside the process, and an untested
+    // recovery path is one that quietly does not work. Costs one `var_os`
+    // lookup per object and is set by nothing but the test suite.
+    let etag = match std::env::var_os("RS3_TEST_STALE_INHERITED_ETAG").is_some() && known.is_some() {
+        true => Some("00000000000000000000000000000000".to_string()),
+        false => etag,
+    };
+    // Only an inherited plan can go stale. A plan built from this function's
+    // own `HeadObject` was current a moment ago, and a 412 against it means
+    // something is rewriting the key continuously -- not a race worth
+    // absorbing silently.
+    let inherited = known.is_some();
     if let Some(ui) = progress {
         ui.add_object(size);
     }
@@ -1154,7 +1198,8 @@ pub(crate) async fn download_key_to_path(
     {
         ui_eprintln!("rs3: `{bucket}/{key}`: skipping content check: {reason}");
     }
-    let result = download_to_temp(
+    let mut size = size;
+    let mut result = download_to_temp(
         client,
         bucket,
         key,
@@ -1168,6 +1213,73 @@ pub(crate) async fn download_key_to_path(
         progress,
     )
     .await;
+
+    // Inheriting size and ETag from a listing removes a request per object,
+    // but widens the window in which the object can be replaced before the
+    // transfer starts. `If-Match` turns that race into a clean 412 instead of
+    // a spliced file; recovering from it is what keeps the saved request from
+    // costing correctness. One retry only: a key being rewritten in a loop is
+    // a moving target, and retrying forever would hide that rather than report
+    // it.
+    if inherited && result.as_ref().is_err_and(is_object_changed) {
+        let fresh = crate::budget::dispatch(
+            budget,
+            progress,
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Inspecting,
+                path: format!("{bucket}/{key}"),
+                part: None,
+            },
+            "HeadObject",
+            client.head_object().bucket(bucket).key(key).send(),
+        )
+        .await
+        .map_err(|err| anyhow!("re-stat `{bucket}/{key}` after it changed: {err}"))?;
+        let fresh_size = fresh.content_length().unwrap_or_default() as u64;
+        let fresh_etag = fresh.e_tag().map(str::to_string);
+        ui_eprintln!(
+            "rs3: `{bucket}/{key}` changed after it was listed; refetching the current version"
+        );
+        // The progress total was declared against the listed size; correct it
+        // so the run's byte accounting still adds up.
+        if let Some(ui) = progress
+            && fresh_size != size
+        {
+            ui.add_object(fresh_size.saturating_sub(size));
+        }
+        let fresh_layout = match verify {
+            true => {
+                crate::verify::discover_layout(
+                    client,
+                    bucket,
+                    key,
+                    fresh_etag.as_deref(),
+                    fresh_size,
+                    budget,
+                    progress,
+                )
+                .await?
+            }
+            false => crate::verify::ObjectLayout::Opaque {
+                reason: "verification disabled".to_string(),
+            },
+        };
+        size = fresh_size;
+        result = download_to_temp(
+            client,
+            bucket,
+            key,
+            &tmp,
+            fresh_size,
+            part_size,
+            parallel,
+            fresh_etag.as_deref(),
+            &fresh_layout,
+            budget,
+            progress,
+        )
+        .await;
+    }
     // Either way the staging directory goes: on success it is empty once the
     // file is renamed out, on failure it still holds the partial object, and
     // neither is anything a later run may trust.
@@ -1386,7 +1498,18 @@ async fn stream_range_into(
     if let Some(etag) = etag {
         req = req.if_match(etag);
     }
-    let resp = req.send().await?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            // 412 means our `If-Match` no longer holds: the object was
+            // replaced. Distinguished here, while the HTTP status is still
+            // visible, because converting to `anyhow` loses it.
+            if err.raw_response().map(|r| r.status().as_u16()) == Some(412) {
+                return Err(anyhow!(ObjectChanged));
+            }
+            return Err(err.into());
+        }
+    };
     let mut reader = resp.body.into_async_read();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -1467,6 +1590,11 @@ async fn download_range_resumable(
         // and resumes identically -- the sparse file would otherwise keep a
         // hole that reads back as zeros.
         let reason = match result {
+            // A replaced object is not a transient fault: every retry would
+            // fail the same precondition, and the backoff ladder would spend
+            // half a minute proving it. Surface it now so the caller can
+            // re-stat the key and start again against what is there.
+            Err(err) if is_object_changed(&err) => return Err(err),
             Err(err) => format!("{err:#}"),
             Ok(()) => format!("body ended {} bytes short", expected - written),
         };
