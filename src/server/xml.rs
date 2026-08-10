@@ -13,16 +13,40 @@ pub struct BucketListEntry {
 pub struct S3ErrorXml {
     pub code: String,
     pub message: String,
-    pub resource: String,
     pub request_id: String,
+    /// Extra elements this particular error carries, emitted between
+    /// `<Message>` and `<RequestId>` in the order given.
+    ///
+    /// AWS attaches error-specific detail rather than folding everything into
+    /// the message: `NoSuchKey` names the `<Key>`, `NoSuchBucket` the
+    /// `<BucketName>`, `InvalidArgument` the offending
+    /// `<ArgumentName>`/`<ArgumentValue>`, `InvalidPartNumber` the
+    /// `<PartNumberRequested>`/`<ActualPartCount>`, `InvalidRange` the
+    /// `<RangeRequested>`/`<ActualObjectSize>`, and `PreconditionFailed` the
+    /// `<Condition>` that failed. Both humans and SDKs that model these fields
+    /// read them, and folding them into prose leaves the modelled field
+    /// `None`.
+    pub details: Vec<(String, String)>,
 }
 
+/// Renders an S3 `<Error>` document.
+///
+/// Deliberately *without* a `<Resource>` element: real S3 does not emit one —
+/// it names the offending thing with a typed element instead (see
+/// [`S3ErrorXml::details`]) — and this was checked against
+/// `s3.ap-southeast-1.amazonaws.com` rather than assumed. The resource is
+/// still threaded through the error helpers for logging, just not put on the
+/// wire.
 pub fn error_xml(error: &S3ErrorXml) -> String {
+    let details: String = error
+        .details
+        .iter()
+        .map(|(name, value)| format!("<{name}>{}</{name}>", escape_xml(value)))
+        .collect();
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>{}</Code><Message>{}</Message><Resource>{}</Resource><RequestId>{}</RequestId><HostId>{}</HostId></Error>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>{}</Code><Message>{}</Message>{details}<RequestId>{}</RequestId><HostId>{}</HostId></Error>"#,
         escape_xml(&error.code),
         escape_xml(&error.message),
-        escape_xml(&error.resource),
         escape_xml(&error.request_id),
         escape_xml(&error.request_id),
     )
@@ -56,6 +80,8 @@ pub fn list_objects_v2_xml(
     let mut contents = String::new();
     for entry in &page.entries {
         contents.push_str(&format!(
+            // v1 carries `<Owner>` unconditionally; v2 omits it unless the
+            // caller passes `fetch-owner=true`. AWS sends no `DisplayName`.
             "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
             escape_xml(&encode_list_value(&entry.object_key, encode_keys)),
             iso_utc_ms(entry.last_modified_ms),
@@ -125,7 +151,9 @@ pub fn list_objects_v1_xml(
     let mut contents = String::new();
     for entry in &page.entries {
         contents.push_str(&format!(
-            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            // v1 carries `<Owner>` unconditionally; v2 omits it unless the
+            // caller passes `fetch-owner=true`. AWS sends no `DisplayName`.
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><Owner><ID>rust-s3-server</ID></Owner><StorageClass>STANDARD</StorageClass></Contents>",
             escape_xml(&encode_list_value(&entry.object_key, encode_keys)),
             iso_utc_ms(entry.last_modified_ms),
             escape_xml(&quote_etag(&entry.etag)),
@@ -196,7 +224,7 @@ pub fn list_object_versions_xml(
     let mut body = String::new();
     for version in versions {
         body.push_str(&format!(
-            "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>{}</StorageClass><Owner><ID>rust-s3-server</ID><DisplayName>rust-s3-server</DisplayName></Owner></Version>",
+            "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>{}</StorageClass><Owner><ID>rust-s3-server</ID></Owner></Version>",
             escape_xml(&encode_list_value(&version.meta.object_key, encode_keys)),
             // This server is non-versioned; S3 reports the version id as the literal
             // "null" for objects in unversioned buckets. The internal storage
@@ -276,22 +304,40 @@ pub fn list_parts_xml(
 ) -> String {
     let mut body = String::new();
     for part in parts {
+        // AWS reports LastModified per part; omitting it leaves an SDK's
+        // `last_modified()` empty for every part.
         body.push_str(&format!(
-            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag><Size>{}</Size></Part>",
+            "<Part><PartNumber>{}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Part>",
             part.number,
+            iso_utc_ms(part.last_modified_ms),
             escape_xml(&quote_etag(&part.etag)),
             part.size,
         ));
     }
-    let next_marker_xml = next_part_number_marker
-        .map(|m| format!("<NextPartNumberMarker>{m}</NextPartNumberMarker>"))
-        .unwrap_or_default();
+    // Sent whether or not the page is truncated -- AWS treats it as "the last
+    // part number in this page", matching `GetObjectAttributes`.
+    let next_marker = next_part_number_marker
+        .or_else(|| parts.last().map(|p| p.number))
+        .unwrap_or(part_number_marker);
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><PartNumberMarker>{part_number_marker}</PartNumberMarker>{next_marker_xml}<MaxParts>{max_parts}</MaxParts><IsTruncated>{is_truncated}</IsTruncated>{body}</ListPartsResult>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId>{OWNERSHIP}<StorageClass>STANDARD</StorageClass><PartNumberMarker>{part_number_marker}</PartNumberMarker><NextPartNumberMarker>{next_marker}</NextPartNumberMarker><MaxParts>{max_parts}</MaxParts><IsTruncated>{is_truncated}</IsTruncated>{body}</ListPartsResult>"#,
         escape_xml(bucket),
         escape_xml(key),
         escape_xml(upload_id),
+        OWNERSHIP = ownership_xml(),
     )
+}
+
+/// The `<Initiator>`/`<Owner>` pair AWS puts in `ListParts`.
+///
+/// This server has no per-user object ownership, so both name the server
+/// itself. They are emitted rather than omitted because an SDK models them,
+/// and a missing `Owner` reads as "ownership unknown" rather than "ownership
+/// is not a concept here". `Owner` carries no `DisplayName`: AWS omits it.
+fn ownership_xml() -> String {
+    "<Initiator><ID>rust-s3-server</ID><DisplayName>rust-s3-server</DisplayName></Initiator>\
+     <Owner><ID>rust-s3-server</ID></Owner>"
+        .replace("     ", "")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -309,9 +355,10 @@ pub fn list_multipart_uploads_xml(
     let mut body = String::new();
     for upload in uploads {
         body.push_str(&format!(
-            "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiator><ID>rust-s3-server</ID><DisplayName>rust-s3-server</DisplayName></Initiator><Owner><ID>rust-s3-server</ID><DisplayName>rust-s3-server</DisplayName></Owner><StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId>{}<StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
             escape_xml(&upload.object_key),
             escape_xml(&upload.upload_id),
+            ownership_xml(),
             iso_utc_ms(upload.initiated_at_ms),
         ));
     }
@@ -320,17 +367,21 @@ pub fn list_multipart_uploads_xml(
     } else {
         format!("<Prefix>{}</Prefix>", escape_xml(prefix))
     };
-    let next_markers_xml = if is_truncated {
-        format!(
-            "<NextKeyMarker>{}</NextKeyMarker><NextUploadIdMarker>{}</NextUploadIdMarker>",
-            escape_xml(next_key_marker.unwrap_or("")),
-            escape_xml(next_upload_id_marker.unwrap_or("")),
-        )
-    } else {
-        String::new()
-    };
+    // Sent on every page, truncated or not: AWS reports the last key and
+    // upload id *in this page*, so a final page still carries them. Falling
+    // back to the last listed upload keeps that true when the caller did not
+    // supply an explicit continuation.
+    let next_markers_xml = format!(
+        "<NextKeyMarker>{}</NextKeyMarker><NextUploadIdMarker>{}</NextUploadIdMarker>",
+        escape_xml(
+            next_key_marker.unwrap_or(uploads.last().map_or("", |u| u.object_key.as_str()))
+        ),
+        escape_xml(
+            next_upload_id_marker.unwrap_or(uploads.last().map_or("", |u| u.upload_id.as_str()))
+        ),
+    );
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket>{prefix_xml}<KeyMarker>{}</KeyMarker><UploadIdMarker>{}</UploadIdMarker><MaxUploads>{max_uploads}</MaxUploads><IsTruncated>{is_truncated}</IsTruncated>{next_markers_xml}{body}</ListMultipartUploadsResult>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><KeyMarker>{}</KeyMarker><UploadIdMarker>{}</UploadIdMarker>{next_markers_xml}{prefix_xml}<MaxUploads>{max_uploads}</MaxUploads><IsTruncated>{is_truncated}</IsTruncated>{body}</ListMultipartUploadsResult>"#,
         escape_xml(bucket),
         escape_xml(key_marker),
         escape_xml(upload_id_marker),
@@ -366,6 +417,122 @@ pub fn delete_objects_xml(results: &[DeleteObjectResult], quiet: bool) -> String
     }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{body}</DeleteResult>"#
+    )
+}
+
+/// One page of a multipart object's part layout, for
+/// [`object_attributes_xml`]. Mirrors AWS's `GetObjectAttributesParts`.
+pub struct ObjectPartsPage<'a> {
+    /// Total parts in the object, not in this page.
+    pub total_parts_count: usize,
+    pub part_number_marker: u16,
+    /// The last part number in this page. AWS sends this whether or not the
+    /// page is truncated, so it is not a continuation-only field.
+    pub next_part_number_marker: u16,
+    pub max_parts: usize,
+    pub is_truncated: bool,
+    pub parts: &'a [ObjectPartXml],
+}
+
+/// One part as reported by GetObjectAttributes.
+pub struct ObjectPartXml {
+    pub number: u16,
+    pub size: u64,
+    /// Base64 of the part's raw 128-bit MD5 digest.
+    ///
+    /// AWS populates `ChecksumMD5` only when the upload declared an MD5
+    /// checksum algorithm, and leaves it absent otherwise. This server always
+    /// has the value -- a part's MD5 is what its stored ETag *is*, and the
+    /// object's composite ETag is built from exactly these digests -- so it is
+    /// always reported. The claim is the literal one the field makes ("the
+    /// 128-bit MD5 digest of this part"), and it is what lets a downloader
+    /// check each part on arrival instead of only checking the composite once
+    /// the whole object has landed.
+    pub checksum_md5: Option<String>,
+}
+
+/// `GetObjectAttributesResponse`. Every field is optional because the
+/// operation is a projection: the caller names the attributes it wants via
+/// `x-amz-object-attributes`, and anything it did not ask for is omitted
+/// rather than sent empty.
+///
+/// The shape here was checked against real S3 rather than inferred, because
+/// two details are surprising and neither is guessable from the API reference:
+///
+/// - **The root element is `GetObjectAttributesResponse`**, not the
+///   `…Output` name the SDK uses for the modelled shape.
+/// - **`<ETag>` is unquoted**, alone among every ETag S3 emits — the header is
+///   quoted, `ListObjects` and `ListParts` quote theirs, and this one does
+///   not. Callers must therefore trim `"` before comparing against a
+///   `HeadObject` ETag, which is the portable rule regardless.
+///
+/// Observed from `s3.ap-southeast-1.amazonaws.com` on 2026-08-10:
+///
+/// ```text
+/// <GetObjectAttributesResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+///   <ETag>b30e35fa7fcee018c17d0b9152178c4d-2</ETag>
+///   <ObjectParts><PartsCount>2</PartsCount><PartNumberMarker>0</PartNumberMarker>
+///   <NextPartNumberMarker>2</NextPartNumberMarker><MaxParts>1000</MaxParts>
+///   <IsTruncated>false</IsTruncated>
+///   <Part><PartNumber>1</PartNumber><Size>5242880</Size><ChecksumSHA256>…</ChecksumSHA256></Part>
+///   …</ObjectParts>
+///   <StorageClass>STANDARD</StorageClass><ObjectSize>6291456</ObjectSize>
+/// </GetObjectAttributesResponse>
+/// ```
+///
+/// Note `NextPartNumberMarker` is present even though `IsTruncated` is false —
+/// AWS emits it as "the last part number in this page", not as a
+/// continuation-only field, so it is emitted unconditionally here too.
+pub fn object_attributes_xml(
+    etag: Option<&str>,
+    storage_class: Option<&str>,
+    object_size: Option<u64>,
+    object_parts: Option<ObjectPartsPage<'_>>,
+) -> String {
+    let mut body = String::new();
+    if let Some(etag) = etag {
+        body.push_str(&format!("<ETag>{}</ETag>", escape_xml(etag)));
+    }
+    if let Some(page) = object_parts {
+        // `TotalPartsCount` is carried on the wire as `<PartsCount>` -- the
+        // element name and the modelled member name differ for this one field,
+        // and an SDK will silently report `None` for the count if it is sent
+        // under the member name instead.
+        body.push_str(&format!(
+            "<ObjectParts><PartsCount>{}</PartsCount><PartNumberMarker>{}</PartNumberMarker>",
+            page.total_parts_count, page.part_number_marker
+        ));
+        body.push_str(&format!(
+            "<NextPartNumberMarker>{}</NextPartNumberMarker>",
+            page.next_part_number_marker
+        ));
+        body.push_str(&format!(
+            "<MaxParts>{}</MaxParts><IsTruncated>{}</IsTruncated>",
+            page.max_parts, page.is_truncated
+        ));
+        for part in page.parts {
+            body.push_str(&format!(
+                "<Part><PartNumber>{}</PartNumber><Size>{}</Size>",
+                part.number, part.size
+            ));
+            if let Some(md5) = &part.checksum_md5 {
+                body.push_str(&format!("<ChecksumMD5>{}</ChecksumMD5>", escape_xml(md5)));
+            }
+            body.push_str("</Part>");
+        }
+        body.push_str("</ObjectParts>");
+    }
+    if let Some(storage_class) = storage_class {
+        body.push_str(&format!(
+            "<StorageClass>{}</StorageClass>",
+            escape_xml(storage_class)
+        ));
+    }
+    if let Some(size) = object_size {
+        body.push_str(&format!("<ObjectSize>{size}</ObjectSize>"));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><GetObjectAttributesResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{body}</GetObjectAttributesResponse>"#
     )
 }
 

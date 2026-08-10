@@ -1,0 +1,87 @@
+{
+  "_README": [
+    "Differences from real S3 that this server accepts, with the reason each is",
+    "accepted. Anything NOT listed here fails `s3probe.py diff --strict`, which",
+    "is what the `aws_compat` integration test runs.",
+    "",
+    "A rule matches a finding when `op` equals the operation name (or \"*\"),",
+    "`kind` equals the finding kind, and `contains` appears in the detail text.",
+    "Adding a rule is a deliberate act: it says 'we know, and here is why'.",
+    "",
+    "Regenerate the golden capture with:",
+    "  AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \\",
+    "  python3 compat/aws/s3probe.py capture \\",
+    "    --endpoint https://s3.<region>.amazonaws.com --region <region> \\",
+    "    --bucket <bucket> --prefix <prefix> --out compat/aws/aws-golden.json"
+  ],
+  "rules": [
+    {
+      "op": "*", "kind": "header", "contains": "x-amz-id-2",
+      "why": "AWS request-tracing header. Carries no protocol meaning; clients log it at most."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "server",
+      "why": "AWS advertises 'AmazonS3'. Impersonating that would be worse than differing."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "x-amz-server-side-encryption",
+      "why": "S3 encrypts at rest by default and says so. This server has no SSE."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "x-amz-bucket-region",
+      "why": "Region discovery. This server is regionless; see the get_bucket_location note."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "x-amz-bucket-arn",
+      "why": "ARNs are an AWS-account concept with no local equivalent."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "x-amz-access-point-alias",
+      "why": "S3 Access Points are an AWS feature; there is nothing to report."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "x-amz-checksum-",
+      "why": "Additional checksums (CRC32/CRC32C/SHA1/SHA256/CRC64NVME) are not implemented. See ChecksumAlgorithm below."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "content-length",
+      "why": "Response framing. AWS chunks some XML replies where we send a length, and vice versa; both are valid HTTP and no client can tell the difference."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "transfer-encoding",
+      "why": "Same framing choice as content-length."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "keep-alive",
+      "why": "Connection management, not protocol semantics."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "content-type: 'application/xml'",
+      "why": "AWS is inconsistent about this and we are not. It sends application/xml on ListObjects, CompleteMultipartUpload and every error, omits it entirely on CreateMultipartUpload and GetObjectAttributes, and sends it on a bodiless HeadBucket. We send it on every XML body and nothing else. Reproducing the inconsistency would need a per-operation table serving no client: SDKs dispatch on the operation they invoked, never on this header."
+    },
+    {
+      "op": "*", "kind": "xml", "contains": "ChecksumAlgorithm",
+      "why": "AWS now adds a default CRC64NVME checksum to every upload and reports the algorithm in listings. This server stores no additional checksums, so it reports none -- the same shape AWS produced before that default existed."
+    },
+    {
+      "op": "*", "kind": "xml", "contains": "ChecksumType",
+      "why": "Partner of ChecksumAlgorithm; see above."
+    },
+    {
+      "op": "*", "kind": "xml", "contains": "ChecksumCRC64NVME",
+      "why": "Partner of ChecksumAlgorithm; see above."
+    },
+    {
+      "op": "get_bucket_location", "kind": "xml", "contains": "LocationConstraint",
+      "why": "AWS reports the bucket's region; this server has no region concept, so it returns the empty LocationConstraint that S3 itself uses to mean us-east-1. A client that treats empty as us-east-1 -- which every SDK does -- works unchanged."
+    },
+    {
+      "op": "mpu_attributes_all", "kind": "xml", "contains": "ObjectParts",
+      "why": "Deliberate superset. AWS returns the per-part list only for uploads made with a COMPOSITE checksum, and returns a bare PartsCount otherwise. Every multipart object here has a composite ETag built from per-part MD5s -- structurally AWS's COMPOSITE case -- and withholding the boundaries would leave callers a PartsCount they cannot use. See handlers/get_object_attributes."
+    },
+    {
+      "op": "mpu_attributes_parts_paged", "kind": "xml", "contains": "ObjectParts",
+      "why": "Same deliberate superset as mpu_attributes_all."
+    }
+  ]
+}

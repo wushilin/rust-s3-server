@@ -471,13 +471,16 @@
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-        assert!(res
-            .headers()
-            .get("content-range")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("bytes */"));
+        // Real S3 answers an unsatisfiable range with an error *document* and
+        // no `Content-Range`, which is a deliberate divergence from RFC 7233's
+        // "SHOULD send Content-Range: bytes */len". Matching AWS wins here:
+        // an S3 client reads the numbers out of the body, and an empty 416
+        // leaves it with a status and nothing to report.
+        assert!(res.headers().get("content-range").is_none());
+        let xml = body_text(res).await;
+        assert!(xml.contains("InvalidRange"), "{xml}");
+        assert_eq!(extract_xml_tag(&xml, "RangeRequested"), Some("bytes=100-200"));
+        assert_eq!(extract_xml_tag(&xml, "ActualObjectSize"), Some("2"));
     }
 
     #[tokio::test]
@@ -4235,4 +4238,514 @@
             body.contains("ListAllMyBucketsResult"),
             "bare host must list buckets: {body}"
         );
+    }
+
+    // ── GetObjectAttributes / partNumber ──────────────────────────────────
+    //
+    // Both exist for one reason: a completed multipart object's part
+    // boundaries are otherwise unrecoverable (ListParts needs an uploadId and
+    // stops answering at completion), yet its composite ETag
+    // `md5(md5(part₁) ‖ …)-N` cannot be rebuilt without them.
+
+    /// Uploads a 4-part object (5/5/5/0.375 MiB) and returns the part bodies.
+    /// Sizes are deliberately not uniform: a layout reported by guessing a
+    /// single part size would still satisfy a uniform object.
+    async fn put_four_part_object(app: &axum::Router, bucket: &str, key: &str) -> Vec<Vec<u8>> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/{bucket}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{bucket}/{key}?uploads"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let xml = body_text(res).await;
+        let upload_id = extract_xml_tag(&xml, "UploadId").unwrap().to_string();
+
+        let parts = vec![
+            vec![b'a'; 5 * 1024 * 1024],
+            vec![b'b'; 5 * 1024 * 1024],
+            vec![b'c'; 5 * 1024 * 1024],
+            vec![b'd'; 384 * 1024],
+        ];
+        let mut etags = Vec::new();
+        for (idx, part) in parts.iter().enumerate() {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/{bucket}/{key}?uploadId={upload_id}&partNumber={}",
+                            idx + 1
+                        ))
+                        .body(Body::from(part.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            etags.push(res.headers()["etag"].to_str().unwrap().to_string());
+        }
+
+        let complete_parts = etags
+            .iter()
+            .enumerate()
+            .map(|(idx, etag)| {
+                format!(
+                    "<Part><PartNumber>{}</PartNumber><ETag>{etag}</ETag></Part>",
+                    idx + 1
+                )
+            })
+            .collect::<String>();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+                    .body(Body::from(format!(
+                        "<CompleteMultipartUpload>{complete_parts}</CompleteMultipartUpload>"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        parts
+    }
+
+    fn md5_base64(bytes: &[u8]) -> String {
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        use md5::{Digest, Md5};
+        BASE64_STANDARD.encode(Md5::digest(bytes))
+    }
+
+    fn md5_hex(bytes: &[u8]) -> String {
+        use md5::{Digest, Md5};
+        format!("{:x}", Md5::digest(bytes))
+    }
+
+    async fn get_attributes(
+        app: &axum::Router,
+        uri: &str,
+        attributes: &[&str],
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method("GET").uri(uri);
+        for attribute in attributes {
+            request = request.header("x-amz-object-attributes", *attribute);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn object_attributes_reports_the_real_part_layout_and_digests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        let parts = put_four_part_object(&app, "goa-bucket", "big.bin").await;
+
+        let res = get_attributes(
+            &app,
+            "/goa-bucket/big.bin?attributes",
+            &["ETag", "ObjectSize", "StorageClass", "ObjectParts"],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = body_text(res).await;
+
+        let total: usize = parts.iter().map(Vec::len).sum();
+        assert_eq!(
+            extract_xml_tag(&xml, "ObjectSize"),
+            Some(total.to_string()).as_deref()
+        );
+        assert_eq!(extract_xml_tag(&xml, "StorageClass"), Some("STANDARD"));
+        // `TotalPartsCount` travels as `<PartsCount>`; sending it under the
+        // modelled name leaves an SDK reporting `None` for the count.
+        assert_eq!(extract_xml_tag(&xml, "PartsCount"), Some("4"));
+        assert_eq!(extract_xml_tag(&xml, "IsTruncated"), Some("false"));
+        assert_eq!(
+            extract_all_xml_tags(&xml, "Size"),
+            parts
+                .iter()
+                .map(|p| p.len().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            extract_all_xml_tags(&xml, "PartNumber"),
+            vec!["1", "2", "3", "4"]
+        );
+        assert_eq!(
+            extract_all_xml_tags(&xml, "ChecksumMD5"),
+            parts.iter().map(|p| md5_base64(p)).collect::<Vec<_>>()
+        );
+        // Unquoted -- real S3 emits a bare string here, alone among its ETags.
+        let etag = extract_xml_tag(&xml, "ETag").unwrap();
+        assert!(!etag.contains('"') && !etag.contains("&quot;"), "ETag must be unquoted: {etag}");
+        assert!(etag.ends_with("-4"), "composite ETag expected: {etag}");
+        // Root element is `…Response`, not the SDK's `…Output` shape name.
+        assert!(xml.contains("<GetObjectAttributesResponse"), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn object_attributes_returns_only_requested_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        put_four_part_object(&app, "goa-proj", "big.bin").await;
+
+        let res = get_attributes(&app, "/goa-proj/big.bin?attributes", &["ObjectSize"]).await;
+        let xml = body_text(res).await;
+        assert!(xml.contains("<ObjectSize>"));
+        // Not asked for, so absent rather than empty: a caller wanting one
+        // field should not pay for a 10,000-part listing.
+        assert!(!xml.contains("<ObjectParts>"), "{xml}");
+        assert!(!xml.contains("<ETag>"), "{xml}");
+        assert!(!xml.contains("<StorageClass>"), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn object_attributes_accepts_a_comma_joined_header() {
+        // The AWS SDK sends one header per attribute, but other clients join
+        // them into one value. Both must mean the same thing.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        put_four_part_object(&app, "goa-comma", "big.bin").await;
+
+        let res = get_attributes(
+            &app,
+            "/goa-comma/big.bin?attributes",
+            &["ETag,ObjectParts"],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = body_text(res).await;
+        assert!(xml.contains("<ETag>"), "{xml}");
+        assert!(xml.contains("<PartsCount>4</PartsCount>"), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn object_attributes_paginates_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        put_four_part_object(&app, "goa-page", "big.bin").await;
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/goa-page/big.bin?attributes")
+                    .header("x-amz-object-attributes", "ObjectParts")
+                    .header("x-amz-max-parts", "2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let xml = body_text(res).await;
+        assert_eq!(extract_all_xml_tags(&xml, "PartNumber"), vec!["1", "2"]);
+        assert_eq!(extract_xml_tag(&xml, "IsTruncated"), Some("true"));
+        // The total stays the object's, not the page's.
+        assert_eq!(extract_xml_tag(&xml, "PartsCount"), Some("4"));
+        assert_eq!(extract_xml_tag(&xml, "NextPartNumberMarker"), Some("2"));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/goa-page/big.bin?attributes")
+                    .header("x-amz-object-attributes", "ObjectParts")
+                    .header("x-amz-max-parts", "2")
+                    .header("x-amz-part-number-marker", "2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let xml = body_text(res).await;
+        assert_eq!(extract_all_xml_tags(&xml, "PartNumber"), vec!["3", "4"]);
+        assert_eq!(extract_xml_tag(&xml, "IsTruncated"), Some("false"));
+        // AWS sends the marker even on a final page -- it means "last part
+        // number in this page", not "there is more".
+        assert_eq!(extract_xml_tag(&xml, "NextPartNumberMarker"), Some("4"));
+    }
+
+    #[tokio::test]
+    async fn object_attributes_omits_parts_for_a_plain_put() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/goa-single")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/goa-single/small.txt")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = get_attributes(
+            &app,
+            "/goa-single/small.txt?attributes",
+            &["ETag", "ObjectParts"],
+        )
+        .await;
+        let xml = body_text(res).await;
+        // An object that never went through a multipart upload has no part
+        // structure; claiming `PartsCount: 1` would send a client down the
+        // composite path for an ETag that is a plain MD5.
+        assert!(!xml.contains("<ObjectParts>"), "{xml}");
+        assert_eq!(
+            extract_xml_tag(&xml, "ETag"),
+            Some(md5_hex(b"hello")).as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn object_attributes_rejects_a_missing_or_unknown_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        put_four_part_object(&app, "goa-bad", "big.bin").await;
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/goa-bad/big.bin?attributes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(res).await.contains("InvalidRequest"));
+
+        let res = get_attributes(&app, "/goa-bad/big.bin?attributes", &["Bogus"]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(res).await.contains("InvalidArgument"));
+    }
+
+    #[tokio::test]
+    async fn object_attributes_on_a_missing_object_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/goa-404")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = get_attributes(&app, "/goa-404/nope.bin?attributes", &["ETag"]).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn part_number_serves_one_part_with_its_place_in_the_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        let parts = put_four_part_object(&app, "pn-bucket", "big.bin").await;
+        let total: usize = parts.iter().map(Vec::len).sum();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/pn-bucket/big.bin?partNumber=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(res.headers()["x-amz-mp-parts-count"], "4");
+        assert_eq!(
+            res.headers()["content-range"],
+            format!("bytes {}-{}/{total}", parts[0].len(), parts[0].len() + parts[1].len() - 1)
+        );
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), parts[1].as_slice());
+
+        // The short tail is the part a uniform-size guess gets wrong.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/pn-bucket/big.bin?partNumber=4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            res.headers()["content-length"],
+            parts[3].len().to_string()
+        );
+        assert_eq!(res.headers()["x-amz-mp-parts-count"], "4");
+    }
+
+    #[tokio::test]
+    async fn part_number_one_is_the_whole_of_a_single_part_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/pn-single")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/pn-single/small.txt")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/pn-single/small.txt?partNumber=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 206 with a whole-object Content-Range, exactly as AWS answers
+        // partNumber=1 on an ordinary PUT object. It is the *absent*
+        // x-amz-mp-parts-count, not the status, that tells the caller its ETag
+        // is a plain MD5 needing no composite reconstruction.
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(res.headers().get("x-amz-mp-parts-count").is_none());
+        assert_eq!(res.headers()["content-range"], "bytes 0-4/5");
+        assert_eq!(body_text(res).await, "hello");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/pn-single/small.txt?partNumber=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let xml = body_text(res).await;
+        assert_eq!(extract_xml_tag(&xml, "ActualPartCount"), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn part_number_rejects_what_it_cannot_satisfy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        put_four_part_object(&app, "pn-bad", "big.bin").await;
+
+        // A well-formed number this object does not have: 416, and the reply
+        // reports the count it actually has so a caller need not probe.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/pn-bad/big.bin?partNumber=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let xml = body_text(res).await;
+        assert!(xml.contains("InvalidPartNumber"), "{xml}");
+        assert_eq!(extract_xml_tag(&xml, "PartNumberRequested"), Some("5"));
+        assert_eq!(extract_xml_tag(&xml, "ActualPartCount"), Some("4"));
+
+        // Not a part number at all: 400 InvalidArgument, naming the offending
+        // parameter. AWS separates these two, and so must we -- one is the
+        // caller's mistake, the other a fact about the object.
+        for bad in ["0", "-1", "abc", "10001", "99999999999999999999"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/pn-bad/big.bin?partNumber={bad}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "partNumber={bad} is not a part number"
+            );
+            let xml = body_text(res).await;
+            assert!(xml.contains("InvalidArgument"), "{xml}");
+            assert_eq!(extract_xml_tag(&xml, "ArgumentName"), Some("partNumber"));
+            assert_eq!(extract_xml_tag(&xml, "ArgumentValue"), Some(bad));
+        }
+
+        // Range and partNumber select the same slot two ways; resolving one
+        // and dropping the other returns bytes nobody asked for.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/pn-bad/big.bin?partNumber=1")
+                    .header("range", "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(res).await.contains("InvalidRequest"));
     }

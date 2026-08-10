@@ -1569,6 +1569,12 @@ async fn object_route(
         Method::PUT if is_copy => handlers::copy_object::handle(store, ctx, body).await,
         Method::PUT => handlers::put_object::handle(store, ctx, body).await,
         Method::GET if has_upload_id => handlers::list_parts::handle(store, ctx, body).await,
+        // `?attributes` is metadata-only and GET-exclusive in AWS; a HEAD
+        // carrying it falls through to the ordinary object read, which is what
+        // a HEAD asks for anyway.
+        Method::GET if ctx.query.contains_key("attributes") => {
+            handlers::get_object_attributes::handle(store, ctx, body).await
+        }
         Method::GET | Method::HEAD => handlers::get_object::handle(store, ctx, body).await,
         Method::DELETE if has_upload_id => {
             handlers::abort_multipart::handle(store, ctx, body).await
@@ -1957,23 +1963,30 @@ fn unimplemented_bucket_subresource(query: &HashMap<String, String>) -> bool {
 
 fn storage_error_response(err: StorageError, resource: &str) -> Response {
     match err {
-        StorageError::BucketNotFound(_) => s3_error(
+        StorageError::BucketNotFound(ref bucket) => s3_error_detailed(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
             "The specified bucket does not exist",
             resource,
+            vec![("BucketName".to_string(), bucket.clone())],
         ),
-        StorageError::ObjectNotFound { .. } => s3_error(
+        StorageError::ObjectNotFound { ref key, .. } => s3_error_detailed(
             StatusCode::NOT_FOUND,
             "NoSuchKey",
-            "The specified key does not exist",
+            // The trailing full stop is AWS's, verified on the wire; a client
+            // matching on the message string sees a different message without
+            // it.
+            "The specified key does not exist.",
             resource,
+            vec![("Key".to_string(), key.clone())],
         ),
-        StorageError::NoSuchUpload(_) => s3_error(
+        StorageError::NoSuchUpload(ref upload_id) => s3_error_detailed(
             StatusCode::NOT_FOUND,
             "NoSuchUpload",
-            "The specified multipart upload does not exist",
+            "The specified upload does not exist. The upload ID may be invalid, \
+             or the upload may have been aborted or completed.",
             resource,
+            vec![("UploadId".to_string(), upload_id.clone())],
         ),
         StorageError::InvalidBucketName(_)
         | StorageError::InvalidObjectKey(_)
@@ -2035,11 +2048,30 @@ fn s3_error(
     message: impl Into<String>,
     resource: &str,
 ) -> Response {
+    s3_error_detailed(status, code, message, resource, Vec::new())
+}
+
+/// [`s3_error`] plus the error-specific elements AWS attaches between
+/// `<Message>` and `<Resource>` — e.g. `ArgumentName`/`ArgumentValue` on
+/// `InvalidArgument`, `PartNumberRequested`/`ActualPartCount` on
+/// `InvalidPartNumber`.
+fn s3_error_detailed(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    resource: &str,
+    details: Vec<(String, String)>,
+) -> Response {
+    let message = message.into();
+    // The resource no longer appears in the body -- real S3 names the
+    // offending thing with a typed element instead -- so it is logged here,
+    // where it is still the fastest way to see which key an error was about.
+    log::debug!("s3 error {status} {code} on {resource}: {message}");
     let body = error_xml(&S3ErrorXml {
         code: code.to_string(),
-        message: message.into(),
-        resource: resource.to_string(),
+        message,
         request_id: "rust-s3-server".to_string(),
+        details,
     });
     xml_response(status, body)
 }

@@ -653,6 +653,14 @@ pub fn requirements_for_request(
         ("GET" | "HEAD", Some(k)) => {
             if has("uploadId") {
                 vec![Requirement::object("s3:ListMultipartUploadParts", bucket, k)]
+            } else if has("attributes") {
+                // AWS gates GetObjectAttributes behind its own action rather
+                // than folding it into s3:GetObject, so a policy granting only
+                // reads does not also grant it. Matched here so a policy
+                // written against real S3 behaves the same way against this
+                // server -- including the failure: a read-only policy that
+                // never mentions the action gets 403, not part metadata.
+                vec![Requirement::object("s3:GetObjectAttributes", bucket, k)]
             } else {
                 vec![Requirement::object("s3:GetObject", bucket, k)]
             }

@@ -14,7 +14,7 @@ use crate::server as srv;
 use crate::server::handlers::ObjectCtx;
 use crate::server::range::{parse_range_header, RangeSelection};
 use crate::storage::errors::StorageError;
-use crate::storage::metadata::{quote_etag, ObjectMeta};
+use crate::storage::metadata::{quote_etag, ObjectMeta, ObjectStorageKind};
 use crate::storage::store::LocalObjectStore;
 use crate::storage::time::{http_date_ms, parse_http_date_ms};
 
@@ -51,11 +51,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             .map(|tok| tok.trim().trim_matches('"'))
             .any(|tok| tok == "*" || tok == server_etag);
         if !matched {
-            return srv::s3_error(
+            return srv::s3_error_detailed(
                 StatusCode::PRECONDITION_FAILED,
                 "PreconditionFailed",
                 "At least one of the pre-conditions you specified did not hold",
                 &format!("/{bucket}/{key}"),
+                vec![("Condition".to_string(), "If-Match".to_string())],
             );
         }
     }
@@ -67,11 +68,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     {
         if let Some(since_ms) = parse_http_date_ms(ius) {
             if object.meta.last_modified_ms > since_ms {
-                return srv::s3_error(
+                return srv::s3_error_detailed(
                     StatusCode::PRECONDITION_FAILED,
                     "PreconditionFailed",
                     "At least one of the pre-conditions you specified did not hold",
                     &format!("/{bucket}/{key}"),
+                    vec![("Condition".to_string(), "If-Unmodified-Since".to_string())],
                 );
             }
         }
@@ -113,31 +115,119 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     }
 
     let total_size = object.meta.size;
+
+    // `partNumber` reads one part of a completed multipart upload. It is the
+    // only way to learn an object's part boundaries from a plain GET/HEAD:
+    // `ListParts` needs an `uploadId` and so stops answering the moment the
+    // upload completes, yet the object's composite ETag
+    // (`md5(md5(part₁) ‖ …)-N`) goes on depending on those boundaries. One
+    // HEAD with `partNumber=1` therefore answers both questions a verifying
+    // downloader has -- is this object multipart, and if so how is it split --
+    // since `x-amz-mp-parts-count` appears only for a multipart object.
+    let part_selection = match query.get("partNumber") {
+        None => None,
+        Some(raw) => {
+            // Range and partNumber are two different selectors for the same
+            // slot. Honouring one and dropping the other silently returns
+            // bytes the caller did not ask for, so refuse the combination.
+            if headers.contains_key(header::RANGE) {
+                return srv::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "Cannot specify both Range header and partNumber query parameter",
+                    &format!("/{bucket}/{key}"),
+                );
+            }
+            match resolve_part(&object.meta, &object.part_offsets, raw) {
+                Ok(selection) => Some(selection),
+                // Not a part number at all: the caller's mistake, and no
+                // object could have satisfied it.
+                Err(PartError::NotAPartNumber) => {
+                    return srv::s3_error_detailed(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "Part number must be an integer between 1 and 10000, inclusive",
+                        &format!("/{bucket}/{key}"),
+                        vec![
+                            ("ArgumentName".to_string(), "partNumber".to_string()),
+                            ("ArgumentValue".to_string(), raw.to_string()),
+                        ],
+                    )
+                }
+                // Well-formed, but this object does not go that far. The reply
+                // says how far it does go, so a caller need not probe.
+                Err(PartError::OutOfRange { requested, actual }) => {
+                    return srv::s3_error_detailed(
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "InvalidPartNumber",
+                        "The requested partnumber is not satisfiable",
+                        &format!("/{bucket}/{key}"),
+                        vec![
+                            ("PartNumberRequested".to_string(), requested.to_string()),
+                            ("ActualPartCount".to_string(), actual.to_string()),
+                        ],
+                    )
+                }
+            }
+        }
+    };
+
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let selection = parse_range_header(range_header, total_size);
 
-    // Unsatisfiable range: return 416 immediately.
+    // Unsatisfiable range: return 416 immediately, with the error document
+    // AWS sends. An empty 416 body leaves an SDK with a status and nothing to
+    // report -- and real S3 does not send `Content-Range` here either, it
+    // names the numbers in the body instead.
     if let RangeSelection::Unsatisfiable { total_size } = selection {
-        let mut response = srv::empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
-        response.headers_mut().insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes */{total_size}")).unwrap(),
+        return srv::s3_error_detailed(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "InvalidRange",
+            "The requested range is not satisfiable",
+            &format!("/{bucket}/{key}"),
+            vec![
+                (
+                    "RangeRequested".to_string(),
+                    range_header.unwrap_or_default().to_string(),
+                ),
+                ("ActualObjectSize".to_string(), total_size.to_string()),
+            ],
         );
-        return response;
     }
 
-    let (status, range_start, range_len, content_range) = match &selection {
-        RangeSelection::Full => (StatusCode::OK, 0u64, total_size, None),
-        RangeSelection::Single {
-            start,
-            end_inclusive,
-        } => (
+    let (status, range_start, range_len, content_range) = match &part_selection {
+        // A part is served as the ranged read it is -- 206 with a
+        // Content-Range -- whether or not the object is multipart. AWS answers
+        // `partNumber=1` on an ordinary PUT object the same way, with a range
+        // spanning the whole object; it is `x-amz-mp-parts-count`, not the
+        // status, that distinguishes the two cases.
+        Some(part) if part.len > 0 => (
             StatusCode::PARTIAL_CONTENT,
-            *start,
-            end_inclusive - start + 1,
-            Some(format!("bytes {start}-{end_inclusive}/{total_size}")),
+            part.start,
+            part.len,
+            Some(format!(
+                "bytes {}-{}/{total_size}",
+                part.start,
+                part.start + part.len - 1
+            )),
         ),
-        RangeSelection::Unsatisfiable { .. } => unreachable!(),
+        // A zero-length part names no satisfiable byte range, so it is
+        // answered plainly rather than with a Content-Range that would have to
+        // claim a byte that isn't there.
+        Some(part) => (StatusCode::OK, part.start, part.len, None),
+        None => match &selection {
+            RangeSelection::Full => (StatusCode::OK, 0u64, total_size, None),
+            RangeSelection::Single {
+                start,
+                end_inclusive,
+            } => (
+                StatusCode::PARTIAL_CONTENT,
+                *start,
+                end_inclusive - start + 1,
+                Some(format!("bytes {start}-{end_inclusive}/{total_size}")),
+            ),
+            RangeSelection::Unsatisfiable { .. } => unreachable!(),
+        },
     };
 
     let etag = etag_quoted;
@@ -158,8 +248,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         .header(header::CONTENT_LENGTH, range_len.to_string())
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::LAST_MODIFIED, last_modified)
-        .header("x-amz-storage-class", storage_class)
         .header("x-amz-request-id", "rust-s3-server");
+    // AWS sends this header only for a non-default class; a STANDARD object
+    // carries no `x-amz-storage-class` at all.
+    if storage_class != "STANDARD" {
+        builder = builder.header("x-amz-storage-class", storage_class);
+    }
     if let Some(content_encoding) = content_encoding {
         builder = builder.header(header::CONTENT_ENCODING, content_encoding);
     }
@@ -189,6 +283,11 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     if let Some(cr) = content_range {
         builder = builder.header(header::CONTENT_RANGE, cr);
     }
+    // Present only for a genuine multipart object, which makes its presence
+    // the single-probe answer to "is this object multipart?".
+    if let Some(count) = part_selection.as_ref().and_then(|part| part.parts_count) {
+        builder = builder.header("x-amz-mp-parts-count", count.to_string());
+    }
 
     let body = if method == Method::HEAD {
         Body::empty()
@@ -207,6 +306,92 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         }
     };
     builder.body(body).unwrap()
+}
+
+/// The byte span one `partNumber` resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartSelection {
+    start: u64,
+    len: u64,
+    /// The object's total part count, and `None` when the object is not a
+    /// multipart one at all. Drives the `x-amz-mp-parts-count` header, whose
+    /// presence is therefore exactly "this object is multipart" — the single
+    /// fact a verifying downloader needs before deciding whether its ETag is a
+    /// plain MD5 or a composite.
+    parts_count: Option<usize>,
+}
+
+/// Why a `partNumber` could not be served. The two outcomes are different
+/// statuses on AWS, and conflating them would tell a client the wrong thing:
+/// a malformed number is the caller's mistake (400, retrying won't help), a
+/// number past the end is a fact about this object (416, and the response says
+/// how many parts there actually are).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartError {
+    /// Outside 1..=10_000, or not an integer at all.
+    NotAPartNumber,
+    /// A well-formed part number that this object does not have.
+    OutOfRange { requested: u32, actual: usize },
+}
+
+/// AWS's inclusive ceiling on part numbers.
+const MAX_PART_NUMBER: u32 = 10_000;
+
+/// Resolves a raw `partNumber` value against an object.
+///
+/// A single-part object still answers `partNumber=1`, with the whole object:
+/// something PUT rather than assembled is one part by definition. It reports
+/// no part count, and that absence is what tells a caller its ETag needs no
+/// composite reconstruction.
+fn resolve_part(
+    meta: &ObjectMeta,
+    part_offsets: &[u64],
+    raw: &str,
+) -> Result<PartSelection, PartError> {
+    let number = raw
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (1..=MAX_PART_NUMBER).contains(n))
+        .ok_or(PartError::NotAPartNumber)?;
+
+    if meta.storage != ObjectStorageKind::Multipart {
+        // One part, so only part one exists. AWS answers it as a range over
+        // the whole object -- a 206 with a full-width Content-Range -- rather
+        // than as an unranged read.
+        return match number {
+            1 => Ok(PartSelection {
+                start: 0,
+                len: meta.size,
+                parts_count: None,
+            }),
+            _ => Err(PartError::OutOfRange {
+                requested: number,
+                actual: 1,
+            }),
+        };
+    }
+    // The offsets are computed alongside `meta.parts`; a mismatch means the
+    // index is inconsistent, and inventing a span from half of it would serve
+    // the wrong bytes under a correct-looking Content-Range.
+    if part_offsets.len() != meta.parts.len() {
+        return Err(PartError::OutOfRange {
+            requested: number,
+            actual: meta.parts.len(),
+        });
+    }
+    let index = number as usize - 1;
+    match (meta.parts.get(index), part_offsets.get(index)) {
+        (Some(part), Some(start)) => Ok(PartSelection {
+            start: *start,
+            len: part.size,
+            parts_count: Some(meta.parts.len()),
+        }),
+        _ => Err(PartError::OutOfRange {
+            requested: number,
+            actual: meta.parts.len(),
+        }),
+    }
 }
 
 /// A directory descriptor that keeps identifying this exact object snapshot
@@ -455,9 +640,87 @@ mod tests {
                     file: format!("part.{}", i + 1),
                     size: *size,
                     etag: format!("etag{}", i + 1),
+                    last_modified_ms: 1,
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn resolve_part_maps_each_part_number_to_its_span() {
+        let meta = multipart_meta(&[5, 7, 3]);
+        let offsets = [0, 5, 12];
+
+        assert_eq!(
+            resolve_part(&meta, &offsets, "1").unwrap(),
+            PartSelection { start: 0, len: 5, parts_count: Some(3) }
+        );
+        assert_eq!(
+            resolve_part(&meta, &offsets, "2").unwrap(),
+            PartSelection { start: 5, len: 7, parts_count: Some(3) }
+        );
+        // The last part is the one whose size differs; getting its offset
+        // right is what makes the reported span usable as a byte range.
+        assert_eq!(
+            resolve_part(&meta, &offsets, "3").unwrap(),
+            PartSelection { start: 12, len: 3, parts_count: Some(3) }
+        );
+    }
+
+    #[test]
+    fn resolve_part_separates_a_bad_number_from_a_missing_part() {
+        // AWS makes these different statuses -- 400 vs 416 -- because they say
+        // different things: one is the caller's mistake, the other is a fact
+        // about this object, reported with the count it actually has.
+        let meta = multipart_meta(&[5, 5]);
+        let offsets = [0, 5];
+
+        assert_eq!(
+            resolve_part(&meta, &offsets, "3"),
+            Err(PartError::OutOfRange { requested: 3, actual: 2 })
+        );
+        for bad in ["0", "-1", "abc", "", "10001", "99999999999999999999"] {
+            assert_eq!(
+                resolve_part(&meta, &offsets, bad),
+                Err(PartError::NotAPartNumber),
+                "partNumber={bad} is not a part number"
+            );
+        }
+        // 10,000 is inclusive, so it is a *valid* number that this object
+        // merely does not have.
+        assert_eq!(
+            resolve_part(&meta, &offsets, "10000"),
+            Err(PartError::OutOfRange { requested: 10_000, actual: 2 })
+        );
+    }
+
+    #[test]
+    fn resolve_part_treats_a_single_part_object_as_one_whole_part() {
+        // A PUT object answers partNumber=1 with the entire object and no
+        // part count -- the absence is what tells a client its ETag is a
+        // plain MD5 rather than a composite.
+        let mut meta = multipart_meta(&[400]);
+        meta.storage = ObjectStorageKind::Single;
+
+        assert_eq!(
+            resolve_part(&meta, &[0], "1").unwrap(),
+            PartSelection { start: 0, len: 400, parts_count: None }
+        );
+        assert_eq!(
+            resolve_part(&meta, &[0], "2"),
+            Err(PartError::OutOfRange { requested: 2, actual: 1 })
+        );
+    }
+
+    #[test]
+    fn resolve_part_refuses_an_inconsistent_offset_index() {
+        // Serving a span computed from a half-valid index would hand back the
+        // wrong bytes under a correct-looking Content-Range.
+        let meta = multipart_meta(&[5, 5]);
+        assert_eq!(
+            resolve_part(&meta, &[0], "1"),
+            Err(PartError::OutOfRange { requested: 1, actual: 2 })
+        );
     }
 
     #[test]

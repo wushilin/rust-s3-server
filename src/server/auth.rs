@@ -624,7 +624,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn canonicalized_amz_headers(headers: &HeaderMap) -> String {
-    let mut pairs = Vec::new();
+    let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
     for (name, value) in headers {
         let name = name.as_str().to_ascii_lowercase();
         if !name.starts_with("x-amz-") {
@@ -636,12 +636,19 @@ fn canonicalized_amz_headers(headers: &HeaderMap) -> String {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        pairs.push((name, value));
+        // Iterating a `HeaderMap` yields one entry per *value*, so a header
+        // sent twice arrives as two pairs. SigV2, like SigV4, folds them into
+        // a single comma-joined line; emitting two lines would sign a string
+        // no client produces.
+        match pairs.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, values)) => values.push(value),
+            None => pairs.push((name, vec![value])),
+        }
     }
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
         .into_iter()
-        .map(|(k, v)| format!("{k}:{v}\n"))
+        .map(|(k, v)| format!("{k}:{}\n", v.join(",")))
         .collect()
 }
 
@@ -990,13 +997,19 @@ fn canonical_headers(headers: &HeaderMap, signed_list: &[String]) -> (String, St
     let mut pairs: Vec<(String, String)> = signed_list
         .iter()
         .map(|name| {
+            // A header sent more than once contributes *all* of its values,
+            // comma-joined in the order received -- SigV4 folds repeats into one
+            // canonical entry, and taking only the first would compute a
+            // different string to sign than the client did. Real clients do send
+            // repeats: the AWS SDK emits one `x-amz-object-attributes` header per
+            // requested attribute rather than one comma-joined header.
             let value = headers
-                .get(name.as_str())
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .split_whitespace()
+                .get_all(name.as_str())
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
                 .collect::<Vec<_>>()
-                .join(" ");
+                .join(",");
             (name.to_lowercase(), value)
         })
         .collect();
@@ -1127,8 +1140,8 @@ fn access_denied() -> Response {
     let body = error_xml(&S3ErrorXml {
         code: "AccessDenied".to_string(),
         message: "Access Denied by user policy".to_string(),
-        resource: "/".to_string(),
         request_id: "rust-s3-server".to_string(),
+        details: Vec::new(),
     });
     axum::response::Response::builder()
         .status(StatusCode::FORBIDDEN)
@@ -1142,8 +1155,8 @@ fn deny(message: &'static str) -> Response {
     let body = error_xml(&S3ErrorXml {
         code: "SignatureDoesNotMatch".to_string(),
         message: message.to_string(),
-        resource: "/".to_string(),
         request_id: "rust-s3-server".to_string(),
+        details: Vec::new(),
     });
     axum::response::Response::builder()
         .status(StatusCode::FORBIDDEN)
@@ -1359,6 +1372,43 @@ mod tests {
     fn canonical_uri_decodes_then_reencodes_each_segment() {
         assert_eq!(canonical_uri("/bucket/my%20key"), "/bucket/my%20key");
         assert_eq!(canonical_uri("/bucket/a+b"), "/bucket/a%2Bb");
+    }
+
+    #[test]
+    fn canonical_headers_folds_a_repeated_header_into_one_comma_joined_entry() {
+        // The AWS SDK sends one `x-amz-object-attributes` header per requested
+        // attribute. Signing only the first value produces a different string
+        // to sign than the client used, and every multi-attribute
+        // GetObjectAttributes request fails with SignatureDoesNotMatch.
+        let mut headers = HeaderMap::new();
+        headers.append("x-amz-object-attributes", "ETag".parse().unwrap());
+        headers.append("x-amz-object-attributes", "ObjectSize".parse().unwrap());
+        headers.append("x-amz-object-attributes", "ObjectParts".parse().unwrap());
+        headers.insert("host", "127.0.0.1:9000".parse().unwrap());
+
+        let signed = vec!["host".to_string(), "x-amz-object-attributes".to_string()];
+        let (canonical, signed_str) = canonical_headers(&headers, &signed);
+        assert_eq!(
+            canonical,
+            "host:127.0.0.1:9000\nx-amz-object-attributes:ETag,ObjectSize,ObjectParts\n"
+        );
+        // One entry in the signed-headers list, however many values arrived.
+        assert_eq!(signed_str, "host;x-amz-object-attributes");
+    }
+
+    #[test]
+    fn canonicalized_amz_headers_folds_repeats_for_sigv2_too() {
+        // Iterating a HeaderMap yields one pair per value, so the SigV2 path
+        // would otherwise emit the same header name on two separate lines.
+        let mut headers = HeaderMap::new();
+        headers.append("x-amz-object-attributes", "ETag".parse().unwrap());
+        headers.append("x-amz-object-attributes", "ObjectParts".parse().unwrap());
+        headers.insert("x-amz-date", "20130524T000000Z".parse().unwrap());
+
+        assert_eq!(
+            canonicalized_amz_headers(&headers),
+            "x-amz-date:20130524T000000Z\nx-amz-object-attributes:ETag,ObjectParts\n"
+        );
     }
 
     #[test]

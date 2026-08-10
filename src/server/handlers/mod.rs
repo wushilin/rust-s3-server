@@ -35,6 +35,8 @@ pub(crate) mod create_multipart;
 pub(crate) mod delete_object;
 #[path = "get_object/lib.rs"]
 pub(crate) mod get_object;
+#[path = "get_object_attributes/lib.rs"]
+pub(crate) mod get_object_attributes;
 #[path = "list_parts/lib.rs"]
 pub(crate) mod list_parts;
 #[path = "put_object/lib.rs"]

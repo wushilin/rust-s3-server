@@ -17,6 +17,13 @@ pub struct PartMeta {
     pub file: String,
     pub size: u64,
     pub etag: String,
+    /// When this part was uploaded. `ListParts` reports it per part, and AWS
+    /// always sends it, so an SDK's `Part::last_modified()` is empty without
+    /// it. Defaulted so part metadata written before this field existed still
+    /// deserializes; such a part reports the Unix epoch rather than failing
+    /// the whole listing.
+    #[serde(default)]
+    pub last_modified_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,10 +109,19 @@ pub struct CorsRule {
     pub max_age_seconds: Option<u32>,
 }
 
+/// What S3 stores when a client sends no `Content-Type`.
+///
+/// `binary/octet-stream`, not the standard `application/octet-stream`: this is
+/// a long-standing AWS quirk, verified on the wire rather than assumed, and a
+/// client that round-trips an object through both services would otherwise see
+/// the type change. The standard spelling is still honoured when a client
+/// sends it -- this is only the default.
+pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
+
 pub fn content_type_or_default(value: Option<&str>) -> String {
     value
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or("application/octet-stream")
+        .unwrap_or(DEFAULT_CONTENT_TYPE)
         .to_string()
 }
 
@@ -199,10 +215,10 @@ mod tests {
 
     #[test]
     fn content_type_defaults() {
-        assert_eq!(content_type_or_default(None), "application/octet-stream");
+        assert_eq!(content_type_or_default(None), "binary/octet-stream");
         assert_eq!(
             content_type_or_default(Some("")),
-            "application/octet-stream"
+            "binary/octet-stream"
         );
         assert_eq!(content_type_or_default(Some("text/plain")), "text/plain");
     }
@@ -227,6 +243,7 @@ mod tests {
                 file: "part.1".to_string(),
                 size: 3,
                 etag: "etag".to_string(),
+                last_modified_ms: 1,
             }],
         };
         let json = serde_json::to_string(&meta).unwrap();

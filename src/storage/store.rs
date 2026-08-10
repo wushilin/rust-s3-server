@@ -848,6 +848,7 @@ impl LocalObjectStore {
                 file: "part.1".to_string(),
                 size: put_meta.size,
                 etag: put_meta.etag.clone(),
+                last_modified_ms: now_ms(),
             }],
         };
         let publish_dir =
@@ -1427,6 +1428,7 @@ impl LocalObjectStore {
             file: file_name.clone(),
             size,
             etag: etag.to_string(),
+            last_modified_ms: now_ms(),
         };
         // `\0mpu/` prefix (NUL is illegal in object keys) guarantees this lock
         // never collides with a real object-key lock.

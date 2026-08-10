@@ -1,0 +1,859 @@
+{
+  "attributes_missing_key": {
+    "body": "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>~PREFIX~/definitely-absent</Key><RequestId>V9BGD8WZ73V90FJB</RequestId><HostId>uSw/aZyFXGNt7uClwwhglRUIOFxnlAXWn1sU7Fmyf48N/U1+P0DDdrV4YRX6JYyRBSwF+V2Ha4U=</HostId></Error>",
+    "body_len": 267,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 404,
+    "xml": [
+      "Error/",
+      "Error/Code=NoSuchKey",
+      "Error/Message=The specified key does not exist.",
+      "Error/Key=~PREFIX~/definitely-absent",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "complete_multipart": {
+    "body": null,
+    "body_len": 469,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "CompleteMultipartUploadResult/",
+      "CompleteMultipartUploadResult/Location=<VOLATILE>",
+      "CompleteMultipartUploadResult/Bucket=<VOLATILE>",
+      "CompleteMultipartUploadResult/Key=~PREFIX~/mpu.bin",
+      "CompleteMultipartUploadResult/ETag=<VOLATILE>",
+      "CompleteMultipartUploadResult/ChecksumCRC64NVME=<VOLATILE>",
+      "CompleteMultipartUploadResult/ChecksumType=<VOLATILE>"
+    ]
+  },
+  "copy_object": {
+    "body": null,
+    "body_len": 315,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "CopyObjectResult/",
+      "CopyObjectResult/LastModified=<VOLATILE>",
+      "CopyObjectResult/ETag=<VOLATILE>",
+      "CopyObjectResult/ChecksumCRC64NVME=<VOLATILE>",
+      "CopyObjectResult/ChecksumType=<VOLATILE>"
+    ]
+  },
+  "create_multipart": {
+    "body": null,
+    "body_len": 394,
+    "headers": {
+      "connection": "<PRESENT>",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "InitiateMultipartUploadResult/",
+      "InitiateMultipartUploadResult/Bucket=<VOLATILE>",
+      "InitiateMultipartUploadResult/Key=~PREFIX~/mpu.bin",
+      "InitiateMultipartUploadResult/UploadId=<VOLATILE>"
+    ]
+  },
+  "delete_object": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 204,
+    "xml": null
+  },
+  "delete_object_absent": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 204,
+    "xml": null
+  },
+  "delete_objects": {
+    "body": null,
+    "body_len": 227,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "DeleteResult/",
+      "DeleteResult/Deleted/",
+      "DeleteResult/Deleted/Key=~PREFIX~/copy.txt",
+      "DeleteResult/Deleted/",
+      "DeleteResult/Deleted/Key=~PREFIX~/mpu.bin"
+    ]
+  },
+  "get_bucket_location": {
+    "body": null,
+    "body_len": 142,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "LocationConstraint=ap-southeast-1"
+    ]
+  },
+  "get_missing_key": {
+    "body": null,
+    "body_len": 306,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 404,
+    "xml": [
+      "Error/",
+      "Error/Code=NoSuchKey",
+      "Error/Message=The specified key does not exist.",
+      "Error/Key=~PREFIX~/definitely-absent",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "get_object": {
+    "body": "hello compat probe\n",
+    "body_len": 19,
+    "headers": {
+      "accept-ranges": "bytes",
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-type": "text/plain",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": null
+  },
+  "get_object_attributes_single": {
+    "body": null,
+    "body_len": 255,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "date": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "GetObjectAttributesResponse/",
+      "GetObjectAttributesResponse/ETag=<VOLATILE>",
+      "GetObjectAttributesResponse/StorageClass=STANDARD",
+      "GetObjectAttributesResponse/ObjectSize=19"
+    ]
+  },
+  "get_object_if_match_bad": {
+    "body": null,
+    "body_len": 328,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 412,
+    "xml": [
+      "Error/",
+      "Error/Code=PreconditionFailed",
+      "Error/Message=At least one of the pre-conditions you specified did not hold",
+      "Error/Condition=If-Match",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "get_object_part_number_1": {
+    "body": "hello compat probe\n",
+    "body_len": 19,
+    "headers": {
+      "accept-ranges": "bytes",
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-range": "bytes 0-18/19",
+      "content-type": "text/plain",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 206,
+    "xml": null
+  },
+  "get_object_part_number_2": {
+    "body": null,
+    "body_len": 358,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 416,
+    "xml": [
+      "Error/",
+      "Error/Code=InvalidPartNumber",
+      "Error/Message=The requested partnumber is not satisfiable",
+      "Error/PartNumberRequested=2",
+      "Error/ActualPartCount=1",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "get_object_part_number_bad": {
+    "body": null,
+    "body_len": 387,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 400,
+    "xml": [
+      "Error/",
+      "Error/Code=InvalidArgument",
+      "Error/Message=Part number must be an integer between 1 and 10000, inclusive",
+      "Error/ArgumentName=partNumber",
+      "Error/ArgumentValue=abc",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "get_object_part_number_zero": {
+    "body": null,
+    "body_len": 365,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 400,
+    "xml": [
+      "Error/",
+      "Error/Code=InvalidArgument",
+      "Error/Message=Part number must be an integer between 1 and 10000, inclusive",
+      "Error/ArgumentName=partNumber",
+      "Error/ArgumentValue=0",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "get_object_range": {
+    "body": "hello",
+    "body_len": 5,
+    "headers": {
+      "accept-ranges": "bytes",
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-range": "bytes 0-4/19",
+      "content-type": "text/plain",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 206,
+    "xml": null
+  },
+  "get_object_range_unsatisfiable": {
+    "body": null,
+    "body_len": 371,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 416,
+    "xml": [
+      "Error/",
+      "Error/Code=InvalidRange",
+      "Error/Message=The requested range is not satisfiable",
+      "Error/RangeRequested=bytes=9999-",
+      "Error/ActualObjectSize=19",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "head_bucket": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-access-point-alias": "false",
+      "x-amz-bucket-arn": "arn:aws:s3:::compat-probe-bucket",
+      "x-amz-bucket-region": "ap-southeast-1",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": null
+  },
+  "head_missing_key": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 404,
+    "xml": null
+  },
+  "head_object": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "accept-ranges": "bytes",
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-type": "text/plain",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": null
+  },
+  "list_multipart_uploads": {
+    "body": null,
+    "body_len": 1084,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "ListMultipartUploadsResult/",
+      "ListMultipartUploadsResult/Bucket=<VOLATILE>",
+      "ListMultipartUploadsResult/KeyMarker=",
+      "ListMultipartUploadsResult/UploadIdMarker=",
+      "ListMultipartUploadsResult/NextKeyMarker=~PREFIX~/mpu.bin",
+      "ListMultipartUploadsResult/NextUploadIdMarker=~UPLOADID~",
+      "ListMultipartUploadsResult/Prefix=~PREFIX~/",
+      "ListMultipartUploadsResult/MaxUploads=1000",
+      "ListMultipartUploadsResult/IsTruncated=false",
+      "ListMultipartUploadsResult/Upload/",
+      "ListMultipartUploadsResult/Upload/Key=~PREFIX~/mpu.bin",
+      "ListMultipartUploadsResult/Upload/UploadId=<VOLATILE>",
+      "ListMultipartUploadsResult/Upload/Initiator/",
+      "ListMultipartUploadsResult/Upload/Initiator/ID=<VOLATILE>",
+      "ListMultipartUploadsResult/Upload/Initiator/DisplayName=<VOLATILE>",
+      "ListMultipartUploadsResult/Upload/Owner/",
+      "ListMultipartUploadsResult/Upload/Owner/ID=<VOLATILE>",
+      "ListMultipartUploadsResult/Upload/StorageClass=STANDARD",
+      "ListMultipartUploadsResult/Upload/Initiated=<VOLATILE>"
+    ]
+  },
+  "list_object_versions": {
+    "body": null,
+    "body_len": 754,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "ListVersionsResult/",
+      "ListVersionsResult/Name=<VOLATILE>",
+      "ListVersionsResult/Prefix=~PREFIX~/",
+      "ListVersionsResult/KeyMarker=",
+      "ListVersionsResult/VersionIdMarker=",
+      "ListVersionsResult/MaxKeys=1000",
+      "ListVersionsResult/IsTruncated=false",
+      "ListVersionsResult/Version/",
+      "ListVersionsResult/Version/Key=~PREFIX~/small.txt",
+      "ListVersionsResult/Version/VersionId=null",
+      "ListVersionsResult/Version/IsLatest=true",
+      "ListVersionsResult/Version/LastModified=<VOLATILE>",
+      "ListVersionsResult/Version/ETag=<VOLATILE>",
+      "ListVersionsResult/Version/ChecksumAlgorithm=CRC64NVME",
+      "ListVersionsResult/Version/ChecksumType=<VOLATILE>",
+      "ListVersionsResult/Version/Size=19",
+      "ListVersionsResult/Version/Owner/",
+      "ListVersionsResult/Version/Owner/ID=<VOLATILE>",
+      "ListVersionsResult/Version/StorageClass=STANDARD"
+    ]
+  },
+  "list_objects_v1": {
+    "body": null,
+    "body_len": 659,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-bucket-region": "ap-southeast-1",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "ListBucketResult/",
+      "ListBucketResult/Name=<VOLATILE>",
+      "ListBucketResult/Prefix=~PREFIX~/",
+      "ListBucketResult/Marker=",
+      "ListBucketResult/MaxKeys=1000",
+      "ListBucketResult/IsTruncated=false",
+      "ListBucketResult/Contents/",
+      "ListBucketResult/Contents/Key=~PREFIX~/small.txt",
+      "ListBucketResult/Contents/LastModified=<VOLATILE>",
+      "ListBucketResult/Contents/ETag=<VOLATILE>",
+      "ListBucketResult/Contents/ChecksumAlgorithm=CRC64NVME",
+      "ListBucketResult/Contents/ChecksumType=<VOLATILE>",
+      "ListBucketResult/Contents/Size=19",
+      "ListBucketResult/Contents/Owner/",
+      "ListBucketResult/Contents/Owner/ID=<VOLATILE>",
+      "ListBucketResult/Contents/StorageClass=STANDARD"
+    ]
+  },
+  "list_objects_v2": {
+    "body": null,
+    "body_len": 576,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-bucket-region": "ap-southeast-1",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "ListBucketResult/",
+      "ListBucketResult/Name=<VOLATILE>",
+      "ListBucketResult/Prefix=~PREFIX~/",
+      "ListBucketResult/KeyCount=1",
+      "ListBucketResult/MaxKeys=1000",
+      "ListBucketResult/IsTruncated=false",
+      "ListBucketResult/Contents/",
+      "ListBucketResult/Contents/Key=~PREFIX~/small.txt",
+      "ListBucketResult/Contents/LastModified=<VOLATILE>",
+      "ListBucketResult/Contents/ETag=<VOLATILE>",
+      "ListBucketResult/Contents/ChecksumAlgorithm=CRC64NVME",
+      "ListBucketResult/Contents/ChecksumType=<VOLATILE>",
+      "ListBucketResult/Contents/Size=19",
+      "ListBucketResult/Contents/StorageClass=STANDARD"
+    ]
+  },
+  "list_objects_v2_delimiter": {
+    "body": null,
+    "body_len": 597,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-bucket-region": "ap-southeast-1",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "ListBucketResult/",
+      "ListBucketResult/Name=<VOLATILE>",
+      "ListBucketResult/Prefix=~PREFIX~/",
+      "ListBucketResult/KeyCount=1",
+      "ListBucketResult/MaxKeys=1",
+      "ListBucketResult/Delimiter=/",
+      "ListBucketResult/IsTruncated=false",
+      "ListBucketResult/Contents/",
+      "ListBucketResult/Contents/Key=~PREFIX~/small.txt",
+      "ListBucketResult/Contents/LastModified=<VOLATILE>",
+      "ListBucketResult/Contents/ETag=<VOLATILE>",
+      "ListBucketResult/Contents/ChecksumAlgorithm=CRC64NVME",
+      "ListBucketResult/Contents/ChecksumType=<VOLATILE>",
+      "ListBucketResult/Contents/Size=19",
+      "ListBucketResult/Contents/StorageClass=STANDARD"
+    ]
+  },
+  "list_parts": {
+    "body": null,
+    "body_len": 1076,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "ListPartsResult/",
+      "ListPartsResult/Bucket=<VOLATILE>",
+      "ListPartsResult/Key=~PREFIX~/mpu.bin",
+      "ListPartsResult/UploadId=<VOLATILE>",
+      "ListPartsResult/Initiator/",
+      "ListPartsResult/Initiator/ID=<VOLATILE>",
+      "ListPartsResult/Initiator/DisplayName=<VOLATILE>",
+      "ListPartsResult/Owner/",
+      "ListPartsResult/Owner/ID=<VOLATILE>",
+      "ListPartsResult/StorageClass=STANDARD",
+      "ListPartsResult/PartNumberMarker=0",
+      "ListPartsResult/NextPartNumberMarker=2",
+      "ListPartsResult/MaxParts=1000",
+      "ListPartsResult/IsTruncated=false",
+      "ListPartsResult/Part/",
+      "ListPartsResult/Part/PartNumber=1",
+      "ListPartsResult/Part/LastModified=<VOLATILE>",
+      "ListPartsResult/Part/ETag=<VOLATILE>",
+      "ListPartsResult/Part/Size=5242880",
+      "ListPartsResult/Part/",
+      "ListPartsResult/Part/PartNumber=2",
+      "ListPartsResult/Part/LastModified=<VOLATILE>",
+      "ListPartsResult/Part/ETag=<VOLATILE>",
+      "ListPartsResult/Part/Size=1048576"
+    ]
+  },
+  "mpu_attributes_all": {
+    "body": null,
+    "body_len": 315,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "date": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "GetObjectAttributesResponse/",
+      "GetObjectAttributesResponse/ETag=<VOLATILE>",
+      "GetObjectAttributesResponse/ObjectParts/",
+      "GetObjectAttributesResponse/ObjectParts/PartsCount=2",
+      "GetObjectAttributesResponse/StorageClass=STANDARD",
+      "GetObjectAttributesResponse/ObjectSize=6291456"
+    ]
+  },
+  "mpu_attributes_bad_name": {
+    "body": null,
+    "body_len": 354,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 400,
+    "xml": [
+      "Error/",
+      "Error/Code=InvalidArgument",
+      "Error/Message=Invalid attribute name specified.",
+      "Error/ArgumentName=x-amz-object-attributes",
+      "Error/ArgumentValue=Bogus",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "mpu_attributes_no_header": {
+    "body": "<Error><Code>InvalidRequest</Code><Message>The x-amz-object-attributes header specifying the attributes to be retrieved is either missing or empty</Message><RequestId>V9BQDJEQ6MC2X044</RequestId><HostId>LXm2i3OD+Rs8FwtbF+cTjHQZRqzp1eWb1oAzKV47llc1J53si4vQv6q94nzCIjzfThuxtWtvCDY=</HostId></Error>",
+    "body_len": 296,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 400,
+    "xml": [
+      "Error/",
+      "Error/Code=InvalidRequest",
+      "Error/Message=The x-amz-object-attributes header specifying the attributes to be retrieved is either missing or empty",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "mpu_attributes_parts_paged": {
+    "body": null,
+    "body_len": 199,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "date": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": [
+      "GetObjectAttributesResponse/",
+      "GetObjectAttributesResponse/ObjectParts/",
+      "GetObjectAttributesResponse/ObjectParts/PartsCount=2"
+    ]
+  },
+  "mpu_get_part_and_range": {
+    "body": null,
+    "body_len": 315,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 400,
+    "xml": [
+      "Error/",
+      "Error/Code=InvalidRequest",
+      "Error/Message=Cannot specify both Range header and partNumber query parameter",
+      "Error/RequestId=<VOLATILE>",
+      "Error/HostId=<VOLATILE>"
+    ]
+  },
+  "mpu_head": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "accept-ranges": "bytes",
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-type": "binary/octet-stream",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": null
+  },
+  "mpu_head_part_1": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "accept-ranges": "bytes",
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-range": "bytes 0-5242879/6291456",
+      "content-type": "binary/octet-stream",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-mp-parts-count": "2",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 206,
+    "xml": null
+  },
+  "mpu_head_part_2": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "accept-ranges": "bytes",
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "content-range": "bytes 5242880-6291455/6291456",
+      "content-type": "binary/octet-stream",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "last-modified": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-mp-parts-count": "2",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 206,
+    "xml": null
+  },
+  "mpu_head_part_9": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-type": "application/xml",
+      "date": "<PRESENT>",
+      "server": "<PRESENT>",
+      "transfer-encoding": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>"
+    },
+    "status": 416,
+    "xml": null
+  },
+  "put_object": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-checksum-crc64nvme": "<PRESENT>",
+      "x-amz-checksum-type": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": null
+  },
+  "upload_part_1": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": null
+  },
+  "upload_part_2": {
+    "body": "",
+    "body_len": 0,
+    "headers": {
+      "connection": "<PRESENT>",
+      "content-length": "<PRESENT>",
+      "date": "<PRESENT>",
+      "etag": "<PRESENT>",
+      "server": "<PRESENT>",
+      "x-amz-id-2": "<PRESENT>",
+      "x-amz-request-id": "<PRESENT>",
+      "x-amz-server-side-encryption": "<PRESENT>"
+    },
+    "status": 200,
+    "xml": null
+  }
+}
