@@ -1,6 +1,6 @@
 [package]
 name = "rs3"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -21,6 +21,7 @@ hmac = "0.12"
 http-body = "1"
 humansize = "2"
 indicatif = "0.17"
+md-5 = "0.10"
 percent-encoding = "2"
 pin-project-lite = "0.2"
 regex = "1"

@@ -371,7 +371,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "md-5",
+ "md-5 0.11.0",
  "pin-project-lite",
  "sha1 0.11.0",
  "sha2 0.11.0",
@@ -1719,6 +1719,16 @@ dependencies = [
 
 [[package]]
 name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
@@ -2004,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "rs3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2023,6 +2033,7 @@ dependencies = [
  "http-body 1.1.0",
  "humansize",
  "indicatif",
+ "md-5 0.10.6",
  "percent-encoding",
  "pin-project-lite",
  "regex",

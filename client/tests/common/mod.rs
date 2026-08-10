@@ -191,6 +191,37 @@ impl TestServer {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// An `aws-sdk-s3` client pointed at this server.
+    ///
+    /// Tests that exercise the *server's* S3 surface rather than rs3's own
+    /// commands need a real SDK on the other end -- an assertion written
+    /// against hand-rolled XML would only prove the server agrees with the
+    /// test author, not that a genuine S3 client can read the response.
+    /// Async, so a test can drive several operations on one runtime.
+    pub async fn sdk_client(&self) -> aws_sdk_s3::Client {
+        use aws_config::{BehaviorVersion, Region};
+        use aws_credential_types::Credentials;
+        use aws_sdk_s3::config::SharedCredentialsProvider;
+
+        let creds = Credentials::new(
+            self.access_key.clone(),
+            self.secret_key.clone(),
+            None,
+            None,
+            "rs3-test",
+        );
+        let sdk_cfg = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(SharedCredentialsProvider::new(creds))
+            .load()
+            .await;
+        let s3_cfg = aws_sdk_s3::config::Builder::from(&sdk_cfg)
+            .endpoint_url(format!("http://127.0.0.1:{}", self.port))
+            .force_path_style(true)
+            .build();
+        aws_sdk_s3::Client::from_conf(s3_cfg)
+    }
+
     /// Directly PUT a zero-byte folder-marker object (key ending in `/`)
     /// using the aws-sdk-s3 crate, bypassing rs3's own `put` command (which
     /// has no way to create a key ending in `/`). Used to reproduce

@@ -1045,6 +1045,22 @@ async fn multipart_server_side_copy(
 /// Downloads `bucket/key` to `output`, returning the transferred size so
 /// callers can build their own `CopyMessage`/`MirrorMessage` (this module
 /// intentionally prints nothing itself -- see [`UploadOutcome`]).
+/// What a listing already told the caller about an object.
+///
+/// `ListObjectsV2` returns a key's size and ETag, which is everything the
+/// download path used its own `HeadObject` for. Passing them in removes that
+/// second round trip per object -- on a mirror of many small objects the HEADs
+/// were half the requests and most of the latency, for data already in hand.
+///
+/// The HEAD is still made when this is `None` (single-object commands, where
+/// no listing happened) and when `--preserve` is set (filesystem attributes
+/// live in user metadata, which no listing returns).
+#[derive(Debug, Clone)]
+pub(crate) struct ListedFacts {
+    pub size: u64,
+    pub etag: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_key_to_path(
     client: &Client,
@@ -1054,6 +1070,8 @@ pub(crate) async fn download_key_to_path(
     part_size: u64,
     parallel: usize,
     preserve: bool,
+    known: Option<ListedFacts>,
+    verify: bool,
     budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<u64> {
@@ -1061,20 +1079,40 @@ pub(crate) async fn download_key_to_path(
     if preserve {
         return Err(anyhow!("--preserve is not supported on this platform"));
     }
-    let head = crate::budget::dispatch(
-        budget,
-        progress,
-        crate::progress::TransferLabel {
-            verb: crate::progress::Verb::Inspecting,
-            path: format!("{bucket}/{key}"),
-            part: None,
-        },
-        "HeadObject",
-        client.head_object().bucket(bucket).key(key).send(),
-    )
-    .await
-    .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?;
-    let size = head.content_length().unwrap_or_default() as u64;
+    // Skip the HEAD when a listing already answered it and nothing else needs
+    // the metadata only a HEAD carries.
+    let known = match preserve {
+        true => None,
+        false => known,
+    };
+    let head = match &known {
+        Some(_) => None,
+        None => Some(
+            crate::budget::dispatch(
+                budget,
+                progress,
+                crate::progress::TransferLabel {
+                    verb: crate::progress::Verb::Inspecting,
+                    path: format!("{bucket}/{key}"),
+                    part: None,
+                },
+                "HeadObject",
+                client.head_object().bucket(bucket).key(key).send(),
+            )
+            .await
+            .map_err(|err| anyhow!("stat `{bucket}/{key}`: {err}"))?,
+        ),
+    };
+    let size = match (&known, &head) {
+        (Some(facts), _) => facts.size,
+        (None, Some(head)) => head.content_length().unwrap_or_default() as u64,
+        (None, None) => unreachable!("one of known/head is always set"),
+    };
+    let etag: Option<String> = match (&known, &head) {
+        (Some(facts), _) => facts.etag.clone(),
+        (None, Some(head)) => head.e_tag().map(str::to_string),
+        (None, None) => None,
+    };
     if let Some(ui) = progress {
         ui.add_object(size);
     }
@@ -1091,6 +1129,31 @@ pub(crate) async fn download_key_to_path(
         .await
         .with_context(|| format!("create staging dir {}", staging.display()))?;
     let tmp = staging.join(output.file_name().unwrap_or_default());
+    // Establishing the layout is what turns the ETag from a label into a
+    // check: it is the uploader's part boundaries, without which a multipart
+    // ETag cannot be recomputed from any number of downloaded bytes.
+    let layout = match verify {
+        true => {
+            crate::verify::discover_layout(
+                client,
+                bucket,
+                key,
+                etag.as_deref(),
+                size,
+                budget,
+                progress,
+            )
+            .await?
+        }
+        false => crate::verify::ObjectLayout::Opaque {
+            reason: "verification disabled".to_string(),
+        },
+    };
+    if let crate::verify::ObjectLayout::Opaque { reason } = &layout
+        && verify
+    {
+        ui_eprintln!("rs3: `{bucket}/{key}`: skipping content check: {reason}");
+    }
     let result = download_to_temp(
         client,
         bucket,
@@ -1099,7 +1162,8 @@ pub(crate) async fn download_key_to_path(
         size,
         part_size,
         parallel,
-        head.e_tag(),
+        etag.as_deref(),
+        &layout,
         budget,
         progress,
     )
@@ -1115,7 +1179,8 @@ pub(crate) async fn download_key_to_path(
             #[cfg(unix)]
             if preserve
                 && let Some(encoded) = head
-                    .metadata()
+                    .as_ref()
+                    .and_then(|head| head.metadata())
                     .and_then(|m| m.iter().find(|(k, _)| k.eq_ignore_ascii_case("mc-attrs")))
                     .map(|(_, v)| v)
                 && let Err(err) = crate::attr::apply_fs_attrs(output, encoded)
@@ -1304,6 +1369,7 @@ async fn stream_range_into(
     end: u64,
     unit: &crate::progress::ProgressNotifier,
     written: &mut u64,
+    mut hasher: Option<&mut md5::Md5>,
 ) -> Result<()> {
     let mut file = fs::OpenOptions::new().write(true).open(tmp).await?;
     file.seek(SeekFrom::Start(from)).await?;
@@ -1329,6 +1395,13 @@ async fn stream_range_into(
             break;
         }
         tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
+        // Hashed only after the write lands. A failed write is retried from
+        // `written`, which has not advanced -- feeding the hasher first would
+        // digest those bytes twice and produce a mismatch on a download that
+        // is actually fine.
+        if let Some(hasher) = hasher.as_deref_mut() {
+            md5::Digest::update(hasher, &buf[..n]);
+        }
         *written += n as u64;
         unit.advance(n as u64);
     }
@@ -1364,6 +1437,9 @@ async fn download_range_resumable(
     start: u64,
     end: u64,
     unit: &crate::progress::ProgressNotifier,
+    // Resumption is strictly forward -- a retry asks only for the bytes not
+    // yet written -- so one hasher stays valid across every attempt.
+    mut hasher: Option<&mut md5::Md5>,
 ) -> Result<()> {
     let expected = end - start + 1;
     let mut written = 0u64;
@@ -1381,6 +1457,7 @@ async fn download_range_resumable(
             end,
             unit,
             &mut written,
+            hasher.as_deref_mut(),
         )
         .await;
         if result.is_ok() && written >= expected {
@@ -1417,6 +1494,13 @@ async fn download_range_resumable(
     }
 }
 
+/// Plans and runs a download, then proves the result.
+///
+/// The plan comes from `layout`, not from `--part-size`, whenever the object
+/// is a real multipart upload: each transfer unit is one *upload* part, so the
+/// MD5 rs3 computes while streaming is a digest the server also knows, and the
+/// object's composite ETag can be rebuilt from them. An arbitrary split moves
+/// the same bytes but produces digests that correspond to nothing.
 #[allow(clippy::too_many_arguments)]
 async fn download_to_temp(
     client: &Client,
@@ -1427,6 +1511,7 @@ async fn download_to_temp(
     part_size: u64,
     parallel: usize,
     etag: Option<&str>,
+    layout: &crate::verify::ObjectLayout,
     budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<()> {
@@ -1434,19 +1519,42 @@ async fn download_to_temp(
         // No range to ask for -- `bytes=0-` on an empty object is not a
         // request any of this can express.
         fs::File::create(tmp).await?;
-        return Ok(());
+        return verify_download(tmp, bucket, key, layout, &[]).await;
     }
     let file = fs::File::create(tmp).await?;
     file.set_len(size).await?;
     drop(file);
-    // One range when the object fits in a part, N when it doesn't -- the
-    // single-range case is the same code path, just without a part label.
-    let part_count = size.div_ceil(part_size);
+
+    // One range per upload part when the layout is known, otherwise the old
+    // uniform split. `hash` marks the ranges whose digest is meaningful: only
+    // a whole upload part has one.
+    let ranges: Vec<(u64, u64)> = match layout.part_sizes() {
+        Some(parts) => {
+            let mut offset = 0u64;
+            parts
+                .iter()
+                .map(|part| {
+                    let start = offset;
+                    offset += part.size;
+                    (start, offset - 1)
+                })
+                .collect()
+        }
+        None => (0..size.div_ceil(part_size))
+            .map(|i| {
+                let start = i * part_size;
+                (start, (size - 1).min(start + part_size - 1))
+            })
+            .collect(),
+    };
+    let hash_ranges = layout.part_sizes().is_some();
+    let part_count = ranges.len();
+
     let progress = progress.cloned();
     let budget = budget.clone();
     let key_label = key.to_string();
     let etag = etag.map(str::to_string);
-    let downloads = stream::iter((0..part_count).map(|part_index| {
+    let downloads = stream::iter(ranges.into_iter().enumerate().map(|(index, (start, end))| {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
@@ -1457,19 +1565,18 @@ async fn download_to_temp(
         let etag = etag.clone();
         async move {
             let _permit = budget.acquire().await;
-            let start = part_index * part_size;
-            let end = (size - 1).min(start + part_size - 1);
             let unit = match &progress {
                 Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
                         verb: crate::progress::Verb::Downloading,
                         path: key_label,
-                        part: (part_count > 1).then_some((part_index + 1, part_count)),
+                        part: (part_count > 1).then_some((index as u64 + 1, part_count as u64)),
                     },
                     end - start + 1,
                 )),
                 None => crate::progress::ProgressNotifier::noop(),
             };
+            let mut hasher = hash_ranges.then(md5::Md5::default);
             download_range_resumable(
                 &client,
                 &bucket,
@@ -1479,10 +1586,12 @@ async fn download_to_temp(
                 start,
                 end,
                 &unit,
+                hasher.as_mut(),
             )
             .await?;
             unit.finish();
-            Ok::<(), anyhow::Error>(())
+            let digest = hasher.map(|h| <[u8; 16]>::from(md5::Digest::finalize(h)));
+            Ok::<(usize, Option<[u8; 16]>), anyhow::Error>((index, digest))
         }
     }))
     .buffer_unordered(parallel.max(1));
@@ -1491,10 +1600,92 @@ async fn download_to_temp(
     // range before anyone was told -- and then the temp file was deleted
     // anyway. `try_collect` drops the stream on the first error, cancelling
     // whatever is still in flight.
-    downloads.try_collect::<Vec<_>>().await?;
-    Ok(())
+    let mut digests: Vec<(usize, Option<[u8; 16]>)> = downloads.try_collect().await?;
+    // Ranges complete out of order; the composite ETag is order-dependent.
+    digests.sort_by_key(|(index, _)| *index);
+    let digests: Vec<[u8; 16]> = digests.into_iter().filter_map(|(_, d)| d).collect();
+    verify_download(tmp, bucket, key, layout, &digests).await
 }
 
+/// Checks the staged file against whatever the ETag proves.
+///
+/// Runs before the publishing rename, so a file that fails is deleted with the
+/// rest of staging and never appears at the destination.
+async fn verify_download(
+    tmp: &Path,
+    bucket: &str,
+    key: &str,
+    layout: &crate::verify::ObjectLayout,
+    part_digests: &[[u8; 16]],
+) -> Result<()> {
+    use crate::verify::{composite_etag, hex, ObjectLayout};
+    match layout {
+        ObjectLayout::Opaque { .. } => Ok(()),
+        ObjectLayout::Single { expected_md5 } => {
+            // A single-`PUT` object is transferred as parallel ranges, which
+            // arrive out of order, so its digest is taken from the finished
+            // file rather than in flight. That also makes it a check of what
+            // actually reached the disk.
+            let actual = md5_of_file(tmp).await?;
+            match actual == *expected_md5 {
+                true => Ok(()),
+                false => Err(anyhow!(
+                    "`{bucket}/{key}`: content check failed -- the server's ETag is {} but the \
+                     downloaded bytes are {}",
+                    hex(expected_md5),
+                    hex(&actual)
+                )),
+            }
+        }
+        ObjectLayout::Multipart {
+            parts,
+            expected_etag,
+        } => {
+            // Per-part first: it names *which* part is wrong, which a
+            // composite mismatch cannot.
+            for (index, (part, digest)) in parts.iter().zip(part_digests).enumerate() {
+                if let Some(expected) = part.expected_md5
+                    && expected != *digest
+                {
+                    return Err(anyhow!(
+                        "`{bucket}/{key}`: part {} failed its content check -- expected {}, got {}",
+                        index + 1,
+                        hex(&expected),
+                        hex(digest)
+                    ));
+                }
+            }
+            let rebuilt = composite_etag(part_digests);
+            match rebuilt == *expected_etag {
+                true => Ok(()),
+                false => Err(anyhow!(
+                    "`{bucket}/{key}`: content check failed -- the server's ETag is {expected_etag} \
+                     but the downloaded parts rebuild to {rebuilt}"
+                )),
+            }
+        }
+    }
+}
+
+/// MD5 of a finished file, read back sequentially.
+async fn md5_of_file(path: &Path) -> Result<[u8; 16]> {
+    use tokio::io::AsyncReadExt;
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("reopen {} to verify", path.display()))?;
+    let mut hasher = md5::Md5::default();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        md5::Digest::update(&mut hasher, &buf[..n]);
+    }
+    Ok(md5::Digest::finalize(hasher).into())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_object(
     source: &str,
     target: Option<PathBuf>,
@@ -1503,6 +1694,7 @@ pub(crate) async fn download_object(
     budget: &crate::budget::StreamBudget,
     session: &crate::messages::TransferSession,
     preserve: bool,
+    verify: bool,
 ) -> Result<()> {
     let parsed = parse_s3_url(source)?;
     let bucket = parsed
@@ -1525,6 +1717,10 @@ pub(crate) async fn download_object(
         part_size,
         parallel,
         preserve,
+        // A single-object command has no listing to inherit from, so its
+        // `HeadObject` stays: it is the only source of size and ETag.
+        None,
+        verify,
         budget,
         session.ui(),
     )

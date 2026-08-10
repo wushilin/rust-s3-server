@@ -7,6 +7,14 @@ pub(crate) struct ListedObject {
     pub key: String,
     pub size: u64,
     pub modified: Option<DateTime<Utc>>,
+    /// The object's ETag, unquoted, exactly as `ListObjectsV2` reported it.
+    ///
+    /// Carried because it is the whole reason a recursive download can skip
+    /// its per-object `HeadObject`: the listing already supplies both fields
+    /// that path consumed (size and ETag), so the HEAD was a second round trip
+    /// for data already in hand. It also feeds ETag verification. `None` only
+    /// if a server omits it.
+    pub etag: Option<String>,
 }
 
 /// Optional `-P` worker-task routing for [`ObjectPaginator`]'s per-page
@@ -110,6 +118,10 @@ impl ObjectPaginator {
             page.push(ListedObject {
                 key: key.to_string(),
                 size,
+                etag: obj
+                    .e_tag()
+                    .map(|e| e.trim().trim_matches('"').to_string())
+                    .filter(|e| !e.is_empty()),
                 modified: obj
                     .last_modified()
                     .and_then(|t| DateTime::<Utc>::from_timestamp(t.secs(), t.subsec_nanos())),

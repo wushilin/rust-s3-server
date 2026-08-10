@@ -12,6 +12,7 @@ mod share;
 mod timefilter;
 mod transfer;
 mod urls;
+mod verify;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -316,6 +317,15 @@ struct PutArgs {
 
 #[derive(Args, Debug)]
 struct CpArgs {
+    /// Skip the ETag content check on downloads.
+    ///
+    /// Downloads are verified by default: a single-`PUT` object's ETag is the
+    /// MD5 of its bytes, and a multipart object's rebuilds from its parts, so
+    /// rs3 can prove the file it wrote is the object the server holds. Turning
+    /// it off trades that proof for the hashing cost and, for multipart
+    /// objects, one metadata request.
+    #[arg(long)]
+    no_verify: bool,
     #[arg(short = 'r', long)]
     recursive: bool,
     #[arg(short = 'P', long, default_value_t = 5)]
@@ -344,6 +354,15 @@ struct CpArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct MirrorArgs {
+    /// Skip the ETag content check on downloads.
+    ///
+    /// Downloads are verified by default: a single-`PUT` object's ETag is the
+    /// MD5 of its bytes, and a multipart object's rebuilds from its parts, so
+    /// rs3 can prove the file it wrote is the object the server holds. Turning
+    /// it off trades that proof for the hashing cost and, for multipart
+    /// objects, one metadata request.
+    #[arg(long)]
+    pub(crate) no_verify: bool,
     #[arg(short = 'P', long, default_value_t = 5)]
     pub(crate) parallel: usize,
     #[arg(short = 's', long, default_value = "256MiB", help = "each part size")]
@@ -382,6 +401,15 @@ pub(crate) struct MirrorArgs {
 
 #[derive(Args, Debug)]
 struct GetArgs {
+    /// Skip the ETag content check on downloads.
+    ///
+    /// Downloads are verified by default: a single-`PUT` object's ETag is the
+    /// MD5 of its bytes, and a multipart object's rebuilds from its parts, so
+    /// rs3 can prove the file it wrote is the object the server holds. Turning
+    /// it off trades that proof for the hashing cost and, for multipart
+    /// objects, one metadata request.
+    #[arg(long)]
+    no_verify: bool,
     source: String,
     target: Option<PathBuf>,
 }
@@ -1464,6 +1492,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         &stream_budget,
                         &session,
                         args.preserve,
+                        !args.no_verify,
                     )
                     .await?;
                     if is_mv {
@@ -1571,6 +1600,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
 /// no directories to prune -- their per-object deletes are sufficient).
 async fn cp_or_mv_recursive(source: &str, target: &str, args: &CpArgs, is_mv: bool) -> Result<()> {
     let mirror_args = MirrorArgs {
+        no_verify: args.no_verify,
         parallel: args.parallel,
         part_size: args.part_size.clone(),
         overwrite: true,
@@ -1925,6 +1955,7 @@ async fn get(args: GetArgs) -> Result<()> {
         &stream_budget,
         &session,
         false,
+        !args.no_verify,
     )
     .await?;
     session.finish();

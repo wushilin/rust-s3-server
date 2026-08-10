@@ -13,6 +13,10 @@ pub(crate) struct Entry {
     pub rel: String,
     pub size: u64,
     pub modified: Option<DateTime<Utc>>,
+    /// The object's ETag when this entry came from an S3 listing, `None` for a
+    /// local file. Carried so a download need not re-`HeadObject` for size and
+    /// ETag the listing already returned -- see [`crate::transfer::ListedFacts`].
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +125,7 @@ pub(crate) async fn collect_local_entries(
                     .to_string_lossy()
                     .replace(std::path::MAIN_SEPARATOR, "/");
                 entries.push(Entry {
+                    etag: None,
                     rel,
                     size: meta.len(),
                     modified: meta.modified().ok().map(DateTime::<Utc>::from),
@@ -167,6 +172,7 @@ pub(crate) async fn collect_s3_entries(
                 rel,
                 size: o.size,
                 modified: o.modified,
+                etag: o.etag,
             })
         })
         .collect();
@@ -410,6 +416,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 parallel,
                 attrs,
                 args.preserve,
+                !args.no_verify,
                 stream_budget,
                 session.ui(),
             )
@@ -626,6 +633,7 @@ async fn copy_entry(
     parallel: usize,
     attrs: &BTreeMap<String, String>,
     preserve: bool,
+    verify: bool,
     budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<(String, String)> {
@@ -670,7 +678,22 @@ async fn copy_entry(
             let key = s3_key(prefix, &entry.rel);
             let output = dst_root.join(&entry.rel);
             crate::transfer::download_key_to_path(
-                client, bucket, &key, &output, part_size, parallel, preserve, budget, progress,
+                client,
+                bucket,
+                &key,
+                &output,
+                part_size,
+                parallel,
+                preserve,
+                // The listing already reported both facts the download needs,
+                // so this object costs one request instead of two.
+                Some(crate::transfer::ListedFacts {
+                    size: entry.size,
+                    etag: entry.etag.clone(),
+                }),
+                verify,
+                budget,
+                progress,
             )
             .await?;
             Ok((
@@ -734,6 +757,7 @@ mod tests {
 
     fn entry(rel: &str, size: u64, ts: Option<i64>) -> Entry {
         Entry {
+            etag: None,
             rel: rel.into(),
             size,
             modified: ts.map(|t| Utc.timestamp_opt(t, 0).unwrap()),
