@@ -36,7 +36,7 @@
 //! to be wrong would produce an ETag mismatch indistinguishable from real
 //! corruption, which is the one failure this module must never invent.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::ObjectAttributes;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -162,17 +162,40 @@ pub(crate) async fn discover_layout(
         }
     };
 
-    let total: u64 = parts.iter().map(|p| p.size).sum();
-    if total != size {
-        return Err(anyhow!(
-            "`{bucket}/{key}`: reported part sizes total {total} bytes but the object is {size}; \
-             refusing to verify against a layout that cannot be right"
-        ));
+    // A layout that does not add up to the object cannot be verified against,
+    // and the overwhelmingly likely cause is a server that accepted the
+    // request and ignored it -- one that does not implement `partNumber`
+    // answers every per-part HEAD with the *whole* object's length, so N parts
+    // report N times the size.
+    //
+    // This degrades rather than fails. Refusing the download would mean rs3
+    // could not fetch a multipart object at all from any S3-compatible server
+    // without both discovery APIs, turning a missing *check* into a missing
+    // *feature*. Verification is best-effort against an unknown server; the
+    // transfer is not.
+    if !layout_covers(&parts, size) {
+        let total: u64 = parts.iter().map(|p| p.size).sum();
+        return Ok(ObjectLayout::Opaque {
+            reason: format!(
+                "the server did not report a usable part layout (parts total {total} bytes, \
+                 object is {size}) -- it likely does not implement GetObjectAttributes or \
+                 partNumber"
+            ),
+        });
     }
     Ok(ObjectLayout::Multipart {
         parts,
         expected_etag,
     })
+}
+
+/// Does a discovered layout actually describe an object of this size?
+///
+/// The check that catches a server which accepted `partNumber` and ignored it:
+/// such a server answers every per-part `HEAD` with the whole object's length,
+/// so an N-part object reports N times its own size.
+fn layout_covers(parts: &[PartSpec], size: u64) -> bool {
+    parts.iter().map(|p| p.size).sum::<u64>() == size
 }
 
 /// One `GetObjectAttributes` (paginated) for the whole layout.
@@ -357,6 +380,25 @@ mod tests {
         assert_eq!(decode_md5_base64("not base64!!"), None);
         // Right encoding, wrong length: not a 128-bit digest.
         assert_eq!(decode_md5_base64("AAAA"), None);
+    }
+
+    #[test]
+    fn layout_covers_rejects_the_ignored_part_number_signature() {
+        let spec = |size| PartSpec {
+            size,
+            expected_md5: None,
+        };
+        // The real shape: a 12 MiB object in 3 parts, from a server that
+        // answered every per-part HEAD with the whole object's length.
+        let ignored = vec![spec(12_582_912), spec(12_582_912), spec(12_582_912)];
+        assert!(!layout_covers(&ignored, 12_582_912));
+
+        // A genuine ragged layout adds up and must be accepted.
+        let real = vec![spec(5_242_880), spec(5_242_880), spec(2_097_152)];
+        assert!(layout_covers(&real, 12_582_912));
+
+        // Off by a single byte is still not a description of this object.
+        assert!(!layout_covers(&real, 12_582_913));
     }
 
     #[test]
