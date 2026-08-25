@@ -1676,6 +1676,7 @@ fn unescape_xml(value: &str) -> String {
     value
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+        .replace("&#34;", "\"")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         // Decode ampersand last so `&amp;lt;` remains the literal text `&lt;`
@@ -1814,6 +1815,7 @@ fn parse_s3_query(raw: &str) -> HashMap<String, String> {
 fn normalize_complete_etag(value: &str) -> String {
     value
         .trim()
+        .replace("&#34;", "\"")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&lt;", "<")
