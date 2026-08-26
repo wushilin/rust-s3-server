@@ -33,6 +33,18 @@
         assert_eq!(parts[0].etag, "900150983cd24fb0d6963f7d28e17f72");
     }
 
+    // aws-sdk-go-v2 escapes the ETag quotes as the numeric entity `&#34;`
+    // rather than `&quot;`. Regression for PR #1.
+    #[test]
+    fn complete_parts_xml_accepts_numeric_entity_etags() {
+        let parts = parse_complete_parts_xml(
+            r#"<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Part><ETag>&#34;d32239bcb673463ab874e80d47fae504&#34;</ETag><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>"#,
+        )
+        .unwrap();
+        assert_eq!(parts[0].number, 1);
+        assert_eq!(parts[0].etag, "d32239bcb673463ab874e80d47fae504");
+    }
+
     #[test]
     fn human_bytes_formats_units() {
         assert_eq!(human_bytes(512), "512 B");
