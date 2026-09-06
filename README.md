@@ -1,5 +1,13 @@
 # rusts3 — single-node S3-compatible server
 
+Why not RustFS? RustFS uses a lot of CPU for useless stuff. I used ZFS with integrity check 
+yet RustFS spends huge amount of CPU time when idling. 
+
+Rust-S3-Server uses 0% CPU when you are not using it. It does zero background magic.
+
+It does FSYNC when you upload objects (you mean realize the upload of many objects might look slower), 
+it prioritizes integrity over naive speed.
+
 A lightweight, single-node S3-compatible server in Rust, with a built-in
 management console. The core AWS S3 API — authentication, bucket/object CRUD,
 listings, multipart, copy, presigning, browser POST, and both path-style and
