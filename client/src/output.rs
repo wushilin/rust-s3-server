@@ -19,6 +19,9 @@ pub(crate) struct OutputOpts {
     pub quiet: bool,
     pub no_color: bool,
     pub stdout_tty: bool,
+    /// `--simple-progress`: transfers render one `<percent>% <elapsed>
+    /// <eta>` line per second on stdout instead of bars or messages.
+    pub simple_progress: bool,
 }
 
 static OUTPUT_OPTS: OnceLock<OutputOpts> = OnceLock::new();
@@ -39,6 +42,7 @@ pub(crate) fn out() -> &'static OutputOpts {
         quiet: false,
         no_color: true,
         stdout_tty: false,
+        simple_progress: false,
     })
 }
 

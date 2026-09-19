@@ -88,8 +88,15 @@ fn mirror_never_uploads_download_staging() {
 
 /// This host's name, formatted the way `staging_dir_for` stamps it.
 fn host() -> String {
+    // Neither file exists off Linux, where rs3 asks `gethostname(2)` instead
+    // -- the same answer `hostname` prints.
     let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .ok()
+        .or_else(|| {
+            let out = std::process::Command::new("hostname").output().ok()?;
+            String::from_utf8(out.stdout).ok()
+        })
         .unwrap_or_default();
     let cleaned: String = raw
         .trim()

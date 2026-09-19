@@ -365,6 +365,7 @@ fn run_exec(
         if let Some(ui) = ui {
             ui.clear();
         }
+        crate::progress::simple_progress_eof();
         std::process::exit(code);
     }
 }

@@ -368,6 +368,9 @@ struct UiInner {
     state: Mutex<UiState>,
     // This UI's slot in the `LIVE_BARS` registry, released on drop.
     bars_id: u64,
+    // `--simple-progress` only: when the run started, and whether its
+    // final line has been written (after which the reporter goes quiet).
+    simple: Option<(Instant, std::sync::atomic::AtomicBool)>,
 }
 
 impl Drop for UiInner {
@@ -475,6 +478,11 @@ fn ui_enabled() -> bool {
 /// `docs/superpowers/specs/2026-07-31-rs3-worker-lanes-design.md`), which
 /// sizes the grid via [`lane_count`].
 pub(crate) fn worker_ui(parallel: usize) -> Option<ProgressUi> {
+    // `--simple-progress` renders the TOTAL row's figures and nothing else;
+    // a standalone command has no total, so it gets no display at all.
+    if simple_progress_enabled() {
+        return None;
+    }
     ui_enabled().then(|| ProgressUi::without_total(parallel))
 }
 
@@ -482,7 +490,86 @@ pub(crate) fn worker_ui(parallel: usize) -> Option<ProgressUi> {
 /// the same [`ui_enabled`] predicate, with the persistent `TOTAL` row below
 /// the grid. `parallel` is the transfer command's `-P` value.
 pub(crate) fn transfer_ui(parallel: usize) -> Option<ProgressUi> {
+    if simple_progress_enabled() {
+        return Some(ProgressUi::simple(parallel));
+    }
     ui_enabled().then(|| ProgressUi::with_total(parallel))
+}
+
+/// `--simple-progress`: on, and not overridden by `--json` (whose stdout is
+/// a machine contract of its own that these lines would corrupt).
+fn simple_progress_enabled() -> bool {
+    let out = crate::output::out();
+    out.simple_progress && !out.json
+}
+
+/// How often `--simple-progress` emits a line. Every tick prints, changed
+/// or not, so a consumer can tell a stalled transfer from a dead process.
+const SIMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Serializes every `--simple-progress` write to stdout; the flag is
+/// whether the closing `EOF` has been written, after which nothing more
+/// may follow it.
+static SIMPLE_OUT: Mutex<bool> = Mutex::new(false);
+
+fn lock_simple_out() -> std::sync::MutexGuard<'static, bool> {
+    SIMPLE_OUT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Compact `1h2m3s`-style duration with zero components dropped (`2m`,
+/// `1m43s`, `12s`), `0s` for zero.
+fn format_simple_duration(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if s > 0 || out.is_empty() {
+        out.push_str(&format!("{s}s"));
+    }
+    out
+}
+
+/// One `--simple-progress` line: `<percent>% <elapsed> <eta>`. Elapsed is
+/// whole seconds; the ETA is the whole-run average rate projected over
+/// what is left, or `-` while there is nothing to project from (planning,
+/// or no byte moved yet). An unfinished run never reads `100%`, so a
+/// consumer can treat that line as completion.
+fn simple_line(pos: u64, len: u64, elapsed: Duration, finished: bool) -> String {
+    let secs = elapsed.as_secs();
+    if finished && pos >= len {
+        return format!("100% {secs}s 0s");
+    }
+    let percent = if len == 0 {
+        0
+    } else {
+        (pos.min(len) as u128 * 100 / len as u128).min(99) as u64
+    };
+    let eta = if pos == 0 || len == 0 {
+        "-".to_string()
+    } else {
+        let left = len.saturating_sub(pos) as f64;
+        format_simple_duration((elapsed.as_secs_f64() * left / pos as f64).ceil() as u64)
+    };
+    format!("{percent}% {secs}s {eta}")
+}
+
+/// Closes the `--simple-progress` stream with a literal `EOF` line, so a
+/// consumer reading a file or pipe it doesn't own the far end of can tell
+/// the run is over -- success or failure. Called on every process-exit
+/// path; a no-op without the flag.
+pub(crate) fn simple_progress_eof() {
+    if !simple_progress_enabled() {
+        return;
+    }
+    let mut eof = lock_simple_out();
+    if !*eof {
+        *eof = true;
+        println!("EOF");
+    }
 }
 
 // ===================== the task abstraction =====================
@@ -720,6 +807,7 @@ impl ProgressUi {
             parallel,
             rows,
             PAINT_INTERVAL,
+            false,
         )
     }
 
@@ -735,6 +823,23 @@ impl ProgressUi {
             parallel,
             rows,
             PAINT_INTERVAL,
+            false,
+        )
+    }
+
+    /// `--simple-progress`'s display: the full accounting of
+    /// [`with_total`](Self::with_total) against a hidden draw target, so no
+    /// bar is ever painted, plus the once-a-second stdout reporter. Paced
+    /// like a real display so the stall ticker keeps the total current.
+    pub(crate) fn simple(parallel: usize) -> Self {
+        Self::with_target(
+            ProgressDrawTarget::hidden(),
+            bar_width_for(None),
+            true,
+            parallel,
+            None,
+            PAINT_INTERVAL,
+            true,
         )
     }
 
@@ -759,6 +864,7 @@ impl ProgressUi {
             parallel,
             None,
             Duration::ZERO,
+            false,
         )
     }
 
@@ -773,6 +879,7 @@ impl ProgressUi {
             parallel,
             None,
             Duration::ZERO,
+            false,
         )
     }
 
@@ -788,6 +895,7 @@ impl ProgressUi {
             parallel,
             None,
             paint_interval,
+            false,
         )
     }
 
@@ -804,6 +912,7 @@ impl ProgressUi {
         parallel: usize,
         term_rows: Option<u16>,
         paint_interval: Duration,
+        simple: bool,
     ) -> Self {
         // With a TOTAL row, reserve 2 rows below the grid (TOTAL + a margin
         // row); without one, reserve 1 (the margin row alone).
@@ -867,10 +976,57 @@ impl ProgressUi {
                     watch,
                 }),
                 bars_id,
+                simple: simple
+                    .then(|| (Instant::now(), std::sync::atomic::AtomicBool::new(false))),
             }),
         };
         ui.spawn_stall_ticker();
+        ui.spawn_simple_reporter();
         ui
+    }
+
+    /// `--simple-progress`'s whole display: prints a [`simple_line`] to
+    /// stdout now and every [`SIMPLE_INTERVAL`] until the run's final line
+    /// or `EOF` has been written. Same `Weak`-holding shape as
+    /// [`spawn_stall_ticker`](Self::spawn_stall_ticker), for the same
+    /// reason.
+    fn spawn_simple_reporter(&self) {
+        if self.inner.simple.is_none() {
+            return;
+        }
+        self.print_simple(false);
+        let weak = Arc::downgrade(&self.inner);
+        let _ = std::thread::Builder::new()
+            .name("rs3-simple-progress".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(SIMPLE_INTERVAL);
+                    match weak.upgrade() {
+                        Some(inner) => ProgressUi { inner }.print_simple(false),
+                        None => return,
+                    }
+                }
+            });
+    }
+
+    fn print_simple(&self, finished: bool) {
+        let Some((started, done)) = &self.inner.simple else {
+            return;
+        };
+        let eof = lock_simple_out();
+        if *eof || done.load(Ordering::Relaxed) {
+            return;
+        }
+        if finished {
+            done.store(true, Ordering::Relaxed);
+        }
+        let line = simple_line(
+            self.overall_position(),
+            self.overall_length(),
+            started.elapsed(),
+            finished,
+        );
+        println!("{line}");
     }
 
     /// Starts the thread that keeps a stalled task's row honest.
@@ -1064,6 +1220,8 @@ impl ProgressUi {
         if let Some(overall) = &self.inner.overall {
             overall.finish();
         }
+        drop(state);
+        self.print_simple(true);
     }
 
     /// Explicit pre-hard-exit teardown: clears every remaining bar/spinner
@@ -1092,7 +1250,6 @@ impl ProgressUi {
         self.inner.state.lock().expect("ProgressUi state poisoned")
     }
 
-    #[allow(dead_code)]
     pub(crate) fn overall_position(&self) -> u64 {
         self.inner
             .overall
@@ -2571,6 +2728,35 @@ mod tests {
             7
         );
         assert_eq!(Measure::Percent.span(), PERCENT_SCALE);
+    }
+
+    #[test]
+    fn simple_line_reports_percent_elapsed_and_eta() {
+        let secs = Duration::from_secs;
+        // Nothing to project from yet: planning, or no byte moved.
+        assert_eq!(simple_line(0, 0, secs(0), false), "0% 0s -");
+        assert_eq!(simple_line(0, 1000, secs(3), false), "0% 3s -");
+        // 10% in 12s -> 108s left at the average rate.
+        assert_eq!(simple_line(100, 1000, secs(12), false), "10% 12s 1m48s");
+        // Elapsed stays in whole seconds however long the run gets.
+        assert_eq!(simple_line(500, 1000, secs(120), false), "50% 120s 2m");
+        // Complete-but-unfinished never reads 100%: that line means done.
+        assert_eq!(simple_line(1000, 1000, secs(80), false), "99% 80s 0s");
+        assert_eq!(simple_line(1000, 1000, secs(80), true), "100% 80s 0s");
+        // An empty run (nothing needed copying) still closes at 100%.
+        assert_eq!(simple_line(0, 0, secs(1), true), "100% 1s 0s");
+        // A run that finished short (failed objects) says so.
+        assert_eq!(simple_line(500, 1000, secs(10), true), "50% 10s 10s");
+    }
+
+    #[test]
+    fn simple_duration_drops_zero_components() {
+        assert_eq!(format_simple_duration(0), "0s");
+        assert_eq!(format_simple_duration(12), "12s");
+        assert_eq!(format_simple_duration(103), "1m43s");
+        assert_eq!(format_simple_duration(120), "2m");
+        assert_eq!(format_simple_duration(3600), "1h");
+        assert_eq!(format_simple_duration(3723), "1h2m3s");
     }
 
     #[test]

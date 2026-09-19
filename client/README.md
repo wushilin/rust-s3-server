@@ -175,6 +175,30 @@ byte-for-byte. Relevant only if you're diffing the two tools' output.
   is caught by clap, which prints its own usage message and exits `2` --
   bypassing rs3's `<prog>: <ERROR>` machinery entirely.
 
+## Simple progress (`--simple-progress`)
+
+For a wrapper that draws its own progress UI (an AppleScript dialog, a shell
+script), `--simple-progress` replaces a transfer's bars and per-object
+messages with one plain line per second on stdout -- appended line by line,
+never redrawn in place, TTY or not:
+
+```
+0% 0s -
+10% 1s 9s
+55% 5s 5s
+100% 9s 0s
+EOF
+```
+
+Each line is `<percent>% <elapsed> <eta>` for the whole invocation. Elapsed
+is whole seconds; the ETA is compact (`12s`, `1m43s`, `2m`, `1h5m`), or `-`
+while there is nothing to estimate from yet (planning, no byte moved). `100%`
+is printed only once the transfer has actually finished, and a literal `EOF`
+line always closes the stream -- on failure too, where the last progress line
+stays below `100%`, the error goes to stderr, and the exit code is non-zero.
+Commands with no byte total (`ls`, `rm`, ...) print their normal output, then
+`EOF`. Without the flag nothing changes; `--json` overrides it.
+
 ## TTY progress display
 
 Everything in this section is a TTY-only, stderr-only display detail.
@@ -324,6 +348,15 @@ Aliases can also come from the environment without a config file:
 `RS3_HOST_<ALIAS>` (preferred) or `MC_HOST_<ALIAS>`, in the form
 `https://ACCESS_KEY:SECRET_KEY@host:port`. `AWS_S3_REGION` or `AWS_REGION`
 sets the region for environment aliases.
+
+The signing region is optional per alias and defaults to `us-east-1`, which
+suits most S3-compatible servers. AWS S3 buckets in other regions need it set:
+pass `--region` to `alias set` (stored as an rs3-only `region` key that `mc`
+ignores). When the flag is omitted, `AWS_S3_REGION`/`AWS_REGION` are used.
+
+```sh
+rs3 alias set aws https://s3.ap-southeast-1.amazonaws.com KEY SECRET --region ap-southeast-1
+```
 
 Example:
 

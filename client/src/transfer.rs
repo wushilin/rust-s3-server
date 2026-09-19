@@ -1353,13 +1353,33 @@ pub(crate) fn is_staging_dir_name(name: &str) -> bool {
 fn resolve_host() -> Option<String> {
     let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-        .ok()?;
+        .ok()
+        .or_else(syscall_hostname)?;
     let cleaned: String = raw
         .trim()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// `gethostname(2)`, for the Unixes that keep the name in neither file
+/// [`resolve_host`] reads first (macOS, the BSDs).
+#[cfg(unix)]
+fn syscall_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a live, writable buffer of exactly the length passed.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // POSIX leaves a truncated name unterminated; take the whole buffer then.
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..len].to_vec()).ok()
+}
+#[cfg(not(unix))]
+fn syscall_hostname() -> Option<String> {
+    None
 }
 
 /// The host field to stamp into a new staging name. Naming always needs
@@ -1416,7 +1436,30 @@ fn owner_alive(pid: u32) -> Option<bool> {
     }
     Some(Path::new(&format!("/proc/{pid}")).exists())
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
+fn owner_alive(pid: u32) -> Option<bool> {
+    // Pids are positive `pid_t`s. Anything else must never reach `kill`,
+    // where 0 and negative values address whole process *groups* -- and a
+    // value no process can hold is, for the same reason, provably not live.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return Some(false);
+    };
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: signal 0 delivers nothing; it only runs the existence and
+    // permission checks.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        // EPERM: it exists, it just isn't ours to signal.
+        Some(libc::EPERM) => Some(true),
+        _ => None,
+    }
+}
+#[cfg(not(unix))]
 fn owner_alive(_pid: u32) -> Option<bool> {
     None
 }

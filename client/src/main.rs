@@ -115,6 +115,12 @@ struct Cli {
     disable_pager: bool,
     #[arg(long, global = true, help = "suppress chatty console output")]
     quiet: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "transfers print only `<percent>% <elapsed> <eta>` lines, then `EOF`"
+    )]
+    simple_progress: bool,
     #[arg(long, global = true, help = "install auto-completion for your shell")]
     autocompletion: bool,
 
@@ -185,6 +191,11 @@ enum AliasCommand {
         api: String,
         #[arg(default_value = "auto", help = "path lookup style: auto, on, or off")]
         path: String,
+        #[arg(
+            long,
+            help = "SigV4 signing region, e.g. ap-southeast-1; required for AWS S3 buckets outside us-east-1 [default: $AWS_S3_REGION, $AWS_REGION, then us-east-1]"
+        )]
+        region: Option<String>,
     },
     #[command(about = "list aliases in configuration file")]
     List,
@@ -583,8 +594,11 @@ async fn main() {
         quiet: cli.quiet,
         no_color: cli.no_color,
         stdout_tty: std::io::stdout().is_terminal(),
+        simple_progress: cli.simple_progress,
     });
-    if let Err(e) = run(cli).await {
+    let result = run(cli).await;
+    crate::progress::simple_progress_eof();
+    if let Err(e) = result {
         print_error(&format!("{e:#}"), "", true);
         std::process::exit(1);
     }
@@ -627,7 +641,13 @@ async fn alias(args: AliasArgs) -> Result<()> {
             secret_key,
             api,
             path,
+            region,
         } => {
+            let region = region
+                .filter(|r| !r.is_empty())
+                .or_else(|| std::env::var("AWS_S3_REGION").ok())
+                .or_else(|| std::env::var("AWS_REGION").ok());
+            let region_hint = region.is_none() && url.contains("amazonaws.com");
             let mut cfg = load_config().await?;
             cfg.version = "10".into();
             cfg.aliases.insert(
@@ -639,19 +659,26 @@ async fn alias(args: AliasArgs) -> Result<()> {
                     api,
                     path,
                     extra: BTreeMap::new(),
-                    region: std::env::var("AWS_S3_REGION")
-                        .ok()
-                        .or_else(|| std::env::var("AWS_REGION").ok()),
+                    region,
                 },
             );
             save_config(&cfg).await?;
             ui_println!("Added `{alias}` successfully.");
+            if region_hint {
+                ui_eprintln!(
+                    "note: no region set for `{alias}`; requests are signed for us-east-1. \
+                     For buckets in another AWS region, re-run with `--region <REGION>`."
+                );
+            }
             Ok(())
         }
         AliasCommand::List => {
             let cfg = load_config().await?;
             for (name, alias) in cfg.aliases {
-                ui_println!("{:<16} {}", name, alias.url);
+                match alias.region {
+                    Some(region) => ui_println!("{:<16} {} ({region})", name, alias.url),
+                    None => ui_println!("{:<16} {}", name, alias.url),
+                }
             }
             Ok(())
         }
