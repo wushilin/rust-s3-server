@@ -25,6 +25,7 @@ mod tests {
             request_id: "test".into(),
             identity: None,
             auth_state: None,
+            client_ip: None,
             tasks: None,
             bucket: bucket.into(),
             query: std::collections::HashMap::new(),

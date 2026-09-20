@@ -42,6 +42,8 @@ const IAM_IMPORT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 pub struct UiState {
     pub store: LocalObjectStore,
     pub iam: IamStore,
+    /// When and from where each access key was last used.
+    pub key_usage: super::key_usage::KeyUsageStore,
     pub config: Arc<AppConfig>,
     pub(crate) metrics: Arc<TrafficMetrics>,
     pub(crate) tasks: Arc<super::registry::TaskRegistry>,
@@ -83,7 +85,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/groups/:name/policy/rules", put(set_group_policy_rules))
         .route("/api/policies/compile", post(compile_policy_rules))
         .route("/api/policies/decompile", post(decompile_policy_rules))
-        .route("/api/keys/:ak", delete(delete_key))
+        .route("/api/keys/:ak", delete(delete_key).put(update_key))
         .route("/api/buckets", get(list_buckets).post(create_bucket))
         .route("/api/buckets/:name", delete(delete_bucket))
         .route("/api/buckets/:name/stats", get(bucket_stats))
@@ -483,16 +485,14 @@ fn require_root(state: &UiState, headers: &HeaderMap) -> Result<UiSession, Respo
 
 
 /// Resolves the console session to the same [`Identity`] the S3 API uses, so
-/// both front doors authorize through one code path. Built-in sessions are
-/// unrestricted; IAM sessions carry their effective policy.
+/// both front doors authorize through one code path. Built-in sessions and
+/// members of the admin group are unrestricted; other IAM sessions carry their
+/// effective policy.
 fn identity_of(state: &UiState, session: &UiSession) -> Identity {
     if session.is_builtin {
         Identity::root(Some(session.username.clone()), None)
     } else {
-        Identity::iam(
-            session.username.clone(),
-            state.iam.policy_for(&session.username),
-        )
+        state.iam.identity_for(&session.username)
     }
 }
 
@@ -757,8 +757,16 @@ async fn delete_user(
             "administrators cannot delete their own account",
         );
     }
+    // The user's access keys are deleted with it; note them first so their
+    // usage stamps can go too.
+    let doomed_keys = state.iam.list_access_keys(&name).await.unwrap_or_default();
     match state.iam.delete_user(&name).await {
         Ok(()) => {
+            for key in &doomed_keys {
+                if let Err(err) = state.key_usage.forget(&key.access_key).await {
+                    log::warn!("could not clear usage of deleted access key {}: {err}", key.access_key);
+                }
+            }
             audit(&state, &rid.0, &actor.username, "delete_user", &name);
             Json(json!({"ok": true})).into_response()
         }
@@ -1071,6 +1079,27 @@ fn may_manage_keys(session: &UiSession, target_user: &str) -> bool {
     session.is_admin || session.username == target_user
 }
 
+/// Fixed tag of a config-file api key. Such keys have no IAM row to carry tags
+/// of their own, so it cannot be edited. (Server-assigned, so not bound by the
+/// charset rule for user-entered tags.)
+const BUILTIN_KEY_TAG: &str = "built-in";
+
+/// One row of a key listing: the key's own fields plus its last-use stamp,
+/// which is tracked the same way for built-in and runtime-issued keys.
+fn key_json(state: &UiState, access_key: &str, mut fields: serde_json::Value) -> serde_json::Value {
+    let usage = state.key_usage.get(access_key);
+    fields["access_key"] = json!(access_key);
+    fields["last_used_at_ms"] = json!(usage.as_ref().map(|u| u.last_used_at_ms));
+    fields["last_used_from"] = json!(usage.map(|u| u.last_used_from));
+    fields
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyTagsRequest {
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
 async fn list_keys(
     State(state): State<UiState>,
     headers: HeaderMap,
@@ -1086,19 +1115,19 @@ async fn list_keys(
     // Built-in users' keys are visible (access key only) but config-managed.
     if let Some(builtin) = state.config.find_builtin_user(&name) {
         return Json(json!({
-            "keys": builtin.api_keys.iter().map(|k| json!({
-                "access_key": k.ak,
+            "keys": builtin.api_keys.iter().map(|k| key_json(&state, &k.ak, json!({
+                "tags": [BUILTIN_KEY_TAG],
                 "builtin": true,
-            })).collect::<Vec<_>>()
+            }))).collect::<Vec<_>>()
         }))
         .into_response();
     }
     match state.iam.list_access_keys(&name).await {
         Ok(keys) => Json(json!({
-            "keys": keys.iter().map(|k| json!({
-                "access_key": k.access_key,
+            "keys": keys.iter().map(|k| key_json(&state, &k.access_key, json!({
+                "tags": k.tags,
                 "created_at_ms": k.created_at_ms,
-            })).collect::<Vec<_>>()
+            }))).collect::<Vec<_>>()
         }))
         .into_response(),
         Err(err) => storage_error(err),
@@ -1110,6 +1139,9 @@ async fn create_key(
     headers: HeaderMap,
     Extension(rid): Extension<super::RequestId>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    // Optional so that a bodiless request gets the same "needs at least one
+    // tag" answer as an empty list, rather than a bare extractor rejection.
+    req: Option<Json<KeyTagsRequest>>,
 ) -> Response {
     let session = match require_session(&state, &headers) {
         Ok(s) => s,
@@ -1118,19 +1150,21 @@ async fn create_key(
     if !may_manage_keys(&session, &name) {
         return error_response(StatusCode::FORBIDDEN, "not your keys");
     }
+    let tags = req.map(|Json(req)| req.tags).unwrap_or_default();
     if state.config.find_builtin_user(&name).is_some() {
         return error_response(
             StatusCode::CONFLICT,
             "built-in users are config-managed; add api_keys in the config file",
         );
     }
-    match state.iam.create_access_key(&name).await {
+    match state.iam.create_access_key(&name, &tags).await {
         // The secret is returned exactly once, at creation.
         Ok(key) => {
-            audit(&state, &rid.0, &session.username, "create_access_key", format!("{name} ak={}", key.access_key));
+            audit(&state, &rid.0, &session.username, "create_access_key", format!("{name} ak={} tags={:?}", key.access_key, key.tags));
             Json(json!({
                 "access_key": key.access_key,
                 "secret_key": key.secret_key,
+                "tags": key.tags,
             }))
             .into_response()
         }
@@ -1170,10 +1204,53 @@ async fn delete_key(
     }
     match state.iam.delete_access_key(&ak).await {
         Ok(()) => {
+            // Key ids are random and never reissued, so a stamp that fails to
+            // clear is only an orphan row, not a wrong answer.
+            if let Err(err) = state.key_usage.forget(&ak).await {
+                log::warn!("could not clear usage of deleted access key {ak}: {err}");
+            }
             audit(&state, &rid.0, &session.username, "delete_access_key", format!("{owner} ak={ak}"));
             Json(json!({"ok": true})).into_response()
         }
         Err(err) => storage_error(err),
+    }
+}
+
+/// Replaces an access key's tags — the only thing about a key that can be
+/// edited. Same ownership rule as deletion; built-in keys are config-managed
+/// and keep their fixed tag.
+async fn update_key(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    axum::extract::Path(ak): axum::extract::Path<String>,
+    Json(req): Json<KeyTagsRequest>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if ak.starts_with("RSWEB_") {
+        return error_response(StatusCode::NOT_FOUND, "no such access key");
+    }
+    if state.config.find_secret(&ak).is_some() {
+        return error_response(
+            StatusCode::CONFLICT,
+            "built-in api keys are config-managed; their tags cannot be edited",
+        );
+    }
+    let Some(owner) = state.iam.find_key(&ak).map(|(_, user)| user) else {
+        return error_response(StatusCode::NOT_FOUND, "no such access key");
+    };
+    if !may_manage_keys(&session, &owner) {
+        return error_response(StatusCode::FORBIDDEN, "not your key");
+    }
+    match state.iam.set_access_key_tags(&ak, &req.tags).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "set_access_key_tags", format!("{owner} ak={ak} tags={:?}", req.tags));
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
@@ -1194,15 +1271,14 @@ async fn list_buckets(
         Ok(g) => g,
         Err(resp) => return resp,
     };
+    let identity = identity_of(&state, &session);
     match state.store.list_buckets().await {
         Ok(buckets) => {
             let mut visible = Vec::new();
             for (name, meta) in buckets {
-                if !authorize(
-                    &state,
-                    &session,
-                    &[Requirement::bucket("s3:ListBucket", &name)],
-                ) {
+                // The same rule the S3 API's ListBuckets applies. Notably a
+                // user scoped to a prefix sees the bucket their prefix is in.
+                if !identity.can_see_bucket(&name) {
                     continue;
                 }
                 // The rail badges the in-flight multipart count next to each

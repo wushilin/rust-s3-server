@@ -10,6 +10,7 @@ pub(crate) mod handlers;
 pub mod iam;
 pub(crate) mod jobs;
 pub mod identity;
+pub mod key_usage;
 pub mod logging;
 pub(crate) mod pipeline;
 pub mod policy;
@@ -227,6 +228,7 @@ pub fn router(store: LocalObjectStore, app_config: Arc<AppConfig>) -> Router {
         AuthState {
             config: app_config,
             iam: None,
+            usage: None,
         },
         Arc::new(TrafficMetrics::default()),
         registry::TaskRegistry::new(),
@@ -1068,9 +1070,15 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             );
         }
     }
+    // "Last used" stamps for access keys: their own database (high-churn,
+    // derived — not part of the IAM export), updated in memory on the request
+    // path and flushed in the background.
+    let key_usage = key_usage::KeyUsageStore::open(FsPath::new(&config.root)).await?;
+    key_usage.spawn_flusher(shutdown.clone());
     let auth_state = AuthState {
         config: config.app_config.clone(),
         iam: Some(iam.clone()),
+        usage: Some(key_usage.clone()),
     };
 
     // Management UI on its own port: web logins (user/password) only —
@@ -1101,6 +1109,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         let ui_state = ui::UiState {
             store: store.clone(),
             iam,
+            key_usage: key_usage.clone(),
             config: config.app_config.clone(),
             metrics: metrics.clone(),
             tasks: tasks.clone(),
@@ -1133,7 +1142,13 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let app = router_with_metrics(store, auth_state, metrics, tasks);
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     let drain = shutdown.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown.cancelled_owned());
+    // Connect info gives the auth layer the peer address, for access keys'
+    // "last used from".
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.cancelled_owned());
 
     // Graceful shutdown waits for in-flight connections, and an idle keep-alive
     // connection is indistinguishable from a busy one — so a single client
@@ -1149,6 +1164,11 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
                 SHUTDOWN_DRAIN_GRACE.as_secs()
             );
         }
+    }
+    // The flusher stopped with the shutdown signal; write out whatever was
+    // stamped while connections drained.
+    if let Err(err) = key_usage.flush().await {
+        log::warn!("could not persist access key usage at shutdown: {err}");
     }
     log::info!("rusts3-v2 shutdown complete");
     Ok(())
@@ -1320,17 +1340,28 @@ fn qps(requests_in_window: u64) -> String {
     format!("{:.2}", requests_in_window as f64 / 10.0)
 }
 
-async fn list_buckets(State(store): State<LocalObjectStore>) -> Response {
+async fn list_buckets(
+    State(store): State<LocalObjectStore>,
+    identity: Option<Extension<Identity>>,
+) -> Response {
+    // No identity means auth is disabled: everything is visible. Otherwise the
+    // caller gets the buckets they may have access to — all of them for root,
+    // an administrator, or a policy granting `s3:ListAllMyBuckets`.
+    let identity = identity.map(|Extension(identity)| identity);
+    if identity.as_ref().is_some_and(|identity| !identity.may_list_buckets()) {
+        return s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied by user policy", "/");
+    }
     match store.list_buckets().await {
         Ok(buckets) => {
-            let bucket_count = buckets.len();
             let buckets = buckets
                 .into_iter()
+                .filter(|(name, _)| identity.as_ref().is_none_or(|identity| identity.can_see_bucket(name)))
                 .map(|(name, meta)| BucketListEntry {
                     name,
                     created_at_ms: meta.created_at_ms,
                 })
                 .collect::<Vec<_>>();
+            let bucket_count = buckets.len();
             with_measure(
                 xml_response(StatusCode::OK, list_buckets_xml(&buckets)),
                 OperationMeasure::Buckets(bucket_count),
@@ -1354,11 +1385,13 @@ async fn bucket_route(
     request_id: Option<Extension<RequestId>>,
     identity: Option<Extension<Identity>>,
     auth_state: Option<Extension<AuthState>>,
+    client_ip: Option<Extension<auth::ClientIp>>,
     tasks: Option<Extension<Arc<registry::TaskRegistry>>>,
     body: Body,
 ) -> Response {
     let query = parse_s3_query(raw_query.as_deref().unwrap_or(""));
     let ctx = handlers::BucketCtx {
+        client_ip: client_ip.map(|Extension(ip)| ip.0),
         request_id: request_id.map(|Extension(id)| id.0).unwrap_or_default(),
         identity: identity.map(|Extension(id)| id),
         auth_state: auth_state.map(|Extension(state)| state),
@@ -2122,6 +2155,8 @@ fn empty_response_with_etag(status: StatusCode, etag: &str) -> Response {
     response
 }
 
+#[cfg(test)]
+mod iam_e2e_tests;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]

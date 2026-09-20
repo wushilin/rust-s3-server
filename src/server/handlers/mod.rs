@@ -93,6 +93,9 @@ pub(crate) struct BucketCtx {
     pub request_id: String,
     pub identity: Option<Identity>,
     pub auth_state: Option<AuthState>,
+    /// The caller's address, set only where authentication was deferred to the
+    /// handler (browser-POST), so it can stamp the access key's last use.
+    pub client_ip: Option<String>,
     /// The in-flight task registry, for verbs that launch their own jobs (e.g.
     /// rebuild-index). `None` only on code paths without a running server.
     pub tasks: Option<Arc<TaskRegistry>>,

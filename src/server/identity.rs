@@ -7,13 +7,13 @@
 //! Keeping this the single choke point means a policy-enforcement fix lands in
 //! exactly one place.
 
-use super::policy::{is_authorized, PolicyDocument, Requirement};
+use super::policy::{bucket_visible, explicitly_denies, is_authorized, PolicyDocument, Requirement};
 
 /// A resolved caller, independent of how it authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
-    /// A root config credential or a built-in console admin: unrestricted, no
-    /// policy applies.
+    /// A root config credential, a built-in console admin, or a member of the
+    /// `admin` group: unrestricted, no policy applies — so nothing can deny it.
     Unrestricted {
         username: Option<String>,
         access_key: Option<String>,
@@ -51,6 +51,31 @@ impl Identity {
                 policy: Some(policy),
                 ..
             } => is_authorized(policy, requirements),
+            Identity::Iam { policy: None, .. } => false,
+        }
+    }
+
+    /// Whether this identity may list buckets at all. Listing is open to anyone
+    /// holding a policy — what they get back is filtered per bucket by
+    /// [`can_see_bucket`](Self::can_see_bucket) — unless that policy forbids
+    /// `s3:ListAllMyBuckets` in so many words.
+    pub fn may_list_buckets(&self) -> bool {
+        match self {
+            Identity::Unrestricted { .. } => true,
+            Identity::Iam { policy: Some(policy), .. } => {
+                !explicitly_denies(policy, &Requirement::all_buckets("s3:ListAllMyBuckets"))
+            }
+            Identity::Iam { policy: None, .. } => false,
+        }
+    }
+
+    /// Whether `bucket` appears in this identity's bucket listing. Shared by
+    /// the S3 API and the console so the two never disagree. Seeing a bucket
+    /// grants nothing: each request on it is still authorized on its own.
+    pub fn can_see_bucket(&self, bucket: &str) -> bool {
+        match self {
+            Identity::Unrestricted { .. } => true,
+            Identity::Iam { policy: Some(policy), .. } => bucket_visible(policy, bucket),
             Identity::Iam { policy: None, .. } => false,
         }
     }

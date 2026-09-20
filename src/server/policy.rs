@@ -456,6 +456,103 @@ pub fn evaluate(policy: &PolicyDocument, requirement: &Requirement) -> bool {
     allowed
 }
 
+/// True when a `Deny` statement matches `requirement` — as opposed to it
+/// merely not being allowed. Lets a caller that grants something by default
+/// still honor a policy that forbids it in so many words.
+pub fn explicitly_denies(policy: &PolicyDocument, requirement: &Requirement) -> bool {
+    policy.statement.iter().any(|statement| {
+        statement.effect == Effect::Deny
+            && statement
+                .action
+                .iter()
+                .any(|pattern| wildcard_match_ci(pattern, requirement.action))
+            && statement
+                .resource
+                .iter()
+                .any(|pattern| wildcard_match(pattern, &requirement.resource))
+            && conditions_match(statement.condition.as_ref(), &requirement.context)
+    })
+}
+
+/// Whether `bucket` belongs in this policy's bucket listing: the policy *may*
+/// give access to the bucket or to something inside it.
+///
+/// A listing is a convenience, not a grant — every request on a listed bucket
+/// is still authorized on its own — so this errs towards showing. Any `Allow`
+/// counts, whatever its action or condition, as long as its resource can reach
+/// the bucket ARN or a key under it: a user scoped to `team/shared/*` sees
+/// `team`, because that is where their objects are. The one thing that hides a
+/// bucket again is an unconditional `Deny` of listing on the bucket itself —
+/// the policy saying outright that this bucket is not theirs to look at.
+pub fn bucket_visible(policy: &PolicyDocument, bucket: &str) -> bool {
+    let bucket_arn = format!("arn:aws:s3:::{bucket}");
+    let object_prefix = format!("{bucket_arn}/");
+    let reaches = |statement: &Statement| {
+        statement.resource.iter().any(|pattern| {
+            wildcard_match(pattern, &bucket_arn) || wildcard_may_match_prefix(pattern, &object_prefix)
+        })
+    };
+    let hidden = policy.statement.iter().any(|statement| {
+        statement.effect == Effect::Deny
+            && statement.condition.is_none()
+            && statement
+                .action
+                .iter()
+                .any(|pattern| wildcard_match_ci(pattern, "s3:ListBucket"))
+            && statement
+                .resource
+                .iter()
+                .any(|pattern| wildcard_match(pattern, &bucket_arn))
+    });
+    !hidden
+        && policy
+            .statement
+            .iter()
+            .any(|statement| statement.effect == Effect::Allow && reaches(statement))
+}
+
+/// True when `pattern` matches at least one string that starts with `prefix`.
+///
+/// Walks the prefix through the glob, tracking every pattern position it could
+/// be at. If any position survives the whole prefix the answer is yes: whatever
+/// pattern is left can always be satisfied by choosing the rest of the string
+/// to suit it.
+fn wildcard_may_match_prefix(pattern: &str, prefix: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    // `*` matches the empty run, so a position on a star is also every position
+    // after it.
+    let close = |positions: &mut Vec<bool>| {
+        for i in 0..pattern.len() {
+            if positions[i] && pattern[i] == b'*' {
+                positions[i + 1] = true;
+            }
+        }
+    };
+    let mut positions = vec![false; pattern.len() + 1];
+    positions[0] = true;
+    close(&mut positions);
+    for &byte in prefix.as_bytes() {
+        let mut next = vec![false; pattern.len() + 1];
+        for i in 0..pattern.len() {
+            if !positions[i] {
+                continue;
+            }
+            match pattern[i] {
+                b'*' => next[i] = true,
+                b'?' => next[i + 1] = true,
+                literal if literal == byte => next[i + 1] = true,
+                _ => {}
+            }
+        }
+        close(&mut next);
+        if !next.iter().any(|&alive| alive) {
+            return false;
+        }
+        positions = next;
+    }
+    true
+}
+
 fn conditions_match(
     condition: Option<&Condition>,
     context: &BTreeMap<String, String>,
@@ -595,7 +692,12 @@ pub fn requirements_for_request(
     };
 
     if bucket.is_empty() {
-        return Some(vec![Requirement::all_buckets("s3:ListAllMyBuckets")]);
+        // ListBuckets is not gated here: the handler answers with the buckets
+        // the caller may see (`Identity::can_see_bucket`), which for a policy
+        // granting `s3:ListAllMyBuckets` is all of them. Refusing the call
+        // outright would leave a user scoped to one bucket unable to find it.
+        // A caller with no policy at all never gets this far.
+        return Some(Vec::new());
     }
     if has("rebuildIndex") {
         // A triggerable admin action, authorized as a custom IAM action rather
@@ -895,9 +997,103 @@ mod tests {
     }
 
     #[test]
+    fn a_glob_may_match_a_prefix_when_some_string_under_it_matches() {
+        let under = |pattern: &str| wildcard_may_match_prefix(pattern, "arn:aws:s3:::team/");
+        for yes in [
+            "*",
+            "arn:aws:s3:::*",
+            "arn:aws:s3:::team/*",
+            "arn:aws:s3:::team/shared/*",
+            "arn:aws:s3:::team/shared/report.pdf",
+            "arn:aws:s3:::te*",
+            "arn:aws:s3:::te?m/*",
+            "arn:aws:s3:::*/shared/*",
+            "arn:aws:s3:::t*m/x",
+        ] {
+            assert!(under(yes), "{yes}");
+        }
+        for no in [
+            "arn:aws:s3:::team",          // the bucket itself, nothing under it
+            "arn:aws:s3:::team-archive/*", // a sibling that starts the same way
+            "arn:aws:s3:::teams/*",
+            "arn:aws:s3:::other/*",
+            "arn:aws:s3:::tea",
+            "",
+        ] {
+            assert!(!under(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_bucket_is_listed_when_the_policy_may_reach_it_or_anything_in_it() {
+        let scoped = compile_rules(&[PolicyRule {
+            effect: Effect::Allow,
+            access: RuleAccess::Read,
+            bucket: "team".to_string(),
+            prefix: "shared/".to_string(),
+        }])
+        .unwrap();
+        // Scoped to a prefix — the bucket holding that prefix is still theirs
+        // to see, though an unqualified ListBucket on it is not allowed.
+        assert!(!evaluate(&scoped, &Requirement::bucket("s3:ListBucket", "team")));
+        assert!(bucket_visible(&scoped, "team"));
+        assert!(!bucket_visible(&scoped, "team-archive"));
+        assert!(!bucket_visible(&scoped, "tea"));
+        assert!(!bucket_visible(&scoped, "other"));
+
+        // An object-only grant, with no bucket-level statement at all.
+        let one_object = policy(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::drop/inbox/*"}]}"#,
+        );
+        assert!(bucket_visible(&one_object, "drop"));
+        assert!(!bucket_visible(&one_object, "dropbox"));
+
+        // Wildcard buckets, and the AWS-style account-wide grant.
+        let wild = policy(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::logs-*/*"}]}"#,
+        );
+        assert!(bucket_visible(&wild, "logs-2026"));
+        assert!(!bucket_visible(&wild, "logs"));
+        let account_wide = policy(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"arn:aws:s3:::*"}]}"#,
+        );
+        assert!(bucket_visible(&account_wide, "anything"));
+
+        // A Deny inside the bucket leaves it listed; a Deny of listing on the
+        // bucket itself takes it off the list.
+        let carved = policy(r#"{"Statement":[
+            {"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::*"},
+            {"Effect":"Deny","Action":"s3:*","Resource":"arn:aws:s3:::docs/secret/*"},
+            {"Effect":"Deny","Action":"s3:*","Resource":["arn:aws:s3:::vault","arn:aws:s3:::vault/*"]}
+        ]}"#);
+        assert!(bucket_visible(&carved, "docs"));
+        assert!(bucket_visible(&carved, "plain"));
+        assert!(!bucket_visible(&carved, "vault"));
+        // A Deny on its own shows nothing.
+        let deny_only = policy(
+            r#"{"Statement":[{"Effect":"Deny","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::*"}]}"#,
+        );
+        assert!(!bucket_visible(&deny_only, "docs"));
+    }
+
+    #[test]
+    fn an_explicit_deny_is_told_apart_from_a_mere_absence_of_allow() {
+        let list_all = Requirement::all_buckets("s3:ListAllMyBuckets");
+        let silent = policy(READ_ONLY_DOCS);
+        assert!(!evaluate(&silent, &list_all));
+        assert!(!explicitly_denies(&silent, &list_all));
+        let forbids = policy(
+            r#"{"Statement":[{"Effect":"Deny","Action":"s3:ListAllMyBuckets","Resource":"arn:aws:s3:::*"}]}"#,
+        );
+        assert!(explicitly_denies(&forbids, &list_all));
+        assert!(!explicitly_denies(&forbids, &Requirement::object("s3:GetObject", "b", "k")));
+    }
+
+    #[test]
     fn requirements_mapping_covers_core_operations() {
         let r = |m: &str, p: &str, q: &str| requirements_for_request(m, p, q, None).unwrap();
-        assert_eq!(r("GET", "/", "")[0].action, "s3:ListAllMyBuckets");
+        // ListBuckets carries no requirement: the handler filters the answer.
+        assert!(r("GET", "/", "").is_empty());
         assert_eq!(r("GET", "/b", "list-type=2")[0].action, "s3:ListBucket");
         assert_eq!(r("GET", "/b", "uploads")[0].action, "s3:ListBucketMultipartUploads");
         assert_eq!(r("PUT", "/b", "")[0].action, "s3:CreateBucket");

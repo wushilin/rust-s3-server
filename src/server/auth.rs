@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use super::config::AppConfig;
 use super::iam::{IamStore, Principal};
+use super::key_usage::KeyUsageStore;
 use super::identity::Identity;
 use super::logging::{TARGET_AUTH, TARGET_AUTHZ};
 use super::policy::{is_authorized, requirements_for_request, PolicyDocument};
@@ -36,6 +37,8 @@ const MAX_SIGNATURE_CLOCK_SKEW_SECS: i64 = 15 * 60;
 pub struct AuthState {
     pub config: Arc<AppConfig>,
     pub iam: Option<IamStore>,
+    /// "Last used" stamps for access keys; `None` disables tracking.
+    pub usage: Option<KeyUsageStore>,
 }
 
 impl AuthState {
@@ -63,6 +66,60 @@ impl AuthState {
             return Some((secret, Principal::IamUser(username)));
         }
         None
+    }
+
+    /// Stamps `access_key` as used just now. Call only once its signature has
+    /// verified, so a request merely *naming* a key never counts as a use.
+    /// Hidden `RSWEB_…` console signing keys are never listed, so not tracked.
+    pub(crate) fn record_key_use(&self, access_key: Option<&str>, from: Option<&str>) {
+        let (Some(usage), Some(access_key)) = (self.usage.as_ref(), access_key) else {
+            return;
+        };
+        if access_key.starts_with("RSWEB_") {
+            return;
+        }
+        usage.record(access_key, crate::storage::time::now_ms(), from.unwrap_or("unknown"));
+    }
+}
+
+/// The caller's address (see [`client_ip`]), attached to a request whose
+/// authentication is deferred to a handler that no longer has the connection
+/// info — the browser-POST form upload.
+#[derive(Debug, Clone)]
+pub(crate) struct ClientIp(pub String);
+
+/// The address a request came from, for display.
+///
+/// That is the TCP peer — unless the peer is on a loopback or private network,
+/// in which case it may be a reverse proxy, and the client address it reported
+/// is used instead: the *last* `X-Forwarded-For` entry (the one that proxy
+/// appended; earlier entries are whatever the client claimed), else
+/// `X-Real-IP`. A peer on a public address is never allowed to speak for
+/// anyone else, so an internet client cannot forge this.
+pub(crate) fn client_ip(extensions: &axum::http::Extensions, headers: &HeaderMap) -> Option<String> {
+    let peer = extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip().to_canonical());
+    if peer.is_some_and(|ip| !may_be_proxy(&ip)) {
+        return peer.map(|ip| ip.to_string());
+    }
+    let forwarded = header_str(headers, "x-forwarded-for")
+        .and_then(|value| value.rsplit(',').next())
+        .or_else(|| header_str(headers, "x-real-ip"))
+        .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_canonical());
+    forwarded.or(peer).map(|ip| ip.to_string())
+}
+
+/// Loopback, private-range, and link-local peers — where a reverse proxy lives.
+fn may_be_proxy(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
     }
 }
 
@@ -97,6 +154,9 @@ pub async fn auth_middleware(
     if is_browser_post_upload(&request) && !post_selects_operation(&request) {
         log::debug!(target: TARGET_AUTH, "[{rid}] authn deferred to browser-POST form verification");
         request.extensions_mut().insert(state.clone());
+        if let Some(ip) = client_ip(request.extensions(), request.headers()) {
+            request.extensions_mut().insert(ClientIp(ip));
+        }
         return next.run(request).await;
     }
 
@@ -127,6 +187,10 @@ pub async fn auth_middleware(
         authn_start.elapsed().as_micros()
     );
     let actor = operation_actor(&state, Some(&principal), claimed_access_key(&request));
+    state.record_key_use(
+        actor.access_key.as_deref(),
+        client_ip(request.extensions(), request.headers()).as_deref(),
+    );
 
     // Phase 2 — authorization: enforce the IAM policy bound to the caller
     // (root config credentials are unrestricted and skip this), then attach the
@@ -136,7 +200,17 @@ pub async fn auth_middleware(
         Principal::Root => Identity::root(actor.username.clone(), actor.access_key.clone()),
         Principal::IamUser(username) => {
             let authz_start = std::time::Instant::now();
-            let Some(policy) = state.iam.as_ref().and_then(|iam| iam.policy_for(username)) else {
+            let identity = match state.iam.as_ref() {
+                Some(iam) => iam.identity_for(username),
+                None => Identity::iam(username.clone(), None),
+            };
+            // Members of the admin group are root: nothing to evaluate.
+            if identity.is_unrestricted() {
+                log::debug!(target: TARGET_AUTHZ, "[{rid}] authz ok user={username} (admin)");
+                request.extensions_mut().insert(identity);
+                return with_operation_actor(next.run(request).await, actor);
+            }
+            let Some(policy) = identity.policy().cloned() else {
                 log::warn!(target: TARGET_AUTHZ, "[{rid}] authz DENY user={username} reason=no_policy_attached");
                 return with_operation_actor(access_denied(), actor);
             };
@@ -336,15 +410,13 @@ pub(crate) fn authorize_browser_post(
     // replayed against a different target.
     verify_post_policy_document(policy_b64, bucket, key)?;
 
-    // An IAM principal is still bound by its user policy.
+    // An IAM principal is still bound by its user policy (admins are root).
     if let Principal::IamUser(username) = &principal {
-        let Some(policy) = state.iam.as_ref().and_then(|iam| iam.policy_for(username)) else {
-            return Err(access_denied());
+        let identity = match state.iam.as_ref() {
+            Some(iam) => iam.identity_for(username),
+            None => Identity::iam(username.clone(), None),
         };
-        if !is_authorized(
-            &policy,
-            &[super::policy::Requirement::object("s3:PutObject", bucket, key)],
-        ) {
+        if !identity.authorize(&[super::policy::Requirement::object("s3:PutObject", bucket, key)]) {
             log::warn!(target: TARGET_AUTHZ, "s3 browser POST denied by policy user={username} bucket={bucket} key={key}");
             return Err(access_denied());
         }
@@ -1497,7 +1569,7 @@ mod tests {
             .header("authorization", format!("AWS AKID:{signature}"))
             .body(Body::empty())
             .unwrap();
-        let state = AuthState { config: Arc::new(config), iam: None };
+        let state = AuthState { config: Arc::new(config), iam: None, usage: None };
         assert_eq!(validate_request(&state, &request), Ok(Principal::Root));
     }
 
@@ -1530,7 +1602,7 @@ mod tests {
             ))
             .body(Body::empty())
             .unwrap();
-        let state = AuthState { config: Arc::new(config), iam: None };
+        let state = AuthState { config: Arc::new(config), iam: None, usage: None };
         assert_eq!(validate_request(&state, &request), Ok(Principal::Root));
     }
 
@@ -1538,7 +1610,7 @@ mod tests {
     fn minio_health_and_metrics_paths_bypass_auth() {
         let mut config = AppConfig::default();
         config.auth.enabled = true;
-        let state = AuthState { config: Arc::new(config), iam: None };
+        let state = AuthState { config: Arc::new(config), iam: None, usage: None };
         for path in [
             "/minio/health/live",
             "/minio/health/ready",
@@ -1575,7 +1647,7 @@ mod tests {
             .header("authorization", "AWS4-HMAC-SHA256 Credential=AKID/1/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123")
             .body(Body::empty())
             .unwrap();
-        let state = AuthState { config: Arc::new(config), iam: None };
+        let state = AuthState { config: Arc::new(config), iam: None, usage: None };
         assert_eq!(
             validate_request(&state, &request),
             Err("Invalid x-amz-date header")
@@ -1648,6 +1720,7 @@ mod tests {
         AuthState {
             config: Arc::new(config),
             iam: None,
+            usage: None,
         }
     }
 
@@ -1697,6 +1770,69 @@ mod tests {
         let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let expired = signed_post_fields("AKID", "secret", "b", "uploads/", &past);
         assert!(authorize_browser_post(&state, &expired, "b", "uploads/x").is_err());
+    }
+
+    fn ip_of(peer: &str, headers: &[(&str, &str)]) -> Option<String> {
+        let mut extensions = axum::http::Extensions::new();
+        extensions.insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        client_ip(&extensions, &map)
+    }
+
+    #[test]
+    fn client_ip_trusts_forwarding_headers_only_from_a_private_peer() {
+        // A public peer speaks only for itself, whatever it claims.
+        assert_eq!(
+            ip_of("203.0.113.9:4000", &[("x-forwarded-for", "10.1.1.1")]).as_deref(),
+            Some("203.0.113.9")
+        );
+        // Behind a proxy: the entry the proxy appended (the last), never the
+        // client-supplied ones before it.
+        assert_eq!(
+            ip_of("127.0.0.1:4000", &[("x-forwarded-for", "6.6.6.6, 198.51.100.7")]).as_deref(),
+            Some("198.51.100.7")
+        );
+        assert_eq!(
+            ip_of("192.168.44.1:4000", &[("x-real-ip", "198.51.100.8")]).as_deref(),
+            Some("198.51.100.8")
+        );
+        // A private peer with no (or junk) forwarding info is a LAN client.
+        assert_eq!(ip_of("192.168.44.62:4000", &[]).as_deref(), Some("192.168.44.62"));
+        assert_eq!(
+            ip_of("10.0.0.5:4000", &[("x-forwarded-for", "not-an-ip")]).as_deref(),
+            Some("10.0.0.5")
+        );
+        // IPv4-mapped peers print as plain IPv4.
+        assert_eq!(ip_of("[::ffff:203.0.113.9]:4000", &[]).as_deref(), Some("203.0.113.9"));
+        // No connect info at all (a unit-tested router): nothing to report.
+        assert_eq!(client_ip(&axum::http::Extensions::new(), &HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn key_use_is_recorded_for_real_keys_but_not_console_signing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = auth_state_with_root_key("AKROOT", "secret");
+        state.usage = Some(KeyUsageStore::open(dir.path()).await.unwrap());
+        let usage = state.usage.clone().unwrap();
+
+        state.record_key_use(Some("AKROOT"), Some("198.51.100.7"));
+        state.record_key_use(Some("RSWEB_alice_abc"), Some("198.51.100.7"));
+        state.record_key_use(None, Some("198.51.100.7"));
+        state.record_key_use(Some("RSAKNOIP"), None);
+
+        let root = usage.get("AKROOT").unwrap();
+        assert_eq!(root.last_used_from, "198.51.100.7");
+        assert!(root.last_used_at_ms > 0);
+        assert!(usage.get("RSWEB_alice_abc").is_none());
+        assert_eq!(usage.get("RSAKNOIP").unwrap().last_used_from, "unknown");
     }
 
     #[test]

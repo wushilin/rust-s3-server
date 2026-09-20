@@ -211,6 +211,24 @@ Built-in users live in configuration, cannot be edited at runtime, and bypass
 policy checks. Runtime users, groups, access keys, and policies live in
 `<base_dir>/admin.rocksdb` and are **default-deny** unless an attached
 user/group policy allows the request; a matching explicit deny always wins.
+A user's effective policy is their own plus that of every group they belong to,
+and any change to it applies to the next request of an already-issued key.
+
+- **The `admin` group is root.** Its members are unrestricted exactly like
+  built-in users: no policy is evaluated for them, so no deny — from another
+  group or attached to them directly — can bind them.
+- **Listing buckets is filtered, not refused.** `ListBuckets` (and the console)
+  show a caller the buckets their policy may reach, including one they hold only
+  a prefix of. Granting `s3:ListAllMyBuckets` lists every bucket, a deny on a
+  whole bucket hides it, and an explicit deny of `s3:ListAllMyBuckets` refuses
+  the call. Seeing a bucket grants nothing in it.
+- **Access keys carry tags and a last-used stamp.** Every key needs at least one
+  tag (letters, digits, and spaces; up to 100 tags of 256 characters) saying what
+  uses it; tags are the only editable part of a key. The console shows when and
+  from which address each key — built-in ones included — last authenticated.
+  Behind a reverse proxy on a private address the client address is taken from
+  `X-Forwarded-For`/`X-Real-IP`. The stamps live in
+  `<base_dir>/key_usage.rocksdb`, apart from the IAM database and its export.
 
 Bcrypt is recommended for console passwords (cleartext is still accepted). S3
 secrets must stay recoverable, because request authentication needs the original

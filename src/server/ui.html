@@ -145,7 +145,7 @@
         <div class="content-head"><div><h2>My Access Keys</h2><p>Credentials used by your applications and S3-compatible clients.</p></div><span class="spacer"></span><button class="btn primary" onclick="createMyKey()"><span data-icon="plus"></span> Create access key</button></div>
         <div class="panel">
           <div class="panel-title"><div><h3>My access keys</h3><p>Secrets are only shown once when a key is created.</p></div><span class="spacer"></span><span class="badge" id="keyCount"></span></div>
-          <div class="table-wrap"><table><thead><tr><th>Access key</th><th>Created</th><th style="width:80px"></th></tr></thead><tbody id="keyRows"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Tags</th><th>Access key</th><th>Created</th><th>Last used</th><th style="width:110px"></th></tr></thead><tbody id="keyRows"></tbody></table></div>
           <div id="keyEmpty" class="empty hidden"></div>
         </div>
       </section>
@@ -395,6 +395,14 @@
     <datalist id="policyBuckets"></datalist><div id="policyError" class="inline-error"></div>
   </div>
   <div class="dialog-actions"><button class="btn danger" onclick="savePolicy(null)">Detach policy</button><span class="spacer"></span><button class="btn" onclick="policyDlg.close()">Cancel</button><button class="btn primary" onclick="savePolicy()">Save policy</button></div>
+</dialog>
+
+<dialog id="keyTagsDlg">
+  <form onsubmit="submitKeyTags(event)">
+    <div class="dialog-head"><div><h3 id="kt_title"></h3><p id="kt_subtitle"></p></div><button type="button" class="dialog-close" onclick="keyTagsDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body"><div class="field"><label for="kt_input">Tags</label><div class="tag-input" id="kt_box" onclick="$('kt_input').focus()"><span id="kt_chips" style="display:contents"></span><input id="kt_input" maxlength="256" placeholder="e.g. backup job, nas01" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div><div class="muted" style="font-size:11.5px">At least one tag is required. Type a comma or semicolon to finish a tag. Letters, digits, and spaces only. Tag what uses this key, so you can tell later whether it is safe to revoke.</div><div id="keyTagsError" class="inline-error"></div></div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="keyTagsDlg.close()">Cancel</button><button class="btn primary" type="submit" id="kt_submit"></button></div>
+  </form>
 </dialog>
 
 <dialog id="secretDlg">

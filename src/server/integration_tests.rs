@@ -35,6 +35,7 @@
                 super::auth::AuthState {
                     config: std::sync::Arc::new(super::config::AppConfig::default()),
                     iam: None,
+                    usage: None,
                 },
                 metrics.clone(),
                 super::registry::TaskRegistry::new(),
@@ -2603,6 +2604,7 @@
             Some(axum::Extension(authority.clone())),
             None,
             None,
+            None,
             Body::from(delete_xml),
         )
         .await;
@@ -2623,6 +2625,7 @@
             axum::http::Method::POST,
             None,
             Some(axum::Extension(authority)),
+            None,
             None,
             None,
             Body::from(r#"<Delete><Object><Key>private/b.txt</Key></Object></Delete>"#),

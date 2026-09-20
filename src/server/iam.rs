@@ -37,6 +37,7 @@ use sha2::Sha256;
 /// Multi-threaded RocksDB handle (see the same alias in `storage::index`).
 type Db = DBWithThreadMode<MultiThreaded>;
 
+use super::identity::Identity;
 use super::policy::{Effect, OneOrMany, PolicyDocument, Statement};
 use crate::storage::errors::{Result, StorageError};
 use crate::storage::time::now_ms;
@@ -48,6 +49,14 @@ const SESSION_TTL_MS: i64 = 12 * 60 * 60 * 1000;
 
 /// Highest entity value version this build understands. See module docs.
 const ENTITY_VERSION: u32 = 1;
+
+/// The single tag of an access key that was stored before tags existed.
+pub const DEFAULT_KEY_TAG: &str = "default";
+const MAX_KEY_TAG_CHARS: usize = 256;
+const MAX_KEY_TAGS: usize = 100;
+/// Separates tags inside the stored `label` string. Tags are restricted to
+/// letters, digits, and spaces, so it can never occur inside one.
+const KEY_TAG_SEP: char = ',';
 
 const CF_USERS: &str = "users";
 const CF_GROUPS: &str = "groups";
@@ -152,6 +161,9 @@ pub struct AccessKey {
     pub access_key: String,
     pub secret_key: String,
     pub username: String,
+    /// What the key is for — the apps, hosts, or owners using it. Never empty:
+    /// a key stored before tags existed reads back as [`DEFAULT_KEY_TAG`].
+    pub tags: Vec<String>,
     pub created_at_ms: i64,
 }
 
@@ -220,8 +232,33 @@ struct AccessKeyV1 {
     secret_key: String,
     #[serde(default)]
     username: String,
+    /// The key's tags joined with [`KEY_TAG_SEP`]; see [`AccessKeyV1::tags`].
+    /// The field began life as a free-text label, hence the name — keeping it
+    /// means a label written by that build is simply a one-tag key, and that
+    /// build still reads what this one writes. Absent on older keys still.
+    #[serde(default)]
+    label: String,
     #[serde(default)]
     created_at_ms: i64,
+}
+
+impl AccessKeyV1 {
+    /// The key's tags. Reading is lenient where writing is strict: whatever an
+    /// older build stored is split and shown as it is, never rejected, and a
+    /// key stored with nothing at all gets [`DEFAULT_KEY_TAG`].
+    fn tags(&self) -> Vec<String> {
+        let tags: Vec<String> = self
+            .label
+            .split(KEY_TAG_SEP)
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect();
+        match tags.is_empty() {
+            true => vec![DEFAULT_KEY_TAG.to_string()],
+            false => tags,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -456,6 +493,16 @@ impl IamStore {
         }
 
         for (username, direct) in direct_policies {
+            // An administrator is root: their effective policy is the admin
+            // grant and nothing else, so no Deny — from another group or from
+            // a policy attached to them directly — can bind them. (Request
+            // paths go further and skip evaluation altogether; see
+            // `identity_for`. This keeps `policy_for` from saying otherwise.)
+            let memberships = snapshot.memberships.get(&username);
+            if memberships.is_some_and(|groups| groups.contains(&Group::Admin)) {
+                snapshot.policies.insert(username, Group::Admin.policy(&group_policies));
+                continue;
+            }
             let mut statements = direct
                 .into_iter()
                 .flat_map(|policy| policy.statement)
@@ -566,6 +613,18 @@ impl IamStore {
     /// treated as deny-everything.
     pub fn policy_for(&self, username: &str) -> Option<PolicyDocument> {
         self.snapshot.read().unwrap().policies.get(username).cloned().flatten()
+    }
+
+    /// The identity an IAM user acts as — the one place that decides it, for
+    /// the S3 API and the console alike. A member of the `admin` group is root
+    /// in every sense: unrestricted, with no policy evaluated at all, so there
+    /// is nothing a Deny could attach to. Everyone else is bound by their
+    /// effective policy (none attached denies everything).
+    pub fn identity_for(&self, username: &str) -> Identity {
+        match self.is_admin(username) {
+            true => Identity::root(Some(username.to_string()), None),
+            false => Identity::iam(username.to_string(), self.policy_for(username)),
+        }
     }
 
     pub fn user_exists(&self, username: &str) -> bool {
@@ -796,7 +855,21 @@ impl IamStore {
                 is_system: false,
                 created_at_ms: now_ms(),
             };
-            db.put_cf_opt(&groups, key.as_bytes(), to_vec(&value), &sync_write())?;
+            // A new group starts with no members. Memberships are keyed by
+            // group *name*, so a row left under this name — by a delete that
+            // raced an assignment, or by an import that carried memberships
+            // without their group — would otherwise come alive here and hand
+            // its user this group's policy without anyone having added them.
+            let user_groups = cf(&db, CF_USER_GROUPS)?;
+            let mut batch = WriteBatch::default();
+            for item in db.iterator_cf(&user_groups, IteratorMode::Start) {
+                let (membership, _) = item?;
+                if split_membership_key(&membership).is_some_and(|(_, g)| g == key) {
+                    batch.delete_cf(&user_groups, &membership);
+                }
+            }
+            batch.put_cf(&groups, key.as_bytes(), to_vec(&value));
+            db.write_opt(batch, &sync_write())?;
             Ok(())
         })
         .await?;
@@ -902,6 +975,15 @@ impl IamStore {
         let group_lowers: Vec<String> = groups.iter().map(|g| g.name().to_ascii_lowercase()).collect();
         blocking(move || {
             let user_groups = cf(&db, CF_USER_GROUPS)?;
+            // Every group must exist *now*: a `Group` value only proves the name
+            // was well-formed, or that the group existed when it was resolved.
+            // See `create_group` for what a membership without a group would do.
+            let groups = cf(&db, CF_GROUPS)?;
+            for group_lower in &group_lowers {
+                if db.get_cf(&groups, group_lower.as_bytes())?.is_none() {
+                    return Err(StorageError::Io(format!("no such group {group_lower}")));
+                }
+            }
             let mut batch = WriteBatch::default();
             // Clear the user's existing memberships (prefix `username\0`).
             let prefix = membership_key(&username_owned, "");
@@ -946,7 +1028,7 @@ impl IamStore {
 
     // ── access keys ───────────────────────────────────────────────────────────
 
-    pub async fn create_access_key(&self, username: &str) -> Result<AccessKey> {
+    pub async fn create_access_key(&self, username: &str, tags: &[String]) -> Result<AccessKey> {
         if !self.user_exists(username) {
             return Err(StorageError::Io(format!("no such user {username}")));
         }
@@ -954,6 +1036,7 @@ impl IamStore {
             access_key: format!("RSAK{}", random_hex(8).to_uppercase()),
             secret_key: random_hex(20),
             username: username.to_string(),
+            tags: validate_key_tags(tags)?,
             created_at_ms: now_ms(),
         };
         let db = self.db.clone();
@@ -965,6 +1048,7 @@ impl IamStore {
                 access_key: stored.access_key.clone(),
                 secret_key: stored.secret_key,
                 username: stored.username,
+                label: join_key_tags(&stored.tags),
                 created_at_ms: stored.created_at_ms,
             };
             db.put_cf_opt(&access, stored.access_key.as_bytes(), to_vec(&value), &sync_write())?;
@@ -973,6 +1057,26 @@ impl IamStore {
         .await?;
         self.reload().await?;
         Ok(key)
+    }
+
+    /// Replaces an existing access key's tags. The secret, owner, and creation
+    /// time are untouched, so nothing the auth path reads changes.
+    pub async fn set_access_key_tags(&self, access_key: &str, tags: &[String]) -> Result<()> {
+        let label = join_key_tags(&validate_key_tags(tags)?);
+        let db = self.db.clone();
+        let access_key_owned = access_key.to_string();
+        blocking(move || {
+            let access = cf(&db, CF_ACCESS_KEYS)?;
+            let Some(value) = db.get_cf(&access, access_key_owned.as_bytes())? else {
+                return Err(StorageError::Io(format!("no such access key {access_key_owned}")));
+            };
+            let mut ak: AccessKeyV1 = from_slice(&value)?;
+            reject_newer(ak.v, "access key")?;
+            ak.label = label;
+            db.put_cf_opt(&access, access_key_owned.as_bytes(), to_vec(&ak), &sync_write())?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn delete_access_key(&self, access_key: &str) -> Result<()> {
@@ -1000,6 +1104,7 @@ impl IamStore {
                 if ak.username == username_owned {
                     keys.push(AccessKey {
                         access_key: String::from_utf8_lossy(&key).into_owned(),
+                        tags: ak.tags(),
                         secret_key: ak.secret_key,
                         username: ak.username,
                         created_at_ms: ak.created_at_ms,
@@ -1107,6 +1212,48 @@ fn validate_username(username: &str) -> Result<()> {
     }
 }
 
+/// Normalizes caller-supplied access key tags. Each is trimmed with inner
+/// whitespace runs collapsed, and may hold only ASCII letters, digits, and
+/// spaces — so a tag can never contain the separator it is stored with, nor
+/// anything that needs escaping where it is rendered. Blank entries are
+/// dropped and case-insensitive duplicates keep their first spelling. At least
+/// one tag must remain.
+fn validate_key_tags(tags: &[String]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in tags {
+        let tag = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if tag.is_empty() {
+            continue;
+        }
+        if !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ') {
+            return Err(StorageError::Io(format!(
+                "invalid tag {tag:?}: tags may contain only letters, digits, and spaces"
+            )));
+        }
+        if tag.len() > MAX_KEY_TAG_CHARS {
+            return Err(StorageError::Io(format!(
+                "tag {tag:?} is longer than {MAX_KEY_TAG_CHARS} characters"
+            )));
+        }
+        if !out.iter().any(|seen| seen.eq_ignore_ascii_case(&tag)) {
+            out.push(tag);
+        }
+    }
+    if out.is_empty() {
+        return Err(StorageError::Io("an access key needs at least one tag".into()));
+    }
+    if out.len() > MAX_KEY_TAGS {
+        return Err(StorageError::Io(format!(
+            "an access key can have at most {MAX_KEY_TAGS} tags"
+        )));
+    }
+    Ok(out)
+}
+
+fn join_key_tags(tags: &[String]) -> String {
+    tags.join(&KEY_TAG_SEP.to_string())
+}
+
 fn validate_group_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -1199,11 +1346,109 @@ mod tests {
         assert!(iam.find_web_key(&ak).is_none());
     }
 
+    fn tags(tags: &[&str]) -> Vec<String> {
+        tags.iter().map(|tag| tag.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn access_key_tags_are_required_validated_and_editable() {
+        let (_tmp, iam) = open_tmp().await;
+        iam.create_user("dave", "password123").await.unwrap();
+
+        // At least one tag; letters, digits, and spaces only; bounded.
+        assert!(iam.create_access_key("dave", &[]).await.is_err());
+        assert!(iam.create_access_key("dave", &tags(&["  ", ""])).await.is_err());
+        for bad in ["back-up", "a,b", "a;b", "caf\u{e9}", "under_score", "<b>", "nul\0"] {
+            assert!(iam.create_access_key("dave", &tags(&[bad])).await.is_err(), "{bad:?}");
+        }
+        assert!(iam.create_access_key("dave", &tags(&[&"x".repeat(257)])).await.is_err());
+        let too_many: Vec<String> = (0..101).map(|i| format!("t{i}")).collect();
+        assert!(iam.create_access_key("dave", &too_many).await.is_err());
+        // The limits themselves are fine, and survive the round trip to disk.
+        let mut most: Vec<String> = (0..99).map(|i| format!("t{i}")).collect();
+        most.push("x".repeat(256));
+        let big = iam.create_access_key("dave", &most).await.unwrap();
+        assert_eq!(big.tags, most);
+        assert_eq!(iam.list_access_keys("dave").await.unwrap()[0].tags, most);
+        iam.delete_access_key(&big.access_key).await.unwrap();
+
+        // Normalized: trimmed, inner spaces collapsed, blanks dropped, and
+        // duplicates folded case-insensitively onto their first spelling.
+        let key = iam
+            .create_access_key("dave", &tags(&["  Backup   Job ", "", "nas01", "NAS01", "backup job"]))
+            .await
+            .unwrap();
+        assert_eq!(key.tags, ["Backup Job", "nas01"]);
+        // Any whitespace counts as a space, so what is stored is still only
+        // letters, digits, and single spaces.
+        let odd = iam.create_access_key("dave", &tags(&["new\nline\there"])).await.unwrap();
+        assert_eq!(odd.tags, ["new line here"]);
+        iam.delete_access_key(&odd.access_key).await.unwrap();
+        let listed = iam.list_access_keys("dave").await.unwrap();
+        assert_eq!(listed[0].tags, ["Backup Job", "nas01"]);
+
+        // Retagging keeps the credential intact, and is validated the same way.
+        iam.set_access_key_tags(&key.access_key, &tags(&["prod", "etl 2"])).await.unwrap();
+        assert!(iam.set_access_key_tags(&key.access_key, &[]).await.is_err());
+        assert!(iam.set_access_key_tags(&key.access_key, &tags(&["no-hyphens"])).await.is_err());
+        assert!(iam.set_access_key_tags("RSAKNOPE", &tags(&["x"])).await.is_err());
+        let listed = iam.list_access_keys("dave").await.unwrap();
+        assert_eq!(listed[0].tags, ["prod", "etl 2"]);
+        assert_eq!(listed[0].secret_key, key.secret_key);
+        assert_eq!(listed[0].created_at_ms, key.created_at_ms);
+        assert_eq!(
+            iam.find_key(&key.access_key).unwrap(),
+            (key.secret_key.clone(), "dave".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_from_before_tags_read_back_as_tags_without_migration() {
+        let (_tmp, iam) = open_tmp().await;
+        iam.create_user("erin", "password123").await.unwrap();
+        let rows: [(&str, &[u8]); 4] = [
+            // No `label` at all: the original format.
+            ("RSAK1", br#"{"v":1,"secret_key":"s1","username":"erin","created_at_ms":1}"#),
+            // A free-text label from the label build, characters tags now refuse included.
+            ("RSAK2", br#"{"v":1,"secret_key":"s2","username":"erin","label":"nas01-backup (old)","created_at_ms":2}"#),
+            // A label that happened to contain commas.
+            ("RSAK3", br#"{"v":1,"secret_key":"s3","username":"erin","label":"etl, prod ,,","created_at_ms":3}"#),
+            ("RSAK4", br#"{"v":1,"secret_key":"s4","username":"erin","label":" , ","created_at_ms":4}"#),
+        ];
+        {
+            let access = cf(&iam.db, CF_ACCESS_KEYS).unwrap();
+            for (ak, value) in rows {
+                iam.db.put_cf(&access, ak.as_bytes(), value).unwrap();
+            }
+        }
+        iam.reload().await.unwrap();
+        assert_eq!(iam.find_key("RSAK2").unwrap().0, "s2");
+        let listed = iam.list_access_keys("erin").await.unwrap();
+        let got: Vec<_> = listed.iter().map(|k| (k.access_key.as_str(), k.tags.clone())).collect();
+        assert_eq!(
+            got,
+            [
+                ("RSAK1", tags(&[DEFAULT_KEY_TAG])),
+                ("RSAK2", tags(&["nas01-backup (old)"])),
+                ("RSAK3", tags(&["etl", "prod"])),
+                ("RSAK4", tags(&[DEFAULT_KEY_TAG])),
+            ]
+        );
+
+        // What this build writes, the label build reads back as its label.
+        iam.set_access_key_tags("RSAK1", &tags(&["etl", "prod"])).await.unwrap();
+        let access = cf(&iam.db, CF_ACCESS_KEYS).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&iam.db.get_cf(&access, b"RSAK1").unwrap().unwrap()).unwrap();
+        assert_eq!(stored["label"], "etl,prod");
+        assert_eq!(stored["secret_key"], "s1");
+    }
+
     #[tokio::test]
     async fn access_keys_resolve_to_owner_and_policy() {
         let (_tmp, iam) = open_tmp().await;
         iam.create_user("bob", "password123").await.unwrap();
-        let key = iam.create_access_key("bob").await.unwrap();
+        let key = iam.create_access_key("bob", &["ci".to_string()]).await.unwrap();
         let (secret, owner) = iam.find_key(&key.access_key).unwrap();
         assert_eq!(secret, key.secret_key);
         assert_eq!(owner, "bob");
@@ -1225,7 +1470,7 @@ mod tests {
         let key = {
             let iam = IamStore::open(tmp.path()).await.unwrap();
             iam.create_user("carol", "password123").await.unwrap();
-            iam.create_access_key("carol").await.unwrap()
+            iam.create_access_key("carol", &["ci".to_string()]).await.unwrap()
         };
         let iam = IamStore::open(tmp.path()).await.unwrap();
         assert!(iam.verify_password("carol", "password123").await.unwrap());
@@ -1303,6 +1548,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_orphan_membership_row_never_comes_alive_when_its_group_is_created() {
+        let (_tmp, iam) = open_tmp().await;
+        iam.create_user("ivy", "password123").await.unwrap();
+        iam.create_user("ivan", "password123").await.unwrap();
+        iam.create_group("keepers", None).await.unwrap();
+        iam.set_user_groups("ivan", &[Group::named("keepers").unwrap()]).await.unwrap();
+
+        // The front door is shut: a membership needs a group that exists, and a
+        // refused call changes nothing.
+        let ghost = [Group::named("keepers").unwrap(), Group::named("ghost").unwrap()];
+        assert!(iam.set_user_groups("ivy", &ghost).await.is_err());
+        assert!(iam.groups_for("ivy").is_empty());
+
+        // An orphan row that got in some other way (a delete racing an
+        // assignment, an import carrying memberships without their group).
+        {
+            let user_groups = cf(&iam.db, CF_USER_GROUPS).unwrap();
+            iam.db.put_cf(&user_groups, membership_key("ivy", "ghost"), []).unwrap();
+        }
+        iam.reload().await.unwrap();
+        assert!(iam.groups_for("ivy").is_empty());
+        assert!(iam.policy_for("ivy").is_none());
+
+        let everything: PolicyDocument = serde_json::from_str(
+            r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::*"}]}"#,
+        )
+        .unwrap();
+        iam.create_group("Ghost", Some(&everything)).await.unwrap();
+        assert!(iam.groups_for("ivy").is_empty());
+        assert!(iam.policy_for("ivy").is_none());
+        let ghost_group = iam.list_groups().await.unwrap().into_iter().find(|g| g.group.name() == "Ghost").unwrap();
+        assert_eq!(ghost_group.members, 0);
+        // Creating it swept only that name's rows.
+        assert_eq!(iam.groups_for("ivan"), ["keepers"]);
+        // And a real membership in the new group works as ever.
+        iam.set_user_groups("ivy", &[Group::named("ghost").unwrap()]).await.unwrap();
+        assert_eq!(iam.groups_for("ivy"), ["Ghost"]);
+        assert!(iam.policy_for("ivy").is_some());
+    }
+
+    #[tokio::test]
     async fn group_lifecycle_and_member_counts() {
         let (_tmp, iam) = open_tmp().await;
         iam.create_user("hank", "password123").await.unwrap();
@@ -1330,7 +1616,7 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let iam = IamStore::open(src.path()).await.unwrap();
         iam.create_user("alice", "password123").await.unwrap();
-        let key = iam.create_access_key("alice").await.unwrap();
+        let key = iam.create_access_key("alice", &["ci".to_string()]).await.unwrap();
         iam.create_group("ops", None).await.unwrap();
         iam.set_user_groups("alice", &[Group::named("ops").unwrap()]).await.unwrap();
         let (webak, _) = iam.web_key_for("alice", false).await.unwrap();

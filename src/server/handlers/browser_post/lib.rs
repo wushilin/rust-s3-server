@@ -90,7 +90,10 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
     // Authorize before touching storage.
     let actor = if let Some(state) = &ctx.auth_state {
         match authorize_browser_post(state, &form.fields, &bucket, &key) {
-            Ok(actor) => actor,
+            Ok(actor) => {
+                state.record_key_use(actor.access_key.as_deref(), ctx.client_ip.as_deref());
+                actor
+            }
             Err(resp) => return resp,
         }
     } else {
