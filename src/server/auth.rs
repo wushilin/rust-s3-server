@@ -112,7 +112,7 @@ pub(crate) fn client_ip(extensions: &axum::http::Extensions, headers: &HeaderMap
 }
 
 /// Loopback, private-range, and link-local peers — where a reverse proxy lives.
-fn may_be_proxy(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn may_be_proxy(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
@@ -168,9 +168,10 @@ pub async fn auth_middleware(
             // Explicit "not proceeding" record for every rejected request.
             log::warn!(
                 target: TARGET_AUTH,
-                "[{rid}] authn DENY method={} path={} reason={msg} ({}µs)",
+                "[{rid}] authn DENY method={} path={} from={} reason={msg} ({}µs)",
                 request.method(),
                 request.uri().path(),
+                client_ip(request.extensions(), request.headers()).as_deref().unwrap_or("unknown"),
                 authn_start.elapsed().as_micros(),
             );
             let access_key = claimed_access_key(&request);
@@ -187,10 +188,9 @@ pub async fn auth_middleware(
         authn_start.elapsed().as_micros()
     );
     let actor = operation_actor(&state, Some(&principal), claimed_access_key(&request));
-    state.record_key_use(
-        actor.access_key.as_deref(),
-        client_ip(request.extensions(), request.headers()).as_deref(),
-    );
+    let from = client_ip(request.extensions(), request.headers());
+    state.record_key_use(actor.access_key.as_deref(), from.as_deref());
+    let from = from.unwrap_or_else(|| "unknown".to_string());
 
     // Phase 2 — authorization: enforce the IAM policy bound to the caller
     // (root config credentials are unrestricted and skip this), then attach the
@@ -211,13 +211,13 @@ pub async fn auth_middleware(
                 return with_operation_actor(next.run(request).await, actor);
             }
             let Some(policy) = identity.policy().cloned() else {
-                log::warn!(target: TARGET_AUTHZ, "[{rid}] authz DENY user={username} reason=no_policy_attached");
+                log::warn!(target: TARGET_AUTHZ, "[{rid}] authz DENY user={username} from={from} reason=no_policy_attached");
                 return with_operation_actor(access_denied(), actor);
             };
             if !authorize_iam(&policy, &request) {
                 log::warn!(
                     target: TARGET_AUTHZ,
-                    "[{rid}] authz DENY user={username} method={} uri={} ({}µs)",
+                    "[{rid}] authz DENY user={username} from={from} method={} uri={} ({}µs)",
                     request.method(),
                     request.uri(),
                     authz_start.elapsed().as_micros(),

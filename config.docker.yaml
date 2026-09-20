@@ -21,6 +21,9 @@ server:
   bind_port: {{RUSTS3_PORT:8002}}
   # Mount a volume here — this is the entire durable state of the server.
   base_dir: "{{RUSTS3_DATA_DIR:/data}}"
+  # "auto" reads a PROXY protocol v1/v2 header when a connection from a private
+  # address opens with one, and serves plain HTTP otherwise. "off" disables it.
+  proxy_protocol: "{{RUSTS3_PROXY_PROTOCOL:auto}}"
 
 storage:
   meta_cache_capacity: {{RUSTS3_META_CACHE_CAPACITY:200000}}

@@ -14,6 +14,7 @@ pub mod key_usage;
 pub mod logging;
 pub(crate) mod pipeline;
 pub mod policy;
+mod proxy_protocol;
 pub mod range;
 pub mod registry;
 pub mod scan_store;
@@ -642,6 +643,9 @@ async fn log_middleware(mut request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let is_copy = request.headers().contains_key("x-amz-copy-source");
+    // Who is asking: the PROXY protocol client when the connection came through
+    // a balancer, a private proxy's X-Forwarded-For, else the TCP peer.
+    let from = auth::client_ip(request.extensions(), request.headers()).unwrap_or_else(|| "-".to_string());
     // Inject the request id before anything else runs, so auth decisions and
     // handler logs can all reference it.
     let request_id = new_request_id();
@@ -719,9 +723,9 @@ async fn log_middleware(mut request: Request<Body>, next: Next) -> Response {
         format!("{measure} in {elapsed_ms}ms")
     };
     if status.is_client_error() || status.is_server_error() {
-        log::warn!(target: logging::TARGET_AUDIT, "[{request_id}] {actor} {operation} {target} {result} {suffix}");
+        log::warn!(target: logging::TARGET_AUDIT, "[{request_id}] {actor} {operation} {target} {result} {suffix} from={from}");
     } else {
-        log::info!(target: logging::TARGET_AUDIT, "[{request_id}] {actor} {operation} {target} {result} {suffix}");
+        log::info!(target: logging::TARGET_AUDIT, "[{request_id}] {actor} {operation} {target} {result} {suffix} from={from}");
     }
     response
 }
@@ -1129,10 +1133,16 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         let ui_listener = tokio::net::TcpListener::bind(&ui_bind).await?;
         let ui_shutdown = shutdown.clone();
         log::info!("management UI listening on {ui_bind}");
+        let ui_proxy_protocol = config.app_config.server.proxy_protocol;
         tokio::spawn(async move {
-            if let Err(err) = axum::serve(ui_listener, ui::router(ui_state))
-                .with_graceful_shutdown(ui_shutdown.cancelled_owned())
-                .await
+            if let Err(err) = proxy_protocol::serve(
+                ui_listener,
+                ui::router(ui_state),
+                ui_shutdown,
+                ui_proxy_protocol,
+                "management UI",
+            )
+            .await
             {
                 log::error!("management UI server error: {err}");
             }
@@ -1142,13 +1152,16 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let app = router_with_metrics(store, auth_state, metrics, tasks);
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     let drain = shutdown.clone();
-    // Connect info gives the auth layer the peer address, for access keys'
-    // "last used from".
-    let server = axum::serve(
+    // Our own accept loop rather than `axum::serve`: it reads an optional PROXY
+    // protocol header off each connection, and gives every request the
+    // resulting client address as connect info (access keys' "last used from").
+    let server = proxy_protocol::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown.cancelled_owned());
+        app,
+        shutdown.clone(),
+        config.app_config.server.proxy_protocol,
+        "S3 API",
+    );
 
     // Graceful shutdown waits for in-flight connections, and an idle keep-alive
     // connection is indistinguishable from a busy one — so a single client

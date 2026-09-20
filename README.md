@@ -227,7 +227,8 @@ and any change to it applies to the next request of an already-issued key.
   uses it; tags are the only editable part of a key. The console shows when and
   from which address each key — built-in ones included — last authenticated.
   Behind a reverse proxy on a private address the client address is taken from
-  `X-Forwarded-For`/`X-Real-IP`. The stamps live in
+  `X-Forwarded-For`/`X-Real-IP`, and behind a TCP load balancer from the PROXY
+  protocol header (v1 or v2, auto-detected on both ports). The stamps live in
   `<base_dir>/key_usage.rocksdb`, apart from the IAM database and its export.
 
 Bcrypt is recommended for console passwords (cleartext is still accepted). S3
@@ -244,6 +245,7 @@ HMAC key.
 | `server.bind_address` | `0.0.0.0` | S3 API listen address. |
 | `server.bind_port` | `8002` | S3 API listen port. |
 | `server.base_dir` | `./rusts3-data` | Object, index, and IAM data root. |
+| `server.proxy_protocol` | `auto` | PROXY protocol v1/v2 on both listeners. `auto` detects it per connection — a header from a loopback/private peer names the real client, a connection without one is plain HTTP; a header from a public peer is dropped. `off` never looks for one. |
 | `ui.enabled` | `true` | Enable the management console. |
 | `ui.bind_address` | S3 bind address | Optional separate console listen address. |
 | `ui.bind_port` | `8003` | Console listen port. |
@@ -287,7 +289,10 @@ process crash preserves committed writes in either mode.
 | `logging.compress` | `false` | Gzip rotated archives. |
 
 File logging also echoes to stdout. Every request receives a correlation ID,
-returned in `x-amz-request-id` and included in logs.
+returned in `x-amz-request-id` and included in logs. Access lines (S3 API and
+console), failed authentication and authorization, and console logins end in
+`from=<client address>` — the PROXY protocol client behind a TCP load balancer,
+a private reverse proxy's `X-Forwarded-For`/`X-Real-IP`, otherwise the TCP peer.
 
 ### Background maintenance
 

@@ -18,6 +18,20 @@ server:
   # Exactly ONE rusts3 process may own a base_dir (enforced via flock).
   base_dir: "./test-data"
 
+  # PROXY protocol (v1 and v2) on BOTH listeners — the S3 API and the console.
+  # Lets a TCP load balancer (HAProxy `send-proxy`/`send-proxy-v2`, nginx stream
+  # `proxy_protocol on`, an AWS NLB) pass the real client address, which is what
+  # access keys' "last used from" and the auth log then show.
+  #   auto  detect per connection: a header is read when present, a connection
+  #         without one is served as plain HTTP — so direct clients and health
+  #         checks keep working on the same port.  A header is honored only
+  #         from a peer on a loopback or private network; from a public address
+  #         the connection is dropped, since anyone could otherwise claim any
+  #         address.
+  #   off   never look for one.
+  # (default auto)
+  proxy_protocol: auto
+
 # ─── Storage ──────────────────────────────────────────────────────────────────
 storage:
   # Maximum SQLite READER connections per bucket index pool.  Mutations

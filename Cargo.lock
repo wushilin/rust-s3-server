@@ -1342,6 +1342,8 @@ dependencies = [
  "futures",
  "hmac",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "libc",
  "log",
  "log4rs",

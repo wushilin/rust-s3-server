@@ -12,6 +12,11 @@ bytes       = "1"
 
 # HTTP framework
 axum = { version = "0.7", features = ["ws"] }
+# The accept loop (server::proxy_protocol) drives hyper directly. Both crates
+# are what axum 0.7 already builds on; HTTP/1 only, as axum was configured, so
+# nothing new enters the dependency tree.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 
 # Storage / serialisation
 serde       = { version = "1",   features = ["derive"] }

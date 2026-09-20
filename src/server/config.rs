@@ -19,6 +19,23 @@ pub struct ServerConfig {
     pub bind_port: u16,
     #[serde(default = "default_base_dir")]
     pub base_dir: String,
+    /// PROXY protocol handling on both listeners (S3 API and console).
+    #[serde(default)]
+    pub proxy_protocol: ProxyProtocolMode,
+}
+
+/// Whether the listeners read a PROXY protocol header (v1 or v2) ahead of HTTP.
+/// See `server::proxy_protocol`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocolMode {
+    /// Detect per connection: a header, when present and sent by a peer on a
+    /// loopback or private network, names the real client; a connection
+    /// without one is served as plain HTTP.
+    #[default]
+    Auto,
+    /// Never look for one. A PROXY header is then simply malformed HTTP.
+    Off,
 }
 
 /// Log rotation and output settings.
@@ -556,6 +573,7 @@ impl Default for ServerConfig {
             bind_address: default_bind_address(),
             bind_port: default_bind_port(),
             base_dir: default_base_dir(),
+            proxy_protocol: ProxyProtocolMode::default(),
         }
     }
 }

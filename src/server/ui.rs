@@ -417,6 +417,7 @@ async fn ui_log_middleware(
 ) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    let from = super::auth::client_ip(request.extensions(), request.headers()).unwrap_or_else(|| "-".to_string());
     let request_id = super::new_request_id();
     request
         .extensions_mut()
@@ -446,9 +447,9 @@ async fn ui_log_middleware(
             format!("ERROR({})", status.as_u16())
         };
         if status.is_client_error() || status.is_server_error() {
-            log::warn!(target: TARGET_AUDIT, "[{request_id}] {actor} {method} {path} {result} in {elapsed_ms}ms");
+            log::warn!(target: TARGET_AUDIT, "[{request_id}] {actor} {method} {path} {result} in {elapsed_ms}ms from={from}");
         } else {
-            log::info!(target: TARGET_AUDIT, "[{request_id}] {actor} {method} {path} {result} in {elapsed_ms}ms");
+            log::info!(target: TARGET_AUDIT, "[{request_id}] {actor} {method} {path} {result} in {elapsed_ms}ms from={from}");
         }
     }
     response
@@ -582,7 +583,14 @@ struct LoginRequest {
     password: String,
 }
 
-async fn login(State(state): State<UiState>, Json(req): Json<LoginRequest>) -> Response {
+async fn login(
+    State(state): State<UiState>,
+    parts: axum::http::request::Parts,
+    Json(req): Json<LoginRequest>,
+) -> Response {
+    // Where the attempt came from — through a proxy too (PROXY protocol, or
+    // X-Forwarded-For from a private peer). A failed login is worth tracing.
+    let from = super::auth::client_ip(&parts.extensions, &parts.headers).unwrap_or_else(|| "unknown".to_string());
     // Built-in admin users (config file) first — they always win over any
     // same-named sqlite user and are unrestricted.
     if let Some(builtin) = state.config.find_builtin_user(&req.username) {
@@ -592,19 +600,19 @@ async fn login(State(state): State<UiState>, Json(req): Json<LoginRequest>) -> R
             .map(|p| verify_builtin_password(p, &req.password))
             .unwrap_or(false);
         if !ok {
-            log::warn!(target: TARGET_AUTH, "ui login failed user={} kind=builtin", req.username);
+            log::warn!(target: TARGET_AUTH, "ui login failed user={} kind=builtin from={from}", req.username);
             return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
         }
-        log::info!(target: TARGET_AUTH, "ui login user={} kind=builtin root=true", req.username);
+        log::info!(target: TARGET_AUTH, "ui login user={} kind=builtin root=true from={from}", req.username);
         return session_response(&state, &req.username, true);
     }
     match state.iam.verify_password(&req.username, &req.password).await {
         Ok(true) => {
-            log::info!(target: TARGET_AUTH, "ui login user={} kind=iam root=false", req.username);
+            log::info!(target: TARGET_AUTH, "ui login user={} kind=iam root=false from={from}", req.username);
             session_response(&state, &req.username, false)
         }
         Ok(false) => {
-            log::warn!(target: TARGET_AUTH, "ui login failed user={} kind=iam", req.username);
+            log::warn!(target: TARGET_AUTH, "ui login failed user={} kind=iam from={from}", req.username);
             error_response(StatusCode::UNAUTHORIZED, "invalid credentials")
         }
         Err(err) => storage_error(err),
