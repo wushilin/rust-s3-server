@@ -586,8 +586,29 @@ pub(crate) struct FindArgs {
     pub(crate) target: String,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The OS-provided main thread stack is 8 MiB on Linux and macOS but 1 MiB
+    // on Windows, and the AWS SDK's futures are deep enough that rs3.exe died
+    // at startup with "thread 'main' has overflowed its stack". Run the real
+    // main on a thread whose stack we size ourselves, the same everywhere.
+    const MAIN_STACK_BYTES: usize = 64 << 20;
+    let main_thread = std::thread::Builder::new()
+        .name("rs3-main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("start the tokio runtime")
+                .block_on(async_main())
+        })
+        .expect("spawn the main thread");
+    if let Err(panic) = main_thread.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     init_output(OutputOpts {
         json: cli.json,
