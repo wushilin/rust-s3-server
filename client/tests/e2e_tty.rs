@@ -95,15 +95,28 @@ fn run_in_pty_allowing_failure(server: &TestServer, args: &[&str]) -> (String, b
 /// would discard the evidence. Handles what indicatif actually emits: `\r`,
 /// `\n`, `ESC[nA`/`ESC[nB` (cursor up/down), `ESC[2K` (clear line), and SGR
 /// colour runs, which are skipped.
+///
+/// The width is `PTY_COLS`, with xterm's auto-wrap: a row painted to exactly
+/// the terminal width leaves the cursor *on* its last cell in a "pending
+/// wrap" state, and the next printable character -- not the write that filled
+/// the row -- moves to a fresh line. indicatif (0.18+) paints full-width rows
+/// back to back with no `\n` between them and counts on precisely this, so a
+/// model without it stacks the whole grid on one line and then blames the
+/// cursor-up for eating the line above.
 fn replay(painted: &str) -> Vec<String> {
     let mut lines: Vec<String> = vec![String::new()];
     let (mut row, mut col) = (0usize, 0usize);
+    let mut pending_wrap = false;
     let mut chars = painted.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\r' => col = 0,
+            '\r' => {
+                col = 0;
+                pending_wrap = false;
+            }
             '\n' => {
                 row += 1;
+                pending_wrap = false;
                 while lines.len() <= row {
                     lines.push(String::new());
                 }
@@ -124,6 +137,8 @@ fn replay(painted: &str) -> Vec<String> {
                     }
                 }
                 let n: usize = params.parse().unwrap_or(1).max(1);
+                // Any cursor movement or erase cancels a pending wrap.
+                pending_wrap = false;
                 match final_byte {
                     'A' => row = row.saturating_sub(n),
                     'B' => {
@@ -132,7 +147,7 @@ fn replay(painted: &str) -> Vec<String> {
                             lines.push(String::new());
                         }
                     }
-                    'C' => col += n,
+                    'C' => col = (col + n).min(PTY_COLS - 1),
                     'D' => col = col.saturating_sub(n),
                     'K' => {
                         // 2K clears the whole line, 0K (default) from the
@@ -144,6 +159,14 @@ fn replay(painted: &str) -> Vec<String> {
                 }
             }
             c => {
+                if pending_wrap {
+                    row += 1;
+                    col = 0;
+                    pending_wrap = false;
+                    while lines.len() <= row {
+                        lines.push(String::new());
+                    }
+                }
                 let line = &mut lines[row];
                 let mut cells: Vec<char> = line.chars().collect();
                 while cells.len() <= col {
@@ -152,6 +175,12 @@ fn replay(painted: &str) -> Vec<String> {
                 cells[col] = c;
                 *line = cells.into_iter().collect();
                 col += 1;
+                if col == PTY_COLS {
+                    // The cursor stays on the last cell; the wrap happens when
+                    // something is written there.
+                    col = PTY_COLS - 1;
+                    pending_wrap = true;
+                }
             }
         }
     }

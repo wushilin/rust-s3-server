@@ -35,6 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           workspaces: |
             . -> target
             client -> client/target
@@ -64,7 +65,10 @@ jobs:
             cargo test --locked
           fi
       - name: Test client
-        run: cargo test --locked --manifest-path client/Cargo.toml
+        run: |
+          # The client's end-to-end tests build the server binary themselves.
+          export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH"
+          cargo test --locked --manifest-path client/Cargo.toml
 
   # Windows is a release platform for both crates. The server's storage layer
   # was written for Unix (openat, flock), so its suite runs here too: a Windows
@@ -72,21 +76,22 @@ jobs:
   test-windows:
     name: test (windows-x86_64)
     runs-on: windows-2025
+    env:
+      # The runner image ships LLVM; bindgen (RocksDB) needs libclang from it —
+      # for the server build and for the one the client's e2e tests spawn.
+      LIBCLANG_PATH: C:/Program Files/LLVM/bin
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/setup-nasm@v1   # aws-lc-sys assembly on x86_64 (client)
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           workspaces: |
             . -> target
             client -> client/target
       - name: Test server
-        shell: bash
-        run: |
-          # The runner image ships LLVM; bindgen (RocksDB) needs libclang from it.
-          export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
-          cargo test --locked
+        run: cargo test --locked
       - name: Test client
         run: cargo test --locked --manifest-path client/Cargo.toml
 
@@ -102,6 +107,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           key: x86_64-unknown-linux-musl
           workspaces: |
             . -> target

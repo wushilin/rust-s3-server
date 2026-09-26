@@ -2440,9 +2440,18 @@ async fn fsync_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Makes a directory's entries durable: opens it and fsyncs, which is how
+/// POSIX persists a rename or a new name. On Windows a directory cannot be
+/// opened as a `File` (`Access is denied`), and NTFS journals directory
+/// metadata itself, so there is nothing to do.
+#[cfg(not(windows))]
 async fn fsync_dir(path: &Path) -> Result<()> {
     let file = tokio::fs::File::open(path).await?;
     file.sync_all().await?;
+    Ok(())
+}
+#[cfg(windows)]
+async fn fsync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 

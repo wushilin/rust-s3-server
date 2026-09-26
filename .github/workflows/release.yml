@@ -85,6 +85,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: matrix.kind != 'freebsd'
         with:
+          cache-on-failure: true
           key: ${{ matrix.target }}
           workspaces: |
             . -> target
