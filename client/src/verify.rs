@@ -112,10 +112,10 @@ pub(crate) fn composite_etag(part_digests: &[[u8; 16]]) -> String {
     for digest in part_digests {
         concatenated.extend_from_slice(digest);
     }
-    format!("{:x}-{}", Md5::digest(&concatenated), part_digests.len())
+    format!("{}-{}", hex(&Md5::digest(&concatenated)), part_digests.len())
 }
 
-pub(crate) fn hex(digest: &[u8; 16]) -> String {
+pub(crate) fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -366,7 +366,7 @@ mod tests {
         expected_input.extend_from_slice(&b);
         assert_eq!(
             composite_etag(&[a, b]),
-            format!("{:x}-2", Md5::digest(&expected_input))
+            format!("{}-2", hex(&Md5::digest(&expected_input)))
         );
     }
 

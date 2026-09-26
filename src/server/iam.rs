@@ -25,8 +25,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng;
 use rocksdb::{
     ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode, MultiThreaded, Options,
     WriteBatch, WriteOptions,
@@ -1269,7 +1269,7 @@ fn validate_group_name(name: &str) -> Result<()> {
 
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

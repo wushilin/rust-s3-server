@@ -53,7 +53,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{DateTime, SecondsFormat, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;

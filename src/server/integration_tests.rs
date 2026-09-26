@@ -4340,7 +4340,7 @@
 
     fn md5_hex(bytes: &[u8]) -> String {
         use md5::{Digest, Md5};
-        format!("{:x}", Md5::digest(bytes))
+        Md5::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
     }
 
     async fn get_attributes(

@@ -212,7 +212,7 @@ fn verified_download_costs_no_extra_request_for_a_small_object() {
     let dst = server.dir.path().join("tiny.out");
     server.rs3_ok(&["cp", "test/vfycheap/tiny.bin", dst.to_str().unwrap()]);
     assert_eq!(std::fs::read(&dst).unwrap(), data);
-    assert_eq!(format!("{:x}", Md5::digest(&data)).len(), 32);
+    assert_eq!(Md5::digest(&data).iter().map(|b| format!("{b:02x}")).collect::<String>().len(), 32);
 }
 
 #[test]

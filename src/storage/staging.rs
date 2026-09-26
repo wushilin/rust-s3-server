@@ -1,10 +1,14 @@
-use rand::{rngs::OsRng, RngCore};
+use rand::rand_core::UnwrapErr;
+use rand::{rngs::SysRng, Rng};
 
 use super::errors::{Result, StorageError};
 
 pub fn new_staging_id(epoch_ms: i64) -> String {
     let mut bytes = [0u8; 8];
-    OsRng.fill_bytes(&mut bytes);
+    // The OS generator (rand 0.10 renamed `OsRng`). `UnwrapErr` adapts the
+    // fallible source into a plain `Rng`; it panics only if the OS itself
+    // refuses to supply randomness.
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     let mut random = String::with_capacity(16);
     for byte in bytes {
         use std::fmt::Write;

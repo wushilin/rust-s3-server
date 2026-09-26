@@ -13,7 +13,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 

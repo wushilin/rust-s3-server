@@ -277,10 +277,10 @@ fn finding_version() -> u32 {
 /// 16 hex chars of randomness — unique enough that a finding id never needs
 /// coordination, short enough to sit in a RocksDB key.
 fn new_finding_id() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     (0..16)
-        .map(|_| std::char::from_digit(rng.gen_range(0..16), 16).unwrap_or('0'))
+        .map(|_| std::char::from_digit(rng.random_range(0..16), 16).unwrap_or('0'))
         .collect()
 }
 

@@ -27,6 +27,8 @@ use futures::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use md5::{Digest, Md5};
+
+use super::encoding::hex_lower;
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
@@ -2547,7 +2549,7 @@ async fn write_file_with_md5(path: &Path, bytes: &[u8]) -> Result<String> {
         file.write_all(chunk).await?;
     }
     file.flush().await?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 /// Copies an immutable object (or inclusive byte range) into one staging file.
@@ -2612,8 +2614,8 @@ async fn copy_object_data_with_hashes(
     output.flush().await?;
     Ok(WrittenHashes {
         size,
-        md5: format!("{:x}", md5.finalize()),
-        sha256: format!("{:x}", sha256.finalize()),
+        md5: hex_lower(&md5.finalize()),
+        sha256: hex_lower(&sha256.finalize()),
     })
 }
 
@@ -2646,8 +2648,8 @@ where
     file.flush().await?;
     Ok(WrittenHashes {
         size,
-        md5: format!("{:x}", md5.finalize()),
-        sha256: format!("{:x}", sha256.finalize()),
+        md5: hex_lower(&md5.finalize()),
+        sha256: hex_lower(&sha256.finalize()),
     })
 }
 
@@ -2732,8 +2734,8 @@ where
     file.flush().await?;
     Ok(WrittenHashes {
         size,
-        md5: format!("{:x}", md5.finalize()),
-        sha256: format!("{:x}", sha256.finalize()),
+        md5: hex_lower(&md5.finalize()),
+        sha256: hex_lower(&sha256.finalize()),
     })
 }
 
@@ -2809,7 +2811,7 @@ async fn has_active_staging(bucket_dir: &Path) -> Result<bool> {
 fn md5_hex(bytes: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
 }
 
 fn multipart_etag(parts: &[PartMeta]) -> Result<String> {
@@ -3639,7 +3641,7 @@ mod tests {
                 read_json(&staging.join("part.1.meta.json")).await.unwrap();
             let mut hasher = Md5::new();
             hasher.update(&data);
-            let data_etag = format!("{:x}", hasher.finalize());
+            let data_etag = hex_lower(&hasher.finalize());
 
             assert!(
                 data == vec![b'A'; 4096] || data == vec![b'B'; 4096],

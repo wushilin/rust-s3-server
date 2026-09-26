@@ -428,6 +428,26 @@ impl StableObjectDir {
     }
 }
 
+/// Without `openat(2)` there is no way to hold a directory open and resolve
+/// names relative to it, so parts are opened by path. A delete or overwrite
+/// that races an in-flight GET can then be observed as a failed part open
+/// (the response ends early) rather than being invisible as it is on Unix.
+#[cfg(not(unix))]
+struct StableObjectDir(std::path::PathBuf);
+
+#[cfg(not(unix))]
+impl StableObjectDir {
+    fn open(path: &FsPath) -> std::io::Result<Self> {
+        // Fail now, as the Unix version does, if the object directory is gone.
+        std::fs::metadata(path)?;
+        Ok(Self(path.to_path_buf()))
+    }
+
+    fn open_part(&self, name: &str) -> std::io::Result<tokio::fs::File> {
+        std::fs::File::open(self.0.join(name)).map(tokio::fs::File::from_std)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PartReadSegment {
     index: usize,

@@ -1,4 +1,15 @@
-use rand::Rng;
+use rand::RngExt;
+
+/// Lowercase hex of a digest (or any bytes). `digest` 0.11 output arrays no
+/// longer implement `LowerHex`, so every ETag/checksum string goes through here.
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 use sha1::{Digest, Sha1};
 
 use super::errors::{Result, StorageError};
@@ -58,9 +69,9 @@ pub fn object_dir_prefix(key: &str) -> String {
 
 /// Returns a 4-char random uppercase-hex collision suffix, e.g. `"A3F1"`.
 pub fn object_dir_random_suffix() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..4)
-        .map(|_| HEX_UPPER[rng.gen_range(0..16)] as char)
+        .map(|_| HEX_UPPER[rng.random_range(0..16)] as char)
         .collect()
 }
 

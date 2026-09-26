@@ -228,10 +228,10 @@ fn finding_prefix(report_id: &str, kind: Option<&str>) -> Vec<u8> {
 
 /// Report ids sort chronologically, so history is a reverse iteration.
 pub fn new_report_id() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     let suffix: String = (0..6)
-        .map(|_| std::char::from_digit(rng.gen_range(0..16), 16).unwrap_or('0'))
+        .map(|_| std::char::from_digit(rng.random_range(0..16), 16).unwrap_or('0'))
         .collect();
     format!("{:013}-{suffix}", now_ms())
 }

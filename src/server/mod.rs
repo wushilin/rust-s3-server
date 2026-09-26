@@ -256,9 +256,9 @@ fn router_with_metrics(
         .route("/minio/v2/metrics/resource", get(metrics_endpoint))
         .route("/minio/prometheus/metrics", get(metrics_endpoint))
         .route("/", get(list_buckets))
-        .route("/:bucket", any(bucket_route))
-        .route("/:bucket/", any(bucket_route))
-        .route("/:bucket/*key", any(object_route))
+        .route("/{bucket}", any(bucket_route))
+        .route("/{bucket}/", any(bucket_route))
+        .route("/{bucket}/{*key}", any(object_route))
         // Innermost: register the in-flight task around the handler only (auth
         // must pass first). Request id is already set by the outer log layer.
         .layer(middleware::from_fn_with_state(
@@ -633,9 +633,9 @@ async fn metrics_endpoint() -> Response {
 pub(crate) struct RequestId(pub String);
 
 fn new_request_id() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -884,6 +884,32 @@ async fn traffic_metrics_middleware(
 
 // ─── Server entry point ───────────────────────────────────────────────────────
 
+/// ` as uid N` for the permission-denied explanation; Unix only, where the
+/// ownership of a mounted volume is what goes wrong.
+#[cfg(unix)]
+fn running_as() -> String {
+    // SAFETY: geteuid never fails and takes no arguments.
+    format!(" as uid {}", unsafe { libc::geteuid() })
+}
+#[cfg(not(unix))]
+fn running_as() -> String {
+    String::new()
+}
+
+#[cfg(unix)]
+fn ownership_hint() -> String {
+    // SAFETY: as above.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    format!(
+        " If this is a mounted volume, give that uid ownership of it \
+         (chown -R {uid}:{gid} <host path>) or run the container with a matching --user."
+    )
+}
+#[cfg(not(unix))]
+fn ownership_hint() -> String {
+    String::new()
+}
+
 /// Takes an exclusive advisory lock on `<root>/.rusts3.lock` and refuses to
 /// start if another process holds it. The returned handle must stay alive
 /// for the process lifetime — dropping it releases the lock.
@@ -895,14 +921,10 @@ fn acquire_process_lock(root: &FsPath) -> Result<std::fs::File, Box<dyn std::err
     let explain = |action: &str, err: std::io::Error| -> Box<dyn std::error::Error> {
         if err.kind() == std::io::ErrorKind::PermissionDenied {
             format!(
-                "cannot {action} the data directory {} as uid {}: {err}. \
-                 If this is a mounted volume, give that uid ownership of it \
-                 (chown -R {}:{} <host path>) or run the container with a \
-                 matching --user.",
+                "cannot {action} the data directory {}{}: {err}.{}",
                 root.display(),
-                unsafe { libc::geteuid() },
-                unsafe { libc::geteuid() },
-                unsafe { libc::getegid() },
+                running_as(),
+                ownership_hint(),
             )
             .into()
         } else {
@@ -916,10 +938,11 @@ fn acquire_process_lock(root: &FsPath) -> Result<std::fs::File, Box<dyn std::err
         .write(true)
         .open(&lock_path)
         .map_err(|err| explain("write to", err))?;
-    let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    // Advisory exclusive lock, released when the handle is dropped (or the
+    // process dies). `flock(2)` on Unix, `LockFileEx` on Windows.
+    if let Err(err) = file.try_lock() {
         return Err(format!(
-            "data directory {} is locked by another rusts3 process (flock on {} failed); \
+            "data directory {} is locked by another rusts3 process (locking {} failed: {err}); \
              exactly one process may own a data directory",
             root.display(),
             lock_path.display()

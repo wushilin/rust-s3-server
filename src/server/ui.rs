@@ -66,31 +66,31 @@ pub fn router(state: UiState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/tasks", get(tasks_page))
-        .route("/assets/:file", get(ui_asset))
+        .route("/assets/{file}", get(ui_asset))
         .route("/favicon.ico", get(favicon))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/ping", get(server_ping))
         .route("/api/users", get(list_users).post(create_user))
-        .route("/api/users/:name", delete(delete_user))
-        .route("/api/users/:name/password", put(reset_password))
-        .route("/api/users/:name/policy", put(set_policy))
-        .route("/api/users/:name/policy/rules", put(set_user_policy_rules))
-        .route("/api/users/:name/groups", get(list_user_groups).put(set_user_groups))
-        .route("/api/users/:name/keys", get(list_keys).post(create_key))
+        .route("/api/users/{name}", delete(delete_user))
+        .route("/api/users/{name}/password", put(reset_password))
+        .route("/api/users/{name}/policy", put(set_policy))
+        .route("/api/users/{name}/policy/rules", put(set_user_policy_rules))
+        .route("/api/users/{name}/groups", get(list_user_groups).put(set_user_groups))
+        .route("/api/users/{name}/keys", get(list_keys).post(create_key))
         .route("/api/groups", get(list_groups).post(create_group))
-        .route("/api/groups/:name", delete(delete_group))
-        .route("/api/groups/:name/policy", put(set_group_policy))
-        .route("/api/groups/:name/policy/rules", put(set_group_policy_rules))
+        .route("/api/groups/{name}", delete(delete_group))
+        .route("/api/groups/{name}/policy", put(set_group_policy))
+        .route("/api/groups/{name}/policy/rules", put(set_group_policy_rules))
         .route("/api/policies/compile", post(compile_policy_rules))
         .route("/api/policies/decompile", post(decompile_policy_rules))
-        .route("/api/keys/:ak", delete(delete_key).put(update_key))
+        .route("/api/keys/{ak}", delete(delete_key).put(update_key))
         .route("/api/buckets", get(list_buckets).post(create_bucket))
-        .route("/api/buckets/:name", delete(delete_bucket))
-        .route("/api/buckets/:name/stats", get(bucket_stats))
-        .route("/api/buckets/:name/rebuild", post(rebuild_bucket))
-        .route("/api/buckets/:name/cors", get(get_bucket_cors).put(set_bucket_cors))
+        .route("/api/buckets/{name}", delete(delete_bucket))
+        .route("/api/buckets/{name}/stats", get(bucket_stats))
+        .route("/api/buckets/{name}/rebuild", post(rebuild_bucket))
+        .route("/api/buckets/{name}/cors", get(get_bucket_cors).put(set_bucket_cors))
         .route("/api/admin/export", get(export_iam))
         // Import buffers and fully validates the dump before an atomic apply, so
         // the body is held in memory. The global IAM database is small by nature
@@ -124,7 +124,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/presign", post(presign))
         .route("/api/tasks", get(list_tasks))
         .route("/api/tasks/ws", get(tasks_ws))
-        .route("/api/tasks/:id/cancel", post(cancel_task))
+        .route("/api/tasks/{id}/cancel", post(cancel_task))
         // Storage health scan (admin only). The scan itself is a registry
         // verb; these routes start it, stream its progress, and serve the
         // reports it leaves behind.
@@ -135,11 +135,11 @@ pub fn router(state: UiState) -> Router {
             get(list_scan_reports).delete(delete_scan_reports),
         )
         .route(
-            "/api/perf/scans/:id",
+            "/api/perf/scans/{id}",
             get(get_scan_report).delete(delete_scan_report),
         )
-        .route("/api/perf/scans/:id/findings", get(list_scan_findings))
-        .route("/api/perf/scans/:id/repair", post(repair_findings))
+        .route("/api/perf/scans/{id}/findings", get(list_scan_findings))
+        .route("/api/perf/scans/{id}/repair", post(repair_findings))
         // Runtime stats (admin only): a single read-only, downsampled series.
         .route("/api/stats/series", get(stats_series))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
@@ -2332,7 +2332,7 @@ async fn tasks_socket(mut socket: WebSocket, state: UiState) {
     let mut events = state.tasks.subscribe();
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(1));
     if socket
-        .send(Message::Text(tasks_payload(&state).to_string()))
+        .send(Message::Text(tasks_payload(&state).to_string().into()))
         .await
         .is_err()
     {
@@ -2341,7 +2341,7 @@ async fn tasks_socket(mut socket: WebSocket, state: UiState) {
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if socket.send(Message::Text(tasks_payload(&state).to_string())).await.is_err() { break; }
+                if socket.send(Message::Text(tasks_payload(&state).to_string().into())).await.is_err() { break; }
             }
             recv = events.recv() => {
                 match recv {
@@ -2349,7 +2349,7 @@ async fn tasks_socket(mut socket: WebSocket, state: UiState) {
                     // A task started/finished, or we lagged — self-heal with a
                     // fresh snapshot.
                     Ok(super::event_hub::Event::TasksChanged) | Err(RecvError::Lagged(_)) => {
-                        if socket.send(Message::Text(tasks_payload(&state).to_string())).await.is_err() { break; }
+                        if socket.send(Message::Text(tasks_payload(&state).to_string().into())).await.is_err() { break; }
                     }
                     // Audit events share the bus (for external subscribers) but
                     // aren't a task change — the console panel ignores them.
@@ -2359,10 +2359,10 @@ async fn tasks_socket(mut socket: WebSocket, state: UiState) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(probe) = serde_json::from_str::<ProbeMsg>(&text) {
+                        if let Ok(probe) = serde_json::from_str::<ProbeMsg>(text.as_str()) {
                             if probe.kind == "probe" {
                                 let reply = probe_reply(&state, &probe.id, &probe.tasks);
-                                if socket.send(Message::Text(reply.to_string())).await.is_err() { break; }
+                                if socket.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
                             }
                         }
                     }
@@ -2501,7 +2501,7 @@ async fn scan_socket(mut socket: WebSocket, state: UiState) {
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
     // Connect mid-scan and you see progress immediately, not at the next tick.
     if socket
-        .send(Message::Text(state.scans.snapshot().to_string()))
+        .send(Message::Text(state.scans.snapshot().to_string().into()))
         .await
         .is_err()
     {
@@ -2510,17 +2510,17 @@ async fn scan_socket(mut socket: WebSocket, state: UiState) {
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if socket.send(Message::Text(state.scans.snapshot().to_string())).await.is_err() { break; }
+                if socket.send(Message::Text(state.scans.snapshot().to_string().into())).await.is_err() { break; }
             }
             recv = events.recv() => {
                 match recv {
                     Err(RecvError::Closed) => break,
                     Ok(event) => {
-                        if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+                        if socket.send(Message::Text(event.to_string().into())).await.is_err() { break; }
                     }
                     // Fell behind the publisher — resync from current state.
                     Err(RecvError::Lagged(_)) => {
-                        if socket.send(Message::Text(state.scans.snapshot().to_string())).await.is_err() { break; }
+                        if socket.send(Message::Text(state.scans.snapshot().to_string().into())).await.is_err() { break; }
                     }
                 }
             }
