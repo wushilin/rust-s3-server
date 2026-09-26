@@ -133,8 +133,33 @@ fn health_probe(port: u16, timeout_secs: u64) -> Result<(), String> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The process's main thread gets whatever stack the OS hands out — 8 MiB
+    // on Linux and macOS, 1 MiB on Windows — and the server's top-level future
+    // is deeper than 1 MiB (on Windows the binary died at startup with "thread
+    // 'main' has overflowed its stack"). Run it on a thread whose stack we
+    // size ourselves, the same everywhere, instead of leaning on the default.
+    const MAIN_STACK_BYTES: usize = 64 << 20;
+    let main_thread = std::thread::Builder::new()
+        .name("rusts3-main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())?;
+            // Errors cross the thread boundary as text: `Box<dyn Error>` is not
+            // `Send`, and the message is all main does with them anyway.
+            runtime.block_on(async_main()).map_err(|err| err.to_string())
+        })?;
+    match main_thread.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(message.into()),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Run { config }) => run_server(AppConfig::from_file(&config)?).await,
