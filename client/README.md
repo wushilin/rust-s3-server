@@ -77,7 +77,8 @@ inventing its own shape:
   default" behavior, `mc-research-output.md` §4). The bar itself is shown
   only when stdout is a TTY and neither `--quiet` nor `--json` is set.
 - **Errors**: human-mode errors print `<prog>: <ERROR> <message>` to
-  stderr, where `<prog>` is the invoking binary's own `argv[0]` basename
+  stderr, where `<prog>` is the invoking binary's own `argv[0]` basename,
+  minus any extension (`rs3`, not `rs3.exe`, on Windows)
   (typically `rs3`, matching mc's own `ProgramName()`-from-`argv[0]`
   derivation rather than a hardcoded string, so scripts grepping for a
   literal `mc:` prefix will not match). `--json` mode instead writes the

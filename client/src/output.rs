@@ -142,11 +142,13 @@ pub(crate) fn print_error(context_msg: &str, cause: &str, fatal: bool) {
     let opts = out();
     if !opts.json {
         let text = join_error_text(context_msg, cause);
+        // The stem, not the file name: `rs3.exe: <ERROR>` would be the one
+        // place the Windows build read differently from every other.
         let prog = std::env::args()
             .next()
             .and_then(|p| {
                 std::path::Path::new(&p)
-                    .file_name()
+                    .file_stem()
                     .map(|f| f.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| "rs3".to_string());

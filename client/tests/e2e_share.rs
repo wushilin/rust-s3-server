@@ -72,6 +72,9 @@ fn share_upload_curl_template() {
 /// human would, and confirm the object lands in the bucket -- this is the
 /// same round trip ground-truth-verified manually against real `mc share
 /// upload`'s own curl output during development (see the task report).
+// Runs the generated command through `sh -c`, so it needs a POSIX shell and
+// POSIX paths: on Windows the payload path's backslashes do not survive `sh`.
+#[cfg(unix)]
 #[test]
 fn share_upload_curl_actually_uploads() {
     let server = TestServer::start();

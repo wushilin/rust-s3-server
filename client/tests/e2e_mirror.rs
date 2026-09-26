@@ -114,6 +114,10 @@ fn host() -> String {
 /// is provably abandoned: our host, and an owning pid that is gone. Staging
 /// owned by a live process -- a concurrent rs3 mid-download -- must survive,
 /// because unlinking it breaks that download at its final rename.
+///
+/// Unix only: proving a pid dead needs `/proc` or `kill(pid, 0)`. Elsewhere
+/// `owner_alive` answers "cannot tell", and by design nothing is reclaimed.
+#[cfg(unix)]
 #[test]
 fn mirror_reclaims_dead_staging_but_spares_live() {
     let server = TestServer::start();
