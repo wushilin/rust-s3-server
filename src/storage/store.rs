@@ -2435,6 +2435,12 @@ fn is_legacy_layout(blob_rel: &str) -> bool {
 }
 
 async fn fsync_file(path: &Path) -> Result<()> {
+    // Windows' FlushFileBuffers needs a handle with write access; a read-only
+    // one fails with "Access is denied". fsync(2) has no such requirement, and
+    // there a read-only handle cannot be mistaken for a write.
+    #[cfg(windows)]
+    let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    #[cfg(not(windows))]
     let file = tokio::fs::File::open(path).await?;
     file.sync_all().await?;
     Ok(())
