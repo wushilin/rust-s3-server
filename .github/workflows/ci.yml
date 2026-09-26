@@ -68,7 +68,7 @@ jobs:
         run: |
           # The client's end-to-end tests build the server binary themselves.
           export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH"
-          cargo test --locked --manifest-path client/Cargo.toml
+          cargo test --locked --no-fail-fast --manifest-path client/Cargo.toml
 
   # Windows is a release platform for both crates. The server's storage layer
   # was written for Unix (openat, flock), so its suite runs here too: a Windows
@@ -91,9 +91,9 @@ jobs:
             . -> target
             client -> client/target
       - name: Test server
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
       - name: Test client
-        run: cargo test --locked --manifest-path client/Cargo.toml
+        run: cargo test --locked --no-fail-fast --manifest-path client/Cargo.toml
 
   # The container image, built the way the release workflow builds it (static
   # musl binaries laid out under dist/) and then exercised end to end with the

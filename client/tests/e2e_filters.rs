@@ -370,6 +370,9 @@ fn cp_without_preserve_does_not_apply_attrs() {
 // directive does for free, so `--preserve` hard-errors there rather than
 // silently dropping it -- mirrors `cp_attr_s3_to_s3_is_rejected` above,
 // which does the same for `--attr`.
+// `--preserve` itself is Unix-only (rs3 refuses it elsewhere), like the two
+// tests above.
+#[cfg(unix)]
 #[test]
 fn cp_preserve_s3_to_s3_same_endpoint_succeeds() {
     let server = TestServer::start();
