@@ -406,6 +406,24 @@ wildcard DNS and TLS for `*.<public_hostname>` and preserve `Host`.
 
 </details>
 
+## Releases and CI
+
+Every push runs both crates' test suites on Linux (x86_64 and aarch64), macOS,
+and Windows, and builds and exercises the container image (`docker-test.sh`).
+
+Releases are cut by pushing a tag; GitHub Actions builds, smoke-tests, and
+publishes them (`.github/workflows/release.yml`):
+
+| Tag | Component | Assets |
+|---|---|---|
+| `v<version>` | server `rusts3` | Linux x86_64/aarch64 (static musl), macOS aarch64/x86_64, FreeBSD x86_64, Windows x86_64/aarch64; `SHA256SUMS`; Docker image `wushilin/rusts3:<version>` and `:latest` (multi-arch, when Docker Hub credentials are configured as the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repository secrets) |
+| `rs3-v<version>` | client `rs3` | the same platforms |
+
+The tag must match the `version` in the crate's `Cargo.toml`. FreeBSD aarch64
+is not built: it is a Tier 3 Rust target with no standard library shipped by
+rustup. Linux binaries are static (`musl.sh`; `MUSL_ARCH=aarch64` for arm) and
+run on any distribution.
+
 ## Management console
 
 Open `http://127.0.0.1:8003`. Configure at least one `auth.users` entry with a

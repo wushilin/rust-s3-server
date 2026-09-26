@@ -1,0 +1,255 @@
+# Tag-triggered releases.
+#
+#   git tag v0.6.0     && git push origin v0.6.0       # server: rusts3
+#   git tag rs3-v0.3.1 && git push origin rs3-v0.3.1   # client: rs3
+#
+# The tag must match the crate version in the corresponding Cargo.toml, or the
+# run fails before building anything. Every platform in the matrix is built and
+# smoke-tested (`--version`), the tarballs and SHA256SUMS are attached to a
+# GitHub release created from the tag, and — for server tags, when Docker Hub
+# credentials are configured as repository secrets — a multi-arch image is
+# published as <version> and latest.
+#
+# Platforms:
+#   linux    x86_64, aarch64   static musl (musl.sh, zig toolchain), built on
+#                              native runners so the binary is executed
+#   macos    aarch64, x86_64   native runners
+#   freebsd  x86_64            built natively inside a FreeBSD VM. aarch64
+#                              FreeBSD is a Tier 3 Rust target (no standard
+#                              library shipped by rustup), so it is not built.
+#   windows  x86_64, aarch64   native runners
+name: Release
+
+on:
+  push:
+    tags: ["v*", "rs3-v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  meta:
+    name: resolve tag
+    runs-on: ubuntu-24.04
+    outputs:
+      component: ${{ steps.meta.outputs.component }}   # server | client
+      version: ${{ steps.meta.outputs.version }}       # 0.6.0
+      bin: ${{ steps.meta.outputs.bin }}               # rusts3 | rs3
+      manifest: ${{ steps.meta.outputs.manifest }}     # Cargo.toml | client/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            rs3-v*) component=client; version="${tag#rs3-v}"; bin=rs3;    manifest=client/Cargo.toml ;;
+            v*)     component=server; version="${tag#v}";     bin=rusts3; manifest=Cargo.toml ;;
+            *) echo "unexpected tag $tag" >&2; exit 1 ;;
+          esac
+          crate_version="$(awk -F'"' '/^\[package\]/{p=1} p && /^version[[:space:]]*=/{print $2; exit}' "$manifest")"
+          if [ "$crate_version" != "$version" ]; then
+            echo "tag $tag names version $version but $manifest says $crate_version" >&2
+            exit 1
+          fi
+          { echo "component=$component"; echo "version=$version"; echo "bin=$bin"; echo "manifest=$manifest"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ needs.meta.outputs.bin }} ${{ matrix.target }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-24.04,     kind: musl,    arch: x86_64 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, kind: musl,    arch: aarch64 }
+          - { target: aarch64-apple-darwin,       os: macos-15,         kind: native }
+          - { target: x86_64-apple-darwin,        os: macos-15-intel,   kind: native }
+          - { target: x86_64-unknown-freebsd,     os: ubuntu-24.04,     kind: freebsd }
+          - { target: x86_64-pc-windows-msvc,     os: windows-2025,     kind: windows }
+          - { target: aarch64-pc-windows-msvc,    os: windows-11-arm,   kind: windows }
+    env:
+      BIN: ${{ needs.meta.outputs.bin }}
+      MANIFEST: ${{ needs.meta.outputs.manifest }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      COMPONENT: ${{ needs.meta.outputs.component }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.kind != 'freebsd'
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.kind != 'freebsd'
+        with:
+          key: ${{ matrix.target }}
+          workspaces: |
+            . -> target
+            client -> client/target
+
+      # ── Linux: static musl via the repo's own musl.sh, zig as the C/C++ toolchain ──
+      - name: Install zig and libclang
+        if: matrix.kind == 'musl'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build (musl)
+        if: matrix.kind == 'musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+          export MUSL_TOOLCHAIN=zig MUSL_ARCH=${{ matrix.arch }} BIN="$BIN"
+          ./musl.sh --locked --manifest-path "$MANIFEST"
+          # The server image also ships the client: build it too on server tags.
+          if [ "$COMPONENT" = server ]; then
+            BIN=rs3 ./musl.sh --locked --manifest-path client/Cargo.toml
+            mkdir -p docker-bins && cp target/${{ matrix.target }}/release/rusts3 client/target/${{ matrix.target }}/release/rs3 docker-bins/
+          fi
+          mkdir -p out && cp "$(dirname "$MANIFEST")/target/${{ matrix.target }}/release/$BIN" out/
+
+      # ── macOS: native ──
+      - name: Build (macOS)
+        if: matrix.kind == 'native'
+        run: |
+          export LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib
+          export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH"
+          cargo build --locked --release --manifest-path "$MANIFEST"
+          mkdir -p out && cp "$(dirname "$MANIFEST")/target/release/$BIN" out/
+
+      # ── Windows: native MSVC (client only) ──
+      - uses: ilammy/setup-nasm@v1   # aws-lc-sys assembly on x86_64; harmless on arm64
+        if: matrix.kind == 'windows'
+      - name: Build (Windows)
+        if: matrix.kind == 'windows'
+        shell: bash
+        run: |
+          # The runner images ship LLVM; bindgen (RocksDB) needs its libclang.
+          export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
+          cargo build --locked --release --manifest-path "$MANIFEST"
+          mkdir -p out && cp "$(dirname "$MANIFEST")/target/release/$BIN.exe" out/
+
+      # ── FreeBSD: native build inside a VM (KVM-accelerated on the Linux runner) ──
+      - name: Build (FreeBSD)
+        if: matrix.kind == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14"
+          usesh: true
+          mem: 8192
+          cpu: 4
+          copyback: true
+          prepare: |
+            pkg install -y curl llvm gmake
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            export PATH="$HOME/.cargo/bin:$PATH"
+            export LIBCLANG_PATH="$(dirname "$(ls /usr/local/llvm*/lib/libclang.so* | head -1)")"
+            cargo build --locked --release --manifest-path "${{ needs.meta.outputs.manifest }}"
+            mkdir -p out && cp "$(dirname "${{ needs.meta.outputs.manifest }}")/target/release/${{ needs.meta.outputs.bin }}" out/
+            out/${{ needs.meta.outputs.bin }} --version
+
+      # ── Smoke test and package ──
+      - name: Smoke test
+        if: matrix.kind != 'freebsd'
+        shell: bash
+        run: |
+          case "${{ matrix.kind }}" in windows) exe=.exe ;; *) exe= ;; esac
+          out/$BIN$exe --version | tee version.txt
+          grep -q "$BIN $VERSION" version.txt
+      - name: Package
+        shell: bash
+        run: |
+          name="$BIN-v$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp LICENSE "dist/$name/"
+          if [ "$COMPONENT" = server ]; then cp config.yaml README.md "dist/$name/"; else cp client/README.md "dist/$name/README.md"; fi
+          if [ "${{ matrix.kind }}" = windows ]; then
+            cp "out/$BIN.exe" "dist/$name/"
+            (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null)
+          else
+            cp "out/$BIN" "dist/$name/"
+            chmod 755 "dist/$name/$BIN"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          fi
+          rm -rf "dist/$name"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: matrix.kind == 'musl' && needs.meta.outputs.component == 'server'
+        with:
+          name: docker-bins-${{ matrix.arch }}
+          path: docker-bins/*
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=--latest; [ "${{ needs.meta.outputs.component }}" = client ] && latest=--latest=false
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" $latest --verify-tag \
+            --title "${{ needs.meta.outputs.bin }} ${{ needs.meta.outputs.version }}" --generate-notes dist/*
+
+  docker:
+    name: publish Docker image
+    needs: [meta, build]
+    if: needs.meta.outputs.component == 'server'
+    runs-on: ubuntu-24.04
+    env:
+      # Secrets are not available in `if:`; gate the steps on this instead.
+      HAS_CREDS: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      IMAGE: docker.io/wushilin/rusts3
+    steps:
+      - name: No Docker Hub credentials configured — skipping image publish
+        if: env.HAS_CREDS != 'true'
+        run: echo "Set the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets to publish $IMAGE."
+      - uses: actions/checkout@v4
+        if: env.HAS_CREDS == 'true'
+      - uses: actions/download-artifact@v4
+        if: env.HAS_CREDS == 'true'
+        with:
+          pattern: docker-bins-*
+          path: docker-bins
+      - name: Lay out binaries per platform
+        if: env.HAS_CREDS == 'true'
+        run: |
+          mkdir -p dist/linux-amd64 dist/linux-arm64
+          cp docker-bins/docker-bins-x86_64/*  dist/linux-amd64/
+          cp docker-bins/docker-bins-aarch64/* dist/linux-arm64/
+          chmod 755 dist/*/*
+      - uses: docker/setup-qemu-action@v3
+        if: env.HAS_CREDS == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: env.HAS_CREDS == 'true'
+      - uses: docker/login-action@v3
+        if: env.HAS_CREDS == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        if: env.HAS_CREDS == 'true'
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
+            ${{ env.IMAGE }}:latest

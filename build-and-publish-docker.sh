@@ -37,6 +37,17 @@ echo ">> Building rs3 client"
 cargo build --release --manifest-path client/Cargo.toml
 strip client/target/release/rs3
 
+# The Dockerfile copies from dist/linux-<TARGETARCH>/ so the same file serves
+# the multi-arch CI build; lay out this host's architecture under its Docker
+# name (amd64/arm64).
+case "$(uname -m)" in
+    x86_64|amd64)  DOCKER_ARCH=amd64 ;;
+    aarch64|arm64) DOCKER_ARCH=arm64 ;;
+    *) echo "error: unsupported host architecture $(uname -m)" >&2; exit 1 ;;
+esac
+rm -rf dist && mkdir -p "dist/linux-${DOCKER_ARCH}"
+cp target/release/rusts3 client/target/release/rs3 "dist/linux-${DOCKER_ARCH}/"
+
 echo ">> Building image ${IMAGE}:${VERSION} (and :latest)"
 # --format docker so the Dockerfile's HEALTHCHECK is preserved (OCI drops it).
 podman build --format docker \

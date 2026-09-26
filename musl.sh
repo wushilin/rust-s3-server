@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# Build a static x86_64 musl binary of rusts3 with cargo — no Docker.
+# Build a static musl binary of rusts3 with cargo — no Docker.
 #
-# The output is ALWAYS x86_64-unknown-linux-musl regardless of the host
-# architecture. On an aarch64 machine that makes this a true cross-compile, so
-# the script verifies the ELF header of the finished binary rather than trusting
-# the toolchain to have done the right thing.
+# The output is x86_64-unknown-linux-musl by default, or aarch64 with
+# MUSL_ARCH=aarch64 — never the host's own architecture by accident. Whenever
+# that differs from the host this is a true cross-compile, so the script
+# verifies the ELF header of the finished binary rather than trusting the
+# toolchain to have done the right thing.
 #
 # RocksDB is compiled from source (bundled C++), so a *full* musl cross
 # toolchain is required: musl-gcc from apt's musl-tools has no g++ and cannot
@@ -21,9 +22,16 @@
 # host clang and aim at the musl target explicitly — without that it would parse
 # RocksDB's headers for the host arch and emit bindings for the wrong ABI.
 #
-#   ./musl.sh
+#   ./musl.sh                      # x86_64
+#   MUSL_ARCH=aarch64 ./musl.sh    # aarch64
+#
+# Anything after the script name is passed on to `cargo build`, e.g.
+# `./musl.sh --manifest-path client/Cargo.toml` builds the rs3 client instead
+# (BIN=rs3 names the binary to verify).
 #
 # Environment overrides:
+#   MUSL_ARCH           x86_64 (default) | aarch64 — the target architecture
+#   BIN                 binary to verify after the build (rusts3)
 #   MUSL_CC / MUSL_CXX  your own musl gcc/g++ (both must be set to take effect)
 #   MUSL_TOOLCHAIN      auto (default) | gcc | zig — force a strategy
 #   MUSL_CROSS_CACHE    where fetched toolchains land (~/.cache/musl-cross)
@@ -31,9 +39,16 @@
 #
 set -euo pipefail
 
-TARGET="x86_64-unknown-linux-musl"
-TOOL_PREFIX="x86_64-linux-musl"
-ZIG_TARGET="x86_64-linux-musl"
+MUSL_ARCH="${MUSL_ARCH:-x86_64}"
+case "$MUSL_ARCH" in
+    x86_64|amd64)   MUSL_ARCH="x86_64";  ELF_MACHINE=62  ;;  # EM_X86_64
+    aarch64|arm64)  MUSL_ARCH="aarch64"; ELF_MACHINE=183 ;;  # EM_AARCH64
+    *) echo "error: MUSL_ARCH must be x86_64 or aarch64" >&2; exit 1 ;;
+esac
+TARGET="${MUSL_ARCH}-unknown-linux-musl"
+TOOL_PREFIX="${MUSL_ARCH}-linux-musl"
+ZIG_TARGET="${MUSL_ARCH}-linux-musl"
+BIN_NAME="${BIN:-rusts3}"
 HOST_ARCH="$(uname -m)"
 CACHE_DIR="${MUSL_CROSS_CACHE:-$HOME/.cache/musl-cross}"
 GCC_TOOLCHAIN_URL="https://musl.cc/${TOOL_PREFIX}-cross.tgz"
@@ -77,8 +92,9 @@ resolve_gcc_toolchain() {
         export PATH="$root/bin:$PATH"
         return 0
     fi
-    # musl.cc publishes x86_64-hosted tarballs only — on any other host the
-    # download would produce binaries this machine cannot execute.
+    # musl.cc publishes x86_64-hosted tarballs only (for every target arch) —
+    # on any other host the download would produce binaries this machine
+    # cannot execute.
     if [[ "$HOST_ARCH" != "x86_64" ]]; then
         return 1
     fi
@@ -121,12 +137,14 @@ resolve_zig() {
                  "manually or set MUSL_CC/MUSL_CXX" >&2
             return 1 ;;
     esac
-    local root="$CACHE_DIR/zig-${zarch}-linux-${ZIG_VERSION}"
+    local zos="linux"
+    [[ "$(uname -s)" == "Darwin" ]] && zos="macos"
+    local root="$CACHE_DIR/zig-${zarch}-${zos}-${ZIG_VERSION}"
     if ! zig_runnable "$root/zig"; then
-        local url="https://ziglang.org/download/${ZIG_VERSION}/zig-${zarch}-linux-${ZIG_VERSION}.tar.xz"
+        local url="https://ziglang.org/download/${ZIG_VERSION}/zig-${zarch}-${zos}-${ZIG_VERSION}.tar.xz"
         echo ">> No musl C++ toolchain found; fetching $url"
         mkdir -p "$CACHE_DIR"
-        local txz="$CACHE_DIR/zig-${zarch}-linux-${ZIG_VERSION}.tar.xz"
+        local txz="$CACHE_DIR/zig-${zarch}-${zos}-${ZIG_VERSION}.tar.xz"
         rm -rf "$root"
         if ! curl -fL --retry 3 -o "$txz" "$url"; then
             echo "error: failed to download $url (is ZIG_VERSION=$ZIG_VERSION a real release?)" >&2
@@ -158,7 +176,7 @@ resolve_zig() {
 # stderr, which rustc's linker_messages lint then reports as a build warning.
 # The setting is ignored either way, so the only thing lost is the noise.
 make_zig_shims() {
-    local dir="$CACHE_DIR/zig-shim-${ZIG_TARGET}"
+    local dir="$CACHE_DIR/zig-shim-${ZIG_TARGET}-$(uname -s | tr A-Z a-z)"
     mkdir -p "$dir"
     local tool
     for tool in cc c++; do
@@ -239,21 +257,28 @@ echo ">> Using CXX=$MUSL_CXX"
 #    target any architecture, it just has to be told which one (step 4).
 if [[ -z "${LIBCLANG_PATH:-}" ]]; then
     for d in /usr/lib/llvm-*/lib /usr/lib64 /usr/lib \
-             "/usr/lib/${HOST_ARCH}-linux-gnu"; do
-        if compgen -G "$d/libclang.so*" >/dev/null 2>&1; then
+             "/usr/lib/${HOST_ARCH}-linux-gnu" \
+             /Library/Developer/CommandLineTools/usr/lib; do
+        if compgen -G "$d/libclang.so*" >/dev/null 2>&1 || compgen -G "$d/libclang.dylib" >/dev/null 2>&1; then
             LIBCLANG_PATH="$d"
             break
         fi
     done
 fi
 [[ -n "${LIBCLANG_PATH:-}" ]] && echo ">> Using LIBCLANG_PATH=$LIBCLANG_PATH"
+# macOS strips DYLD_* from the environment of anything run through /usr/bin/env,
+# and the bindgen build script finds libclang through the dynamic loader.
+[[ "$(uname -s)" == "Darwin" && -n "${LIBCLANG_PATH:-}" ]] && export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
 
 # 4. Per-target compiler/linker wiring for cargo, the cc crate, and bindgen.
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$MUSL_CC"
-export CC_x86_64_unknown_linux_musl="$MUSL_CC"
-export CXX_x86_64_unknown_linux_musl="$MUSL_CXX"
-export AR_x86_64_unknown_linux_musl="$MUSL_AR"
-[[ -n "${MUSL_RANLIB:-}" ]] && export RANLIB_x86_64_unknown_linux_musl="$MUSL_RANLIB"
+# cargo/cc spell the target two ways in variable names: upper-case with
+# underscores for the linker, the plain triple with underscores for cc.
+TARGET_ENV="${TARGET//-/_}"
+export "CARGO_TARGET_$(echo "$TARGET_ENV" | tr a-z A-Z)_LINKER=$MUSL_CC"
+export "CC_${TARGET_ENV}=$MUSL_CC"
+export "CXX_${TARGET_ENV}=$MUSL_CXX"
+export "AR_${TARGET_ENV}=$MUSL_AR"
+[[ -n "${MUSL_RANLIB:-}" ]] && export "RANLIB_${TARGET_ENV}=$MUSL_RANLIB"
 export LIBCLANG_PATH
 
 # bindgen parses RocksDB's headers with the *host* clang, so the target has to
@@ -264,10 +289,14 @@ case "$TOOLCHAIN_KIND" in
     zig)
         ZIG_LIB="$(dirname "$ZIG_BIN")/lib"
         [[ -d "$ZIG_LIB" ]] || ZIG_LIB="$("$ZIG_BIN" env | sed -n 's/.*"lib_dir"[^"]*"\([^"]*\)".*/\1/p' | head -1)"
-        for inc in "$ZIG_LIB/libc/include/x86_64-linux-musl" \
+        case "$MUSL_ARCH" in
+            x86_64)  zig_arch_any="x86-linux-any" ;;
+            aarch64) zig_arch_any="aarch64-linux-any" ;;
+        esac
+        for inc in "$ZIG_LIB/libc/include/${MUSL_ARCH}-linux-musl" \
                    "$ZIG_LIB/libc/include/generic-musl" \
                    "$ZIG_LIB/libc/include/any-linux-any" \
-                   "$ZIG_LIB/libc/include/x86-linux-any" \
+                   "$ZIG_LIB/libc/include/${zig_arch_any}" \
                    "$ZIG_LIB/libcxx/include"; do
             [[ -d "$inc" ]] && BINDGEN_TARGET_ARGS="$BINDGEN_TARGET_ARGS -I$inc"
         done ;;
@@ -288,25 +317,32 @@ fi
 export RUSTFLAGS
 
 # 5. Build.
-echo ">> Building rusts3 for $TARGET (release)"
+echo ">> Building $BIN_NAME for $TARGET (release)"
 cargo build --release --target "$TARGET" "$@"
 
-BIN="${CARGO_TARGET_DIR:-target}/$TARGET/release/rusts3"
+# The client is its own crate with its own target dir; find the binary under
+# whichever manifest was built.
+MANIFEST_DIR="."
+for (( i = 1; i <= $#; i++ )); do
+    [[ "${!i}" == "--manifest-path" ]] && { j=$((i + 1)); MANIFEST_DIR="$(dirname "${!j}")"; }
+    [[ "${!i}" == --manifest-path=* ]] && MANIFEST_DIR="$(dirname "${!i#--manifest-path=}")"
+done
+BIN="${CARGO_TARGET_DIR:-$MANIFEST_DIR/target}/$TARGET/release/$BIN_NAME"
 
-# 6. Prove the result really is a 64-bit x86_64 ELF. On a cross-build a
-#    misconfigured toolchain happily emits a host-arch binary, and that mistake
-#    is invisible until the binary is shipped. Read the ELF header directly so
-#    the check does not depend on file(1) being installed:
-#    byte 4 is EI_CLASS (2 = 64-bit), bytes 18-19 are e_machine (62 = x86-64).
+# 6. Prove the result really is a 64-bit ELF for the requested architecture.
+#    On a cross-build a misconfigured toolchain happily emits a host-arch
+#    binary, and that mistake is invisible until the binary is shipped. Read
+#    the ELF header directly so the check does not depend on file(1) being
+#    installed: byte 4 is EI_CLASS (2 = 64-bit), bytes 18-19 are e_machine.
 read -r elf_class < <(od -An -tu1 -j4 -N1 "$BIN")
 read -r m_lo m_hi < <(od -An -tu1 -j18 -N2 "$BIN")
 elf_machine=$(( m_lo + m_hi * 256 ))
-if (( elf_class != 2 || elf_machine != 62 )); then
-    echo "error: $BIN is not a 64-bit x86_64 ELF" \
-         "(EI_CLASS=$elf_class, e_machine=$elf_machine; wanted 2 and 62)" >&2
+if (( elf_class != 2 || elf_machine != ELF_MACHINE )); then
+    echo "error: $BIN is not a 64-bit $MUSL_ARCH ELF" \
+         "(EI_CLASS=$elf_class, e_machine=$elf_machine; wanted 2 and $ELF_MACHINE)" >&2
     exit 1
 fi
-echo ">> Verified x86_64 (e_machine=62), 64-bit ELF"
+echo ">> Verified $MUSL_ARCH (e_machine=$ELF_MACHINE), 64-bit ELF"
 
 if command -v readelf >/dev/null 2>&1; then
     if readelf -l "$BIN" 2>/dev/null | grep -q INTERP; then

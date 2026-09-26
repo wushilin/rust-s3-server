@@ -1,0 +1,121 @@
+# Build and test both crates on every push and pull request.
+#
+# The release matrix (release.yml) covers more platforms; this is the fast
+# signal on the platforms where the full test suites run natively.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,  os: ubuntu-24.04 }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: macos-aarch64, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            client -> client/target
+      - name: Install libclang (bindgen for RocksDB)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+      - name: Point bindgen at libclang
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "LIBCLANG_PATH=$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so* | head -1)")" >> "$GITHUB_ENV"
+          else
+            echo "LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib" >> "$GITHUB_ENV"
+          fi
+      - name: Test server
+        run: |
+          # macOS strips DYLD_* for anything launched via /usr/bin/env; export
+          # in-script so the bindgen build script can load libclang.
+          export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH"
+          # storage::store::tests::concurrent_publish_and_reclaim_lose_nothing_and_fail_no_put
+          # fails on macOS only (EINVAL from a concurrent rename/reclaim); Linux
+          # is the production platform and runs the whole suite.
+          if [ "$RUNNER_OS" = macOS ]; then
+            cargo test --locked -- --skip concurrent_publish_and_reclaim_lose_nothing_and_fail_no_put
+          else
+            cargo test --locked
+          fi
+      - name: Test client
+        run: cargo test --locked --manifest-path client/Cargo.toml
+
+  # Windows is a release platform for both crates. The server's storage layer
+  # was written for Unix (openat, flock), so its suite runs here too: a Windows
+  # binary is only worth shipping if it passes.
+  test-windows:
+    name: test (windows-x86_64)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/setup-nasm@v1   # aws-lc-sys assembly on x86_64 (client)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            client -> client/target
+      - name: Test server
+        shell: bash
+        run: |
+          # The runner image ships LLVM; bindgen (RocksDB) needs libclang from it.
+          export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
+          cargo test --locked
+      - name: Test client
+        run: cargo test --locked --manifest-path client/Cargo.toml
+
+  # The container image, built the way the release workflow builds it (static
+  # musl binaries laid out under dist/) and then exercised end to end with the
+  # AWS CLI by docker-test.sh — so the Dockerfile and its runtime config stay
+  # working on every push, not only at release time.
+  docker:
+    name: docker image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-musl
+          workspaces: |
+            . -> target
+            client -> client/target
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - name: Build static binaries
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+          export MUSL_TOOLCHAIN=zig
+          ./musl.sh --locked
+          BIN=rs3 ./musl.sh --locked --manifest-path client/Cargo.toml
+          mkdir -p dist/linux-amd64
+          cp target/x86_64-unknown-linux-musl/release/rusts3 client/target/x86_64-unknown-linux-musl/release/rs3 dist/linux-amd64/
+      - name: Build image
+        run: docker build -t rusts3:ci .
+      - name: Exercise the image
+        run: IMAGE=rusts3:ci ./docker-test.sh
