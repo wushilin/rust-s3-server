@@ -256,12 +256,15 @@ echo ">> Using CXX=$MUSL_CXX"
 #    otherwise probe common locations. The host's libclang is fine — it can
 #    target any architecture, it just has to be told which one (step 4).
 if [[ -z "${LIBCLANG_PATH:-}" ]]; then
-    for d in /usr/lib/llvm-*/lib /usr/lib64 /usr/lib \
-             "/usr/lib/${HOST_ARCH}-linux-gnu" \
-             /Library/Developer/CommandLineTools/usr/lib; do
-        if compgen -G "$d/libclang.so*" >/dev/null 2>&1 || compgen -G "$d/libclang.dylib" >/dev/null 2>&1; then
+    for d in /usr/lib64 /usr/lib "/usr/lib/${HOST_ARCH}-linux-gnu" \
+             /Library/Developer/CommandLineTools/usr/lib \
+             $(ls -d /usr/lib/llvm-*/lib 2>/dev/null | sort -V); do
+        # clang-sys dlopens `libclang.so` or `libclang-N.so` (the -dev symlink);
+        # a directory holding only the runtime `libclang.so.1` will not do.
+        if compgen -G "$d/libclang.so" >/dev/null 2>&1 || compgen -G "$d/libclang-*.so" >/dev/null 2>&1 \
+           || compgen -G "$d/libclang.dylib" >/dev/null 2>&1; then
             LIBCLANG_PATH="$d"
-            break
+            # Keep looking: a later (newer) LLVM directory wins.
         fi
     done
 fi

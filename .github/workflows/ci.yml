@@ -44,7 +44,9 @@ jobs:
       - name: Point bindgen at libclang
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            echo "LIBCLANG_PATH=$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so* | head -1)")" >> "$GITHUB_ENV"
+            # clang-sys loads `libclang.so` or `libclang-N.so` (the -dev symlink),
+            # not the runtime-only `libclang.so.1` older LLVM dirs also carry.
+            echo "LIBCLANG_PATH=$(dirname "$(ls -v /usr/lib/llvm-*/lib/libclang-*.so /usr/lib/llvm-*/lib/libclang.so 2>/dev/null | tail -1)")" >> "$GITHUB_ENV"
           else
             echo "LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib" >> "$GITHUB_ENV"
           fi
