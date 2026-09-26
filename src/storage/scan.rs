@@ -1381,9 +1381,20 @@ mod tests {
     }
 
     fn filetime_set(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
-        let file = std::fs::OpenOptions::new().write(true).open(path).or_else(|_| {
-            std::fs::OpenOptions::new().read(true).open(path)
-        })?;
+        let mut writable = std::fs::OpenOptions::new();
+        writable.write(true);
+        let mut readable = std::fs::OpenOptions::new();
+        readable.read(true);
+        // Windows opens directories only with FILE_FLAG_BACKUP_SEMANTICS;
+        // without it every `age(&dir)` silently did nothing there.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            writable.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+            readable.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        let file = writable.open(path).or_else(|_| readable.open(path))?;
         file.set_modified(time)
     }
 

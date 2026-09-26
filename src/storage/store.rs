@@ -946,11 +946,17 @@ impl LocalObjectStore {
                 )));
             }
             let leaf = bucket_dir.join(blob_rel_parent(&blob_rel));
-            tokio::fs::create_dir_all(&leaf).await?;
+            match tokio::fs::create_dir_all(&leaf).await {
+                Ok(()) => {}
+                // A leaf the reclaimer is deleting at this instant: Windows
+                // reports the delete-pending directory as denied, not gone.
+                Err(err) if is_leaf_reclaimed_race(&err) => continue,
+                Err(err) => return Err(err.into()),
+            }
             let dest = bucket_dir.join(&blob_rel);
             match tokio::fs::rename(publish_dir, &dest).await {
                 Ok(()) => break dest,
-                Err(err) if err.kind() == ErrorKind::NotFound => {
+                Err(err) if is_leaf_reclaimed_race(&err) => {
                     // ENOENT is ambiguous: it can mean the destination fanout
                     // leaf was reclaimed out from under us (recreate + retry),
                     // OR the *source* dir vanished — e.g. a racing abort/second
@@ -2291,6 +2297,10 @@ impl LocalObjectStore {
 
         tmp.checkpoint_truncate().await?;
         tmp.close().await;
+        // `close` flushes; the files are open until the last handle drops.
+        // Windows refuses to rename a directory with open handles, so the
+        // handle must be gone before the swap (harmless elsewhere).
+        drop(tmp);
 
         // Remove the prior live index (a RocksDB directory) plus any legacy
         // SQLite leftovers from before the switch, then atomically swap the
@@ -2444,6 +2454,16 @@ async fn fsync_file(path: &Path) -> Result<()> {
     let file = tokio::fs::File::open(path).await?;
     file.sync_all().await?;
     Ok(())
+}
+
+/// The errors a publish rename (or the leaf `create_dir_all` before it) gets
+/// when the empty-directory reclaimer removes the destination's fanout leaf at
+/// the same instant. Retrying — which recreates the leaf — converges. `ENOENT`
+/// everywhere; on Windows a directory in the delete-pending state answers
+/// `ERROR_ACCESS_DENIED` until the delete completes.
+fn is_leaf_reclaimed_race(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::NotFound
+        || (cfg!(windows) && err.kind() == ErrorKind::PermissionDenied)
 }
 
 /// Makes a directory's entries durable: opens it and fsyncs, which is how
