@@ -421,8 +421,10 @@ publishes them (`.github/workflows/release.yml`):
 
 The tag must match the `version` in the crate's `Cargo.toml`. FreeBSD aarch64
 is not built: it is a Tier 3 Rust target with no standard library shipped by
-rustup. Linux binaries are static (`musl.sh`; `MUSL_ARCH=aarch64` for arm) and
-run on any distribution.
+rustup. The FreeBSD server binary links the system RocksDB (`pkg install
+rocksdb`); librocksdb-sys does not build RocksDB from source there. Linux
+binaries are static (`musl.sh`; `MUSL_ARCH=aarch64` for arm) and run on any
+distribution.
 
 ## Management console
 

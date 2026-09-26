@@ -175,6 +175,11 @@ resolve_zig() {
 # zig's lld answers "ignoring deprecated linker optimization setting '1'" on
 # stderr, which rustc's linker_messages lint then reports as a build warning.
 # The setting is ignored either way, so the only thing lost is the noise.
+#
+# And -Wl,--fix-cortex-a53-843419, which rustc always passes for aarch64 Linux
+# targets: zig's lld rejects it outright ("unsupported linker arg"). It works
+# around an erratum in one early Cortex-A53 revision; zig has no equivalent,
+# and every other aarch64 core is unaffected.
 make_zig_shims() {
     local dir="$CACHE_DIR/zig-shim-${ZIG_TARGET}-$(uname -s | tr A-Z a-z)"
     mkdir -p "$dir"
@@ -188,6 +193,7 @@ while (( \$# )); do
         --target=*|-target=*) shift ;;
         --target|-target)     if (( \$# >= 2 )); then shift 2; else shift; fi ;;
         -Wl,-O[0-9]*)         shift ;;
+        -Wl,--fix-cortex-a53-843419) shift ;;
         *)                    args+=("\$1"); shift ;;
     esac
 done

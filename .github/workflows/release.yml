@@ -14,9 +14,10 @@
 #   linux    x86_64, aarch64   static musl (musl.sh, zig toolchain), built on
 #                              native runners so the binary is executed
 #   macos    aarch64, x86_64   native runners
-#   freebsd  x86_64            built natively inside a FreeBSD VM. aarch64
-#                              FreeBSD is a Tier 3 Rust target (no standard
-#                              library shipped by rustup), so it is not built.
+#   freebsd  x86_64            built natively inside a FreeBSD VM; the server
+#                              links the system RocksDB (`pkg install rocksdb`).
+#                              aarch64 FreeBSD is a Tier 3 Rust target (no
+#                              standard library from rustup), so it is not built.
 #   windows  x86_64, aarch64   native runners
 name: Release
 
@@ -142,7 +143,10 @@ jobs:
           cpu: 4
           copyback: true
           prepare: |
-            pkg install -y curl llvm gmake
+            # librocksdb-sys does not build RocksDB from source on FreeBSD; it
+            # links the system library from the rocksdb package (a runtime
+            # dependency of the FreeBSD server binary).
+            pkg install -y curl llvm gmake rocksdb
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           run: |
             set -e
