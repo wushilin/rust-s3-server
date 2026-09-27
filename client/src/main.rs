@@ -1444,9 +1444,10 @@ async fn is_remote_spec(spec: &str) -> bool {
 
 /// A local operand spelled so every downstream `is_s3_url`/`resolve_side`
 /// check also reads it as local: relative paths that look like
-/// `ALIAS/BUCKET` get a `./` prefix.
+/// `ALIAS/BUCKET` get a `./` prefix. Absolute paths are left alone:
+/// `./C:\dir/` is not a path on Windows.
 fn local_spec(spec: &str) -> String {
-    if is_s3_url(spec) {
+    if is_s3_url(spec) && Path::new(spec).is_relative() {
         format!("./{spec}")
     } else {
         spec.to_string()
@@ -3282,4 +3283,29 @@ async fn tree(args: TreeArgs) -> Result<()> {
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod local_spec_tests {
+    use super::local_spec;
+
+    #[test]
+    fn relative_alias_lookalikes_get_a_dot_slash() {
+        assert_eq!(local_spec("data/file.txt"), "./data/file.txt");
+        assert_eq!(local_spec("file.txt"), "file.txt");
+        assert_eq!(local_spec("./data/x"), "./data/x");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_windows_paths_are_left_alone() {
+        assert_eq!(local_spec(r"C:\tmp\pg/"), r"C:\tmp\pg/");
+        assert_eq!(local_spec("C:/tmp/pg"), "C:/tmp/pg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_unix_paths_are_left_alone() {
+        assert_eq!(local_spec("/tmp/pg/"), "/tmp/pg/");
+    }
 }
