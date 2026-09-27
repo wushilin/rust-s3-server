@@ -184,8 +184,8 @@ impl Harness {
         body: &[u8],
     ) -> (StatusCode, String) {
         let datetime = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let auth = super::auth::compute_auth_header(
-            method, path, query, HOST, &cred.ak, &cred.sk, REGION, &datetime,
+        let auth = super::auth::compute_auth_header_with_headers(
+            method, path, query, HOST, &cred.ak, &cred.sk, REGION, &datetime, headers,
         );
         let uri = match query.is_empty() {
             true => path.to_string(),

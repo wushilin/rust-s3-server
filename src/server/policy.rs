@@ -679,17 +679,24 @@ pub fn requirements_for_request(
     query: &str,
     copy_source: Option<&str>,
 ) -> Option<Vec<Requirement>> {
-    let has = |name: &str| {
-        query
-            .split('&')
-            .any(|p| p == name || p.starts_with(&format!("{name}=")))
-    };
+    // Parse the query exactly as the router does (`parse_s3_query`
+    // percent-decodes keys and values), so `?%75ploadId` or `?c%6Frs` selects
+    // the same operation here as in dispatch. Requests repeating a parameter
+    // are rejected before either runs, so "first vs last wins" cannot differ.
+    let params = super::parse_s3_query(query);
+    let has = |name: &str| params.contains_key(name);
     let path = path.trim_start_matches('/');
-    let (bucket, key) = match path.split_once('/') {
+    let (raw_bucket, key) = match path.split_once('/') {
         Some((b, k)) if !k.is_empty() => (b, Some(k)),
         Some((b, _)) => (b, None),
         None => (path, None),
     };
+    // The router's `Path` extractor percent-decodes the bucket segment too;
+    // evaluate the policy against the same name (`/%73ecret/x` is `secret`).
+    let decoded_bucket = urlencoding::decode(raw_bucket)
+        .map(|v| v.into_owned())
+        .unwrap_or_else(|_| raw_bucket.to_string());
+    let bucket = decoded_bucket.as_str();
 
     if bucket.is_empty() {
         // ListBuckets is not gated here: the handler answers with the buckets
@@ -714,7 +721,7 @@ pub fn requirements_for_request(
             .map(|v| v.into_owned())
             .unwrap_or_else(|_| k.to_string())
     });
-    let list_context = list_condition_context(query);
+    let list_context = list_condition_context(&params);
 
     let reqs = match (method, &decoded_key) {
         // ── bucket level ──
@@ -753,7 +760,12 @@ pub fn requirements_for_request(
         ("POST", None) => vec![Requirement::object("s3:PutObject", bucket, "*")],
         // ── object level ──
         ("GET" | "HEAD", Some(k)) => {
-            if has("uploadId") {
+            // The router sends a HEAD to the plain object read whatever its
+            // query says (ListParts and GetObjectAttributes are GET-only), so
+            // a HEAD always needs s3:GetObject.
+            if method == "HEAD" {
+                vec![Requirement::object("s3:GetObject", bucket, k)]
+            } else if has("uploadId") {
                 vec![Requirement::object("s3:ListMultipartUploadParts", bucket, k)]
             } else if has("attributes") {
                 // AWS gates GetObjectAttributes behind its own action rather
@@ -770,13 +782,12 @@ pub fn requirements_for_request(
         ("PUT", Some(k)) => {
             let mut reqs = vec![Requirement::object("s3:PutObject", bucket, k)];
             if let Some(source) = copy_source {
-                let source = source.trim_start_matches('/');
-                let decoded = urlencoding::decode(source)
-                    .map(|v| v.into_owned())
-                    .unwrap_or_else(|_| source.to_string());
-                if let Some((sb, sk)) = decoded.split_once('/') {
-                    reqs.push(Requirement::object("s3:GetObject", sb, sk));
-                }
+                // Resolve the source exactly as the copy handlers will (the
+                // `?versionId=` suffix stripped, the same percent-decoding). A
+                // source they could not parse is denied outright rather than
+                // authorized against some other reading of it.
+                let (sb, sk) = super::parse_copy_source(source)?;
+                reqs.push(Requirement::object("s3:GetObject", &sb, &sk));
             }
             reqs
         }
@@ -801,30 +812,17 @@ pub fn requirements_for_request(
     Some(reqs)
 }
 
-fn list_condition_context(query: &str) -> BTreeMap<String, String> {
+fn list_condition_context(params: &std::collections::HashMap<String, String>) -> BTreeMap<String, String> {
     let mut context = BTreeMap::new();
     // AWS evaluates an omitted prefix as the empty prefix.
     context.insert(
         "s3:prefix".to_string(),
-        query_value(query, "prefix").unwrap_or_default(),
+        params.get("prefix").cloned().unwrap_or_default(),
     );
-    if let Some(delimiter) = query_value(query, "delimiter") {
-        context.insert("s3:delimiter".to_string(), delimiter);
+    if let Some(delimiter) = params.get("delimiter") {
+        context.insert("s3:delimiter".to_string(), delimiter.clone());
     }
     context
-}
-
-fn query_value(query: &str, wanted: &str) -> Option<String> {
-    query.split('&').find_map(|part| {
-        let (raw_key, raw_value) = part.split_once('=').unwrap_or((part, ""));
-        let key = urlencoding::decode(raw_key).ok()?;
-        if key != wanted {
-            return None;
-        }
-        urlencoding::decode(raw_value)
-            .ok()
-            .map(|value| value.into_owned())
-    })
 }
 
 #[cfg(test)]

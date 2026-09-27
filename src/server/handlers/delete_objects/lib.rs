@@ -26,15 +26,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
             )
         }
     };
-    let (keys, quiet) = srv::parse_delete_objects_xml(&String::from_utf8_lossy(&raw));
-    if keys.is_empty() {
-        return srv::s3_error(
-            StatusCode::BAD_REQUEST,
-            "MalformedXML",
-            "No Object keys found in Delete request",
-            &resource,
-        );
-    }
+    let (keys, quiet) = match srv::parse_delete_objects_xml(&String::from_utf8_lossy(&raw)) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return srv::s3_error(StatusCode::BAD_REQUEST, "MalformedXML", message, &resource)
+        }
+    };
 
     // Authorize each key. No identity (auth disabled) means allow.
     let allowed = keys

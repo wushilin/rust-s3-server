@@ -52,6 +52,12 @@
 //! Extra parameters beyond what a provider uses are accepted and ignored, so
 //! the calling convention can grow without a flag day.
 //!
+//! Placeholders inside YAML comments are left untouched — a commented-out
+//! `# password: {{RUSTS3_ADMIN_PASSWORD}}` is documentation, not a reference,
+//! and must not abort startup. Both full-line comments and trailing ` # …`
+//! comments outside quotes count; a `#` inside a quoted string, a placeholder,
+//! or a block scalar (`key: |`) body does not.
+//!
 //! ## Adding a provider
 //!
 //! Implement [`Resolver`] and register it. A resolver receives the whole
@@ -368,13 +374,127 @@ impl std::fmt::Display for MissingVars {
 
 impl std::error::Error for MissingVars {}
 
-/// Expands every placeholder in `text` using `registry`.
+/// Byte ranges (`start..end`, end exclusive) of the YAML comments in `text`.
+///
+/// Deliberately conservative: anything it is unsure about is treated as *not*
+/// a comment, which just means the placeholder is expanded as it always was.
+fn yaml_comment_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    // Indentation of the line that opened a block scalar (`key: |`) while its
+    // body lasts: a `#` in there is content, not a comment.
+    let mut block_indent: Option<usize> = None;
+    for raw in text.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let content = line.trim_start_matches([' ', '\t']);
+        let indent = line.len() - content.len();
+        if let Some(parent) = block_indent {
+            if content.is_empty() || indent > parent {
+                continue;
+            }
+            block_indent = None;
+        }
+        let comment_at = find_yaml_comment(line);
+        if let Some(at) = comment_at {
+            spans.push((line_start + at, line_start + line.len()));
+        }
+        if opens_block_scalar(&line[..comment_at.unwrap_or(line.len())]) {
+            block_indent = Some(indent);
+        }
+    }
+    spans
+}
+
+/// Where the comment on one line starts: a `#` at the line start or after
+/// whitespace, outside quotes and outside `{{…}}` placeholders.
+fn find_yaml_comment(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(b'"') => {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    quote = None;
+                }
+            }
+            // Single-quoted: `''` is an escape, which closing and immediately
+            // reopening handles correctly.
+            Some(_) => {
+                if b == b'\'' {
+                    quote = None;
+                }
+            }
+            None => {
+                if bytes[i..].starts_with(b"{{") {
+                    // A placeholder's own text (a default may contain ` #`) is
+                    // never a comment. Unterminated on this line: give up.
+                    let end = line[i + 2..].find("}}")?;
+                    i += 2 + end + 2;
+                    continue;
+                }
+                match b {
+                    b'#' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t') => return Some(i),
+                    // A quote only opens a string where a scalar begins, so the
+                    // apostrophe in `note: it's` is plain text.
+                    b'"' | b'\'' => {
+                        let before = line[..i].trim_end_matches([' ', '\t']);
+                        if before.is_empty()
+                            || before.ends_with([':', '-', '[', '{', ',', '?'])
+                        {
+                            quote = Some(b);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True when a line (comment already stripped) ends with a block scalar
+/// indicator: `|`, `>`, optionally with chomping/indentation indicators.
+fn opens_block_scalar(code: &str) -> bool {
+    let code = code.trim_end();
+    let token = code.rsplit([' ', '\t']).next().unwrap_or("");
+    let mut chars = token.chars();
+    matches!(chars.next(), Some('|' | '>'))
+        && chars.all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+        && (token.len() == code.len() || code[..code.len() - token.len()].trim_end().ends_with([':', '-']))
+}
+
+/// Expands every placeholder in `text` using `registry`. Placeholders inside
+/// YAML comments are copied through verbatim (see the module docs).
 pub fn expand_with_registry(text: &str, registry: &Registry) -> Result<String, MissingVars> {
     let mut out = String::with_capacity(text.len());
     let mut missing: BTreeSet<String> = BTreeSet::new();
     let mut rest = text;
+    let comments = yaml_comment_spans(text);
+    let mut next_comment = 0;
 
     while let Some(start) = rest.find("{{") {
+        let absolute = text.len() - rest.len() + start;
+        while next_comment < comments.len() && comments[next_comment].1 <= absolute {
+            next_comment += 1;
+        }
+        if let Some(&(from, to)) = comments.get(next_comment) {
+            if from <= absolute {
+                // Inside a comment: copy through to the end of it untouched.
+                let consumed = to - (text.len() - rest.len());
+                out.push_str(&rest[..consumed]);
+                rest = &rest[consumed..];
+                continue;
+            }
+        }
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let Some(end) = after.find("}}") else {
@@ -645,6 +765,38 @@ mod tests {
         registry.register(Box::new(Reverse));
         let out = expand_with_registry("a: {{reverse:abc}}", &registry).unwrap();
         assert_eq!(out, "a: cba");
+    }
+
+    #[test]
+    fn placeholders_in_full_line_comments_are_left_alone() {
+        let text = "# password: {{SECRET}}\n  # also {{OTHER}}\nport: {{PORT:8002}}\n";
+        let out = expand_env(text, &[]).unwrap();
+        assert_eq!(out, "# password: {{SECRET}}\n  # also {{OTHER}}\nport: 8002\n");
+    }
+
+    #[test]
+    fn placeholders_in_trailing_comments_are_left_alone() {
+        let out = expand_env("port: {{PORT:1}} # was {{OLD_PORT}}\n", &[]).unwrap();
+        assert_eq!(out, "port: 1 # was {{OLD_PORT}}\n");
+    }
+
+    #[test]
+    fn a_hash_inside_quotes_or_a_default_is_not_a_comment() {
+        let out = expand_env(
+            "a: \"x # {{A}}\"\nb: 'y # {{B:2}}'\nc: {{C:d #e}} {{D:4}}\nn: it's # {{E}}\n",
+            &[("A", "1")],
+        )
+        .unwrap();
+        assert_eq!(out, "a: \"x # 1\"\nb: 'y # 2'\nc: d #e 4\nn: it's # {{E}}\n");
+        // A still-missing placeholder outside a comment is reported as before.
+        assert!(expand_env("a: \"# {{MISSING}}\"\n", &[]).is_err());
+    }
+
+    #[test]
+    fn a_hash_line_in_a_block_scalar_is_content() {
+        let text = "script: |\n  # {{A:1}}\n  run\nnext: {{B:2}} # {{C}}\n";
+        let out = expand_env(text, &[]).unwrap();
+        assert_eq!(out, "script: |\n  # 1\n  run\nnext: 2 # {{C}}\n");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use super::auth::presign_query;
 use super::config::AppConfig;
 use super::identity::Identity;
-use super::logging::{TARGET_AUDIT, TARGET_AUTH, TARGET_AUTHZ};
+use super::logging::{escape_control, TARGET_AUDIT, TARGET_AUTH, TARGET_AUTHZ};
 use super::TrafficMetrics;
 use super::iam::{Group, IamStore};
 use super::policy::{
@@ -155,11 +155,11 @@ pub fn router(state: UiState) -> Router {
         .with_state(state)
 }
 
-/// SameSite=Strict is the primary cookie-side CSRF defense. This adds an
-/// independent request-side check for modern browsers: cross-site unsafe
-/// requests are rejected, and an Origin header must match the configured
-/// public console origin when one is set. Requests without browser fetch
-/// metadata remain usable by non-browser administration clients.
+/// SameSite=Strict is the primary cookie-side CSRF defense, but SameSite is
+/// about *sites*, and a page served by the S3 port of this very host is
+/// same-site. So unsafe requests get an independent, origin-level check (see
+/// [`cross_origin_browser_request`]). Requests without browser fetch metadata
+/// remain usable by non-browser administration clients.
 async fn ui_csrf_middleware(
     State(config): State<Arc<AppConfig>>,
     request: Request<Body>,
@@ -169,26 +169,110 @@ async fn ui_csrf_middleware(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
     );
-    if unsafe_method {
-        let cross_site = request
-            .headers()
-            .get("sec-fetch-site")
-            .and_then(|value| value.to_str().ok())
-            == Some("cross-site");
-        let configured_origin = config.ui.public_hostname.as_deref().map(|host| {
-            format!("{}://{host}", config.ui.public_scheme.as_str())
-        });
-        let wrong_origin = request
-            .headers()
-            .get("origin")
-            .and_then(|value| value.to_str().ok())
-            .zip(configured_origin.as_deref())
-            .is_some_and(|(actual, expected)| actual != expected);
-        if cross_site || wrong_origin {
-            return error_response(StatusCode::FORBIDDEN, "cross-site request rejected");
-        }
+    if unsafe_method && cross_origin_browser_request(&config, request.headers()) {
+        return error_response(StatusCode::FORBIDDEN, "cross-site request rejected");
     }
     next.run(request).await
+}
+
+/// True when a browser's own request metadata says the request was made by a
+/// page of another *origin* (not merely another site):
+///
+/// - `Sec-Fetch-Site`, when present, must be `same-origin` (or `none`: typed
+///   into the address bar / a bookmark). `same-site` is rejected — that is
+///   exactly the S3 port of the same host.
+/// - `Origin`, when present, must equal the configured public console origin
+///   (`ui.public_hostname` + `ui.public_scheme`), or — when none is configured
+///   — name the host the request was sent to (`Host`, or the
+///   `X-Forwarded-Host` a reverse proxy set). Only `host[:port]` is compared
+///   when falling back to `Host`, so a TLS-terminating proxy that speaks plain
+///   HTTP to us still matches its `https://` origin; a page on another port is
+///   a different authority and is rejected. A browser can never attach
+///   `X-Forwarded-Host` to a cross-origin request without a CORS preflight,
+///   which this listener never grants, so honoring it cannot be abused.
+///
+/// Neither header present — curl, scripts — is not a browser, and passes.
+/// WebSocket upgrades are GETs that skip the middleware; their handlers call
+/// this directly.
+fn cross_origin_browser_request(config: &AppConfig, headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin" | "none")) {
+            return true;
+        }
+    }
+    match headers.get(header::ORIGIN) {
+        None => false,
+        Some(origin) => match origin.to_str() {
+            Ok(origin) => !origin_allowed(config, headers, origin),
+            Err(_) => true,
+        },
+    }
+}
+
+fn origin_allowed(config: &AppConfig, headers: &HeaderMap, origin: &str) -> bool {
+    if let Some(host) = config.ui.public_hostname.as_deref() {
+        let expected = format!("{}://{host}", config.ui.public_scheme.as_str());
+        return origin.eq_ignore_ascii_case(&expected);
+    }
+    // `null` (sandboxed frames, data: URLs) and anything malformed fail here.
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(['/', '@']) {
+        return false;
+    }
+    let forwarded_host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next());
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    [host, forwarded_host]
+        .into_iter()
+        .flatten()
+        .any(|candidate| same_authority(scheme, authority, candidate))
+}
+
+/// `host[:port]` equality, case-insensitive, treating the scheme's default
+/// port as implied (a browser omits `:443` from `Origin`; a client may still
+/// send it in `Host`).
+fn same_authority(scheme: &str, a: &str, b: &str) -> bool {
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        ":443"
+    } else if scheme.eq_ignore_ascii_case("http") {
+        ":80"
+    } else {
+        return false;
+    };
+    let normalize = |value: &str| {
+        let value = value.trim().to_ascii_lowercase();
+        match value.strip_suffix(default_port) {
+            Some(stripped) => stripped.to_string(),
+            None => value,
+        }
+    };
+    let (a, b) = (normalize(a), normalize(b));
+    !a.is_empty() && a == b
+}
+
+/// Endpoints that take a raw request body (the IAM dump) accept it only as
+/// `application/octet-stream`. That is not a CORS "simple" content type, so a
+/// browser can never send such a request cross-origin without a preflight —
+/// no `<form>` or `no-cors` fetch can deliver a dump, whatever the cookie
+/// policy. The console (and any script) sets the header explicitly.
+fn require_binary_body(headers: &HeaderMap) -> Result<(), Response> {
+    let is_binary = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/octet-stream"));
+    if is_binary {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "upload the dump with Content-Type: application/octet-stream",
+        ))
+    }
 }
 
 /// The console and the login form are two documents, not one page that hides
@@ -457,13 +541,24 @@ async fn ui_log_middleware(
 
 // ── session helpers ──────────────────────────────────────────────────────────
 
-fn session_of(state: &UiState, headers: &HeaderMap) -> Option<UiSession> {
+/// The session token from the request's cookie, if any.
+fn session_token(headers: &HeaderMap) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-    let token = cookies.split(';').find_map(|c| {
+    cookies.split(';').find_map(|c| {
         let (name, value) = c.trim().split_once('=')?;
         (name == SESSION_COOKIE).then(|| value.to_string())
-    })?;
-    let (username, is_builtin) = state.iam.resolve_session(&token)?;
+    })
+}
+
+fn session_of(state: &UiState, headers: &HeaderMap) -> Option<UiSession> {
+    session_for_token(state, &session_token(headers)?)
+}
+
+/// Resolves a token to a live session, with admin membership as of *now*.
+/// Long-lived connections (the WebSockets) call this again periodically, so a
+/// logout, expiry, deletion or demotion also ends a stream already open.
+fn session_for_token(state: &UiState, token: &str) -> Option<UiSession> {
+    let (username, is_builtin) = state.iam.resolve_session(token)?;
     let is_admin = is_builtin || state.iam.is_admin(&username);
     Some(UiSession {
         username,
@@ -506,7 +601,7 @@ fn authorize(state: &UiState, session: &UiSession, requirements: &[Requirement])
             log::warn!(
                 target: TARGET_AUTHZ,
                 "ui access denied by policy user={} action={} resource={}",
-                session.username, r.action, r.resource,
+                escape_control(&session.username), r.action, escape_control(&r.resource),
             );
         }
     }
@@ -546,7 +641,13 @@ fn begin_verb(
 fn audit(state: &UiState, request_id: &str, actor: &str, action: &str, target: impl Into<String>) {
     let target = target.into();
     // Same positional shape as the S3 audit line: `[rid] actor op target result`.
-    log::info!(target: TARGET_AUDIT, "[{request_id}] {actor} {action} {target} OK");
+    log::info!(
+        target: TARGET_AUDIT,
+        "[{request_id}] {} {} {} OK",
+        escape_control(actor),
+        escape_control(action),
+        escape_control(&target),
+    );
     state.tasks.publish(super::event_hub::Event::Audit {
         actor: actor.to_string(),
         action: action.to_string(),
@@ -591,38 +692,167 @@ async fn login(
     // Where the attempt came from — through a proxy too (PROXY protocol, or
     // X-Forwarded-For from a private peer). A failed login is worth tracing.
     let from = super::auth::client_ip(&parts.extensions, &parts.headers).unwrap_or_else(|| "unknown".to_string());
+    // The name is attacker-supplied: never let it forge log lines.
+    let user_log = escape_control(&req.username).into_owned();
+    let throttle_keys = LoginThrottle::keys(&from, &req.username);
+    let now = crate::storage::time::now_ms();
+    if let Some(wait_ms) = LOGIN_THROTTLE.locked_for(&throttle_keys, now) {
+        log::warn!(target: TARGET_AUTH, "ui login throttled user={user_log} from={from} retry_after_ms={wait_ms}");
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed login attempts; try again later",
+        );
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from(((wait_ms + 999) / 1000).max(1) as u64),
+        );
+        return response;
+    }
+    let failed = |kind: &str| {
+        LOGIN_THROTTLE.record_failure(&throttle_keys, crate::storage::time::now_ms());
+        log::warn!(target: TARGET_AUTH, "ui login failed user={user_log} kind={kind} from={from}");
+        error_response(StatusCode::UNAUTHORIZED, "invalid credentials")
+    };
     // Built-in admin users (config file) first — they always win over any
     // same-named sqlite user and are unrestricted.
     if let Some(builtin) = state.config.find_builtin_user(&req.username) {
-        let ok = builtin
-            .password
-            .as_deref()
-            .map(|p| verify_builtin_password(p, &req.password))
-            .unwrap_or(false);
+        // bcrypt is deliberately slow: verify on the blocking pool, never on an
+        // async worker.
+        let configured = builtin.password.clone();
+        let candidate = req.password.clone();
+        let ok = tokio::task::spawn_blocking(move || {
+            configured
+                .as_deref()
+                .map(|p| verify_builtin_password(p, &candidate))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
         if !ok {
-            log::warn!(target: TARGET_AUTH, "ui login failed user={} kind=builtin from={from}", req.username);
-            return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+            return failed("builtin");
         }
-        log::info!(target: TARGET_AUTH, "ui login user={} kind=builtin root=true from={from}", req.username);
+        LOGIN_THROTTLE.record_success(&throttle_keys);
+        log::info!(target: TARGET_AUTH, "ui login user={user_log} kind=builtin root=true from={from}");
         return session_response(&state, &req.username, true);
     }
     match state.iam.verify_password(&req.username, &req.password).await {
         Ok(true) => {
-            log::info!(target: TARGET_AUTH, "ui login user={} kind=iam root=false from={from}", req.username);
+            LOGIN_THROTTLE.record_success(&throttle_keys);
+            log::info!(target: TARGET_AUTH, "ui login user={user_log} kind=iam root=false from={from}");
             session_response(&state, &req.username, false)
         }
-        Ok(false) => {
-            log::warn!(target: TARGET_AUTH, "ui login failed user={} kind=iam from={from}", req.username);
-            error_response(StatusCode::UNAUTHORIZED, "invalid credentials")
-        }
+        Ok(false) => failed("iam"),
         Err(err) => storage_error(err),
+    }
+}
+
+// ── login throttling ─────────────────────────────────────────────────────────
+
+/// Failures a username may accumulate before each further failure locks it.
+const LOGIN_FREE_FAILURES_PER_USER: u32 = 5;
+/// Failures one client address may accumulate (across any names) before the
+/// same backoff applies to the address — higher, since a NAT may be shared.
+const LOGIN_FREE_FAILURES_PER_IP: u32 = 20;
+/// The backoff doubles per failure past the free allowance, up to this.
+const LOGIN_MAX_LOCKOUT_MS: i64 = 15 * 60 * 1000;
+/// A counter with no failure for this long is forgotten.
+const LOGIN_FORGET_MS: i64 = 30 * 60 * 1000;
+/// Hard bound on tracked counters, so a flood of made-up names or addresses
+/// cannot grow memory without limit.
+const LOGIN_THROTTLE_CAPACITY: usize = 10_000;
+
+static LOGIN_THROTTLE: std::sync::LazyLock<LoginThrottle> =
+    std::sync::LazyLock::new(LoginThrottle::default);
+
+#[derive(Debug, Clone, Copy)]
+struct LoginFailures {
+    count: u32,
+    locked_until_ms: i64,
+    last_failure_ms: i64,
+}
+
+/// In-memory brute-force brake for the console login: per-address and
+/// per-username failure counters with exponential backoff (a temporary
+/// lockout). A locked attempt is refused before any password hashing, so it
+/// also caps the CPU an attacker can make the server burn. Process-local and
+/// bounded; a restart forgets it.
+#[derive(Default)]
+struct LoginThrottle {
+    entries: std::sync::Mutex<std::collections::HashMap<String, LoginFailures>>,
+}
+
+impl LoginThrottle {
+    /// `(ip key, user key)`. The name is length-capped: it is attacker input.
+    fn keys(ip: &str, username: &str) -> [(String, u32); 2] {
+        let name: String = username.chars().take(128).collect();
+        [
+            (format!("ip\u{0}{ip}"), LOGIN_FREE_FAILURES_PER_IP),
+            (format!("user\u{0}{name}"), LOGIN_FREE_FAILURES_PER_USER),
+        ]
+    }
+
+    /// Milliseconds until the longest lockout among `keys` ends, if any.
+    fn locked_for(&self, keys: &[(String, u32)], now: i64) -> Option<i64> {
+        let entries = self.entries.lock().unwrap();
+        keys.iter()
+            .filter_map(|(key, _)| entries.get(key))
+            .map(|f| f.locked_until_ms - now)
+            .filter(|wait| *wait > 0)
+            .max()
+    }
+
+    fn record_failure(&self, keys: &[(String, u32)], now: i64) {
+        let mut entries = self.entries.lock().unwrap();
+        for (key, free) in keys {
+            if !entries.contains_key(key) && entries.len() >= LOGIN_THROTTLE_CAPACITY {
+                entries.retain(|_, f| now - f.last_failure_ms < LOGIN_FORGET_MS || f.locked_until_ms > now);
+                if entries.len() >= LOGIN_THROTTLE_CAPACITY {
+                    // Still full: evict the stalest counter.
+                    if let Some(oldest) = entries
+                        .iter()
+                        .min_by_key(|(_, f)| f.last_failure_ms)
+                        .map(|(k, _)| k.clone())
+                    {
+                        entries.remove(&oldest);
+                    }
+                }
+            }
+            let entry = entries.entry(key.clone()).or_insert(LoginFailures {
+                count: 0,
+                locked_until_ms: 0,
+                last_failure_ms: now,
+            });
+            if now - entry.last_failure_ms >= LOGIN_FORGET_MS {
+                entry.count = 0;
+            }
+            entry.count = entry.count.saturating_add(1);
+            entry.last_failure_ms = now;
+            if entry.count > *free {
+                let doublings = (entry.count - free - 1).min(20);
+                let lockout = (1000i64 << doublings).min(LOGIN_MAX_LOCKOUT_MS);
+                entry.locked_until_ms = now + lockout;
+            }
+        }
+    }
+
+    /// A successful login clears the *username* counter only: letting it clear
+    /// the address counter would let one valid account reset an attacker's
+    /// per-address budget.
+    fn record_success(&self, keys: &[(String, u32)]) {
+        let mut entries = self.entries.lock().unwrap();
+        for (key, _) in keys.iter().filter(|(key, _)| key.starts_with("user\u{0}")) {
+            entries.remove(key);
+        }
     }
 }
 
 fn session_response(state: &UiState, username: &str, is_builtin: bool) -> Response {
     let token = state.iam.create_session(username, is_builtin);
     let is_admin = is_builtin || state.iam.is_admin(username);
-    let cookie = format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/");
+    let cookie = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/{}",
+        cookie_secure_attr(&state.config)
+    );
     (
         [(header::SET_COOKIE, cookie)],
         Json(json!({ "username": username, "is_admin": is_admin, "is_builtin": is_builtin })),
@@ -630,16 +860,24 @@ fn session_response(state: &UiState, username: &str, is_builtin: bool) -> Respon
         .into_response()
 }
 
-async fn logout(State(state): State<UiState>, headers: HeaderMap) -> Response {
-    if let Some(cookies) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
-        if let Some(token) = cookies.split(';').find_map(|c| {
-            let (name, value) = c.trim().split_once('=')?;
-            (name == SESSION_COOKIE).then(|| value.to_string())
-        }) {
-            state.iam.destroy_session(&token);
-        }
+/// `; Secure` when the console is published over HTTPS, so the session cookie
+/// is never sent over a plain-HTTP connection to the same host.
+fn cookie_secure_attr(config: &AppConfig) -> &'static str {
+    if config.ui.public_scheme == super::config::PublicScheme::Https {
+        "; Secure"
+    } else {
+        ""
     }
-    let clear = format!("{SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/");
+}
+
+async fn logout(State(state): State<UiState>, headers: HeaderMap) -> Response {
+    if let Some(token) = session_token(&headers) {
+        state.iam.destroy_session(&token);
+    }
+    let clear = format!(
+        "{SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/{}",
+        cookie_secure_attr(&state.config)
+    );
     ([(header::SET_COOKIE, clear)], Json(json!({"ok": true}))).into_response()
 }
 
@@ -1579,6 +1817,9 @@ async fn import_iam(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    if let Err(resp) = require_binary_body(&headers) {
+        return resp;
+    }
     let mode = match query.mode.as_str() {
         "" | "merge" => rawdb::ImportMode::Merge,
         "replace" => rawdb::ImportMode::Replace,
@@ -1594,6 +1835,14 @@ async fn import_iam(
     }
     match state.iam.import_raw(body.to_vec(), mode).await {
         Ok(report) => {
+            // The import may have removed users or replaced their rows —
+            // passwords included — so live console sessions no longer vouch
+            // for anyone. Drop every IAM session except the importing admin's
+            // own (while that user still exists). Built-in config users are
+            // not IAM rows and are unaffected.
+            state.iam.purge_iam_sessions(|name| {
+                actor.is_builtin || name != actor.username || !state.iam.user_exists(name)
+            });
             audit(
                 &state,
                 &rid.0,
@@ -1631,6 +1880,9 @@ async fn preview_import_iam(
     body: axum::body::Bytes,
 ) -> Response {
     if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    if let Err(resp) = require_binary_body(&headers) {
         return resp;
     }
     if body.is_empty() {
@@ -1884,7 +2136,7 @@ async fn download_object(
     {
         Ok(resp) => resp,
         Err(err) => {
-            log::error!("download response build failed key={}: {err}", q.key);
+            log::error!("download response build failed key={}: {err}", escape_control(&q.key));
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::empty())
@@ -2312,10 +2564,25 @@ async fn tasks_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if cross_origin_browser_request(&state.config, &headers) {
+        return error_response(StatusCode::FORBIDDEN, "cross-site request rejected");
+    }
     if require_root(&state, &headers).is_err() {
         return error_response(StatusCode::UNAUTHORIZED, "admin only");
     }
-    ws.on_upgrade(move |socket| tasks_socket(socket, state))
+    let token = session_token(&headers).unwrap_or_default();
+    ws.on_upgrade(move |socket| tasks_socket(socket, state, token))
+}
+
+/// Minimum spacing between event-driven task snapshots on one socket. Every S3
+/// request enters and leaves the registry, so under load events arrive far
+/// faster than a person can read; they are coalesced into at most one snapshot
+/// per interval (the heartbeat still refreshes progress every second).
+const TASKS_PUSH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// True while the socket's session is still live and still an admin one.
+fn socket_still_authorized(state: &UiState, token: &str) -> bool {
+    session_for_token(state, token).is_some_and(|s| s.is_admin)
 }
 
 #[derive(Deserialize)]
@@ -2327,8 +2594,9 @@ struct ProbeMsg {
     tasks: Vec<String>,
 }
 
-async fn tasks_socket(mut socket: WebSocket, state: UiState) {
+async fn tasks_socket(mut socket: WebSocket, state: UiState, token: String) {
     use tokio::sync::broadcast::error::RecvError;
+    use tokio::time::Instant;
     let mut events = state.tasks.subscribe();
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(1));
     if socket
@@ -2338,18 +2606,40 @@ async fn tasks_socket(mut socket: WebSocket, state: UiState) {
     {
         return;
     }
+    let mut last_push = Instant::now();
+    // A task change seen but not yet pushed; `flush` fires when it may be.
+    let mut pending = false;
+    let flush = tokio::time::sleep(std::time::Duration::ZERO);
+    tokio::pin!(flush);
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                // Authorization was checked at upgrade; re-check it every beat
+                // so logout, expiry, deletion or demotion ends the stream.
+                if !socket_still_authorized(&state, &token) {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
                 if socket.send(Message::Text(tasks_payload(&state).to_string().into())).await.is_err() { break; }
+                last_push = Instant::now();
+                pending = false;
+            }
+            () = &mut flush, if pending => {
+                if socket.send(Message::Text(tasks_payload(&state).to_string().into())).await.is_err() { break; }
+                last_push = Instant::now();
+                pending = false;
             }
             recv = events.recv() => {
                 match recv {
                     Err(RecvError::Closed) => break,
                     // A task started/finished, or we lagged — self-heal with a
-                    // fresh snapshot.
+                    // fresh snapshot, coalesced: immediately if the socket has
+                    // been quiet, else at most once per interval.
                     Ok(super::event_hub::Event::TasksChanged) | Err(RecvError::Lagged(_)) => {
-                        if socket.send(Message::Text(tasks_payload(&state).to_string().into())).await.is_err() { break; }
+                        if !pending {
+                            pending = true;
+                            flush.as_mut().reset(last_push + TASKS_PUSH_MIN_INTERVAL);
+                        }
                     }
                     // Audit events share the bus (for external subscribers) but
                     // aren't a task change — the console panel ignores them.
@@ -2489,13 +2779,17 @@ async fn scan_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if cross_origin_browser_request(&state.config, &headers) {
+        return error_response(StatusCode::FORBIDDEN, "cross-site request rejected");
+    }
     if require_root(&state, &headers).is_err() {
         return error_response(StatusCode::UNAUTHORIZED, "admin only");
     }
-    ws.on_upgrade(move |socket| scan_socket(socket, state))
+    let token = session_token(&headers).unwrap_or_default();
+    ws.on_upgrade(move |socket| scan_socket(socket, state, token))
 }
 
-async fn scan_socket(mut socket: WebSocket, state: UiState) {
+async fn scan_socket(mut socket: WebSocket, state: UiState, token: String) {
     use tokio::sync::broadcast::error::RecvError;
     let mut events = state.scans.subscribe();
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -2510,6 +2804,11 @@ async fn scan_socket(mut socket: WebSocket, state: UiState) {
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                // Re-validate the session each beat, as the tasks socket does.
+                if !socket_still_authorized(&state, &token) {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
                 if socket.send(Message::Text(state.scans.snapshot().to_string().into())).await.is_err() { break; }
             }
             recv = events.recv() => {
@@ -3024,5 +3323,124 @@ mod folder_tests {
     #[test]
     fn folder_key_rejects_embedded_double_slashes() {
         assert!(folder_object_key("", "a////b").is_err());
+    }
+}
+
+#[cfg(test)]
+mod csrf_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn a_non_browser_client_passes() {
+        let config = AppConfig::default();
+        assert!(!cross_origin_browser_request(&config, &headers(&[("host", "h:8003")])));
+    }
+
+    #[test]
+    fn same_site_but_other_origin_is_rejected() {
+        // A page on the S3 port of the same host is same-*site*.
+        let config = AppConfig::default();
+        let req = headers(&[
+            ("host", "h:8003"),
+            ("origin", "http://h:8002"),
+            ("sec-fetch-site", "same-site"),
+        ]);
+        assert!(cross_origin_browser_request(&config, &req));
+        // Origin alone (older browsers) catches it too.
+        let req = headers(&[("host", "h:8003"), ("origin", "http://h:8002")]);
+        assert!(cross_origin_browser_request(&config, &req));
+        let req = headers(&[("host", "h:8003"), ("origin", "null")]);
+        assert!(cross_origin_browser_request(&config, &req));
+    }
+
+    #[test]
+    fn the_console_itself_passes_directly_and_behind_a_tls_proxy() {
+        let config = AppConfig::default();
+        let req = headers(&[
+            ("host", "h:8003"),
+            ("origin", "http://H:8003"),
+            ("sec-fetch-site", "same-origin"),
+        ]);
+        assert!(!cross_origin_browser_request(&config, &req));
+        // TLS terminated by a proxy that preserves Host.
+        let req = headers(&[("host", "console.example.com"), ("origin", "https://console.example.com")]);
+        assert!(!cross_origin_browser_request(&config, &req));
+        let req = headers(&[("host", "console.example.com:443"), ("origin", "https://console.example.com")]);
+        assert!(!cross_origin_browser_request(&config, &req));
+        // A proxy that rewrites Host but reports the original.
+        let req = headers(&[
+            ("host", "127.0.0.1:8003"),
+            ("x-forwarded-host", "console.example.com"),
+            ("origin", "https://console.example.com"),
+        ]);
+        assert!(!cross_origin_browser_request(&config, &req));
+    }
+
+    #[test]
+    fn a_configured_public_origin_is_authoritative() {
+        let mut config = AppConfig::default();
+        config.ui.public_hostname = Some("console.example.com".into());
+        config.ui.public_scheme = super::super::config::PublicScheme::Https;
+        let ok = headers(&[("host", "10.0.0.5:8003"), ("origin", "https://console.example.com")]);
+        assert!(!cross_origin_browser_request(&config, &ok));
+        let bad = headers(&[("host", "console.example.com"), ("origin", "http://console.example.com")]);
+        assert!(cross_origin_browser_request(&config, &bad));
+        assert_eq!(cookie_secure_attr(&config), "; Secure");
+        assert_eq!(cookie_secure_attr(&AppConfig::default()), "");
+    }
+
+    #[test]
+    fn raw_dump_uploads_need_a_non_simple_content_type() {
+        assert!(require_binary_body(&headers(&[("content-type", "application/octet-stream")])).is_ok());
+        assert!(require_binary_body(&headers(&[("content-type", "Application/Octet-Stream; x=1")])).is_ok());
+        assert!(require_binary_body(&headers(&[("content-type", "text/plain")])).is_err());
+        assert!(require_binary_body(&headers(&[])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_failures_back_off_and_success_clears_the_user() {
+        let throttle = LoginThrottle::default();
+        let keys = LoginThrottle::keys("10.0.0.1", "admin");
+        let mut now = 1_000_000;
+        for _ in 0..LOGIN_FREE_FAILURES_PER_USER {
+            assert_eq!(throttle.locked_for(&keys, now), None);
+            throttle.record_failure(&keys, now);
+        }
+        assert_eq!(throttle.locked_for(&keys, now), None, "the free allowance is not locked");
+        throttle.record_failure(&keys, now);
+        assert_eq!(throttle.locked_for(&keys, now), Some(1000));
+        now += 1000;
+        throttle.record_failure(&keys, now);
+        assert_eq!(throttle.locked_for(&keys, now), Some(2000), "backoff doubles");
+        // The same name from another address is locked too.
+        let elsewhere = LoginThrottle::keys("10.0.0.2", "admin");
+        assert!(throttle.locked_for(&elsewhere, now).is_some());
+        throttle.record_success(&keys);
+        assert_eq!(throttle.locked_for(&elsewhere, now), None);
+    }
+
+    #[test]
+    fn the_counter_table_is_bounded() {
+        let throttle = LoginThrottle::default();
+        for i in 0..(LOGIN_THROTTLE_CAPACITY + 100) {
+            throttle.record_failure(&LoginThrottle::keys("1.2.3.4", &format!("u{i}")), i as i64);
+        }
+        assert!(throttle.entries.lock().unwrap().len() <= LOGIN_THROTTLE_CAPACITY);
     }
 }

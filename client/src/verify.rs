@@ -112,27 +112,89 @@ pub(crate) fn composite_etag(part_digests: &[[u8; 16]]) -> String {
     for digest in part_digests {
         concatenated.extend_from_slice(digest);
     }
-    format!("{}-{}", hex(&Md5::digest(&concatenated)), part_digests.len())
+    format!(
+        "{}-{}",
+        hex(&Md5::digest(&concatenated)),
+        part_digests.len()
+    )
 }
 
 pub(crate) fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Why an object's encryption makes its ETag something other than an MD5,
+/// or `None` when it does not.
+///
+/// SSE-KMS (`aws:kms`, `aws:kms:dsse`) and SSE-C objects get ETags that are
+/// *shaped* like an MD5 -- 32 hex digits, `-N` for multipart -- but are not
+/// one, so checking against them fails every download of a perfectly good
+/// object. SSE-S3 (`AES256`) ETags remain MD5s. Only a `HeadObject` carries
+/// these fields; a listing does not.
+pub(crate) fn opaque_encryption(
+    server_side_encryption: Option<&str>,
+    sse_customer_algorithm: Option<&str>,
+) -> Option<String> {
+    if let Some(alg) = sse_customer_algorithm {
+        return Some(format!(
+            "the object is SSE-C encrypted ({alg}); its ETag is not an MD5"
+        ));
+    }
+    match server_side_encryption {
+        Some(sse) if sse.to_ascii_lowercase().starts_with("aws:kms") => Some(format!(
+            "the object is SSE-KMS encrypted ({sse}); its ETag is not an MD5"
+        )),
+        _ => None,
+    }
+}
+
+/// [`opaque_encryption`] from a `HeadObject` response.
+pub(crate) fn opaque_encryption_of(
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> Option<String> {
+    opaque_encryption(
+        head.server_side_encryption().map(|s| s.as_str()),
+        head.sse_customer_algorithm(),
+    )
+}
+
+/// A download whose bytes do not match what the ETag says they should be.
+///
+/// Typed so the caller can tell it from a transfer failure: when the ETag
+/// came from a listing -- which says nothing about encryption -- a mismatch
+/// may only mean the ETag was never an MD5, and is worth one `HeadObject` to
+/// find out before a good file is thrown away.
+#[derive(Debug)]
+pub(crate) struct ContentMismatch(pub String);
+
+impl std::fmt::Display for ContentMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ContentMismatch {}
+
 /// Establishes how `bucket/key` must be verified.
 ///
 /// `etag` and `size` come from the `HeadObject` the caller already made, so a
 /// single-part object costs no extra request at all — its ETag alone is the
-/// answer.
+/// answer. `encryption` is [`opaque_encryption`]'s verdict on that HEAD (or
+/// `None` when the facts came from a listing, which cannot tell).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn discover_layout(
     client: &Client,
     bucket: &str,
     key: &str,
     etag: Option<&str>,
     size: u64,
+    encryption: Option<String>,
     budget: &crate::budget::StreamBudget,
     progress: Option<&crate::progress::ProgressUi>,
 ) -> Result<ObjectLayout> {
+    if let Some(reason) = encryption {
+        return Ok(ObjectLayout::Opaque { reason });
+    }
     let Some(etag) = etag else {
         return Ok(ObjectLayout::Opaque {
             reason: "the server reported no ETag".to_string(),
@@ -354,6 +416,17 @@ mod tests {
         assert!(parse_etag("d41d8cd98f00b204e9800998ecf8427e-0").is_none());
         assert!(parse_etag("d41d8cd98f00b204e9800998ecf8427e-x").is_none());
         assert!(parse_etag("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
+    }
+
+    #[test]
+    fn kms_and_sse_c_etags_are_opaque_but_sse_s3_is_not() {
+        assert!(opaque_encryption(Some("aws:kms"), None).is_some());
+        assert!(opaque_encryption(Some("aws:kms:dsse"), None).is_some());
+        assert!(opaque_encryption(None, Some("AES256")).is_some());
+        assert!(opaque_encryption(Some("AES256"), Some("AES256")).is_some());
+        // SSE-S3 ETags are still MD5s, and so is an unencrypted object's.
+        assert!(opaque_encryption(Some("AES256"), None).is_none());
+        assert!(opaque_encryption(None, None).is_none());
     }
 
     #[test]

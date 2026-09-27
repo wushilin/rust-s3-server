@@ -47,6 +47,25 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &resource)
         }
     };
+    // The `x-amz-copy-source-if-*` conditions apply to UploadPartCopy exactly
+    // as they do to CopyObject: a mismatch must not copy anything.
+    let src_object = match store.read_object(&src_bucket, &src_key).await {
+        Ok(object) => object,
+        Err(err) => return srv::storage_error_response(err, &format!("/{src_bucket}/{src_key}")),
+    };
+    if !srv::copy_source_preconditions_match(
+        &ctx.headers,
+        &src_object.meta.etag,
+        src_object.meta.last_modified_ms,
+    ) {
+        return srv::s3_error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold",
+            &format!("/{src_bucket}/{src_key}"),
+        );
+    }
+    drop(src_object);
     match store
         .copy_multipart_part(
             &ctx.bucket,

@@ -539,19 +539,29 @@ pub fn object_attributes_xml(
 pub(crate) fn escape_xml(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
-        // Characters illegal in XML 1.0 (control chars other than tab/LF/CR) are
-        // not well-formed even when entity-escaped, and object keys may legally
-        // contain them. Drop them so one bad key can't make the whole response
-        // unparseable to strict SDK XML parsers.
-        if ch.is_control() && ch != '\t' && ch != '\n' && ch != '\r' {
-            continue;
-        }
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            // Tab and LF survive an XML parser as they are.
+            '\t' | '\n' => out.push(ch),
+            // Object keys may hold any character, and dropping one would name
+            // a key that does not exist. Everything a parser would not hand
+            // back verbatim goes out as a character reference instead, the
+            // way AWS writes it:
+            // - CR, which parsers fold into LF by end-of-line normalisation;
+            // - DEL and the C1 controls (U+0080-U+009F), legal in XML 1.0 but
+            //   restricted in XML 1.1, and invisible in any case;
+            // - the other C0 controls and U+FFFE/U+FFFF, which XML 1.0 does
+            //   not allow even as references. AWS emits them this way too;
+            //   strict parsers reject such a listing on AWS as here, and
+            //   `encoding-type=url` is the remedy on both.
+            '\r' | '\u{7f}'..='\u{9f}' | '\u{fffe}' | '\u{ffff}' => {
+                out.push_str(&format!("&#x{:X};", ch as u32))
+            }
+            _ if ch < ' ' => out.push_str(&format!("&#x{:X};", ch as u32)),
             _ => out.push(ch),
         }
     }
@@ -571,6 +581,16 @@ mod tests {
     use super::*;
     use crate::storage::index::ObjectRecord;
     use crate::storage::metadata::ObjectMeta;
+
+    #[test]
+    fn escape_xml_writes_controls_as_character_references() {
+        assert_eq!(escape_xml("a&<>\"'b"), "a&amp;&lt;&gt;&quot;&apos;b");
+        assert_eq!(escape_xml("t\tn\nr\r"), "t\tn\nr&#xD;");
+        assert_eq!(escape_xml("\u{1}\u{1f}"), "&#x1;&#x1F;");
+        assert_eq!(escape_xml("\u{7f}\u{85}\u{9f}\u{a0}"), "&#x7F;&#x85;&#x9F;\u{a0}");
+        assert_eq!(escape_xml("\u{fffe}\u{ffff}\u{fffd}"), "&#xFFFE;&#xFFFF;\u{fffd}");
+        assert_eq!(escape_xml("€/文件"), "€/文件");
+    }
 
     #[test]
     fn list_v2_includes_s3_required_fields() {

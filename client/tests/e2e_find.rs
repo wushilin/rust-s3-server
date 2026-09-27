@@ -218,3 +218,19 @@ fn find_exec_key_with_unbalanced_quote_does_not_abort() {
         "recorded: {recorded}"
     );
 }
+
+#[test]
+fn find_zero_size_thresholds_are_disabled() {
+    // mc parity: `--larger 0` / `--smaller 0` do not filter at all.
+    let server = TestServer::start();
+    seed(&server, "fndz");
+    let empty = server.dir.path().join("empty.bin");
+    std::fs::write(&empty, b"").unwrap();
+    server.rs3_ok(&["put", empty.to_str().unwrap(), "test/fndz/a/empty.bin"]);
+    let out = server.rs3_ok(&["find", "test/fndz", "--smaller", "0"]);
+    assert_eq!(out.lines().count(), 4, "out: {out}");
+    let out = server.rs3_ok(&["find", "test/fndz", "--larger", "0"]);
+    assert!(out.contains("test/fndz/a/empty.bin"), "out: {out}");
+    let out = server.rs3_ok(&["find", "test/fndz", "--larger", "1 KiB"]);
+    assert_eq!(out.trim(), "test/fndz/a/bar/big.log");
+}

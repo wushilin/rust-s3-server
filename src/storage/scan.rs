@@ -70,7 +70,7 @@ use tokio::task::yield_now;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{Result, StorageError};
-use super::index::ObjectRecord;
+use super::index::{same_blob_dir, ObjectRecord};
 use super::metadata::ObjectMeta;
 use super::store::{move_object_dir_to_trash, LocalObjectStore};
 use super::time::now_ms;
@@ -452,9 +452,13 @@ fn attr_fingerprint(size: u64, etag: &str, last_modified_ms: i64) -> u64 {
     hasher.finish()
 }
 
+/// Hash of a relative blob dir, separator-insensitive (see
+/// [`same_blob_dir`]): rows written on Windows may carry `\`.
 fn hash64(value: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
+    for byte in value.bytes() {
+        hasher.write_u8(if byte == b'\\' { b'/' } else { byte });
+    }
     hasher.finish()
 }
 
@@ -804,7 +808,7 @@ impl LocalObjectStore {
                     .with("meta_last_modified_ms", candidate.meta_last_modified_ms),
                 ),
                 None => None,
-                Some(row) if row.blob_dir != candidate.rel => Some(
+                Some(row) if !same_blob_dir(&row.blob_dir, &candidate.rel) => Some(
                     Finding::new(
                         bucket,
                         FindingKind::SupersededBlob,
@@ -1045,7 +1049,7 @@ impl LocalObjectStore {
                 // delete a live object.
                 if action == RepairAction::TrashBlob {
                     if let Some(row) = &row {
-                        if row.blob_dir == rel {
+                        if same_blob_dir(&row.blob_dir, &rel) {
                             return Ok((
                                 FindingState::Stale,
                                 "the index now points at this dir; it is a live object".to_string(),
@@ -1062,7 +1066,7 @@ impl LocalObjectStore {
                     // Corrupt object: drop the row first so nothing can start
                     // reading the bytes we are about to move away.
                     match &row {
-                        Some(row) if row.blob_dir == rel => {
+                        Some(row) if same_blob_dir(&row.blob_dir, &rel) => {
                             self.delete_row(bucket, &object_key, row).await?;
                             messages.push("index row deleted".to_string());
                         }
@@ -1084,7 +1088,7 @@ impl LocalObjectStore {
                     return Ok((FindingState::Stale, "the index row is already gone".to_string()));
                 };
                 if let Some(rel) = &finding.blob_dir {
-                    if &row.blob_dir != rel {
+                    if !same_blob_dir(&row.blob_dir, rel) {
                         return Ok((
                             FindingState::Stale,
                             format!("the row now points at {}, not {rel}", row.blob_dir),
@@ -1112,7 +1116,7 @@ impl LocalObjectStore {
                 let Some(row) = row else {
                     return Ok((FindingState::Stale, "the index row is gone".to_string()));
                 };
-                if row.blob_dir != rel {
+                if !same_blob_dir(&row.blob_dir, &rel) {
                     return Ok((
                         FindingState::Stale,
                         format!("the row now points at {}, not {rel}", row.blob_dir),

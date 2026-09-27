@@ -22,7 +22,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +32,7 @@ use super::encoding::hex_lower;
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-use super::aws_chunked::decode_aws_chunked;
+use super::aws_chunked::{decode_aws_chunked, AwsChunkedDecoder, CHUNK_SIGNATURE_MISMATCH};
 use super::cache::BoundedLruCache;
 use super::config::{DurabilityMode, StorageConfig};
 use super::encoding::{
@@ -60,6 +60,10 @@ const INDEX_CACHE_WARN_THRESHOLD: usize = 500;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 const REBUILD_PROGRESS_EVERY: usize = 1000;
 const COPY_BUFFER_SIZE: usize = 256 * 1024;
+/// How long a rebuild / bucket delete waits for requests already holding the
+/// bucket's index handle to finish before giving up (the old database must
+/// not be swapped out or deleted while anyone can still commit to it).
+const INDEX_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Filesystem-backed S3-compatible object store.
 ///
@@ -169,6 +173,9 @@ pub struct IntentResolution {
     pub selected: usize,
     pub resolved: usize,
     pub failed: usize,
+    /// Highest intent id selected — pass it back as `after_id` to continue
+    /// past this batch (including any intents that failed) within a run.
+    pub last_id: Option<i64>,
 }
 
 /// Result of a successful object read.
@@ -276,6 +283,17 @@ impl LocalObjectStore {
         self.locks.lock(bucket, key).await
     }
 
+    /// Takes the per-upload lock that Complete and Abort hold. The staging
+    /// sweeper takes it (then the key lock) before reaping a multipart
+    /// upload, so it can never delete an upload mid-Complete.
+    pub(crate) async fn lock_multipart_upload(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> super::locks::ObjectWriteGuard {
+        self.locks.lock(bucket, &upload_lock_key(upload_id)).await
+    }
+
     /// Drops a key's cached `meta.json` parse. Anything that changes a row out
     /// of band must call this so reads don't serve the stale parse.
     pub(crate) fn forget_cached_meta(&self, bucket: &str, key: &str) {
@@ -291,6 +309,11 @@ impl LocalObjectStore {
     #[cfg(test)]
     pub fn arm_crash_point(&self, name: &str) {
         self.crash_points.lock().unwrap().insert(name.to_string());
+    }
+
+    #[cfg(test)]
+    pub fn disarm_crash_point(&self, name: &str) {
+        self.crash_points.lock().unwrap().remove(name);
     }
 
     fn crash_point(&self, name: &str) {
@@ -404,16 +427,37 @@ impl LocalObjectStore {
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        if !self.index(bucket).await?.is_empty().await? || has_active_staging(&bucket_dir).await? {
+        // Open through the normal path first (surfaces rebuild-needed etc.).
+        drop(self.index(bucket).await?);
+        // Raise the data-plane gate so no new request can pick up the index,
+        // then drain the requests that already hold it: one that is mid-PUT
+        // would otherwise commit into a database we are about to delete.
+        if !self.try_begin_rebuild(bucket) {
+            return Err(StorageError::BucketRebuilding(bucket.to_string()));
+        }
+        let _gate = RebuildGateGuard {
+            store: self,
+            bucket,
+        };
+        let open_lock = self.index_open_lock(bucket);
+        let _open_guard = open_lock.lock().await;
+        let index = match self.take_index_exclusive(bucket).await? {
+            Some(index) => index,
+            None => ObjectIndex::open(&bucket_dir, self.durability).await?,
+        };
+        let empty = index.is_empty().await? && !has_active_staging(&bucket_dir).await?;
+        if !empty {
+            self.index_cache
+                .lock()
+                .unwrap()
+                .insert(bucket.to_string(), index);
             return Err(StorageError::InvalidMultipartUpload(
                 "bucket is not empty".to_string(),
             ));
         }
-        let removed = self.index_cache.lock().unwrap().remove(bucket);
         self.bucket_meta_cache.remove(&bucket.to_string());
-        if let Some(index) = removed {
-            index.close().await;
-        }
+        index.close().await;
+        drop(index);
         tokio::fs::remove_dir_all(&bucket_dir).await?;
         if self.durability == Durability::Full {
             // Make the directory-entry removal durable before we ack, so a
@@ -445,14 +489,16 @@ impl LocalObjectStore {
         // LOCK on open, so concurrent first-touches of the same bucket would
         // otherwise race and one would get a spurious error. Whoever wins the
         // lock opens and caches; everyone else re-checks the cache below.
-        let open_lock = {
-            let mut locks = self.index_open_locks.lock().unwrap();
-            locks
-                .entry(bucket.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
+        let open_lock = self.index_open_lock(bucket);
         let _open_guard = open_lock.lock().await;
+        // Re-check under the open lock: a rebuild or bucket delete holds it
+        // while it swaps/deletes the database, and raises the gate first.
+        if !self.bucket_exists(bucket).await {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        if self.rebuilding.lock().unwrap().contains(bucket) {
+            return Err(StorageError::BucketRebuilding(bucket.to_string()));
+        }
         if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
             return Ok(index);
         }
@@ -480,6 +526,48 @@ impl LocalObjectStore {
             );
         }
         Ok(index)
+    }
+
+    /// The per-bucket async lock serialising index open / swap / delete.
+    fn index_open_lock(&self, bucket: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.index_open_locks.lock().unwrap();
+        locks
+            .entry(bucket.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Removes the bucket's cached index handle and waits until every request
+    /// that already cloned it has dropped its clone, so the caller holds the
+    /// only handle and nobody can still commit to the database. The caller
+    /// must hold the bucket's [`index_open_lock`](Self::index_open_lock) (so
+    /// nothing re-opens it) and should have raised the rebuild gate (so new
+    /// requests fail fast instead of queueing on that lock).
+    ///
+    /// A handle still in use after [`INDEX_DRAIN_TIMEOUT`] (e.g. a long
+    /// storage scan) aborts the operation: the handle goes back into the
+    /// cache untouched and a clear error is returned rather than hanging.
+    async fn take_index_exclusive(&self, bucket: &str) -> Result<Option<ObjectIndex>> {
+        let Some(index) = self.index_cache.lock().unwrap().remove(bucket) else {
+            return Ok(None);
+        };
+        let deadline = tokio::time::Instant::now() + INDEX_DRAIN_TIMEOUT;
+        while index.handle_count() > 1 {
+            if tokio::time::Instant::now() >= deadline {
+                let in_use = index.handle_count() - 1;
+                self.index_cache
+                    .lock()
+                    .unwrap()
+                    .insert(bucket.to_string(), index);
+                return Err(StorageError::Io(format!(
+                    "bucket {bucket} index is still in use by {in_use} in-flight operation(s) \
+                     after {}s (a running scan?); retry once they finish",
+                    INDEX_DRAIN_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Ok(Some(index))
     }
 
     // ── puts (staging unchanged, commit rewritten) ────────────────────────────
@@ -623,6 +711,7 @@ impl LocalObjectStore {
         let staging_id = new_staging_id(now_ms());
         let staging_dir = self.layout.put_staging_dir(bucket, &staging_id)?;
         tokio::fs::create_dir_all(&staging_dir).await?;
+        let cleanup = StagingDirGuard::new(&staging_dir);
         let part_path = staging_dir.join("part.1");
         let etag = write_file_with_md5(&part_path, bytes).await?;
         let meta = PutMeta {
@@ -639,6 +728,7 @@ impl LocalObjectStore {
             user_meta: user_meta.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
+        cleanup.disarm();
         Ok(staging_id)
     }
 
@@ -689,6 +779,7 @@ impl LocalObjectStore {
         let staging_id = new_staging_id(now_ms());
         let staging_dir = self.layout.put_staging_dir(bucket, &staging_id)?;
         tokio::fs::create_dir_all(&staging_dir).await?;
+        let cleanup = StagingDirGuard::new(&staging_dir);
         let part_path = staging_dir.join("part.1");
         let written = match write_stream_with_hashes(&part_path, stream).await {
             Ok(written) => written,
@@ -720,6 +811,7 @@ impl LocalObjectStore {
             user_meta: user_meta.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
+        cleanup.disarm();
         Ok(staging_id)
     }
 
@@ -769,6 +861,7 @@ impl LocalObjectStore {
         let staging_id = new_staging_id(now_ms());
         let staging_dir = self.layout.put_staging_dir(bucket, &staging_id)?;
         tokio::fs::create_dir_all(&staging_dir).await?;
+        let cleanup = StagingDirGuard::new(&staging_dir);
         let part_path = staging_dir.join("part.1");
         let written = match write_aws_chunked_stream_with_hashes(&part_path, stream).await {
             Ok(written) => written,
@@ -805,6 +898,7 @@ impl LocalObjectStore {
             user_meta: user_meta.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
+        cleanup.disarm();
         Ok(staging_id)
     }
 
@@ -824,6 +918,9 @@ impl LocalObjectStore {
         {
             return Err(StorageError::InvalidStagingId(staging_id.to_string()));
         }
+        // From here the staging dir is ours to consume: every failure (a
+        // missing part, a failed prepare, a cancelled request) removes it.
+        let cleanup = StagingDirGuard::new(&staging_dir);
         let staged_part = staging_dir.join("part.1");
         let staged_part = if staged_part.exists() {
             staged_part
@@ -862,6 +959,7 @@ impl LocalObjectStore {
             .publish_prepared_dir(bucket, key, &publish_dir, object_meta, precondition)
             .await;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        cleanup.disarm();
         result
     }
 
@@ -932,6 +1030,9 @@ impl LocalObjectStore {
         // cleaner may race dir creation — the retry recreates it) and
         // choosing a fresh name on collision (never publish into an
         // existing dir).
+        let objects_dir = bucket_dir.join("objects");
+        let objects_existed = tokio::fs::metadata(&objects_dir).await.is_ok();
+        let mut leaf_created = false;
         let mut attempts = 0u32;
         let dest = loop {
             // Backstop against any unforeseen non-converging retry: the loop
@@ -946,6 +1047,11 @@ impl LocalObjectStore {
                 )));
             }
             let leaf = bucket_dir.join(blob_rel_parent(&blob_rel));
+            if tokio::fs::metadata(&leaf).await.is_err() {
+                // A new directory entry in objects/ that must itself be made
+                // durable (below), or a crash can lose the whole leaf.
+                leaf_created = true;
+            }
             match tokio::fs::create_dir_all(&leaf).await {
                 Ok(()) => {}
                 // A leaf the reclaimer is deleting at this instant: Windows
@@ -996,6 +1102,12 @@ impl LocalObjectStore {
         self.crash_point("publish_after_rename");
         if self.durability == Durability::Full {
             fsync_dir(dest.parent().unwrap_or(&bucket_dir)).await?;
+            if leaf_created {
+                fsync_dir(&objects_dir).await?;
+                if !objects_existed {
+                    fsync_dir(&bucket_dir).await?;
+                }
+            }
         }
 
         let record = ObjectRecord {
@@ -1018,6 +1130,20 @@ impl LocalObjectStore {
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
 
         if let (Some(old), Some(retire_id)) = (&old, retire_id) {
+            // Relaxed mode: the commit may still sit in an unsynced WAL. Sync
+            // it before retiring the displaced blob, or a power loss can roll
+            // the row back to a blob dir that is already in trash. (If the
+            // sync fails, leave the retire to the resolver.)
+            if self.durability == Durability::Relaxed {
+                if let Err(err) = index.sync_wal().await {
+                    log::warn!("wal sync before retire failed bucket={bucket} key={key} error={err}");
+                    return Ok(PutResult {
+                        etag: object_meta.etag,
+                        size: object_meta.size,
+                        last_modified_ms,
+                    });
+                }
+            }
             let old_abs = bucket_dir.join(&old.blob_dir);
             match move_object_dir_to_trash(&self.layout, bucket, &old_abs).await {
                 Ok(_) => {
@@ -1121,6 +1247,14 @@ impl LocalObjectStore {
         let retire_id = index.commit_delete(key, &row.blob_dir, now_ms()).await?;
         self.crash_point("delete_after_commit");
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+        if self.durability == Durability::Relaxed {
+            // Same as publish: never trash a blob a not-yet-durable commit
+            // displaced. On failure the retire intent stays for the resolver.
+            if let Err(err) = index.sync_wal().await {
+                log::warn!("wal sync before retire failed bucket={bucket} key={key} error={err}");
+                return Ok(Some(deleted_size));
+            }
+        }
         let abs = self.layout.bucket_dir(bucket)?.join(&row.blob_dir);
         match move_object_dir_to_trash(&self.layout, bucket, &abs).await {
             Ok(_) => {
@@ -1141,21 +1275,25 @@ impl LocalObjectStore {
     /// Resolves stale intents: trash whatever an abandoned publish left in
     /// the live tree, finish whatever retirement didn't complete. Intents
     /// are re-confirmed under the per-key lock before acting; a blob dir
-    /// currently referenced by its row is never touched.
+    /// currently referenced by its row is never touched. Selection resumes
+    /// strictly after intent id `after_id` (a cursor from the previous batch's
+    /// `last_id`), so permanently failing intents can't starve the rest.
     pub async fn resolve_stale_intents(
         &self,
         bucket: &str,
         min_age_ms: i64,
         limit: usize,
+        after_id: Option<i64>,
     ) -> Result<IntentResolution> {
         validate_bucket_name(bucket)?;
         let index = self.index(bucket).await?;
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         let intents = index
-            .stale_intents(now_ms(), min_age_ms, limit.max(1) as i64)
+            .stale_intents_after(now_ms(), min_age_ms, limit.max(1) as i64, after_id)
             .await?;
         let mut outcome = IntentResolution {
             selected: intents.len(),
+            last_id: intents.iter().map(|i| i.id).max(),
             ..IntentResolution::default()
         };
         for stale in intents {
@@ -1192,7 +1330,7 @@ impl LocalObjectStore {
         let row = index.get(&intent.object_key).await?;
         let referenced = row
             .as_ref()
-            .map(|r| r.blob_dir == intent.blob_dir)
+            .map(|r| super::index::same_blob_dir(&r.blob_dir, &intent.blob_dir))
             .unwrap_or(false);
         if referenced {
             // A live blob is never trashed. A publish intent here means the
@@ -1243,12 +1381,16 @@ impl LocalObjectStore {
     /// serves traffic. O(operations in flight at crash time).
     pub async fn drain_intents(&self, bucket: &str) -> Result<usize> {
         let mut total = 0usize;
+        let mut after_id = None;
         loop {
-            let outcome = self.resolve_stale_intents(bucket, 0, 1000).await?;
+            let outcome = self.resolve_stale_intents(bucket, 0, 1000, after_id).await?;
             total += outcome.resolved;
-            if outcome.selected < 1000 || outcome.failed > 0 {
+            // Failures stay behind the cursor (retried next pass) instead of
+            // being re-selected until the loop gives up on everything after.
+            if outcome.selected < 1000 || outcome.last_id.is_none() {
                 break;
             }
+            after_id = outcome.last_id;
         }
         Ok(total)
     }
@@ -1397,7 +1539,14 @@ impl LocalObjectStore {
         self.ensure_bucket_and_key(bucket, key).await?;
         let upload_id = new_staging_id(now_ms());
         let staging_dir = self.layout.multipart_staging_dir(bucket, &upload_id)?;
+        // `staging/multipart` and `staging`: note which ancestors this call
+        // creates, since their new directory entries need fsyncing too.
+        let multipart_root = staging_dir.parent().unwrap_or(&staging_dir).to_path_buf();
+        let staging_root = multipart_root.parent().unwrap_or(&multipart_root).to_path_buf();
+        let multipart_root_existed = tokio::fs::metadata(&multipart_root).await.is_ok();
+        let staging_root_existed = tokio::fs::metadata(&staging_root).await.is_ok();
         tokio::fs::create_dir_all(&staging_dir).await?;
+        let cleanup = StagingDirGuard::new(&staging_dir);
         let upload = UploadMeta {
             bucket: bucket.to_string(),
             object_key: key.to_string(),
@@ -1409,17 +1558,41 @@ impl LocalObjectStore {
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
         };
-        write_json_atomic(&staging_dir.join("upload.json"), &upload).await?;
+        let upload_json = staging_dir.join("upload.json");
+        write_json_atomic(&upload_json, &upload).await?;
+        if self.durability == Durability::Full {
+            // The client is handed an UploadId it will upload parts against
+            // for days; a crash must not make the upload vanish.
+            fsync_file(&upload_json).await?;
+            fsync_dir(&staging_dir).await?;
+            fsync_dir(&multipart_root).await?;
+            if !multipart_root_existed {
+                fsync_dir(&staging_root).await?;
+                if !staging_root_existed {
+                    if let Some(bucket_dir) = staging_root.parent() {
+                        fsync_dir(bucket_dir).await?;
+                    }
+                }
+            }
+        }
+        cleanup.disarm();
         Ok(upload_id)
     }
 
     /// Atomically commit a fully-written, size-verified temp part into place.
     ///
-    /// Holds a short per-`(upload_id, part_number)` lock so the data file and
-    /// its `meta.json` are swapped as a unit — concurrent uploads of the *same*
-    /// part number resolve last-writer-wins without interleaving, matching S3.
-    /// The byte transfer runs BEFORE this call, unlocked, so uploads of
-    /// different parts never contend and a big transfer never holds the lock.
+    /// The part's bytes land under a fresh, unique data file name
+    /// (`part.N.<id>`), and `part.N.meta.json` — which names that file — is
+    /// the single atomic commit point. A crash anywhere leaves either the old
+    /// meta pointing at the old (still present) bytes, or the new meta
+    /// pointing at the new bytes: never new bytes under old metadata. The
+    /// superseded data file is removed only after the new meta is in place.
+    ///
+    /// Holds the per-`(upload_id, part_number)` lock (which Complete also
+    /// takes) so concurrent uploads of the *same* part number resolve
+    /// last-writer-wins without interleaving, matching S3. The byte transfer
+    /// runs BEFORE this call, unlocked, so uploads of different parts never
+    /// contend and a big transfer never holds the lock.
     async fn commit_staged_part(
         &self,
         bucket: &str,
@@ -1430,7 +1603,7 @@ impl LocalObjectStore {
         etag: &str,
     ) -> Result<()> {
         let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
-        let file_name = format!("part.{part_number}");
+        let file_name = format!("part.{part_number}.{}", new_staging_id(now_ms()));
         let part = PartMeta {
             number: part_number,
             file: file_name.clone(),
@@ -1438,24 +1611,42 @@ impl LocalObjectStore {
             etag: etag.to_string(),
             last_modified_ms: now_ms(),
         };
-        // `\0mpu/` prefix (NUL is illegal in object keys) guarantees this lock
-        // never collides with a real object-key lock.
         let _guard = self
             .locks
-            .lock(bucket, &format!("\0mpu/{upload_id}/part.{part_number}"))
+            .lock(bucket, &part_lock_key(upload_id, part_number))
             .await;
-        tokio::fs::rename(temp_path, staging_dir.join(&file_name)).await?;
         let part_meta_path = staging_dir.join(format!("part.{part_number}.meta.json"));
-        write_json_atomic(&part_meta_path, &part).await?;
+        let previous = read_json_if_exists::<PartMeta>(&part_meta_path)
+            .await
+            .ok()
+            .flatten();
+        let data_path = staging_dir.join(&file_name);
+        tokio::fs::rename(temp_path, &data_path).await?;
+        let staged = async {
+            if self.durability == Durability::Full {
+                // UploadPart returns an ETag the client treats as committed,
+                // so the part must be on stable storage before we ack — and
+                // the bytes (file + directory entry) before the meta that
+                // names them, so a crash can never persist the meta alone.
+                fsync_file(&data_path).await?;
+                fsync_dir(&staging_dir).await?;
+            }
+            write_json_atomic(&part_meta_path, &part).await
+        }
+        .await;
+        if let Err(err) = staged {
+            // The meta was not swapped: the previous part (if any) stands.
+            let _ = tokio::fs::remove_file(&data_path).await;
+            return Err(err);
+        }
         if self.durability == Durability::Full {
-            // UploadPart returns an ETag the client treats as committed, so the
-            // part must be on stable storage before we ack: the part bytes, its
-            // sidecar meta, and the staging directory entries for both renames.
-            // Complete re-fsyncs at publish, but a crash between here and
-            // Complete must not lose an acked part.
-            fsync_file(&staging_dir.join(&file_name)).await?;
             fsync_file(&part_meta_path).await?;
             fsync_dir(&staging_dir).await?;
+        }
+        if let Some(previous) = previous {
+            if previous.file != file_name && is_plain_file_name(&previous.file) {
+                let _ = tokio::fs::remove_file(staging_dir.join(&previous.file)).await;
+            }
         }
         Ok(())
     }
@@ -1646,14 +1837,12 @@ impl LocalObjectStore {
         upload_id: &str,
         requested_parts: &[CompletePartRequest],
     ) -> Result<PutResult> {
-        let upload = self.validate_upload(bucket, key, upload_id).await?;
+        self.validate_upload(bucket, key, upload_id).await?;
         if requested_parts.is_empty() {
             return Err(StorageError::InvalidMultipartUpload(
                 "complete request has no parts".to_string(),
             ));
         }
-        let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
-        let mut parts = Vec::with_capacity(requested_parts.len());
         let mut previous = 0;
         for requested in requested_parts {
             if requested.number <= previous {
@@ -1662,6 +1851,35 @@ impl LocalObjectStore {
                 ));
             }
             previous = requested.number;
+        }
+
+        // Lock order (everywhere): upload lock → part locks ascending → key
+        // lock (taken inside publish). The upload lock serialises Complete
+        // against another Complete, Abort and the staging sweeper; the part
+        // locks exclude a concurrent UploadPart of a requested part from the
+        // first meta read until the part bytes have moved into the publish
+        // dir, so the meta we publish always describes the bytes we publish.
+        let _upload_guard = self.locks.lock(bucket, &upload_lock_key(upload_id)).await;
+        let mut _part_guards = Vec::with_capacity(requested_parts.len());
+        for requested in requested_parts {
+            _part_guards.push(
+                self.locks
+                    .lock(bucket, &part_lock_key(upload_id, requested.number))
+                    .await,
+            );
+        }
+        // Re-validate under the lock: an Abort/sweep may have won the race.
+        let upload = self.validate_upload(bucket, key, upload_id).await?;
+        let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
+
+        // Start clean: a previous attempt that failed or crashed may have
+        // moved parts into `object/` already. Put them back (or drop them if
+        // the part has since been re-uploaded) so this attempt publishes
+        // exactly the currently committed parts.
+        reset_multipart_publish_dir(&staging_dir).await?;
+
+        let mut parts = Vec::with_capacity(requested_parts.len());
+        for requested in requested_parts {
             let part_meta: PartMeta =
                 read_json(&staging_dir.join(format!("part.{}.meta.json", requested.number)))
                     .await?;
@@ -1671,7 +1889,23 @@ impl LocalObjectStore {
                     requested.number
                 )));
             }
-            ensure_file_exists(&staging_dir.join(&part_meta.file)).await?;
+            if !is_plain_file_name(&part_meta.file) {
+                return Err(StorageError::InvalidMultipartUpload(format!(
+                    "part {} has an invalid data file name",
+                    requested.number
+                )));
+            }
+            let data = staging_dir.join(&part_meta.file);
+            ensure_file_exists(&data).await?;
+            // Cheap guard against bytes that do not belong to this meta
+            // (e.g. a legacy-format part torn by a crash mid-upload).
+            let len = tokio::fs::metadata(&data).await?.len();
+            if len != part_meta.size {
+                return Err(StorageError::InvalidMultipartUpload(format!(
+                    "part {} data ({len} bytes) does not match its recorded size ({}); re-upload the part",
+                    requested.number, part_meta.size
+                )));
+            }
             parts.push(part_meta);
         }
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
@@ -1685,6 +1919,14 @@ impl LocalObjectStore {
 
         let size = parts.iter().map(|p| p.size).sum();
         let etag = multipart_etag(&parts)?;
+        // Published parts use the canonical `part.N` names.
+        let object_parts: Vec<PartMeta> = parts
+            .iter()
+            .map(|p| PartMeta {
+                file: format!("part.{}", p.number),
+                ..p.clone()
+            })
+            .collect();
         let object_meta = ObjectMeta {
             format_version: 1,
             bucket: bucket.to_string(),
@@ -1698,9 +1940,10 @@ impl LocalObjectStore {
             content_language: upload.content_language.clone(),
             storage_class: upload.storage_class.clone(),
             user_meta: upload.user_meta.clone(),
-            parts: parts.clone(),
+            parts: object_parts,
         };
         let publish_dir = prepare_multipart_publish_dir(&staging_dir, &parts, &object_meta).await?;
+        self.crash_point("complete_after_prepare");
 
         // Multipart completion is unconditional (object_store never sends a
         // precondition with it).
@@ -1754,6 +1997,7 @@ impl LocalObjectStore {
         let staging_id = new_staging_id(now_ms());
         let staging_dir = self.layout.put_staging_dir(dst_bucket, &staging_id)?;
         tokio::fs::create_dir_all(&staging_dir).await?;
+        let cleanup = StagingDirGuard::new(&staging_dir);
         let written = copy_object_data_with_hashes(&src, &staging_dir.join("part.1"), None).await?;
         let meta = PutMeta {
             bucket: dst_bucket.to_string(),
@@ -1770,6 +2014,8 @@ impl LocalObjectStore {
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         drop(_source_guard);
+        // commit_staged_put owns the staging dir from here (and removes it).
+        cleanup.disarm();
         self.commit_staged_put(dst_bucket, dst_key, &staging_id, None)
             .await
     }
@@ -1850,6 +2096,8 @@ impl LocalObjectStore {
 
     pub async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
         self.validate_upload(bucket, key, upload_id).await?;
+        // Same lock order as Complete: upload lock first, then the key lock.
+        let _upload_guard = self.locks.lock(bucket, &upload_lock_key(upload_id)).await;
         let _guard = self.locks.lock(bucket, key).await;
         let staging_dir = self.layout.multipart_staging_dir(bucket, upload_id)?;
         match tokio::fs::remove_dir_all(&staging_dir).await {
@@ -1961,21 +2209,30 @@ impl LocalObjectStore {
                 Err(err) => return Err(err.into()),
             }
         };
-        let mut entries = tokio::fs::read_dir(&old_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            // Object leaves hold files only (meta.json + part.N), no subdirs.
-            tokio::fs::hard_link(old_dir.join(entry.file_name()), new_dir.join(entry.file_name()))
-                .await?;
-        }
-        if self.durability == Durability::Full {
-            fsync_dir(&new_dir).await?;
-        }
+        let linked_and_flipped: Result<bool> = async {
+            let mut entries = tokio::fs::read_dir(&old_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                // Object leaves hold files only (meta.json + part.N), no subdirs.
+                tokio::fs::hard_link(old_dir.join(entry.file_name()), new_dir.join(entry.file_name()))
+                    .await?;
+            }
+            if self.durability == Durability::Full {
+                fsync_dir(&new_dir).await?;
+            }
 
-        // 2. Atomic pivot: repoint the index row, guarded by the old path so a
-        //    concurrent overwrite (should the lock ever not hold) can't be lost.
-        if !index.update_blob_dir(key, &row.blob_dir, &new_rel).await? {
-            let _ = tokio::fs::remove_dir_all(&new_dir).await; // abandon the orphan copy
-            return Ok(false);
+            // 2. Atomic pivot: repoint the index row, guarded by the old path so a
+            //    concurrent overwrite (should the lock ever not hold) can't be lost.
+            index.update_blob_dir(key, &row.blob_dir, &new_rel).await
+        }
+        .await;
+        match linked_and_flipped {
+            Ok(true) => {}
+            other => {
+                // Not flipped (lost the race, or failed): abandon the orphan
+                // copy so a key that keeps failing can't leak a dir per attempt.
+                let _ = tokio::fs::remove_dir_all(&new_dir).await;
+                return other;
+            }
         }
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
 
@@ -1998,9 +2255,15 @@ impl LocalObjectStore {
         Ok(true)
     }
 
-    /// Up to `limit` keys in `bucket` still on the legacy 4-level layout.
-    pub async fn legacy_layout_keys(&self, bucket: &str, limit: usize) -> Result<Vec<String>> {
-        self.index(bucket).await?.legacy_layout_keys(limit).await
+    /// Up to `limit` keys in `bucket` still on the legacy 4-level layout,
+    /// strictly after `after`.
+    pub async fn legacy_layout_keys(
+        &self,
+        bucket: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        self.index(bucket).await?.legacy_layout_keys(after, limit).await
     }
 
     /// Cheap check for whether `bucket` still has any legacy layout structure:
@@ -2125,11 +2388,50 @@ impl LocalObjectStore {
         }
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         let objects_dir = bucket_dir.join("objects");
+        let live_path = index::index_db_path(&bucket_dir);
 
-        // Drop and close any cached handle so the swap below is safe.
-        let removed = self.index_cache.lock().unwrap().remove(bucket);
-        if let Some(old) = removed {
+        // Hold the open lock for the whole rebuild so nothing re-opens the
+        // live database under us, then take the cached handle exclusively:
+        // requests that already cloned it may still be committing, and a
+        // commit into a database we are about to replace would be lost. The
+        // callers raised the 503 gate, so no new request picks it up.
+        let open_lock = self.index_open_lock(bucket);
+        let _open_guard = open_lock.lock().await;
+        let old = match self.take_index_exclusive(bucket).await? {
+            Some(old) => Some(old),
+            None if live_path.exists() => match ObjectIndex::open_at(&live_path, Durability::Relaxed).await {
+                Ok(old) => Some(old),
+                Err(err) => {
+                    log::warn!(
+                        "rebuild cannot read prior index bucket={bucket} error={err}; pending intents ignored"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // Pending intents in the prior index describe blob dirs that are NOT
+        // (or no longer) objects: a retirement whose trash move never ran, or
+        // a publish that never committed. The walk below would resurrect
+        // them (a deleted object coming back), so finish them first — the
+        // same adjudication the intent resolver applies.
+        let mut dirs_trashed_up_front = 0usize;
+        if let Some(old) = &old {
+            match self.retire_pending_intent_dirs(old, &bucket_dir, bucket).await {
+                Ok(n) => dirs_trashed_up_front = n,
+                Err(err) => {
+                    log::warn!(
+                        "rebuild could not read pending intents bucket={bucket} error={err}; continuing without them"
+                    );
+                }
+            }
+        }
+        if let Some(old) = old {
             old.close().await;
+            // Drop the last handle so RocksDB releases its directory lock
+            // before the live directory is replaced.
+            drop(old);
         }
 
         // A RocksDB "database" is a directory, so the temp index is a directory
@@ -2155,6 +2457,7 @@ impl LocalObjectStore {
         let frontier = Arc::new(RebuildFrontier::new());
         frontier.push(objects_dir.clone());
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut workers = Vec::new();
         for _ in 0..worker_count.max(1) {
             let frontier = Arc::clone(&frontier);
@@ -2162,6 +2465,7 @@ impl LocalObjectStore {
             let bucket_dir = bucket_dir.clone();
             let shutdown = self.shutdown.clone();
             let cancelled = Arc::clone(&cancelled);
+            let aborted = Arc::clone(&aborted);
             workers.push(tokio::spawn(async move {
                 while let Some(dir) = frontier.pop().await {
                     if shutdown.is_cancelled() {
@@ -2170,51 +2474,20 @@ impl LocalObjectStore {
                         frontier.task_done();
                         break;
                     }
-                    let mut has_meta = false;
-                    let mut subdirs = Vec::new();
-                    let mut has_files = false;
-                    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-                        while let Ok(Some(entry)) = entries.next_entry().await {
-                            if entry.file_name() == "meta.json" {
-                                has_meta = true;
-                            } else {
-                                // d_type from readdir — no extra stat.
-                                match entry.file_type().await {
-                                    Ok(ft) if ft.is_dir() => subdirs.push(entry.path()),
-                                    _ => has_files = true,
-                                }
-                            }
-                        }
+                    if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                        frontier.drain();
+                        frontier.task_done();
+                        break;
                     }
-                    let message = if has_meta {
-                        match read_json::<ObjectMeta>(&dir.join("meta.json")).await {
-                            Ok(meta) => {
-                                let rel = dir
-                                    .strip_prefix(&bucket_dir)
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|_| dir.to_string_lossy().to_string());
-                                Some(RebuildMessage::Object(
-                                    ObjectRecord {
-                                        object_key: meta.object_key.clone(),
-                                        blob_dir: rel,
-                                        size: meta.size,
-                                        etag: meta.etag.clone(),
-                                        last_modified_ms: meta.last_modified_ms,
-                                    },
-                                    dir,
-                                ))
+                    let message = match rebuild_classify_dir(&dir, &bucket_dir).await {
+                        Ok(RebuildDir::Descend(subdirs)) => {
+                            for sub in subdirs {
+                                frontier.push(sub);
                             }
-                            Err(_) => Some(RebuildMessage::Invalid(dir)),
+                            None
                         }
-                    } else if !subdirs.is_empty() || !has_files {
-                        for sub in subdirs {
-                            frontier.push(sub);
-                        }
-                        None
-                    } else {
-                        // Files but no meta.json: cannot be a valid publish
-                        // (blobs are staged complete before the rename).
-                        Some(RebuildMessage::Invalid(dir))
+                        Ok(RebuildDir::Message(message)) => Some(message),
+                        Err(err) => Some(RebuildMessage::Error(err)),
                     };
                     if let Some(message) = message {
                         if entry_tx.send(message).await.is_err() {
@@ -2232,64 +2505,80 @@ impl LocalObjectStore {
 
         // Batch writer (this task): newer-wins upserts; losers and invalid
         // dirs go to trash immediately — migration day is the one full pass
-        // over the tree, so it doubles as the audit.
-        let mut batch: Vec<ObjectRecord> = Vec::with_capacity(self.rebuild_batch_size);
-        let mut dirs_by_rel: HashMap<String, PathBuf> = HashMap::new();
+        // over the tree, so it doubles as the audit. Any I/O error aborts the
+        // rebuild before the swap, leaving the prior index in place.
         let mut indexed = 0usize;
-        let mut trashed = 0usize;
-        loop {
-            let message = entry_rx.recv().await;
-            let done = message.is_none();
-            let flush = match message {
-                Some(RebuildMessage::Object(record, dir)) => {
-                    dirs_by_rel.insert(record.blob_dir.clone(), dir);
-                    batch.push(record);
-                    batch.len() >= self.rebuild_batch_size
+        let mut trashed = dirs_trashed_up_front;
+        let written: Result<()> = async {
+            let mut batch: Vec<ObjectRecord> = Vec::with_capacity(self.rebuild_batch_size);
+            let mut dirs_by_rel: HashMap<String, PathBuf> = HashMap::new();
+            loop {
+                let message = entry_rx.recv().await;
+                let done = message.is_none();
+                let flush = match message {
+                    Some(RebuildMessage::Object(record, dir)) => {
+                        dirs_by_rel.insert(record.blob_dir.clone(), dir);
+                        batch.push(record);
+                        batch.len() >= self.rebuild_batch_size
+                    }
+                    Some(RebuildMessage::Invalid(dir)) => {
+                        log::warn!(
+                            "rebuild trashing invalid blob dir bucket={bucket} dir={}",
+                            dir.display()
+                        );
+                        move_object_dir_to_trash(&self.layout, bucket, &dir).await?;
+                        trashed += 1;
+                        false
+                    }
+                    Some(RebuildMessage::Error(err)) => return Err(err),
+                    None => true,
+                };
+                if flush && !batch.is_empty() {
+                    let outcome = tmp.insert_rebuild_batch(&batch).await?;
+                    indexed += outcome.inserted;
+                    for loser in &outcome.loser_blob_dirs {
+                        let abs = dirs_by_rel
+                            .remove(loser)
+                            .unwrap_or_else(|| bucket_dir.join(loser));
+                        log::info!(
+                            "rebuild trashing superseded duplicate bucket={bucket} dir={loser}"
+                        );
+                        move_object_dir_to_trash(&self.layout, bucket, &abs).await?;
+                        trashed += 1;
+                    }
+                    batch.clear();
+                    dirs_by_rel.clear();
+                    if let Some(p) = self.rebuild_progress.lock().unwrap().get_mut(bucket) {
+                        p.objects_indexed = indexed;
+                        p.dirs_trashed = trashed;
+                    }
+                    if indexed % REBUILD_PROGRESS_EVERY < self.rebuild_batch_size {
+                        log::info!(
+                            "rebuild progress bucket={bucket} objects_indexed={indexed} trashed={trashed}"
+                        );
+                    }
                 }
-                Some(RebuildMessage::Invalid(dir)) => {
-                    log::warn!(
-                        "rebuild trashing invalid blob dir bucket={bucket} dir={}",
-                        dir.display()
-                    );
-                    move_object_dir_to_trash(&self.layout, bucket, &dir).await?;
-                    trashed += 1;
-                    false
+                if done {
+                    return Ok(());
                 }
-                None => true,
-            };
-            if flush && !batch.is_empty() {
-                let outcome = tmp.insert_rebuild_batch(&batch).await?;
-                indexed += outcome.inserted;
-                for loser in &outcome.loser_blob_dirs {
-                    let abs = dirs_by_rel
-                        .remove(loser)
-                        .unwrap_or_else(|| bucket_dir.join(loser));
-                    log::info!(
-                        "rebuild trashing superseded duplicate bucket={bucket} dir={loser}"
-                    );
-                    move_object_dir_to_trash(&self.layout, bucket, &abs).await?;
-                    trashed += 1;
-                }
-                batch.clear();
-                dirs_by_rel.clear();
-                if let Some(p) = self.rebuild_progress.lock().unwrap().get_mut(bucket) {
-                    p.objects_indexed = indexed;
-                    p.dirs_trashed = trashed;
-                }
-                if indexed % REBUILD_PROGRESS_EVERY < self.rebuild_batch_size {
-                    log::info!(
-                        "rebuild progress bucket={bucket} objects_indexed={indexed} trashed={trashed}"
-                    );
-                }
-            }
-            if done {
-                break;
             }
         }
+        .await;
+        if written.is_err() {
+            aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Unblocks any worker parked on a full channel.
+        drop(entry_rx);
         for worker in workers {
             worker
                 .await
                 .map_err(|err| StorageError::Io(format!("rebuild worker panicked: {err}")))?;
+        }
+        if let Err(err) = written {
+            drop(tmp);
+            let _ = tokio::fs::remove_dir_all(&tmp_path).await;
+            log::error!("rebuild aborted bucket={bucket} error={err}; prior index kept");
+            return Err(err);
         }
         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(StorageError::Io("rebuild cancelled".to_string()));
@@ -2305,7 +2594,6 @@ impl LocalObjectStore {
         // Remove the prior live index (a RocksDB directory) plus any legacy
         // SQLite leftovers from before the switch, then atomically swap the
         // freshly built directory into place.
-        let live_path = index::index_db_path(&bucket_dir);
         let _ = tokio::fs::remove_dir_all(&live_path).await;
         for suffix in ["", "-wal", "-shm"] {
             let _ = tokio::fs::remove_file(bucket_dir.join(format!("index.sqlite{suffix}"))).await;
@@ -2318,6 +2606,49 @@ impl LocalObjectStore {
             "rebuild finished bucket={bucket} objects_indexed={indexed} dirs_trashed={trashed}"
         );
         Ok(indexed)
+    }
+
+    /// Before a rebuild walks the tree: trashes every blob dir a pending
+    /// intent in the prior index describes, unless that index's row for the
+    /// key still references it (a live blob is never trashed). Returns the
+    /// number of dirs trashed.
+    async fn retire_pending_intent_dirs(
+        &self,
+        old: &ObjectIndex,
+        bucket_dir: &Path,
+        bucket: &str,
+    ) -> Result<usize> {
+        // `now = i64::MAX, min_age = 0` selects every intent.
+        let intents = old.stale_intents(i64::MAX, 0, i64::MAX).await?;
+        let mut trashed = 0usize;
+        for intent in intents {
+            let rel = intent.blob_dir.as_str();
+            if !rel.starts_with("objects/") || rel.split('/').any(|c| c == ".." || c.is_empty()) {
+                log::warn!(
+                    "rebuild ignoring intent {} with unexpected blob dir {rel}",
+                    intent.id
+                );
+                continue;
+            }
+            let live = old
+                .get(&intent.object_key)
+                .await?
+                .is_some_and(|row| row.blob_dir == intent.blob_dir);
+            if live {
+                continue;
+            }
+            let abs = bucket_dir.join(rel);
+            if tokio::fs::metadata(&abs).await.is_ok() {
+                log::info!(
+                    "rebuild trashing blob dir of pending intent bucket={bucket} key={} op={} dir={rel}",
+                    intent.object_key,
+                    intent.op
+                );
+                move_object_dir_to_trash(&self.layout, bucket, &abs).await?;
+                trashed += 1;
+            }
+        }
+        Ok(trashed)
     }
 
     async fn ensure_bucket_and_key(&self, bucket: &str, key: &str) -> Result<()> {
@@ -2352,6 +2683,105 @@ impl LocalObjectStore {
 enum RebuildMessage {
     Object(ObjectRecord, PathBuf),
     Invalid(PathBuf),
+    /// An I/O failure while walking: the rebuild must abort, not guess.
+    Error(StorageError),
+}
+
+enum RebuildDir {
+    /// Not an object dir: walk these children.
+    Descend(Vec<PathBuf>),
+    Message(RebuildMessage),
+}
+
+/// Classifies one directory of the rebuild walk. I/O errors propagate — an
+/// unreadable directory or `meta.json` is never mistaken for an empty or
+/// invalid one (which would drop or trash a live object). A dir is `Invalid`
+/// only when its listing succeeded and it either holds files but no
+/// `meta.json`, or its `meta.json` was read and failed to parse.
+async fn rebuild_classify_dir(dir: &Path, bucket_dir: &Path) -> Result<RebuildDir> {
+    let mut has_meta = false;
+    let mut subdirs = Vec::new();
+    let mut has_files = false;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        // Gone since it was queued (the empty-dir reclaimer), or no
+        // `objects/` yet: nothing to index.
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Ok(RebuildDir::Descend(Vec::new()))
+        }
+        Err(err) => {
+            return Err(StorageError::Io(format!(
+                "rebuild cannot list {}: {err}",
+                dir.display()
+            )))
+        }
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(err) => {
+                return Err(StorageError::Io(format!(
+                    "rebuild cannot list {}: {err}",
+                    dir.display()
+                )))
+            }
+        };
+        if entry.file_name() == "meta.json" {
+            has_meta = true;
+        } else {
+            // d_type from readdir — no extra stat.
+            let ft = entry.file_type().await.map_err(|err| {
+                StorageError::Io(format!(
+                    "rebuild cannot stat {}: {err}",
+                    entry.path().display()
+                ))
+            })?;
+            if ft.is_dir() {
+                subdirs.push(entry.path());
+            } else {
+                has_files = true;
+            }
+        }
+    }
+    if has_meta {
+        let meta_path = dir.join("meta.json");
+        let bytes = tokio::fs::read(&meta_path).await.map_err(|err| {
+            StorageError::Io(format!("rebuild cannot read {}: {err}", meta_path.display()))
+        })?;
+        let Ok(meta) = serde_json::from_slice::<ObjectMeta>(&bytes) else {
+            return Ok(RebuildDir::Message(RebuildMessage::Invalid(dir.to_path_buf())));
+        };
+        let rel = dir.strip_prefix(bucket_dir).map_err(|_| {
+            StorageError::Io(format!("rebuild walked outside the bucket: {}", dir.display()))
+        })?;
+        return Ok(RebuildDir::Message(RebuildMessage::Object(
+            ObjectRecord {
+                object_key: meta.object_key.clone(),
+                blob_dir: rel_path_string(rel),
+                size: meta.size,
+                etag: meta.etag.clone(),
+                last_modified_ms: meta.last_modified_ms,
+            },
+            dir.to_path_buf(),
+        )));
+    }
+    if !subdirs.is_empty() || !has_files {
+        Ok(RebuildDir::Descend(subdirs))
+    } else {
+        // Files but no meta.json: cannot be a valid publish (blobs are
+        // staged complete before the rename).
+        Ok(RebuildDir::Message(RebuildMessage::Invalid(dir.to_path_buf())))
+    }
+}
+
+/// A bucket-relative path in the index's canonical form: components joined
+/// with `/` on every platform (the request path always writes `/`).
+fn rel_path_string(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Work-stealing directory frontier for the parallel rebuild traversal.
@@ -2416,7 +2846,78 @@ impl RebuildFrontier {
     }
 }
 
+/// Lowers the rebuild gate for `bucket` when dropped (every exit path).
+struct RebuildGateGuard<'a> {
+    store: &'a LocalObjectStore,
+    bucket: &'a str,
+}
+
+impl Drop for RebuildGateGuard<'_> {
+    fn drop(&mut self) {
+        self.store.end_rebuild(self.bucket);
+    }
+}
+
+/// Removes a staging dir on drop unless disarmed — every error (and a
+/// cancelled request future) cleans up instead of leaking the staged blob.
+struct StagingDirGuard {
+    path: Option<PathBuf>,
+}
+
+impl StagingDirGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: Some(path.to_path_buf()),
+        }
+    }
+
+    /// The staging dir is handed on (or already consumed); keep it.
+    fn disarm(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for StagingDirGuard {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&path);
+                });
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+}
+
 // ── free helpers ─────────────────────────────────────────────────────────────
+
+/// The per-upload lock: taken by Complete, Abort and the staging sweeper (in
+/// that order before any part or object-key lock) so they never interleave.
+fn upload_lock_key(upload_id: &str) -> String {
+    format!("\0mpu/{upload_id}")
+}
+
+/// The per-part lock: taken by UploadPart's commit and, for every requested
+/// part (ascending), by Complete from reading the part meta until publish.
+/// `\0` (illegal in object keys) keeps these off real object-key locks.
+fn part_lock_key(upload_id: &str, part_number: u16) -> String {
+    format!("\0mpu/{upload_id}/part.{part_number}")
+}
+
+/// A part data file name recorded in `part.N.meta.json` must be a plain
+/// file name inside the upload dir.
+fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+}
 
 /// Fresh, unique, opaque blob dir path relative to the bucket dir:
 /// `objects/<4hex>/V1XXXXXX_YYYY` — a single 4-char fanout level. Every publish
@@ -2505,7 +3006,9 @@ async fn prepare_single_publish_dir(
     let publish_dir = staging_dir.join("object");
     tokio::fs::create_dir_all(&publish_dir).await?;
     let publish_part = publish_dir.join("part.1");
-    if staged_part != publish_part && !publish_part.exists() {
+    if staged_part != publish_part {
+        // Always move the staged bytes in (the rename replaces any leftover
+        // from an earlier attempt), never keep a stale `object/part.1`.
         tokio::fs::rename(staged_part, &publish_part).await?;
     }
     ensure_file_exists(&publish_part).await?;
@@ -2513,6 +3016,66 @@ async fn prepare_single_publish_dir(
     Ok(publish_dir)
 }
 
+/// Reads and parses a JSON file, `Ok(None)` if it does not exist.
+async fn read_json_if_exists<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Undoes whatever an earlier, failed or crashed Complete left in the
+/// upload's `object/` publish dir, so every Complete starts from the parts as
+/// currently committed. Each `object/part.N` goes back to the data file its
+/// `part.N.meta.json` names — unless that file exists again (the part was
+/// re-uploaded since, so the moved copy is stale) or the part no longer has a
+/// meta, in which case the copy is dropped. Idempotent under crashes: a
+/// half-done reset is simply finished by the next one. Caller holds the
+/// upload lock.
+async fn reset_multipart_publish_dir(staging_dir: &Path) -> Result<()> {
+    let publish_dir = staging_dir.join("object");
+    let mut entries = match tokio::fs::read_dir(&publish_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let number = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("part."))
+            .and_then(|n| n.parse::<u16>().ok());
+        let restore_to = match number {
+            Some(number) => {
+                read_json_if_exists::<PartMeta>(
+                    &staging_dir.join(format!("part.{number}.meta.json")),
+                )
+                .await?
+                .filter(|meta| is_plain_file_name(&meta.file))
+                .map(|meta| staging_dir.join(meta.file))
+            }
+            None => None,
+        };
+        match restore_to {
+            Some(target) if tokio::fs::metadata(&target).await.is_err() => {
+                tokio::fs::rename(&path, &target).await?;
+            }
+            _ => match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            },
+        }
+    }
+    tokio::fs::remove_dir(&publish_dir).await?;
+    Ok(())
+}
+
+/// Moves each part's committed data file (`parts[i].file`) into a fresh
+/// `object/` publish dir under its canonical name (`meta.parts[i].file`) and
+/// writes `meta.json`. The caller has reset `object/` first.
 async fn prepare_multipart_publish_dir(
     staging_dir: &Path,
     parts: &[PartMeta],
@@ -2520,12 +3083,10 @@ async fn prepare_multipart_publish_dir(
 ) -> Result<PathBuf> {
     let publish_dir = staging_dir.join("object");
     tokio::fs::create_dir_all(&publish_dir).await?;
-    for part in parts {
-        let source = staging_dir.join(&part.file);
-        let dest = publish_dir.join(&part.file);
-        if !dest.exists() {
-            tokio::fs::rename(&source, &dest).await?;
-        }
+    for (source_part, object_part) in parts.iter().zip(&meta.parts) {
+        let source = staging_dir.join(&source_part.file);
+        let dest = publish_dir.join(&object_part.file);
+        tokio::fs::rename(&source, &dest).await?;
         ensure_file_exists(&dest).await?;
     }
     write_json_atomic(&publish_dir.join("meta.json"), meta).await?;
@@ -2703,68 +3264,33 @@ where
     let mut md5 = Md5::new();
     let mut sha256 = Sha256::new();
     let mut size = 0u64;
-    let mut buffer = BytesMut::new();
-    let mut saw_final_chunk = false;
+    // Chunk data is streamed straight through to the file as it arrives; only
+    // chunk-header/trailer lines are buffered, each capped by the decoder.
+    let mut decoder = AwsChunkedDecoder::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| StorageError::Io(err.to_string()))?;
-        buffer.extend_from_slice(&chunk);
-
-        loop {
-            let Some(header_end) = find_bytes(&buffer, b"\r\n") else {
-                break;
-            };
-            let header = std::str::from_utf8(&buffer[..header_end]).map_err(|_| {
-                StorageError::InvalidAwsChunkedBody("invalid chunk header utf8".into())
-            })?;
-            let size_hex = header.split(';').next().unwrap_or("");
-            let chunk_size = usize::from_str_radix(size_hex, 16).map_err(|_| {
-                StorageError::InvalidAwsChunkedBody(format!("invalid chunk size {size_hex}"))
-            })?;
-            let data_start = header_end + 2;
-
-            if chunk_size == 0 {
-                let trailer = &buffer[data_start..];
-                if trailer == b"\r\n" || find_bytes(trailer, b"\r\n\r\n").is_some() {
-                    saw_final_chunk = true;
-                    buffer.clear();
-                    break;
-                }
-                break;
+        let chunk = chunk.map_err(|err| {
+            let message = err.to_string();
+            // A chunk-signature failure detected upstream (the auth layer's
+            // verifying body) is a client error, not an I/O fault.
+            if message.contains(CHUNK_SIGNATURE_MISMATCH) {
+                StorageError::InvalidAwsChunkedBody(CHUNK_SIGNATURE_MISMATCH.to_string())
+            } else {
+                StorageError::Io(message)
             }
-
-            let data_end = data_start.checked_add(chunk_size).ok_or_else(|| {
-                StorageError::InvalidAwsChunkedBody("chunk size overflow".into())
-            })?;
-            let framed_end = data_end.checked_add(2).ok_or_else(|| {
-                StorageError::InvalidAwsChunkedBody("chunk size overflow".into())
-            })?;
-            if buffer.len() < framed_end {
-                break;
-            }
-            if &buffer[data_end..framed_end] != b"\r\n" {
-                return Err(StorageError::InvalidAwsChunkedBody(
-                    "chunk data missing trailing CRLF".into(),
-                ));
-            }
-            let data = &buffer[data_start..data_end];
+        })?;
+        for range in decoder.feed(&chunk)? {
+            let data = &chunk[range];
             size += data.len() as u64;
             md5.update(data);
             sha256.update(data);
             file.write_all(data).await?;
-            buffer.advance(framed_end);
         }
-
-        if saw_final_chunk {
+        if decoder.is_done() {
             break;
         }
     }
-
-    if !saw_final_chunk {
-        return Err(StorageError::InvalidAwsChunkedBody(
-            "missing final chunk".to_string(),
-        ));
-    }
+    decoder.finish()?;
 
     file.flush().await?;
     Ok(WrittenHashes {
@@ -2772,12 +3298,6 @@ where
         md5: hex_lower(&md5.finalize()),
         sha256: hex_lower(&sha256.finalize()),
     })
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 async fn ensure_file_exists(path: &Path) -> Result<()> {
@@ -3641,6 +4161,237 @@ mod tests {
         assert_invariants(&store, "bucket").await;
     }
 
+    // ── multipart / rebuild / staging regressions ─────────────────────────────
+
+    async fn upload_two_parts(store: &LocalObjectStore, key: &str, tail: &[u8]) -> (String, Vec<CompletePartRequest>) {
+        let upload_id = store.initiate_multipart("bucket", key, None, None).await.unwrap();
+        let part1 = vec![7u8; MIN_MULTIPART_PART_SIZE as usize];
+        let e1 = store
+            .put_multipart_part("bucket", key, &upload_id, 1, &part1, false)
+            .await
+            .unwrap();
+        let e2 = store
+            .put_multipart_part("bucket", key, &upload_id, 2, tail, false)
+            .await
+            .unwrap();
+        let parts = vec![
+            CompletePartRequest { number: 1, etag: e1.etag },
+            CompletePartRequest { number: 2, etag: e2.etag },
+        ];
+        (upload_id, parts)
+    }
+
+    async fn crash_complete(store: &LocalObjectStore, key: &str, upload_id: &str, parts: &[CompletePartRequest]) {
+        store.arm_crash_point("complete_after_prepare");
+        let (store2, key, upload_id, parts) =
+            (store.clone(), key.to_string(), upload_id.to_string(), parts.to_vec());
+        let result = tokio::spawn(async move {
+            store2.complete_multipart("bucket", &key, &upload_id, &parts).await
+        })
+        .await;
+        assert!(result.unwrap_err().is_panic(), "crash point must fire");
+        store.disarm_crash_point("complete_after_prepare");
+    }
+
+    async fn tail_of(store: &LocalObjectStore, key: &str) -> Vec<u8> {
+        let body = read_body(store, "bucket", key).await;
+        body[MIN_MULTIPART_PART_SIZE as usize..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn complete_retry_after_crash_publishes_the_same_parts() {
+        let (_tmp, store) = store_and_bucket().await;
+        let (upload_id, parts) = upload_two_parts(&store, "k", b"tail").await;
+        crash_complete(&store, "k", &upload_id, &parts).await;
+        // Parts were moved into object/ by the crashed attempt; a retry must
+        // still find and publish them.
+        store.complete_multipart("bucket", "k", &upload_id, &parts).await.unwrap();
+        assert_eq!(tail_of(&store, "k").await, b"tail");
+        assert_invariants(&store, "bucket").await;
+    }
+
+    #[tokio::test]
+    async fn complete_retry_after_reupload_publishes_new_part_bytes() {
+        let (_tmp, store) = store_and_bucket().await;
+        let (upload_id, mut parts) = upload_two_parts(&store, "k", b"old!").await;
+        crash_complete(&store, "k", &upload_id, &parts).await;
+        // The client re-uploads part 2 (same length, different bytes) and
+        // completes with the new ETag: the new bytes must be what is served,
+        // never the stale copy the crashed attempt left in object/.
+        let e2 = store
+            .put_multipart_part("bucket", "k", &upload_id, 2, b"new!", false)
+            .await
+            .unwrap();
+        parts[1].etag = e2.etag.clone();
+        let result = store.complete_multipart("bucket", "k", &upload_id, &parts).await.unwrap();
+        assert_eq!(tail_of(&store, "k").await, b"new!");
+        let read = store.read_object("bucket", "k").await.unwrap();
+        assert_eq!(read.meta.parts[1].etag, e2.etag);
+        assert_eq!(read.meta.etag, result.etag);
+        assert_invariants(&store, "bucket").await;
+    }
+
+    #[tokio::test]
+    async fn complete_waits_for_in_flight_upload_of_a_requested_part() {
+        let (_tmp, store) = store_and_bucket().await;
+        let (upload_id, parts) = upload_two_parts(&store, "k", b"tail").await;
+        // An UploadPart of part 2 mid-commit holds this lock.
+        let held = store.locks.lock("bucket", &part_lock_key(&upload_id, 2)).await;
+        let (store2, id2, parts2) = (store.clone(), upload_id.clone(), parts.clone());
+        let complete = tokio::spawn(async move {
+            store2.complete_multipart("bucket", "k", &id2, &parts2).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!complete.is_finished(), "Complete must not read part 2 while it is being committed");
+        drop(held);
+        complete.await.unwrap().unwrap();
+        assert_eq!(tail_of(&store, "k").await, b"tail");
+    }
+
+    #[tokio::test]
+    async fn torn_part_upload_never_publishes_new_bytes_under_old_meta() {
+        let (_tmp, store) = store_and_bucket().await;
+        let (upload_id, parts) = upload_two_parts(&store, "k", b"good").await;
+        // Simulate a crash in a re-upload of part 2 after its bytes landed but
+        // before its meta was swapped: a new data file with no meta naming it.
+        let staging = store.layout().multipart_staging_dir("bucket", &upload_id).unwrap();
+        tokio::fs::write(staging.join(format!("part.2.{}", new_staging_id(now_ms()))), b"EVIL")
+            .await
+            .unwrap();
+        store.complete_multipart("bucket", "k", &upload_id, &parts).await.unwrap();
+        assert_eq!(tail_of(&store, "k").await, b"good");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_part_data_that_disagrees_with_its_meta() {
+        let (_tmp, store) = store_and_bucket().await;
+        let (upload_id, parts) = upload_two_parts(&store, "k", b"good").await;
+        let staging = store.layout().multipart_staging_dir("bucket", &upload_id).unwrap();
+        let meta: PartMeta = read_json(&staging.join("part.2.meta.json")).await.unwrap();
+        tokio::fs::write(staging.join(&meta.file), b"longer bytes").await.unwrap();
+        let err = store.complete_multipart("bucket", "k", &upload_id, &parts).await;
+        assert!(matches!(err, Err(StorageError::InvalidMultipartUpload(_))), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_waits_for_in_flight_index_holders() {
+        let (_tmp, store) = store_and_bucket().await;
+        store.put_object("bucket", "a", b"a", None, None, false).await.unwrap();
+        let held = store.index("bucket").await.unwrap();
+        assert!(store.try_begin_rebuild("bucket"));
+        let store2 = store.clone();
+        let rebuild = tokio::spawn(async move { store2.rebuild_index("bucket").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!rebuild.is_finished(), "rebuild must not swap the index while it is in use");
+        // The in-flight holder can still commit to the (still live) index...
+        held.get("a").await.unwrap().unwrap();
+        drop(held);
+        assert_eq!(rebuild.await.unwrap().unwrap(), 1);
+        store.end_rebuild("bucket");
+        assert_eq!(read_body(&store, "bucket", "a").await, b"a");
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_waits_for_in_flight_index_holders() {
+        let (_tmp, store) = store_and_bucket().await;
+        let held = store.index("bucket").await.unwrap();
+        let store2 = store.clone();
+        let delete = tokio::spawn(async move { store2.delete_bucket("bucket").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!delete.is_finished(), "delete must not remove the index while it is in use");
+        drop(held);
+        delete.await.unwrap().unwrap();
+        assert!(!store.bucket_exists("bucket").await);
+        // The bucket can be recreated (no lingering RocksDB lock).
+        store.create_bucket("bucket").await.unwrap();
+        store.put_object("bucket", "x", b"x", None, None, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebuild_does_not_resurrect_object_with_pending_retire() {
+        let (_tmp, store) = store_and_bucket().await;
+        store.put_object("bucket", "k", b"data", None, None, false).await.unwrap();
+        store.arm_crash_point("delete_after_commit");
+        let store2 = store.clone();
+        let result = tokio::spawn(async move { store2.delete_object("bucket", "k").await }).await;
+        assert!(result.unwrap_err().is_panic());
+        store.disarm_crash_point("delete_after_commit");
+        // The row is gone but the blob is still in the live tree, described
+        // by a pending retire intent.
+        store.rebuild_index("bucket").await.unwrap();
+        assert!(matches!(
+            store.read_object("bucket", "k").await,
+            Err(StorageError::ObjectNotFound { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rebuild_aborts_on_unreadable_meta_and_keeps_old_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, store) = store_and_bucket().await;
+        store.put_object("bucket", "k", b"data", None, None, false).await.unwrap();
+        let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
+        let row = store.index("bucket").await.unwrap().get("k").await.unwrap().unwrap();
+        let meta_path = bucket_dir.join(&row.blob_dir).join("meta.json");
+        std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&meta_path).is_ok() {
+            // Running as root: permissions don't restrict reads.
+            std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let result = store.rebuild_index("bucket").await;
+        std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err(), "an unreadable meta.json must abort the rebuild");
+        assert!(meta_path.exists(), "the live blob must not be trashed");
+        assert_eq!(read_body(&store, "bucket", "k").await, b"data");
+    }
+
+    #[test]
+    fn rebuild_rel_paths_use_forward_slashes() {
+        let rel: PathBuf = ["objects", "abcd", "V1x_y"].iter().collect();
+        assert_eq!(rel_path_string(&rel), "objects/abcd/V1x_y");
+    }
+
+    #[tokio::test]
+    async fn failed_commit_does_not_leak_staging() {
+        let (_tmp, store) = store_and_bucket().await;
+        let staging_id = store.stage_put("bucket", "k", b"data", None, None).await.unwrap();
+        let staging_dir = store.layout().put_staging_dir("bucket", &staging_id).unwrap();
+        tokio::fs::remove_file(staging_dir.join("part.1")).await.unwrap();
+        assert!(store.commit_staged_put("bucket", "k", &staging_id, None).await.is_err());
+        for _ in 0..200 {
+            if !staging_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!staging_dir.exists(), "failed commit leaked its staging dir");
+    }
+
+    #[tokio::test]
+    async fn staging_sweep_waits_for_in_flight_complete() {
+        let (_tmp, store) = store_and_bucket().await;
+        let upload_id = store.initiate_multipart("bucket", "k", None, None).await.unwrap();
+        let staging = store.layout().multipart_staging_dir("bucket", &upload_id).unwrap();
+        let held = store.lock_multipart_upload("bucket", &upload_id).await;
+        let config = super::super::sweeper::SweepConfig {
+            multipart_expiry_ms: 1_000,
+            ..Default::default()
+        };
+        let store2 = store.clone();
+        let sweep = tokio::spawn(async move {
+            super::super::sweeper::delete_staging_bucket(&store2, "bucket", &config, now_ms() + 10_000)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!sweep.is_finished(), "sweep must wait for the upload lock");
+        assert!(staging.exists());
+        drop(held);
+        assert_eq!(sweep.await.unwrap().unwrap(), 1);
+        assert!(!staging.exists());
+    }
+
     #[tokio::test]
     async fn concurrent_same_part_upload_stays_consistent() {
         // Two concurrent uploads of the SAME part number must resolve
@@ -3671,9 +4422,9 @@ mod tests {
                 .layout()
                 .multipart_staging_dir("bucket", &upload_id)
                 .unwrap();
-            let data = tokio::fs::read(staging.join("part.1")).await.unwrap();
             let meta: PartMeta =
                 read_json(&staging.join("part.1.meta.json")).await.unwrap();
+            let data = tokio::fs::read(staging.join(&meta.file)).await.unwrap();
             let mut hasher = Md5::new();
             hasher.update(&data);
             let data_etag = hex_lower(&hasher.finalize());
@@ -3762,7 +4513,8 @@ mod tests {
             .unwrap();
         assert_eq!(copied.size, 5);
         let staging = store.layout.multipart_staging_dir("bucket", &upload_id).unwrap();
-        assert_eq!(tokio::fs::read(staging.join("part.1")).await.unwrap(), b"23456");
+        let meta: PartMeta = read_json(&staging.join("part.1.meta.json")).await.unwrap();
+        assert_eq!(tokio::fs::read(staging.join(&meta.file)).await.unwrap(), b"23456");
     }
 
     #[tokio::test]

@@ -24,12 +24,15 @@ use super::identity::Identity;
 use super::logging::{TARGET_AUTH, TARGET_AUTHZ};
 use super::policy::{is_authorized, requirements_for_request, PolicyDocument};
 use super::xml::{error_xml, S3ErrorXml};
+use crate::storage::aws_chunked::{AwsChunkedDecoder, ChunkSigner};
 use super::OperationActor;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
 
 const MAX_SIGNATURE_CLOCK_SKEW_SECS: i64 = 15 * 60;
+/// Longest lifetime of a presigned URL (SigV4 `X-Amz-Expires`, SigV2 `Expires`).
+const MAX_PRESIGNED_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Shared state for the auth middleware: static config credentials (root,
 /// unrestricted) plus the IAM store (policy-bound access keys).
@@ -162,8 +165,8 @@ pub async fn auth_middleware(
 
     // Phase 1 — authentication: prove the caller holds a valid credential.
     let authn_start = std::time::Instant::now();
-    let principal = match validate_request(&state, &request) {
-        Ok(principal) => principal,
+    let verified = match validate_request(&state, &request) {
+        Ok(verified) => verified,
         Err(msg) => {
             // Explicit "not proceeding" record for every rejected request.
             log::warn!(
@@ -182,12 +185,27 @@ pub async fn auth_middleware(
             return with_operation_actor(deny(msg), actor);
         }
     };
+    let Verified {
+        principal,
+        access_key,
+        chunk_signer,
+    } = verified;
     log::debug!(
         target: TARGET_AUTH,
         "[{rid}] authn ok principal={principal:?} ({}µs)",
         authn_start.elapsed().as_micros()
     );
-    let actor = operation_actor(&state, Some(&principal), claimed_access_key(&request));
+    // Attribute the request to the key whose signature actually verified —
+    // not to whichever credential `claimed_access_key` happens to read first
+    // when a request carries both a header and query credentials.
+    let actor = operation_actor(&state, Some(&principal), access_key);
+    // A `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` body is signed chunk by chunk;
+    // the header signature covers only the seed. Verify every chunk as the
+    // handler reads the body, so a tampered or spliced chunk fails the upload.
+    if let Some(signer) = chunk_signer {
+        let (parts, body) = request.into_parts();
+        request = Request::from_parts(parts, verify_signed_chunks(body, signer));
+    }
     let from = client_ip(request.extensions(), request.headers());
     state.record_key_use(actor.access_key.as_deref(), from.as_deref());
     let from = from.unwrap_or_else(|| "unknown".to_string());
@@ -276,6 +294,8 @@ fn operation_actor(
     }
 }
 
+/// The access key a request *names* — used only to attribute a request that
+/// failed authentication. A verified request uses [`Verified::access_key`].
 fn claimed_access_key(request: &Request<Body>) -> Option<String> {
     if let Some(auth) = request
         .headers()
@@ -357,20 +377,28 @@ fn is_browser_post_upload(request: &Request<Body>) -> bool {
         .unwrap_or(false)
 }
 
+/// What a verified browser POST may do: who it runs as and, when the policy
+/// carries a `content-length-range` condition, the allowed file size.
+#[derive(Debug, Default)]
+pub(crate) struct BrowserPostGrant {
+    pub actor: OperationActor,
+    pub content_length_range: Option<(u64, u64)>,
+}
+
 /// Verifies a browser POST upload's SigV4 form signature and authorizes it.
 ///
-/// Returns the resolved [`OperationActor`] on success, or a ready-to-send
-/// error response on failure. The form fields are the parsed `multipart/
-/// form-data` values; the signature covers the base64 `policy` field, per the
-/// S3 POST-upload signing scheme.
+/// Returns the resolved grant on success, or a ready-to-send error response on
+/// failure. The form fields are the parsed `multipart/form-data` values that
+/// precede the file part; the signature covers the base64 `policy` field, per
+/// the S3 POST-upload signing scheme.
 pub(crate) fn authorize_browser_post(
     state: &AuthState,
     fields: &std::collections::BTreeMap<String, String>,
     bucket: &str,
     key: &str,
-) -> Result<OperationActor, Response> {
+) -> Result<BrowserPostGrant, Response> {
     if !state.config.auth.enabled {
-        return Ok(OperationActor::default());
+        return Ok(BrowserPostGrant::default());
     }
     let field = |name: &str| {
         fields
@@ -392,7 +420,10 @@ pub(crate) fn authorize_browser_post(
     let date = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
     let region = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
     let service = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
-    let _terminator = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
+    let terminator = parts.next().ok_or_else(|| deny("Invalid x-amz-credential"))?;
+    if service != "s3" || terminator != "aws4_request" {
+        return Err(deny("Invalid x-amz-credential scope"));
+    }
 
     let (secret, principal) = state
         .lookup(access_key)
@@ -406,9 +437,10 @@ pub(crate) fn authorize_browser_post(
     }
 
     // Enforce the policy document: it must be unexpired and its conditions
-    // must actually cover this bucket/key, so a captured signature cannot be
-    // replayed against a different target.
-    verify_post_policy_document(policy_b64, bucket, key)?;
+    // must actually cover this bucket/key and every other form field, so a
+    // captured signature cannot be replayed against a different target or
+    // with different metadata.
+    let content_length_range = verify_post_policy_document(policy_b64, fields, bucket, key)?;
 
     // An IAM principal is still bound by its user policy (admins are root).
     if let Principal::IamUser(username) = &principal {
@@ -432,16 +464,56 @@ pub(crate) fn authorize_browser_post(
             .find(|user| user.api_keys.iter().any(|k| k.ak == access_key))
             .map(|user| user.user.clone()),
     };
-    Ok(OperationActor {
-        username,
-        access_key: Some(access_key.to_string()),
+    Ok(BrowserPostGrant {
+        actor: OperationActor {
+            username,
+            access_key: Some(access_key.to_string()),
+        },
+        content_length_range,
     })
 }
 
+/// Form fields a POST policy need not mention: the signature machinery itself
+/// (verified separately), the file, and `x-ignore-*` (as in S3). `bucket` is
+/// implied by the URL and checked against it.
+fn post_field_exempt_from_policy(name: &str) -> bool {
+    matches!(
+        name,
+        "policy"
+            | "file"
+            | "bucket"
+            | "x-amz-signature"
+            | "x-amz-algorithm"
+            | "x-amz-credential"
+            | "x-amz-date"
+            | "x-amz-security-token"
+            | "signature"
+            | "awsaccesskeyid"
+    ) || name.starts_with("x-ignore-")
+}
+
+fn policy_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// Decodes and enforces the base64 POST policy: rejects an absent/expired
-/// `expiration`, and requires the `conditions` to match the target bucket and
-/// key (exact `eq`, `starts-with`, or the `{"bucket": …}` form).
-fn verify_post_policy_document(policy_b64: &str, bucket: &str, key: &str) -> Result<(), Response> {
+/// `expiration`; requires every condition (`{"field": "value"}`,
+/// `["eq", "$field", v]`, `["starts-with", "$field", prefix]`,
+/// `["content-length-range", min, max]`) to hold, rejecting any other
+/// operator; requires `bucket` and `key` to be constrained; and requires every
+/// submitted form field (bar [`post_field_exempt_from_policy`]) to be named by
+/// some condition. Returns the `content-length-range`, if any, for the caller
+/// to enforce against the file it receives.
+fn verify_post_policy_document(
+    policy_b64: &str,
+    fields: &std::collections::BTreeMap<String, String>,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<(u64, u64)>, Response> {
     let raw = BASE64_STANDARD
         .decode(policy_b64.as_bytes())
         .map_err(|_| deny("POST policy is not valid base64"))?;
@@ -464,66 +536,175 @@ fn verify_post_policy_document(policy_b64: &str, bucket: &str, key: &str) -> Res
         .and_then(|v| v.as_array())
         .ok_or_else(|| deny("POST policy has no conditions"))?;
 
-    let mut bucket_ok = false;
-    let mut key_ok = false;
-    for condition in conditions {
-        match condition {
-            // Object form: {"bucket": "name"} or {"key": "value"}.
-            serde_json::Value::Object(map) => {
-                if let Some(v) = map.get("bucket").and_then(|v| v.as_str()) {
-                    if v != bucket {
-                        return Err(deny("POST policy bucket condition does not match"));
-                    }
-                    bucket_ok = true;
-                }
-                if let Some(v) = map.get("key").and_then(|v| v.as_str()) {
-                    if v != key {
-                        return Err(deny("POST policy key condition does not match"));
-                    }
-                    key_ok = true;
-                }
-            }
-            // Array form: ["eq", "$key", "value"] or ["starts-with", "$key", "prefix"].
-            serde_json::Value::Array(items) => {
-                let op = items.first().and_then(|v| v.as_str()).unwrap_or("");
-                let target = items.get(1).and_then(|v| v.as_str()).unwrap_or("");
-                let value = items.get(2).and_then(|v| v.as_str()).unwrap_or("");
-                let subject = match target {
-                    "$key" => Some((&mut key_ok, key)),
-                    "$bucket" => Some((&mut bucket_ok, bucket)),
-                    _ => None,
-                };
-                if let Some((flag, actual)) = subject {
-                    let matches = match op {
-                        "eq" => actual == value,
-                        "starts-with" => actual.starts_with(value),
-                        _ => true, // unrecognized op on a known field — don't constrain
-                    };
-                    if !matches {
-                        return Err(deny("POST policy condition does not match request"));
-                    }
-                    *flag = true;
-                }
-            }
-            _ => {}
+    // A `bucket` form field, if sent, must name the bucket being posted to.
+    if let Some((_, value)) = fields.iter().find(|(k, _)| k.eq_ignore_ascii_case("bucket")) {
+        if value != bucket {
+            return Err(deny("POST bucket field does not match the request bucket"));
         }
     }
-    if !bucket_ok || !key_ok {
+    // The value a condition on `name` is checked against. Absent fields are
+    // the empty string (so `starts-with ""` allows anything, `eq` fails).
+    let actual = |name: &str| -> String {
+        if name.eq_ignore_ascii_case("bucket") {
+            return bucket.to_string();
+        }
+        if name.eq_ignore_ascii_case("key") {
+            return key.to_string();
+        }
+        fields
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+
+    let mut covered = std::collections::HashSet::new();
+    let mut content_length_range = None;
+    for condition in conditions {
+        match condition {
+            // Object form: {"field": "value"} — exact match.
+            serde_json::Value::Object(map) => {
+                for (name, expected) in map {
+                    let expected = expected
+                        .as_str()
+                        .ok_or_else(|| deny("POST policy condition value is not a string"))?;
+                    if actual(name) != expected {
+                        return Err(deny("POST policy condition does not match request"));
+                    }
+                    covered.insert(name.to_ascii_lowercase());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                let op = items
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| deny("POST policy condition is malformed"))?
+                    .to_ascii_lowercase();
+                if items.len() != 3 {
+                    return Err(deny("POST policy condition is malformed"));
+                }
+                match op.as_str() {
+                    "eq" | "starts-with" => {
+                        let name = items[1]
+                            .as_str()
+                            .and_then(|t| t.strip_prefix('$'))
+                            .ok_or_else(|| deny("POST policy condition is malformed"))?;
+                        let expected = items[2]
+                            .as_str()
+                            .ok_or_else(|| deny("POST policy condition is malformed"))?;
+                        let value = actual(name);
+                        let matches = if op == "eq" {
+                            value == expected
+                        } else {
+                            value.starts_with(expected)
+                        };
+                        if !matches {
+                            return Err(deny("POST policy condition does not match request"));
+                        }
+                        covered.insert(name.to_ascii_lowercase());
+                    }
+                    "content-length-range" => {
+                        let min = policy_u64(&items[1])
+                            .ok_or_else(|| deny("POST policy content-length-range is malformed"))?;
+                        let max = policy_u64(&items[2])
+                            .ok_or_else(|| deny("POST policy content-length-range is malformed"))?;
+                        if min > max {
+                            return Err(deny("POST policy content-length-range is malformed"));
+                        }
+                        // Several ranges all have to hold: keep their intersection.
+                        content_length_range = Some(match content_length_range {
+                            Some((lo, hi)) => (min.max(lo), max.min(hi)),
+                            None => (min, max),
+                        });
+                    }
+                    _ => return Err(deny("POST policy has an unsupported condition operator")),
+                }
+            }
+            _ => return Err(deny("POST policy condition is malformed")),
+        }
+    }
+    if !covered.contains("bucket") || !covered.contains("key") {
         return Err(deny("POST policy does not constrain bucket and key"));
     }
-    Ok(())
+    for name in fields.keys() {
+        let name = name.to_ascii_lowercase();
+        if !post_field_exempt_from_policy(&name) && !covered.contains(&name) {
+            return Err(deny("POST form field is not covered by the policy"));
+        }
+    }
+    Ok(content_length_range)
 }
 
 // ─── Core validator ───────────────────────────────────────────────────────────
 
-fn validate_request(state: &AuthState, request: &Request<Body>) -> Result<Principal, &'static str> {
+/// A request whose credentials verified.
+#[derive(Debug)]
+struct Verified {
+    principal: Principal,
+    /// The access key whose signature verified (`None` for the unauthenticated
+    /// health/metrics probes).
+    access_key: Option<String>,
+    /// Set for a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]` request: the
+    /// context that verifies its per-chunk signatures, seeded with the header
+    /// signature.
+    chunk_signer: Option<ChunkSigner>,
+}
+
+impl Verified {
+    fn key(principal: Principal, access_key: &str) -> Self {
+        Self {
+            principal,
+            access_key: Some(access_key.to_string()),
+            chunk_signer: None,
+        }
+    }
+}
+
+/// The first header that is present but not covered by `signed`: `host` must
+/// always be signed, as must every `x-amz-*` header (bar `exempt`) and, when
+/// `require_content_md5`, a `Content-MD5`. SigV4 only protects what is signed;
+/// an unsigned `x-amz-copy-source`, `x-amz-meta-*`, `x-amz-decoded-content-length`
+/// … could otherwise be added to, or altered on, a captured request.
+fn first_unsigned_header(
+    headers: &HeaderMap,
+    signed: &[String],
+    require_content_md5: bool,
+    exempt: &[&str],
+) -> Option<String> {
+    let is_signed = |name: &str| signed.iter().any(|h| h.eq_ignore_ascii_case(name));
+    if !is_signed("host") {
+        return Some("host".to_string());
+    }
+    headers
+        .keys()
+        .map(|name| name.as_str())
+        .find(|name| {
+            (name.starts_with("x-amz-") || (require_content_md5 && *name == "content-md5"))
+                && !exempt.contains(name)
+                && !is_signed(name)
+        })
+        .map(str::to_string)
+}
+
+/// True for a concrete (hex SHA-256) payload hash.
+fn is_concrete_payload_hash(value: &str) -> bool {
+    value != "UNSIGNED-PAYLOAD" && !value.starts_with("STREAMING-")
+}
+
+fn validate_request(state: &AuthState, request: &Request<Body>) -> Result<Verified, &'static str> {
+    // Only the exact health/metrics routes, and only for reads, are public.
+    // Any other `/minio/...` path is an ordinary bucket (`minio`) request and
+    // must authenticate like one.
     if matches!(
-        request.uri().path(),
-        "/minio/health/live" | "/minio/health/ready"
-    ) || request.uri().path().starts_with("/minio/v2/metrics/")
-        || request.uri().path() == "/minio/prometheus/metrics"
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) && super::is_probe_path(request.uri().path())
     {
-        return Ok(Principal::Root);
+        return Ok(Verified {
+            principal: Principal::Root,
+            access_key: None,
+            chunk_signer: None,
+        });
     }
 
     let uri_str = request.uri().to_string();
@@ -578,6 +759,24 @@ fn validate_request(state: &AuthState, request: &Request<Body>) -> Result<Princi
     {
         return Err("Invalid credential scope");
     }
+    // As in S3: every x-amz-* header present (and Content-MD5) must be signed.
+    if first_unsigned_header(request.headers(), &parsed.signed_headers, true, &[]).is_some() {
+        return Err("There were headers present in the request which were not signed");
+    }
+    // An aws-chunked body is only integrity-protected by a STREAMING-* payload
+    // mode; paired with a concrete hash the body would go unchecked (the hash
+    // is not comparable to the framed bytes).
+    if is_concrete_payload_hash(payload_hash) && super::is_aws_chunked(request.headers()) {
+        return Err("aws-chunked content requires a STREAMING x-amz-content-sha256");
+    }
+    let signed_streaming = match payload_hash {
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => true,
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => false,
+        other if other.starts_with("STREAMING-") => {
+            return Err("Unsupported streaming x-amz-content-sha256");
+        }
+        _ => false,
+    };
 
     let canonical = build_canonical_request(request, &parsed.signed_headers, payload_hash);
     let string_to_sign = build_string_to_sign(date, &parsed.credential_scope, &canonical);
@@ -587,14 +786,52 @@ fn validate_request(state: &AuthState, request: &Request<Body>) -> Result<Princi
     if !constant_time_eq(&expected, &parsed.signature) {
         return Err("Signature does not match");
     }
-    Ok(principal)
+    let chunk_signer = signed_streaming.then(|| ChunkSigner {
+        signing_key,
+        amz_date: date.to_string(),
+        scope: parsed.credential_scope.clone(),
+        prev_signature: parsed.signature.clone(),
+    });
+    Ok(Verified {
+        principal,
+        access_key: Some(parsed.access_key),
+        chunk_signer,
+    })
+}
+
+/// Wraps a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` body so every chunk signature
+/// is verified as the body is read. Bytes pass through unchanged (the handler
+/// still decodes the framing); a bad signature, malformed framing, or a body
+/// that ends before its signed final chunk surfaces as a body error, which
+/// fails the write before anything is committed.
+fn verify_signed_chunks(body: Body, signer: ChunkSigner) -> Body {
+    use futures::StreamExt;
+    let stream = body.into_data_stream();
+    let decoder = AwsChunkedDecoder::with_signer(signer);
+    Body::from_stream(futures::stream::unfold(
+        Some((stream, decoder)),
+        |state| async move {
+            let (mut stream, mut decoder) = state?;
+            match stream.next().await {
+                Some(Ok(bytes)) => match decoder.feed(&bytes) {
+                    Ok(_) => Some((Ok(bytes), Some((stream, decoder)))),
+                    Err(err) => Some((Err(std::io::Error::other(err.to_string())), None)),
+                },
+                Some(Err(err)) => Some((Err(std::io::Error::other(err.to_string())), None)),
+                None => match decoder.finish() {
+                    Ok(()) => None,
+                    Err(err) => Some((Err(std::io::Error::other(err.to_string())), None)),
+                },
+            }
+        },
+    ))
 }
 
 fn validate_signature_v2(
     state: &AuthState,
     request: &Request<Body>,
     value: &str,
-) -> Result<Principal, &'static str> {
+) -> Result<Verified, &'static str> {
     let (access_key, signature) = value
         .split_once(':')
         .ok_or("Malformed Authorization header")?;
@@ -624,13 +861,13 @@ fn validate_signature_v2(
     if !constant_time_eq(&expected, signature) {
         return Err("Signature does not match");
     }
-    Ok(principal)
+    Ok(Verified::key(principal, access_key))
 }
 
 fn validate_signature_v2_query(
     state: &AuthState,
     request: &Request<Body>,
-) -> Result<Principal, &'static str> {
+) -> Result<Verified, &'static str> {
     let query = request.uri().query().ok_or("Missing query string")?;
     let access_key = query_param(query, "AWSAccessKeyId").ok_or("Missing AWSAccessKeyId")?;
     let signature = query_param(query, "Signature").ok_or("Missing Signature")?;
@@ -638,8 +875,14 @@ fn validate_signature_v2_query(
     let expires_epoch = expires
         .parse::<i64>()
         .map_err(|_| "Invalid Expires value")?;
-    if Utc::now().timestamp() > expires_epoch {
+    let now = Utc::now().timestamp();
+    if now > expires_epoch {
         return Err("Presigned URL expired");
+    }
+    // Same 7-day ceiling as SigV4 presigning: a far-future `Expires` would
+    // otherwise mint a practically permanent bearer URL.
+    if expires_epoch - now > MAX_PRESIGNED_EXPIRES_SECS {
+        return Err("Expires is too far in the future");
     }
     let (secret, principal) = state.lookup(&access_key).ok_or("Unknown access key")?;
     let string_to_sign = signature_v2_query_string_to_sign(request, &expires);
@@ -649,7 +892,7 @@ fn validate_signature_v2_query(
     if !constant_time_eq(&expected, &signature) {
         return Err("Signature does not match");
     }
-    Ok(principal)
+    Ok(Verified::key(principal, &access_key))
 }
 
 fn signature_v2_string_to_sign(request: &Request<Body>) -> String {
@@ -799,7 +1042,7 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 /// 1. Checking that the URL has not expired (`X-Amz-Date + X-Amz-Expires`).
 /// 2. Reconstructing the canonical request exactly as the signer did.
 /// 3. Verifying the HMAC-SHA256 signature.
-fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Principal, &'static str> {
+fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Verified, &'static str> {
     let raw_query = request.uri().query().unwrap_or("");
 
     // Decode all query parameters once.
@@ -852,7 +1095,7 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
     // AWS rejects presigned URLs whose lifetime exceeds 7 days; enforce the
     // same ceiling so an over-long X-Amz-Expires can't mint a near-permanent
     // bearer URL.
-    if expires_secs < 0 || expires_secs > 604_800 {
+    if expires_secs < 0 || expires_secs > MAX_PRESIGNED_EXPIRES_SECS {
         return Err("X-Amz-Expires is out of range");
     }
     let expires_at = signed_at + chrono::Duration::seconds(expires_secs);
@@ -893,6 +1136,15 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
         })
     };
     let headers_for_canon = host_override.as_ref().unwrap_or_else(|| request.headers());
+    // Every x-amz-* header sent with a presigned URL must be one it signed.
+    // `x-amz-content-sha256` is exempt: presigned payloads are UNSIGNED unless
+    // the URL signs that header, and some tools attach it regardless; left
+    // unsigned it can only make the server *reject* a body whose hash differs.
+    if first_unsigned_header(request.headers(), &signed_headers, false, &["x-amz-content-sha256"])
+        .is_some()
+    {
+        return Err("There were headers present in the request which were not signed");
+    }
     for signed_header in &signed_headers {
         if signed_header.eq_ignore_ascii_case("host") {
             continue;
@@ -907,6 +1159,9 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
     let method = request.method().as_str();
     let uri = canonical_uri(signed_path(request));
     let payload_hash = presigned_payload_hash(request.headers(), &signed_headers);
+    if is_concrete_payload_hash(&payload_hash) && super::is_aws_chunked(request.headers()) {
+        return Err("aws-chunked content requires a STREAMING x-amz-content-sha256");
+    }
     let canonical = format!(
         "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\n{signed_hdrs_str}\n{payload_hash}"
     );
@@ -918,7 +1173,7 @@ fn validate_presigned(state: &AuthState, request: &Request<Body>) -> Result<Prin
     if !constant_time_eq(&expected, signature) {
         return Err("Presigned signature does not match");
     }
-    Ok(principal)
+    Ok(Verified::key(principal, access_key))
 }
 
 fn presigned_payload_hash(headers: &HeaderMap, signed_headers: &[String]) -> String {
@@ -1402,8 +1657,8 @@ pub(crate) fn presign_query_with_signed_headers(
 
 /// Generates an `Authorization` header value for a regular SigV4 request (test helper).
 ///
-/// Signs `host` and `x-amz-date` with `UNSIGNED-PAYLOAD` as the payload hash.
-/// The caller must send both `host: <host>` and `x-amz-date: <datetime>` headers.
+/// Signs `host`, `x-amz-content-sha256` (`UNSIGNED-PAYLOAD`) and `x-amz-date`.
+/// The caller must send those three headers with exactly these values.
 #[cfg(test)]
 pub(crate) fn compute_auth_header(
     method: &str,
@@ -1415,24 +1670,75 @@ pub(crate) fn compute_auth_header(
     region: &str,
     datetime: &str,
 ) -> String {
+    compute_auth_header_with_headers(
+        method, path, query, host, access_key, secret_key, region, datetime, &[],
+    )
+}
+
+/// [`compute_auth_header`] that also signs `extra` headers (which the caller
+/// must send verbatim).
+#[cfg(test)]
+pub(crate) fn compute_auth_header_with_headers(
+    method: &str,
+    path: &str,
+    query: &str,
+    host: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    datetime: &str,
+    extra: &[(&str, &str)],
+) -> String {
+    compute_auth_header_payload(
+        method, path, query, host, access_key, secret_key, region, datetime, "UNSIGNED-PAYLOAD", extra,
+    )
+    .0
+}
+
+/// Returns `(authorization, seed_signature)` for a request whose
+/// `x-amz-content-sha256` is `payload_hash`.
+#[cfg(test)]
+pub(crate) fn compute_auth_header_payload(
+    method: &str,
+    path: &str,
+    query: &str,
+    host: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    datetime: &str,
+    payload_hash: &str,
+    extra: &[(&str, &str)],
+) -> (String, String) {
     let date = &datetime[..8];
     let credential_scope = format!("{date}/{region}/s3/aws4_request");
 
     let canonical_query = canonical_query_string(query);
     let uri = canonical_uri(path);
 
-    // Sign host + x-amz-date, use UNSIGNED-PAYLOAD as the body hash.
-    let canonical_hdrs = format!("host:{host}\nx-amz-date:{datetime}\n");
-    let canonical = format!(
-        "{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\nhost;x-amz-date\nUNSIGNED-PAYLOAD"
-    );
+    let mut headers: Vec<(String, String)> = vec![
+        ("host".to_string(), host.to_string()),
+        ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
+        ("x-amz-date".to_string(), datetime.to_string()),
+    ];
+    for (name, value) in extra {
+        headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+    }
+    headers.sort();
+    let canonical_hdrs: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let signed = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let canonical =
+        format!("{method}\n{uri}\n{canonical_query}\n{canonical_hdrs}\n{signed}\n{payload_hash}");
 
     let string_to_sign = build_string_to_sign(datetime, &credential_scope, &canonical);
     let signing_key = derive_signing_key(secret_key, date, region, "s3");
     let signature = hex_hmac(&signing_key, string_to_sign.as_bytes());
 
-    format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders=host;x-amz-date, Signature={signature}"
+    (
+        format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed}, Signature={signature}"
+        ),
+        signature,
     )
 }
 
@@ -1570,7 +1876,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let state = AuthState { config: Arc::new(config), iam: None, usage: None };
-        assert_eq!(validate_request(&state, &request), Ok(Principal::Root));
+        assert_eq!(validate_request(&state, &request).map(|v| v.principal), Ok(Principal::Root));
     }
 
     #[test]
@@ -1584,7 +1890,8 @@ mod tests {
                 access_key: "AKID".to_string(),
                 secret_key: "secret".to_string(),
             });
-        let expires = "4102444800";
+        let expires_at = (Utc::now().timestamp() + 3600).to_string();
+        let expires = expires_at.as_str();
         let unsigned = Request::builder()
             .method("GET")
             .uri(format!("/bucket/key?AWSAccessKeyId=AKID&Expires={expires}"))
@@ -1603,7 +1910,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let state = AuthState { config: Arc::new(config), iam: None, usage: None };
-        assert_eq!(validate_request(&state, &request), Ok(Principal::Root));
+        assert_eq!(validate_request(&state, &request).map(|v| v.principal), Ok(Principal::Root));
     }
 
     #[test]
@@ -1625,8 +1932,80 @@ mod tests {
                 .uri(path)
                 .body(Body::empty())
                 .unwrap();
-            assert_eq!(validate_request(&state, &request), Ok(Principal::Root), "{path}");
+            assert_eq!(validate_request(&state, &request).map(|v| v.principal), Ok(Principal::Root), "{path}");
         }
+    }
+
+    #[test]
+    fn probe_bypass_is_exact_and_read_only() {
+        let state = auth_state_with_root_key("AKID", "secret");
+        for (method, path) in [
+            ("PUT", "/minio/health/live"),
+            ("POST", "/minio/v2/metrics/cluster"),
+            ("GET", "/minio/v2/metrics/x"),
+            ("GET", "/minio/v2/metrics/cluster/"),
+        ] {
+            let request = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+            assert!(validate_request(&state, &request).is_err(), "{method} {path}");
+        }
+        let head = Request::builder().method("HEAD").uri("/minio/health/ready").body(Body::empty()).unwrap();
+        assert!(validate_request(&state, &head).is_ok());
+    }
+
+    #[test]
+    fn signature_v2_query_expires_is_capped_at_seven_days() {
+        let state = auth_state_with_root_key("AKID", "secret");
+        let sign = |expires: &str| {
+            let unsigned = Request::builder()
+                .uri(format!("/bucket/key?AWSAccessKeyId=AKID&Expires={expires}"))
+                .body(Body::empty())
+                .unwrap();
+            let mut mac = HmacSha1::new_from_slice(b"secret").unwrap();
+            mac.update(signature_v2_query_string_to_sign(&unsigned, expires).as_bytes());
+            let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+            Request::builder()
+                .uri(format!(
+                    "/bucket/key?AWSAccessKeyId=AKID&Expires={expires}&Signature={}",
+                    urlencoding::encode(&signature)
+                ))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let far = (Utc::now().timestamp() + MAX_PRESIGNED_EXPIRES_SECS + 60).to_string();
+        assert_eq!(
+            validate_request(&state, &sign(&far)).map(|v| v.principal),
+            Err("Expires is too far in the future")
+        );
+        let near = (Utc::now().timestamp() + 60).to_string();
+        let verified = validate_request(&state, &sign(&near)).unwrap();
+        assert_eq!(verified.access_key.as_deref(), Some("AKID"));
+    }
+
+    #[test]
+    fn post_policy_rejects_unknown_operators_and_uncovered_fields() {
+        let expiration = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let encode = |conditions: serde_json::Value| {
+            BASE64_STANDARD.encode(
+                serde_json::json!({"expiration": expiration, "conditions": conditions}).to_string(),
+            )
+        };
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("key".to_string(), "a/b".to_string());
+        let base = serde_json::json!([{"bucket": "b"}, ["starts-with", "$key", "a/"]]);
+        assert_eq!(verify_post_policy_document(&encode(base.clone()), &fields, "b", "a/b").ok(), Some(None));
+
+        let bad_op = serde_json::json!([{"bucket": "b"}, ["starts-with", "$key", "a/"], ["bogus", "$key", "x"]]);
+        assert!(verify_post_policy_document(&encode(bad_op), &fields, "b", "a/b").is_err());
+
+        let mut extra = fields.clone();
+        extra.insert("success_action_redirect".to_string(), "https://evil".to_string());
+        assert!(verify_post_policy_document(&encode(base), &extra, "b", "a/b").is_err());
+
+        let ranged = serde_json::json!([{"bucket": "b"}, {"key": "a/b"}, ["content-length-range", "1", 100]]);
+        assert_eq!(
+            verify_post_policy_document(&encode(ranged), &fields, "b", "a/b").ok(),
+            Some(Some((1, 100)))
+        );
     }
 
     #[test]
@@ -1649,7 +2028,7 @@ mod tests {
             .unwrap();
         let state = AuthState { config: Arc::new(config), iam: None, usage: None };
         assert_eq!(
-            validate_request(&state, &request),
+            validate_request(&state, &request).map(|v| v.principal),
             Err("Invalid x-amz-date header")
         );
     }
@@ -1679,7 +2058,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(
-            validate_request(&state, &request),
+            validate_request(&state, &request).map(|v| v.principal),
             Err("Request timestamp is outside the allowed clock skew")
         );
     }
@@ -1888,7 +2267,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(
-            validate_request(&state, &request),
+            validate_request(&state, &request).map(|v| v.principal),
             Err("X-Amz-Expires is out of range")
         );
     }
@@ -1917,7 +2296,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(
-            validate_request(&state, &request),
+            validate_request(&state, &request).map(|v| v.principal),
             Err("X-Amz-Date is too far in the future")
         );
     }

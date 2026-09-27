@@ -266,6 +266,9 @@ fn router_with_metrics(
             task_registry_middleware,
         ))
         .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
+        // Before auth: a repeated query parameter could be read differently by
+        // the policy check and the router.
+        .layer(middleware::from_fn(reject_duplicate_query_params))
         .layer(middleware::from_fn_with_state(
             metrics,
             traffic_metrics_middleware,
@@ -488,9 +491,7 @@ fn host_style_bucket(config: &AppConfig, request: &Request<Body>) -> Option<Stri
         return None;
     }
     let path = request.uri().path();
-    if matches!(path, "/minio/health/live" | "/minio/health/ready" | "/minio/prometheus/metrics")
-        || path.starts_with("/minio/v2/metrics/")
-    {
+    if is_probe_path(path) {
         return None;
     }
     let host = request
@@ -504,6 +505,47 @@ fn host_style_bucket(config: &AppConfig, request: &Request<Body>) -> Option<Stri
         return None;
     }
     Some(bucket.to_string())
+}
+
+/// The exact health/metrics paths the router serves itself (unauthenticated
+/// for GET/HEAD). Anything else under `/minio/` is an ordinary bucket path.
+pub(crate) fn is_probe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/minio/health/live"
+            | "/minio/health/ready"
+            | "/minio/v2/metrics/cluster"
+            | "/minio/v2/metrics/node"
+            | "/minio/v2/metrics/bucket"
+            | "/minio/v2/metrics/resource"
+            | "/minio/prometheus/metrics"
+    )
+}
+
+/// Rejects a request that names any query parameter twice (compared after
+/// percent-decoding, as the router compares them). Authorization and dispatch
+/// each read the query; with a repeated parameter they could each pick a
+/// different occurrence (`?prefix=a&prefix=b`, `?uploadId=x&%75ploadId=y`), so
+/// such a request is refused before either runs. S3 defines no operation that
+/// repeats a query parameter.
+async fn reject_duplicate_query_params(request: Request<Body>, next: Next) -> Response {
+    if let Some(name) = duplicate_query_param(request.uri().query().unwrap_or("")) {
+        return s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            format!("Query parameter {name} is specified more than once"),
+            request.uri().path(),
+        );
+    }
+    next.run(request).await
+}
+
+pub(crate) fn duplicate_query_param(raw: &str) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| percent_decode(part.split('=').next().unwrap_or("")))
+        .find(|key| !seen.insert(key.clone()))
 }
 
 /// `host[:port]` → `host` (bracketed IPv6 literals keep their brackets off).
@@ -692,6 +734,8 @@ async fn log_middleware(mut request: Request<Body>, next: Next) -> Response {
         .unwrap_or_default()
         .label();
     let (operation, target) = operation_and_target(&method, &uri, is_copy);
+    // Object keys may carry newlines; keep one request on one log line.
+    let target = logging::escape_control(&target).into_owned();
     let result = if matches!(
         response.extensions().get::<OperationDisposition>(),
         Some(OperationDisposition::Partial)
@@ -1721,39 +1765,200 @@ fn parse_complete_parts_xml(xml: &str) -> Result<Vec<CompletePartRequest>, &'sta
     }
 }
 
-fn parse_delete_objects_xml(xml: &str) -> (Vec<String>, bool) {
-    let object_re = Regex::new(r#"(?s)<Object>\s*(.*?)\s*</Object>"#).unwrap();
-    let key_re = Regex::new(r#"(?s)<Key>\s*(.*?)\s*</Key>"#).unwrap();
-    let quiet_re = Regex::new(r#"(?si)<Quiet>\s*(true|false)\s*</Quiet>"#).unwrap();
-    let quiet = quiet_re
-        .captures(xml)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().eq_ignore_ascii_case("true"))
+/// S3's ceiling on keys in one DeleteObjects request.
+const MAX_DELETE_OBJECTS_KEYS: usize = 1000;
+
+/// Parses a DeleteObjects body into its keys and the Quiet flag.
+///
+/// Parsed as real XML rather than pattern-matched: a key's text is kept
+/// byte-for-byte (`"report "` must not become `"report"`), entities --
+/// named, decimal and hex -- are decoded exactly once, and CDATA is honoured.
+/// The error is the message of a `MalformedXML` reply.
+fn parse_delete_objects_xml(xml: &str) -> Result<(Vec<String>, bool), &'static str> {
+    let root = parse_xml_tree(xml)?;
+    if root.name != "Delete" {
+        return Err("The XML you provided was not well-formed or did not validate against our published schema");
+    }
+    let quiet = root
+        .children
+        .iter()
+        .find(|child| child.name == "Quiet")
+        .map(|quiet| quiet.text.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let keys = object_re
-        .captures_iter(xml)
-        .filter_map(|c| {
-            let block = c.get(1)?.as_str();
-            let key = key_re.captures(block)?.get(1)?.as_str();
-            Some(unescape_xml(key))
-        })
-        .collect();
-    (keys, quiet)
+    let mut keys = Vec::new();
+    for object in root.children.iter().filter(|child| child.name == "Object") {
+        let key = object
+            .children
+            .iter()
+            .find(|child| child.name == "Key")
+            .ok_or("The XML you provided was not well-formed or did not validate against our published schema")?;
+        keys.push(key.text.clone());
+        if keys.len() > MAX_DELETE_OBJECTS_KEYS {
+            return Err("The XML you provided was not well-formed or did not validate against our published schema");
+        }
+    }
+    if keys.is_empty() {
+        return Err("No Object keys found in Delete request");
+    }
+    Ok((keys, quiet))
 }
 
+/// One element of a parsed request body: its local name (namespace prefix
+/// dropped), its child elements, and its decoded character data (text and
+/// CDATA concatenated, whitespace preserved).
+#[derive(Debug, Default)]
+struct XmlNode {
+    name: String,
+    children: Vec<XmlNode>,
+    text: String,
+}
+
+/// A deliberately small, non-validating XML parser for S3 request bodies.
+/// Handles the XML declaration, processing instructions, comments, CDATA,
+/// attributes (skipped, quote-aware), self-closing tags and entity decoding.
+/// DTDs are refused outright, so no user-defined entity can ever expand.
+fn parse_xml_tree(xml: &str) -> Result<XmlNode, &'static str> {
+    const MALFORMED: &str =
+        "The XML you provided was not well-formed or did not validate against our published schema";
+    fn local_name(raw: &str) -> String {
+        raw.rsplit(':').next().unwrap_or(raw).to_string()
+    }
+    let mut stack: Vec<XmlNode> = Vec::new();
+    let mut root: Option<XmlNode> = None;
+    let mut rest = xml.strip_prefix('\u{feff}').unwrap_or(xml);
+    loop {
+        let lt = rest.find('<').unwrap_or(rest.len());
+        let text = &rest[..lt];
+        match stack.last_mut() {
+            Some(top) => top.text.push_str(&unescape_xml(text)),
+            None if !text.trim().is_empty() => return Err(MALFORMED),
+            None => {}
+        }
+        rest = &rest[lt..];
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after) = rest.strip_prefix("<?") {
+            let end = after.find("?>").ok_or(MALFORMED)?;
+            rest = &after[end + 2..];
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            let end = after.find("-->").ok_or(MALFORMED)?;
+            rest = &after[end + 3..];
+        } else if let Some(after) = rest.strip_prefix("<![CDATA[") {
+            let end = after.find("]]>").ok_or(MALFORMED)?;
+            stack.last_mut().ok_or(MALFORMED)?.text.push_str(&after[..end]);
+            rest = &after[end + 3..];
+        } else if rest.starts_with("<!") {
+            return Err(MALFORMED);
+        } else if let Some(after) = rest.strip_prefix("</") {
+            let end = after.find('>').ok_or(MALFORMED)?;
+            let name = local_name(after[..end].trim());
+            let node = stack.pop().ok_or(MALFORMED)?;
+            if node.name != name {
+                return Err(MALFORMED);
+            }
+            match stack.last_mut() {
+                Some(parent) => parent.children.push(node),
+                None if root.is_none() => root = Some(node),
+                None => return Err(MALFORMED),
+            }
+            rest = &after[end + 1..];
+        } else {
+            let after = &rest[1..];
+            let mut quote = None;
+            let end = after
+                .char_indices()
+                .find(|&(_, ch)| match quote {
+                    Some(q) if ch == q => {
+                        quote = None;
+                        false
+                    }
+                    Some(_) => false,
+                    None if ch == '"' || ch == '\'' => {
+                        quote = Some(ch);
+                        false
+                    }
+                    None => ch == '>',
+                })
+                .map(|(i, _)| i)
+                .ok_or(MALFORMED)?;
+            let inner = &after[..end];
+            let self_closing = inner.ends_with('/');
+            let inner = inner.strip_suffix('/').unwrap_or(inner);
+            let raw_name = inner.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+            if raw_name.is_empty() || (stack.is_empty() && root.is_some()) {
+                return Err(MALFORMED);
+            }
+            let node = XmlNode {
+                name: local_name(raw_name),
+                ..XmlNode::default()
+            };
+            if self_closing {
+                match stack.last_mut() {
+                    Some(parent) => parent.children.push(node),
+                    None => root = Some(node),
+                }
+            } else {
+                stack.push(node);
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    if !stack.is_empty() {
+        return Err(MALFORMED);
+    }
+    root.ok_or(MALFORMED)
+}
+
+/// Decodes XML character data exactly once: the five predefined entities plus
+/// decimal (`&#10;`) and hex (`&#x1F600;`) character references. Anything that
+/// is not a recognisable reference is kept literally.
 fn unescape_xml(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&#34;", "\"")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        // Decode ampersand last so `&amp;lt;` remains the literal text `&lt;`
-        // instead of being decoded twice into `<`.
-        .replace("&amp;", "&")
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let decoded = tail.find(';').filter(|&semi| semi <= 12).and_then(|semi| {
+            let entity = &tail[1..semi];
+            let ch = match entity {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => {
+                    let code = if let Some(hex) = entity
+                        .strip_prefix("#x")
+                        .or_else(|| entity.strip_prefix("#X"))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else if let Some(dec) = entity.strip_prefix('#') {
+                        dec.parse::<u32>().ok()
+                    } else {
+                        None
+                    };
+                    code.and_then(char::from_u32)
+                }
+            };
+            ch.map(|ch| (ch, semi))
+        });
+        match decoded {
+            Some((ch, semi)) => {
+                out.push(ch);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
-fn parse_copy_source(raw: &str) -> Option<(String, String)> {
+pub(crate) fn parse_copy_source(raw: &str) -> Option<(String, String)> {
     // An `x-amz-copy-source` may carry a `?versionId=…` suffix; strip it so it
     // never becomes part of the source key. This server addresses only the
     // current version, so the version id is simply ignored.
@@ -1816,9 +2021,11 @@ fn copy_source_preconditions_match(
         }
     }
 
+    // S3 copies when if-match holds even if if-unmodified-since fails.
     if let Some(value) = headers
         .get("x-amz-copy-source-if-unmodified-since")
         .and_then(|v| v.to_str().ok())
+        .filter(|_| !headers.contains_key("x-amz-copy-source-if-match"))
     {
         if let Some(since_ms) = parse_http_date_ms(value) {
             if source_last_modified_ms > since_ms {
@@ -1869,7 +2076,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn parse_s3_query(raw: &str) -> HashMap<String, String> {
+pub(crate) fn parse_s3_query(raw: &str) -> HashMap<String, String> {
     raw.split('&')
         .filter(|part| !part.is_empty())
         .filter_map(|part| {
@@ -1882,16 +2089,7 @@ fn parse_s3_query(raw: &str) -> HashMap<String, String> {
 }
 
 fn normalize_complete_etag(value: &str) -> String {
-    value
-        .trim()
-        .replace("&#34;", "\"")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .trim_matches('"')
-        .to_string()
+    unescape_xml(value.trim()).trim_matches('"').to_string()
 }
 
 fn is_aws_chunked(headers: &HeaderMap) -> bool {
@@ -2074,6 +2272,24 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
             err.to_string(),
             resource,
         ),
+        // Malformed aws-chunked framing or a failed chunk signature is the
+        // client's fault.
+        StorageError::InvalidAwsChunkedBody(ref message)
+            if message.contains(crate::storage::aws_chunked::CHUNK_SIGNATURE_MISMATCH) =>
+        {
+            s3_error(
+                StatusCode::FORBIDDEN,
+                "SignatureDoesNotMatch",
+                err.to_string(),
+                resource,
+            )
+        }
+        StorageError::InvalidAwsChunkedBody(_) => s3_error(
+            StatusCode::BAD_REQUEST,
+            "IncompleteBody",
+            err.to_string(),
+            resource,
+        ),
         StorageError::PayloadHashMismatch { .. } => s3_error(
             StatusCode::BAD_REQUEST,
             "XAmzContentSHA256Mismatch",
@@ -2191,6 +2407,8 @@ fn empty_response_with_etag(status: StatusCode, etag: &str) -> Response {
     response
 }
 
+#[cfg(test)]
+mod auth_regression_tests;
 #[cfg(test)]
 mod iam_e2e_tests;
 #[cfg(test)]

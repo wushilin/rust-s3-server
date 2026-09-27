@@ -1345,6 +1345,68 @@
         assert_eq!(prefixes, expected, "every common prefix exactly once");
     }
 
+    /// Mixed keys and common prefixes, every max-keys: v1 (NextMarker) and v2
+    /// (NextContinuationToken) walk every item exactly once, a truncated page
+    /// is never followed by an empty one, and when a page ends on a common
+    /// prefix the cursor is that prefix (as S3 returns it).
+    #[tokio::test]
+    async fn list_objects_delimiter_pagination_mixed_items_every_page_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Vec<String> = ["a/0", "a/b/1", "a/b/2", "a/c", "a/d/1", "a/d/2", "a/e"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        let app = seed_bucket(&tmp, "mixed-delim", &keys).await;
+        let expected = ["a/0", "a/b/", "a/c", "a/d/", "a/e"];
+
+        for v2 in [false, true] {
+            for max_keys in 1..=expected.len() + 1 {
+                let mut items: Vec<String> = Vec::new();
+                let mut cursor: Option<String> = None;
+                let mut pages = 0usize;
+                loop {
+                    let mut uri = format!("/mixed-delim?prefix=a%2F&delimiter=%2F&max-keys={max_keys}");
+                    if v2 {
+                        uri.push_str("&list-type=2");
+                    }
+                    if let Some(c) = &cursor {
+                        let name = if v2 { "continuation-token" } else { "marker" };
+                        uri.push_str(&format!("&{name}={}", urlencoding::encode(c)));
+                    }
+                    let body = get_body(&app, &uri).await;
+                    pages += 1;
+                    let mut page: Vec<String> = extract_all_xml_tags(&body, "Key");
+                    page.extend(
+                        extract_all_xml_tags(&body, "Prefix")
+                            .into_iter()
+                            .filter(|p| p != "a/"),
+                    );
+                    page.sort();
+                    assert!(!page.is_empty(), "v2={v2} max_keys={max_keys} page {pages} is empty");
+                    items.extend(page.clone());
+                    if extract_xml_tag(&body, "IsTruncated") != Some("true") {
+                        break;
+                    }
+                    let tag = if v2 { "NextContinuationToken" } else { "NextMarker" };
+                    let next = extract_xml_tag(&body, tag).expect("truncated page carries a cursor").to_string();
+                    assert_eq!(Some(&next), page.last(), "cursor is the page's last item");
+                    cursor = Some(next);
+                    assert!(pages <= expected.len(), "pagination did not terminate");
+                }
+                assert_eq!(items, expected, "v2={v2} max_keys={max_keys}");
+            }
+        }
+
+        // One group only: rolling it up leaves nothing for a further page.
+        for uri in [
+            "/mixed-delim?prefix=a%2Fb&delimiter=%2F&max-keys=1",
+            "/mixed-delim?prefix=a%2Fd&delimiter=%2F&max-keys=1&list-type=2",
+        ] {
+            let body = get_body(&app, uri).await;
+            assert_eq!(extract_xml_tag(&body, "IsTruncated"), Some("false"), "{uri}");
+        }
+    }
+
     /// `max-keys=0` must not advertise a further page: a client that trusts
     /// IsTruncated would replay the same request forever, since a zero-sized
     /// page can never carry the cursor forward.
@@ -4751,4 +4813,180 @@
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(body_text(res).await.contains("InvalidRequest"));
+    }
+
+    /// One request against `app`: method, uri, extra headers, body.
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: impl Into<Body>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(body.into()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_response_header_overrides_are_rejected_not_panicked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        send(&app, "PUT", "/ovr-bucket", &[], Body::empty()).await;
+        send(&app, "PUT", "/ovr-bucket/k", &[], "hello").await;
+
+        for query in [
+            "response-content-disposition=a%0Ab",
+            "response-content-type=text%0D%0Ax-evil:%201",
+            "response-cache-control=%00",
+            "response-expires=%7F",
+        ] {
+            for method in ["GET", "HEAD"] {
+                let res = send(&app, method, &format!("/ovr-bucket/k?{query}"), &[], Body::empty()).await;
+                assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {query}");
+                if method == "GET" {
+                    assert!(body_text(res).await.contains("InvalidArgument"));
+                }
+            }
+        }
+
+        // Valid overrides still apply, and replace rather than duplicate.
+        let res = send(
+            &app,
+            "GET",
+            "/ovr-bucket/k?response-content-type=text%2Fplain&response-content-disposition=attachment%3B%20filename%3D%22a.txt%22",
+            &[],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get_all("content-type").iter().count(), 1);
+        assert_eq!(res.headers()["content-type"], "text/plain");
+        assert_eq!(res.headers()["content-disposition"], "attachment; filename=\"a.txt\"");
+        assert_eq!(body_text(res).await, "hello");
+    }
+
+    #[tokio::test]
+    async fn get_date_conditions_yield_to_etag_conditions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        send(&app, "PUT", "/cond-bucket", &[], Body::empty()).await;
+        let put = send(&app, "PUT", "/cond-bucket/k", &[], "hello").await;
+        let etag = put.headers()["etag"].to_str().unwrap().to_string();
+        let long_ago = "Mon, 01 Jan 2001 00:00:00 GMT";
+        let future = "Fri, 01 Jan 2100 00:00:00 GMT";
+
+        // If-Match holds; If-Unmodified-Since alone would fail -> served.
+        let res = send(
+            &app,
+            "GET",
+            "/cond-bucket/k",
+            &[("if-match", &etag), ("if-unmodified-since", long_ago)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        // Without If-Match the date check still applies.
+        let res = send(&app, "GET", "/cond-bucket/k", &[("if-unmodified-since", long_ago)], Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+
+        // If-None-Match does not match; If-Modified-Since alone would 304 -> served.
+        let res = send(
+            &app,
+            "GET",
+            "/cond-bucket/k",
+            &[("if-none-match", "\"other\""), ("if-modified-since", future)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reversed_range_is_ignored_and_serves_the_full_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        send(&app, "PUT", "/rev-bucket", &[], Body::empty()).await;
+        send(&app, "PUT", "/rev-bucket/k", &[], "0123456789").await;
+        let res = send(&app, "GET", "/rev-bucket/k", &[("range", "bytes=5-3")], Body::empty()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get("content-range").is_none());
+        assert_eq!(body_text(res).await, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_honors_source_preconditions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        send(&app, "PUT", "/upc-bucket", &[], Body::empty()).await;
+        let put = send(&app, "PUT", "/upc-bucket/src", &[], "abcdefgh").await;
+        let etag = put.headers()["etag"].to_str().unwrap().to_string();
+        let res = send(&app, "POST", "/upc-bucket/dst?uploads", &[], Body::empty()).await;
+        let xml = body_text(res).await;
+        let upload_id = extract_xml_tag(&xml, "UploadId").unwrap().to_string();
+        let uri = format!("/upc-bucket/dst?uploadId={upload_id}&partNumber=1");
+
+        for (name, value) in [
+            ("x-amz-copy-source-if-match", "\"not-the-etag\""),
+            ("x-amz-copy-source-if-none-match", etag.as_str()),
+            ("x-amz-copy-source-if-modified-since", "Fri, 01 Jan 2100 00:00:00 GMT"),
+            ("x-amz-copy-source-if-unmodified-since", "Mon, 01 Jan 2001 00:00:00 GMT"),
+        ] {
+            let res = send(
+                &app,
+                "PUT",
+                &uri,
+                &[("x-amz-copy-source", "/upc-bucket/src"), (name, value)],
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED, "{name}");
+            assert!(body_text(res).await.contains("PreconditionFailed"));
+        }
+        // No part was created by the refused copies.
+        let parts = body_text(send(&app, "GET", &format!("/upc-bucket/dst?uploadId={upload_id}"), &[], Body::empty()).await).await;
+        assert!(extract_xml_tag(&parts, "PartNumber").is_none(), "{parts}");
+
+        let res = send(
+            &app,
+            "PUT",
+            &uri,
+            &[("x-amz-copy-source", "/upc-bucket/src"), ("x-amz-copy-source-if-match", &etag)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_objects_keeps_key_whitespace_and_decodes_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        send(&app, "PUT", "/dws-bucket", &[], Body::empty()).await;
+        for key in ["report", "report%20", "a%0Ab"] {
+            send(&app, "PUT", &format!("/dws-bucket/{key}"), &[], "x").await;
+        }
+        let res = send(
+            &app,
+            "POST",
+            "/dws-bucket?delete",
+            &[],
+            "<Delete><Quiet>true</Quiet><Object><Key>report </Key></Object><Object><Key>a&#10;b</Key></Object></Delete>",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = body_text(res).await;
+        assert_eq!(send(&app, "HEAD", "/dws-bucket/report", &[], Body::empty()).await.status(), StatusCode::OK);
+        assert_eq!(send(&app, "HEAD", "/dws-bucket/report%20", &[], Body::empty()).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(send(&app, "HEAD", "/dws-bucket/a%0Ab", &[], Body::empty()).await.status(), StatusCode::NOT_FOUND);
+
+        let too_many = format!("<Delete>{}</Delete>", "<Object><Key>k</Key></Object>".repeat(1001));
+        let res = send(&app, "POST", "/dws-bucket?delete", &[], too_many).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(res).await.contains("MalformedXML"));
     }

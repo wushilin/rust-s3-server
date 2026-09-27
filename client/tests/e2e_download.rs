@@ -8,8 +8,11 @@ use common::TestServer;
 /// mistake for content.
 fn no_staging_left(dir: &std::path::Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|rd| {
-        !rd.filter_map(Result::ok)
-            .any(|e| e.file_name().to_string_lossy().starts_with("__rs3_staging_"))
+        !rd.filter_map(Result::ok).any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("__rs3_staging_")
+        })
     })
 }
 

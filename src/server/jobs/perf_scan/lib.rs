@@ -242,20 +242,28 @@ pub(crate) fn spawn(
             let report_id = report_id.clone();
             tokio::spawn(async move {
                 let mut batch: Vec<Finding> = Vec::with_capacity(FINDING_BATCH);
-                let mut written = 0u64;
+                let mut tally = PersistTally::default();
                 loop {
                     let received = rx.recv().await;
                     let closed = received.is_none();
                     if let Some(finding) = received {
+                        *tally
+                            .received
+                            .entry((finding.bucket.clone(), finding.kind.as_str().to_string()))
+                            .or_insert(0) += 1;
                         batch.push(finding);
                     }
                     if batch.len() >= FINDING_BATCH || (closed && !batch.is_empty()) {
-                        written += batch.len() as u64;
-                        if let Err(err) = scan_store
+                        let count = batch.len() as u64;
+                        match scan_store
                             .append_findings(&report_id, std::mem::take(&mut batch))
                             .await
                         {
-                            log::error!("{JOB} could not persist findings report={report_id} error={err}");
+                            Ok(_) => tally.written += count,
+                            Err(err) => {
+                                tally.lost += count;
+                                log::error!("{JOB} could not persist findings report={report_id} error={err}");
+                            }
                         }
                         batch = Vec::with_capacity(FINDING_BATCH);
                     }
@@ -263,7 +271,7 @@ pub(crate) fn spawn(
                         break;
                     }
                 }
-                written
+                tally
             })
         };
 
@@ -298,14 +306,24 @@ pub(crate) fn spawn(
 
         // Close the sink so the persister drains and finishes.
         drop(tx);
-        match persister.await {
-            Ok(written) => log::info!("[{task_id}] {JOB} persisted findings={written} report={report_id}"),
-            Err(err) => log::error!("[{task_id}] {JOB} persister panicked report={report_id} error={err}"),
-        }
+        let tally = match persister.await {
+            Ok(tally) => {
+                log::info!("[{task_id}] {JOB} persisted findings={} report={report_id}", tally.written);
+                Some(tally)
+            }
+            Err(err) => {
+                log::error!("[{task_id}] {JOB} persister panicked report={report_id} error={err}");
+                None
+            }
+        };
         drop(poller);
 
         report.status = status;
         report.error = error;
+        match &tally {
+            Some(tally) => apply_tally(&mut report, tally),
+            None => mark_degraded(&mut report, "the findings persister crashed; the finding list may be incomplete".to_string()),
+        }
         report.finished_at_ms = now_ms();
         if let Err(err) = service.store().put_report(&report).await {
             log::error!("[{task_id}] {JOB} could not finalize report={report_id} error={err}");
@@ -325,6 +343,51 @@ pub(crate) fn spawn(
         }));
     });
     Some(returned)
+}
+
+/// What the persister saw: every finding received, by `(bucket, kind)`, and how
+/// many were (not) written to the findings family.
+#[derive(Default)]
+struct PersistTally {
+    received: std::collections::HashMap<(String, String), u64>,
+    written: u64,
+    lost: u64,
+}
+
+/// Reconciles the report with what the persister actually handled:
+///
+/// - a bucket whose scan failed midway still streamed (and persisted) the
+///   findings it found before failing; its report carries those counts rather
+///   than an empty table that contradicts the finding list;
+/// - findings that could not be persisted make the report degraded, so a
+///   short finding list is never mistaken for a clean one.
+fn apply_tally(report: &mut ScanReport, tally: &PersistTally) {
+    for bucket in report.buckets.iter_mut().filter(|b| b.error.is_some()) {
+        for ((name, kind), count) in &tally.received {
+            if *name == bucket.bucket {
+                *bucket.findings.entry(kind.clone()).or_insert(0) += count;
+                *report.findings.entry(kind.clone()).or_insert(0) += count;
+                report.findings_total += count;
+            }
+        }
+    }
+    if tally.lost > 0 {
+        mark_degraded(
+            report,
+            format!(
+                "degraded: {} finding{} could not be persisted; the counts are exact but the finding list is incomplete",
+                tally.lost,
+                if tally.lost == 1 { "" } else { "s" }
+            ),
+        );
+    }
+}
+
+fn mark_degraded(report: &mut ScanReport, message: String) {
+    report.error = Some(match report.error.take() {
+        Some(existing) => format!("{existing}; {message}"),
+        None => message,
+    });
 }
 
 /// Runs a batch of repairs against findings of one report. Each is re-verified
@@ -557,5 +620,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let service = ScanService::new(ScanStore::open(tmp.path()).await.unwrap());
         assert_eq!(service.snapshot()["type"], "idle");
+    }
+
+    #[test]
+    fn failed_bucket_keeps_partial_counts_and_lost_findings_degrade() {
+        let mut report = ScanReport::new("r".into(), "me".into(), vec!["ok".into(), "bad".into()]);
+        let mut ok = BucketReport {
+            bucket: "ok".into(),
+            ..BucketReport::default()
+        };
+        ok.findings.insert("orphan_blob".into(), 2);
+        report.absorb(ok);
+        report.absorb(BucketReport {
+            bucket: "bad".into(),
+            error: Some("index went away".into()),
+            ..BucketReport::default()
+        });
+        let mut tally = PersistTally::default();
+        tally.received.insert(("ok".into(), "orphan_blob".into()), 2);
+        tally.received.insert(("bad".into(), "orphan_blob".into()), 3);
+        tally.received.insert(("bad".into(), "missing_blob".into()), 1);
+
+        apply_tally(&mut report, &tally);
+        assert_eq!(report.findings_total, 6, "ok's 2 counted once + bad's 4 partial");
+        assert_eq!(report.findings["orphan_blob"], 5);
+        assert_eq!(report.findings["missing_blob"], 1);
+        assert_eq!(report.buckets[1].findings["orphan_blob"], 3);
+        assert!(report.error.is_none(), "nothing lost, not degraded");
+
+        tally.received.clear();
+        tally.lost = 7;
+        apply_tally(&mut report, &tally);
+        assert!(report.error.as_deref().unwrap().contains("7 findings could not be persisted"));
     }
 }

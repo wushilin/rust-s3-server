@@ -81,7 +81,7 @@ fn char_class_matches(class: &[char], c: char) -> bool {
     matched != negate
 }
 
-/// Hand-rolled recursive glob matcher supporting `*` (any run of any
+/// Hand-rolled iterative glob matcher supporting `*` (any run of any
 /// characters, `/` included -- this is always "flat" wildcard semantics;
 /// see module docs / [SEM] §7's trap (b)), `?` (exactly one character),
 /// and `[...]` character classes ([SEM] §7's `--name` trap (a) references
@@ -92,29 +92,72 @@ fn char_class_matches(class: &[char], c: char) -> bool {
 pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    wildcard_match_inner(&p, &t)
+    let tokens = tokenize_glob(&p);
+    wildcard_match_tokens(&tokens, &t)
 }
 
-fn wildcard_match_inner(p: &[char], t: &[char]) -> bool {
-    if p.is_empty() {
-        return t.is_empty();
-    }
-    match p[0] {
-        '*' => {
-            wildcard_match_inner(&p[1..], t) || (!t.is_empty() && wildcard_match_inner(p, &t[1..]))
+/// One pattern element. Everything except `Star` consumes exactly one
+/// text character, which is what lets [`wildcard_match_tokens`] use the
+/// linear-backtracking two-pointer algorithm.
+enum GlobToken<'a> {
+    Star,
+    Any,
+    Class(&'a [char]),
+    Lit(char),
+}
+
+fn tokenize_glob(p: &[char]) -> Vec<GlobToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            '*' => tokens.push(GlobToken::Star),
+            '?' => tokens.push(GlobToken::Any),
+            '[' => match p[i..].iter().position(|&c| c == ']').filter(|&j| j > 0) {
+                Some(close) => {
+                    tokens.push(GlobToken::Class(&p[i + 1..i + close]));
+                    i += close;
+                }
+                // No closing `]` found: treat `[` as a literal character.
+                None => tokens.push(GlobToken::Lit('[')),
+            },
+            c => tokens.push(GlobToken::Lit(c)),
         }
-        '?' => !t.is_empty() && wildcard_match_inner(&p[1..], &t[1..]),
-        '[' => match p.iter().position(|&c| c == ']').filter(|&i| i > 0) {
-            Some(close) => {
-                !t.is_empty()
-                    && char_class_matches(&p[1..close], t[0])
-                    && wildcard_match_inner(&p[close + 1..], &t[1..])
-            }
-            // No closing `]` found: treat `[` as a literal character.
-            None => !t.is_empty() && t[0] == '[' && wildcard_match_inner(&p[1..], &t[1..]),
-        },
-        c => !t.is_empty() && t[0] == c && wildcard_match_inner(&p[1..], &t[1..]),
+        i += 1;
     }
+    tokens
+}
+
+/// Iterative glob match: on a mismatch, backtrack only to the most recent
+/// `*` and let it absorb one more character -- O(len(p) * len(t)) worst
+/// case instead of exponential in the number of `*`s.
+fn wildcard_match_tokens(p: &[GlobToken<'_>], t: &[char]) -> bool {
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        let single = match p.get(pi) {
+            Some(GlobToken::Star) => {
+                star = Some((pi, ti));
+                pi += 1;
+                continue;
+            }
+            Some(GlobToken::Any) => true,
+            Some(GlobToken::Class(class)) => char_class_matches(class, t[ti]),
+            Some(GlobToken::Lit(c)) => *c == t[ti],
+            None => false,
+        };
+        if single {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|tok| matches!(tok, GlobToken::Star))
 }
 
 /// `--name PATTERN`: [SEM] §7 trap (a). First try `PATTERN` as a glob
@@ -138,9 +181,11 @@ pub(crate) fn path_match(pattern: &str, relative_path: &str) -> bool {
     wildcard_match(pattern, relative_path)
 }
 
-/// `--larger`/`--smaller SIZE`: metric (`k`/`m`/`g`/`t`, 1000-based) and
-/// IEC (`ki`/`mi`/`gi`/`ti`, 1024-based) units, case-insensitive, an
-/// optional trailing `b`, no suffix meaning plain bytes.
+/// `--larger`/`--smaller SIZE`: metric (`k`/`m`/`g`/`t`/`p`/`e`, 1000-based)
+/// and IEC (`ki`/`mi`/`gi`/`ti`/`pi`/`ei`, 1024-based) units,
+/// case-insensitive, optionally separated from the number by spaces (as
+/// go-humanize's `ParseBytes` allows), an optional trailing `b`, no suffix
+/// meaning plain bytes.
 pub(crate) fn parse_find_size(input: &str) -> Result<u64> {
     let s = input.trim();
     if s.is_empty() {
@@ -154,7 +199,7 @@ pub(crate) fn parse_find_size(input: &str) -> Result<u64> {
         return Err(anyhow!("invalid size `{s}`"));
     }
     let value: f64 = num_str.parse().map_err(|_| anyhow!("invalid size `{s}`"))?;
-    let mut unit = unit_str.to_ascii_lowercase();
+    let mut unit = unit_str.trim_start().to_ascii_lowercase();
     if let Some(stripped) = unit.strip_suffix('b') {
         unit = stripped.to_string();
     }
@@ -168,6 +213,10 @@ pub(crate) fn parse_find_size(input: &str) -> Result<u64> {
         "mi" => 1024.0 * 1024.0,
         "gi" => 1024.0 * 1024.0 * 1024.0,
         "ti" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "p" => 1e15,
+        "e" => 1e18,
+        "pi" => 1024f64.powi(5),
+        "ei" => 1024f64.powi(6),
         other => return Err(anyhow!("unsupported size unit `{other}` in `{s}`")),
     };
     Ok((value * multiplier).round() as u64)
@@ -206,17 +255,39 @@ pub(crate) fn substitute_tokens(
     let size_str = humanize_ibytes(size);
     let time_str = print_date(time);
 
-    let mut rendered = template.to_string();
-    rendered = rendered.replace("{}", key);
-    rendered = rendered.replace("{\"\"}", &quote(key));
-    rendered = rendered.replace("{base}", base);
-    rendered = rendered.replace("{\"base\"}", &quote(base));
-    rendered = rendered.replace("{dir}", dir);
-    rendered = rendered.replace("{\"dir\"}", &quote(dir));
-    rendered = rendered.replace("{size}", &size_str);
-    rendered = rendered.replace("{\"size\"}", &quote(&size_str));
-    rendered = rendered.replace("{time}", &time_str);
-    rendered = rendered.replace("{\"time\"}", &quote(&time_str));
+    // One left-to-right scan: substituted values are never re-scanned, so
+    // a key that itself contains e.g. `{base}` is emitted verbatim.
+    let quoted_key = quote(key);
+    let quoted_base = quote(base);
+    let quoted_dir = quote(dir);
+    let quoted_size = quote(&size_str);
+    let quoted_time = quote(&time_str);
+    let tokens: [(&str, &str); 10] = [
+        ("{}", key),
+        ("{\"\"}", &quoted_key),
+        ("{base}", base),
+        ("{\"base\"}", &quoted_base),
+        ("{dir}", dir),
+        ("{\"dir\"}", &quoted_dir),
+        ("{size}", &size_str),
+        ("{\"size\"}", &quoted_size),
+        ("{time}", &time_str),
+        ("{\"time\"}", &quoted_time),
+    ];
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+    'scan: while !rest.is_empty() {
+        for (token, value) in &tokens {
+            if let Some(after) = rest.strip_prefix(token) {
+                rendered.push_str(value);
+                rest = after;
+                continue 'scan;
+            }
+        }
+        let ch = rest.chars().next().expect("rest is non-empty");
+        rendered.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
     rendered
 }
 
@@ -449,12 +520,16 @@ pub(crate) async fn run_find(args: FindArgs) -> Result<()> {
         {
             continue;
         }
+        // mc parity: a zero threshold (e.g. `--larger 0`) disables the
+        // filter rather than excluding empty objects.
         if let Some(threshold) = larger
+            && threshold > 0
             && obj.size <= threshold
         {
             continue;
         }
         if let Some(threshold) = smaller
+            && threshold > 0
             && obj.size >= threshold
         {
             continue;
@@ -613,5 +688,49 @@ mod tests {
         assert!(reject_unsupported_tokens("{version}").is_err());
         assert!(reject_unsupported_tokens("{\"version\"}").is_err());
         assert!(reject_unsupported_tokens("{} {base}").is_ok());
+    }
+
+    #[test]
+    fn wildcard_many_stars_is_not_exponential() {
+        let text = "a".repeat(200);
+        let pattern = format!("{}b", "*a".repeat(30));
+        let start = std::time::Instant::now();
+        assert!(!wildcard_match(&pattern, &text));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(wildcard_match("*a*a*a*", &text));
+    }
+
+    #[test]
+    fn wildcard_semantics_preserved() {
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "a"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("**", "abc"));
+        assert!(wildcard_match("a*c", "abbbc"));
+        assert!(!wildcard_match("a*c", "abbbd"));
+        assert!(wildcard_match("?b*", "abxyz"));
+        assert!(!wildcard_match("?", ""));
+        assert!(wildcard_match("[a-c]x", "bx"));
+        assert!(!wildcard_match("[a-c]x", "dx"));
+        assert!(wildcard_match("*[0-9].log", "app/run7.log"));
+        assert!(wildcard_match("a[b", "a[b"), "unterminated [ is literal");
+        assert!(!wildcard_match("a[b", "ab"));
+        assert!(wildcard_match("*x*y", "axxbxy"));
+    }
+
+    #[test]
+    fn size_grammar_space_and_large_units() {
+        assert_eq!(parse_find_size("5 KiB").unwrap(), 5 * 1024);
+        assert_eq!(parse_find_size("2 MB").unwrap(), 2_000_000);
+        assert_eq!(parse_find_size("1P").unwrap(), 1_000_000_000_000_000);
+        assert_eq!(parse_find_size("1Pi").unwrap(), 1u64 << 50);
+        assert_eq!(parse_find_size("1E").unwrap(), 1_000_000_000_000_000_000);
+        assert_eq!(parse_find_size("2EiB").unwrap(), 2u64 << 60);
+    }
+
+    #[test]
+    fn token_text_inside_key_is_not_reexpanded() {
+        let s = substitute_tokens("{} {base}", "a/{base}/x{size}", "x", 0, sample_time());
+        assert_eq!(s, "a/{base}/x{size} x{size}");
     }
 }

@@ -25,6 +25,12 @@ use crate::storage::time::now_ms;
 /// on-screen linger + fade-out (shorter); this is just the delivery window.
 const COMPLETED_LINGER_MS: i64 = 5000;
 
+/// Upper bound on the lingering finished-task list. Under a burst of small S3
+/// requests thousands can finish inside one linger window; every snapshot
+/// clones this list, so it is capped (oldest dropped first) to keep snapshot
+/// cost — and the time the lock is held — bounded.
+const MAX_RECENT_TASKS: usize = 256;
+
 /// Where a task came from: a client request or the server's own scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
@@ -378,6 +384,10 @@ impl Drop for TaskGuard {
             let mut recent = self.registry.recent.lock().unwrap();
             recent.retain(|r| now - r.ended_at_ms < COMPLETED_LINGER_MS);
             recent.push(RecentTask { snapshot, ended_at_ms: now });
+            if recent.len() > MAX_RECENT_TASKS {
+                let excess = recent.len() - MAX_RECENT_TASKS;
+                recent.drain(..excess);
+            }
         }
         log::debug!("[{}] task- {}:{} active={active}", self.id, self.kind.as_str(), self.op);
         // Exit event: consumers learn immediately (and see it as completed).
@@ -419,6 +429,20 @@ mod tests {
             registry.register_uncancellable("run-2", TaskKind::Job, "rebuild_index", "/b");
         assert_eq!(registry.cancel("run-2"), CancelResult::Refused);
         assert!(!rebuild.is_cancelled());
+    }
+
+    #[test]
+    fn lingering_finished_tasks_are_capped() {
+        let registry = TaskRegistry::new();
+        for i in 0..(MAX_RECENT_TASKS + 50) {
+            drop(registry.register(format!("rid-{i}"), TaskKind::S3, "GET", "/b/k"));
+        }
+        assert_eq!(registry.recent.lock().unwrap().len(), MAX_RECENT_TASKS);
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), MAX_RECENT_TASKS);
+        // The newest survive; the oldest were dropped.
+        assert!(snap.iter().any(|t| t.id == format!("rid-{}", MAX_RECENT_TASKS + 49)));
+        assert!(!snap.iter().any(|t| t.id == "rid-0"));
     }
 
     #[test]

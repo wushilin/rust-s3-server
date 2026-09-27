@@ -91,15 +91,12 @@ const CONFIG_HEADER: &str = "\
 /// Minimal HTTP/1.1 GET of the unauthenticated liveness endpoint. Deliberately
 /// hand-rolled over `TcpStream`: a health check must not need an async runtime,
 /// a TLS stack, or anything installed in the image alongside the binary.
-fn health_probe(port: u16, timeout_secs: u64) -> Result<(), String> {
+fn health_probe(address: std::net::SocketAddr, timeout_secs: u64) -> Result<(), String> {
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream};
+    use std::net::TcpStream;
     use std::time::Duration;
 
     let timeout = Duration::from_secs(timeout_secs.max(1));
-    // Always loopback: the configured bind address may be 0.0.0.0, which is not
-    // a valid destination, and a health check is by definition local.
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream =
         TcpStream::connect_timeout(&address, timeout).map_err(|err| format!("connect: {err}"))?;
     stream
@@ -107,7 +104,10 @@ fn health_probe(port: u16, timeout_secs: u64) -> Result<(), String> {
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(|err| format!("timeout setup: {err}"))?;
     stream
-        .write_all(b"GET /minio/health/live HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!("GET /minio/health/live HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .map_err(|err| format!("write: {err}"))?;
 
     let mut response = Vec::new();
@@ -131,6 +131,29 @@ fn health_probe(port: u16, timeout_secs: u64) -> Result<(), String> {
     } else {
         Err(format!("unexpected status line: {status:?}"))
     }
+}
+
+/// Where the health check connects: the address the server is bound to. A
+/// wildcard bind is not a valid destination, so it becomes the loopback of the
+/// same family (0.0.0.0 -> 127.0.0.1, :: -> ::1); a specific address is probed
+/// as it is, since the server may not be listening on loopback at all.
+fn health_probe_address(bind_address: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let trimmed = bind_address.trim();
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let ip = unbracketed
+        .parse::<IpAddr>()
+        .map_err(|err| format!("invalid server bind address {bind_address:?}: {err}"))?;
+    let ip = match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    };
+    Ok(SocketAddr::new(ip, port))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -197,7 +220,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::HealthCheck { config, timeout }) => {
             let config = AppConfig::from_file(&config)?;
-            match health_probe(config.server.bind_port, timeout) {
+            let address =
+                health_probe_address(&config.server.bind_address, config.server.bind_port)?;
+            match health_probe(address, timeout) {
                 Ok(()) => {
                     println!("ok");
                     Ok(())
@@ -295,8 +320,19 @@ async fn run_server(cfg: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{health_probe_address, Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn health_probe_targets_the_bind_address() {
+        let probe = |bind: &str| health_probe_address(bind, 9000).unwrap().to_string();
+        assert_eq!(probe("0.0.0.0"), "127.0.0.1:9000");
+        assert_eq!(probe("::"), "[::1]:9000");
+        assert_eq!(probe("[::]"), "[::1]:9000");
+        assert_eq!(probe("192.168.44.99"), "192.168.44.99:9000");
+        assert_eq!(probe("[fd00::5]"), "[fd00::5]:9000");
+        assert!(health_probe_address("not-an-ip", 9000).is_err());
+    }
 
     #[test]
     fn run_and_validate_default_to_config_yaml() {

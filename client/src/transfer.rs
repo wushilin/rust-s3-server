@@ -11,7 +11,7 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::Length;
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use futures::TryStreamExt;
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -94,6 +94,112 @@ fn apply_attrs<T: AttrTarget>(mut req: T, metadata: &BTreeMap<String, String>) -
     Ok(req)
 }
 
+/// Carries a source object's system headers and user metadata onto a new
+/// object, the way `CopyObject`'s default `COPY` metadata directive does
+/// server-side -- for the paths that build the target themselves (streamed
+/// cross-endpoint copies, multipart copies).
+fn apply_source_head<T: AttrTarget>(
+    mut req: T,
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> T {
+    if let Some(v) = head.content_type() {
+        req = req.attr_content_type(v.to_string());
+    }
+    if let Some(v) = head.cache_control() {
+        req = req.attr_cache_control(v.to_string());
+    }
+    if let Some(v) = head.content_encoding() {
+        req = req.attr_content_encoding(v.to_string());
+    }
+    if let Some(v) = head.content_disposition() {
+        req = req.attr_content_disposition(v.to_string());
+    }
+    if let Some(v) = head.content_language() {
+        req = req.attr_content_language(v.to_string());
+    }
+    if let Some(metadata) = head.metadata() {
+        for (k, v) in metadata {
+            req = req.attr_metadata(k.clone(), v.clone());
+        }
+    }
+    req
+}
+
+/// Converts an SDK error, recognising a 412 as [`ObjectChanged`] while the
+/// HTTP status is still visible (converting to `anyhow` loses it).
+fn precondition_aware<E>(
+    err: aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>,
+) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    if err.raw_response().map(|r| r.status().as_u16()) == Some(412) {
+        return anyhow!(ObjectChanged);
+    }
+    err.into()
+}
+
+/// A ranged GET answered with something other than the range. Not
+/// transient -- the same server will answer the same way again -- so the
+/// resumable download fails at once instead of retrying.
+#[derive(Debug)]
+struct RangeMismatch(String);
+
+impl std::fmt::Display for RangeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RangeMismatch {}
+
+/// Checks that a response to `Range: bytes={from}-{end}` is that range.
+///
+/// A server that ignores `Range` answers 200 with the whole object and no
+/// `Content-Range`; written at offset `from`, that body overruns every
+/// neighbouring range. It is only acceptable when the range asked for *was*
+/// the whole object -- `from == 0` and the body is exactly `end + 1` bytes.
+fn check_range_response(
+    content_range: Option<&str>,
+    content_length: Option<i64>,
+    from: u64,
+    end: u64,
+) -> Result<()> {
+    match content_range {
+        Some(range) => {
+            let parsed = range
+                .trim()
+                .strip_prefix("bytes ")
+                .and_then(|rest| rest.split_once('/'))
+                .and_then(|(span, _)| span.split_once('-'))
+                .and_then(|(a, b)| {
+                    Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
+                });
+            match parsed {
+                Some((a, b)) if a == from && b == end => Ok(()),
+                _ => Err(anyhow!(RangeMismatch(format!(
+                    "server answered `bytes={from}-{end}` with Content-Range `{range}`"
+                )))),
+            }
+        }
+        None if from == 0 && content_length == Some(end as i64 + 1) => Ok(()),
+        None => Err(anyhow!(RangeMismatch(format!(
+            "server ignored `Range: bytes={from}-{end}` (no Content-Range, {} byte body)",
+            content_length.map_or_else(|| "unknown".to_string(), |n| n.to_string())
+        )))),
+    }
+}
+
+/// [`check_range_response`] on a `GetObject` response, yielding its body.
+fn checked_range_body(
+    resp: aws_sdk_s3::operation::get_object::GetObjectOutput,
+    from: u64,
+    end: u64,
+) -> Result<ByteStream> {
+    check_range_response(resp.content_range(), resp.content_length(), from, end)?;
+    Ok(resp.body)
+}
+
 const COPY_SOURCE_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'-')
@@ -103,6 +209,47 @@ const COPY_SOURCE_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
 
 const MAX_SINGLE_COPY: u64 = 5 * 1024 * 1024 * 1024; // AWS CopyObject ceiling
 
+const MIB: u64 = 1024 * 1024;
+/// S3's multipart limits: at most 10,000 parts, each at most 5 GiB, for an
+/// object of at most 5 TiB.
+pub(crate) const MAX_PARTS: u64 = 10_000;
+const MAX_PART_SIZE: u64 = 5 * 1024 * MIB;
+const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * MIB;
+
+/// The part size a multipart transfer of `total` bytes must actually use.
+///
+/// `--part-size` is a preference, not a promise: at 5 MiB (a common
+/// setting) anything past ~48.8 GiB needs more than 10,000 parts, and the
+/// server rejects part 10,001 -- after the first 10,000 were already paid
+/// for. So the part size is raised to the smallest whole-MiB size that fits
+/// the object in 10,000 parts, and an object S3 cannot hold at all is refused
+/// before any request is made.
+pub(crate) fn effective_part_size(total: u64, requested: u64) -> Result<u64> {
+    if total > MAX_OBJECT_SIZE {
+        return Err(anyhow!(
+            "object is {total} bytes, larger than the 5 TiB S3 multipart maximum"
+        ));
+    }
+    let minimum = total.div_ceil(MAX_PARTS).div_ceil(MIB) * MIB;
+    let part_size = requested.max(minimum);
+    if part_size > MAX_PART_SIZE {
+        return Err(anyhow!(
+            "multipart part size {part_size} exceeds the 5 GiB S3 maximum"
+        ));
+    }
+    Ok(part_size)
+}
+
+/// Part size for part `part_number` (1-based) of a stream of unknown length.
+///
+/// Doubles every 1,000 parts, capped at 5 GiB: starting from 5 MiB, the
+/// 10,000 parts then reach ~5 TiB -- the S3 object maximum -- while a small
+/// stream still uploads in small parts and holds little in memory.
+pub(crate) fn stream_part_size(base: u64, part_number: u64) -> u64 {
+    let doublings = (part_number.saturating_sub(1) / 1_000).min(20) as u32;
+    base.saturating_mul(1u64 << doublings).min(MAX_PART_SIZE)
+}
+
 /// Result of a single [`upload_file`] call: enough for a caller to build its
 /// own `CopyMessage`/`MirrorMessage` (this module intentionally prints
 /// nothing itself -- message shape/type is the caller's call, since `cp`/
@@ -111,6 +258,50 @@ pub(crate) struct UploadOutcome {
     /// Fully resolved `alias/bucket/key` the object now lives at.
     pub target: String,
     pub size: u64,
+}
+
+/// Validates a relative path derived from an S3 key before it is joined onto
+/// a local destination directory.
+///
+/// A key is an arbitrary string chosen by whoever wrote the bucket, so
+/// `x/../../../home/u/.ssh/authorized_keys` is a perfectly legal key -- and
+/// `dst.join()` of it points outside `dst`. Anything that could climb out of,
+/// or replace, the destination root is refused: `..` components, a root or
+/// drive prefix, and (on Windows, where they are separators or drive syntax)
+/// backslashes and colons. `.` and empty components are harmless and
+/// dropped. The returned path is relative and made only of normal
+/// components.
+pub(crate) fn safe_relative_path(rel: &str) -> Result<PathBuf> {
+    let refuse = |why: &str| {
+        Err(anyhow!(
+            "refusing unsafe local path `{rel}` from key: {why}"
+        ))
+    };
+    if cfg!(windows) && (rel.contains('\\') || rel.contains(':')) {
+        return refuse("contains a Windows separator or drive prefix");
+    }
+    if rel.starts_with('/') {
+        return refuse("absolute path");
+    }
+    let mut out = PathBuf::new();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return refuse("contains a `..` component"),
+            _ => {}
+        }
+        // Belt and braces: whatever the platform parses out of one
+        // `/`-free segment must be a single ordinary name.
+        let mut comps = Path::new(part).components();
+        match (comps.next(), comps.next()) {
+            (Some(std::path::Component::Normal(name)), None) => out.push(name),
+            _ => return refuse("not a plain file name"),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return refuse("empty path");
+    }
+    Ok(out)
 }
 
 pub(crate) fn encode_copy_source(bucket: &str, key: &str) -> String {
@@ -241,6 +432,7 @@ pub(crate) async fn multipart_upload(
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
+    let part_size = effective_part_size(total_size, part_size)?;
     let source_label = source.display().to_string();
     let mut create = client.create_multipart_upload().bucket(bucket).key(key);
     if let Some(sc) = storage_class {
@@ -423,6 +615,11 @@ where
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
+    if part_size > MAX_PART_SIZE {
+        return Err(anyhow!(
+            "multipart part size {part_size} exceeds the 5 GiB S3 maximum"
+        ));
+    }
     let part_size = usize::try_from(part_size).unwrap_or(usize::MAX);
     let concurrent = concurrent.max(1);
 
@@ -504,14 +701,19 @@ where
 /// Reads and uploads part 2 onward (part 1's buffer -- already known to be
 /// completely full, since that's what routed the caller into the
 /// multipart path -- is passed in as `first_body`), keeping at most
-/// `concurrent` `UploadPart` calls in flight via [`FuturesUnordered`].
-/// Reading is inherently sequential (there's only one `reader`), so this
-/// interleaves it with uploading: once `concurrent` uploads are
-/// outstanding, the next read waits for one to finish first, which also
-/// bounds how many `part_size` buffers are held in memory at once. With
-/// `concurrent == 1` this degenerates to plain sequential read-then-upload
-/// without any special-cased branch, since a single already-outstanding
-/// upload always blocks the next read.
+/// `concurrent` `UploadPart` calls in flight.
+///
+/// Each upload runs as its own spawned task, so the parts already in flight
+/// keep moving while the next buffer is read from `reader`. (Held in a
+/// `FuturesUnordered` they were only polled while this loop was waiting on
+/// them -- which it never does while reading -- so `--concurrent N` stalled
+/// every upload for the whole duration of each stdin read.) Once
+/// `concurrent` uploads are outstanding, the next read waits for one to
+/// finish first, which also bounds how many buffers are held in memory.
+///
+/// The input's length is unknown, so part sizes grow as parts accumulate
+/// ([`stream_part_size`]) to stay within S3's 10,000-part limit; input that
+/// still has bytes left after part 10,000 fails before part 10,001 is sent.
 // Every parameter is an independent input to one multipart stream; bundling
 // them into a struct would only move the same list one level away.
 #[allow(clippy::too_many_arguments)]
@@ -531,15 +733,19 @@ where
     let mut total = first_body.len() as u64;
     let mut next_part_number = 2i32;
     let mut uploaded = Vec::new();
-    let mut in_flight = FuturesUnordered::new();
+    // Dropping a `JoinSet` aborts every task still in it, so an early
+    // return on error does not leave uploads running behind the abort.
+    let mut in_flight = tokio::task::JoinSet::new();
     let mut eof = false;
 
-    let spawn_upload = |part_number: i32, body: Vec<u8>| {
+    let spawn_upload = |in_flight: &mut tokio::task::JoinSet<Result<UploadedPart>>,
+                        part_number: i32,
+                        body: Vec<u8>| {
         let client = client.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
         let upload_id = upload_id.to_string();
-        async move {
+        in_flight.spawn(async move {
             let resp = client
                 .upload_part()
                 .bucket(bucket)
@@ -553,27 +759,43 @@ where
                 part_number,
                 etag: resp.e_tag().map(String::from),
             })
-        }
+        });
     };
 
-    in_flight.push(spawn_upload(1, first_body));
+    spawn_upload(&mut in_flight, 1, first_body);
 
     loop {
         if !eof && in_flight.len() < concurrent {
-            let mut buf = vec![0u8; part_size];
+            if next_part_number as u64 > MAX_PARTS {
+                // Part 10,000 was full. One more byte means the input does
+                // not fit in an S3 object at these part sizes.
+                let mut probe = [0u8; 1];
+                if fill_buffer(reader, &mut probe).await? > 0 {
+                    return Err(anyhow!(
+                        "input exceeds the S3 limit of {MAX_PARTS} parts ({total} bytes \
+                         read so far); use a larger --part-size"
+                    ));
+                }
+                eof = true;
+                continue;
+            }
+            let this_size =
+                usize::try_from(stream_part_size(part_size as u64, next_part_number as u64))
+                    .unwrap_or(usize::MAX);
+            let mut buf = vec![0u8; this_size];
             let filled = fill_buffer(reader, &mut buf).await?;
             if filled == 0 {
                 eof = true;
             } else {
                 buf.truncate(filled);
                 total += filled as u64;
-                in_flight.push(spawn_upload(next_part_number, buf));
+                spawn_upload(&mut in_flight, next_part_number, buf);
                 next_part_number += 1;
             }
             continue;
         }
-        match in_flight.next().await {
-            Some(res) => uploaded.push(res?),
+        match in_flight.join_next().await {
+            Some(res) => uploaded.push(res.map_err(|err| anyhow!("part upload task: {err}"))??),
             None => break,
         }
     }
@@ -589,6 +811,7 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     target_client: &Client,
     target_bucket: &str,
     target_key: &str,
+    source_head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
     total_size: u64,
     part_size: u64,
     parallel: usize,
@@ -598,7 +821,13 @@ pub(crate) async fn multipart_copy_s3_to_s3(
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
+    let part_size = effective_part_size(total_size, part_size)?;
     let source_key_label = source_key.to_string();
+    // Every ranged GET is pinned to the version the HEAD saw: a source
+    // replaced mid-copy then fails with a 412 (and the upload is aborted)
+    // instead of completing as a splice of two versions -- which `mv` would
+    // then make permanent by deleting the source.
+    let source_etag = source_head.e_tag().map(str::to_string);
     let created = crate::budget::dispatch(
         budget,
         progress,
@@ -608,11 +837,14 @@ pub(crate) async fn multipart_copy_s3_to_s3(
             part: None,
         },
         "CreateMultipartUpload",
-        target_client
-            .create_multipart_upload()
-            .bucket(target_bucket)
-            .key(target_key)
-            .send(),
+        apply_source_head(
+            target_client
+                .create_multipart_upload()
+                .bucket(target_bucket)
+                .key(target_key),
+            source_head,
+        )
+        .send(),
     )
     .await?;
     let upload_id = created
@@ -633,19 +865,28 @@ pub(crate) async fn multipart_copy_s3_to_s3(
         let progress = progress.clone();
         let budget = budget.clone();
         let source_key_label = source_key_label.clone();
+        let source_etag = source_etag.clone();
         async move {
             let _permit = budget.acquire().await;
             let start = (part_index - 1) * part_size;
             let end = (total_size - 1).min(start + part_size - 1);
             let range = format!("bytes={start}-{end}");
-            let body = source_client
+            let mut get = source_client
                 .get_object()
-                .bucket(source_bucket)
-                .key(source_key)
-                .range(range)
+                .bucket(&source_bucket)
+                .key(&source_key)
+                .range(range);
+            if let Some(etag) = source_etag {
+                get = get.if_match(etag);
+            }
+            let resp = get
                 .send()
-                .await?
-                .body;
+                .await
+                .map_err(precondition_aware)
+                .with_context(|| {
+                    format!("read `{source_bucket}/{source_key}` bytes {start}-{end}")
+                })?;
+            let body = checked_range_body(resp, start, end)?;
             let unit = match &progress {
                 Some(ui) => ui.start(crate::progress::ProgressAwareTask::bytes(
                     crate::progress::TransferLabel {
@@ -812,6 +1053,30 @@ pub(crate) async fn transfer_object_between_s3(
     if std::env::var("RS3_DEBUG_COPY").is_ok() {
         ui_eprintln!("rs3: falling back to streaming copy");
     }
+    // The streamed copy builds the target itself, so it needs what
+    // `CopyObject` would have carried server-side: Content-Type and the rest
+    // of the system headers, user metadata, and the ETag that pins every GET
+    // below to one version of the source.
+    let head = crate::budget::dispatch(
+        budget,
+        progress,
+        crate::progress::TransferLabel {
+            verb: crate::progress::Verb::Inspecting,
+            path: source_key.to_string(),
+            part: None,
+        },
+        "HeadObject",
+        source_client
+            .head_object()
+            .bucket(source_bucket)
+            .key(source_key)
+            .send(),
+    )
+    .await
+    .map_err(|err| anyhow!("stat `{source_bucket}/{source_key}`: {err}"))?;
+    // The HEAD is what the ETag pins, so its length is the one to copy.
+    let size = head.content_length().map_or(size, |len| len.max(0) as u64);
+    let source_etag = head.e_tag().map(str::to_string);
     if disable_multipart || size <= part_size {
         // One pipeline (GET streamed straight into the PUT body) = one
         // permit, held across both calls -- not two acquisitions.
@@ -827,21 +1092,30 @@ pub(crate) async fn transfer_object_between_s3(
             )),
             None => crate::progress::ProgressNotifier::noop(),
         };
-        let resp = source_client
+        let mut get = source_client
             .get_object()
             .bucket(source_bucket)
-            .key(source_key)
+            .key(source_key);
+        if let Some(etag) = &source_etag {
+            get = get.if_match(etag);
+        }
+        let resp = get
             .send()
-            .await?;
+            .await
+            .map_err(precondition_aware)
+            .with_context(|| format!("read `{source_bucket}/{source_key}`"))?;
         let body = crate::progress::instrument_body(resp.body, &unit);
-        target_client
-            .put_object()
-            .bucket(target_bucket)
-            .key(target_key)
-            .content_length(size as i64)
-            .body(body)
-            .send()
-            .await?;
+        apply_source_head(
+            target_client
+                .put_object()
+                .bucket(target_bucket)
+                .key(target_key)
+                .content_length(size as i64)
+                .body(body),
+            &head,
+        )
+        .send()
+        .await?;
         unit.finish();
     } else {
         multipart_copy_s3_to_s3(
@@ -851,6 +1125,7 @@ pub(crate) async fn transfer_object_between_s3(
             target_client,
             target_bucket,
             target_key,
+            &head,
             size,
             part_size,
             parallel,
@@ -878,6 +1153,7 @@ async fn multipart_server_side_copy(
     if part_size < 5 * 1024 * 1024 {
         return Err(anyhow!("multipart part size must be at least 5MiB"));
     }
+    let part_size = effective_part_size(total_size, part_size)?;
     let source_key_label = source_key.to_string();
     // `upload_part_copy` has no equivalent of `copy_object`'s
     // `x-amz-metadata-directive: COPY` -- `create_multipart_upload` starts
@@ -907,18 +1183,17 @@ async fn multipart_server_side_copy(
     )
     .await
     .map_err(|err| anyhow!("stat `{source_bucket}/{source_key}`: {err}"))?;
-    let mut create = target_client
-        .create_multipart_upload()
-        .bucket(target_bucket)
-        .key(target_key);
-    if let Some(content_type) = head.content_type() {
-        create = create.content_type(content_type.to_string());
-    }
-    if let Some(metadata) = head.metadata() {
-        for (k, v) in metadata {
-            create = create.metadata(k.clone(), v.clone());
-        }
-    }
+    let create = apply_source_head(
+        target_client
+            .create_multipart_upload()
+            .bucket(target_bucket)
+            .key(target_key),
+        &head,
+    );
+    // Every part copy is pinned to the version this HEAD saw, so a source
+    // replaced mid-copy fails with a 412 (and the upload is aborted) rather
+    // than completing as parts of two different objects.
+    let source_etag = head.e_tag().map(str::to_string);
     let created = crate::budget::dispatch(
         budget,
         progress,
@@ -948,6 +1223,8 @@ async fn multipart_server_side_copy(
         let progress = progress.clone();
         let budget = budget.clone();
         let source_key_label = source_key_label.clone();
+        let source_etag = source_etag.clone();
+        let source_key_label_ctx = source_key_label.clone();
         async move {
             let _permit = budget.acquire().await;
             let start = (part_index - 1) * part_size;
@@ -972,8 +1249,11 @@ async fn multipart_server_side_copy(
                 .part_number(part_number)
                 .copy_source(copy_source)
                 .copy_source_range(format!("bytes={start}-{end}"))
+                .set_copy_source_if_match(source_etag)
                 .send()
-                .await?;
+                .await
+                .map_err(precondition_aware)
+                .with_context(|| format!("copy part {part_number} of `{source_key_label_ctx}`"))?;
             unit.finish();
             Ok::<UploadedPart, anyhow::Error>(UploadedPart {
                 part_number,
@@ -1148,7 +1428,8 @@ pub(crate) async fn download_key_to_path(
     // provoked deterministically from outside the process, and an untested
     // recovery path is one that quietly does not work. Costs one `var_os`
     // lookup per object and is set by nothing but the test suite.
-    let etag = match std::env::var_os("RS3_TEST_STALE_INHERITED_ETAG").is_some() && known.is_some() {
+    let etag = match std::env::var_os("RS3_TEST_STALE_INHERITED_ETAG").is_some() && known.is_some()
+    {
         true => Some("00000000000000000000000000000000".to_string()),
         false => etag,
     };
@@ -1184,6 +1465,7 @@ pub(crate) async fn download_key_to_path(
                 key,
                 etag.as_deref(),
                 size,
+                head.as_ref().and_then(crate::verify::opaque_encryption_of),
                 budget,
                 progress,
             )
@@ -1255,6 +1537,7 @@ pub(crate) async fn download_key_to_path(
                     key,
                     fresh_etag.as_deref(),
                     fresh_size,
+                    crate::verify::opaque_encryption_of(&fresh),
                     budget,
                     progress,
                 )
@@ -1279,6 +1562,33 @@ pub(crate) async fn download_key_to_path(
             progress,
         )
         .await;
+    }
+    // A listing carries no encryption facts, so an ETag inherited from one
+    // was assumed to be an MD5. If the bytes disagree with it, ask the
+    // object itself before discarding the file: an SSE-KMS/SSE-C ETag only
+    // looks like an MD5, and a mismatch against it proves nothing.
+    if inherited
+        && head.is_none()
+        && result.as_ref().is_err_and(|err| {
+            err.chain()
+                .any(|cause| cause.is::<crate::verify::ContentMismatch>())
+        })
+        && let Ok(fresh) = crate::budget::dispatch(
+            budget,
+            progress,
+            crate::progress::TransferLabel {
+                verb: crate::progress::Verb::Inspecting,
+                path: format!("{bucket}/{key}"),
+                part: None,
+            },
+            "HeadObject",
+            client.head_object().bucket(bucket).key(key).send(),
+        )
+        .await
+        && let Some(reason) = crate::verify::opaque_encryption_of(&fresh)
+    {
+        ui_eprintln!("rs3: `{bucket}/{key}`: skipping content check: {reason}");
+        result = Ok(());
     }
     // Either way the staging directory goes: on success it is empty once the
     // file is renamed out, on failure it still holds the partial object, and
@@ -1541,25 +1851,26 @@ async fn stream_range_into(
     if let Some(etag) = etag {
         req = req.if_match(etag);
     }
-    let resp = match req.send().await {
-        Ok(resp) => resp,
-        Err(err) => {
-            // 412 means our `If-Match` no longer holds: the object was
-            // replaced. Distinguished here, while the HTTP status is still
-            // visible, because converting to `anyhow` loses it.
-            if err.raw_response().map(|r| r.status().as_u16()) == Some(412) {
-                return Err(anyhow!(ObjectChanged));
-            }
-            return Err(err.into());
-        }
-    };
-    let mut reader = resp.body.into_async_read();
+    // 412 means our `If-Match` no longer holds: the object was replaced.
+    let resp = req.send().await.map_err(precondition_aware)?;
+    // Never write past `end`: a body that is not the requested range would
+    // otherwise overwrite the ranges beside it.
+    let body = checked_range_body(resp, from, end)?;
+    let mut remaining = end - from + 1;
+    let mut reader = body.into_async_read();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
         if n == 0 {
             break;
         }
+        if n as u64 > remaining {
+            return Err(anyhow!(RangeMismatch(format!(
+                "server sent more than the {} bytes of `bytes={from}-{end}`",
+                end - from + 1
+            ))));
+        }
+        remaining -= n as u64;
         tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
         // Hashed only after the write lands. A failed write is retried from
         // `written`, which has not advanced -- feeding the hasher first would
@@ -1638,6 +1949,9 @@ async fn download_range_resumable(
             // half a minute proving it. Surface it now so the caller can
             // re-stat the key and start again against what is there.
             Err(err) if is_object_changed(&err) => return Err(err),
+            Err(err) if err.chain().any(|c| c.is::<RangeMismatch>()) => {
+                return Err(err.context(format!("`{bucket}/{key}` bytes {start}-{end}")));
+            }
             Err(err) => format!("{err:#}"),
             Ok(()) => format!("body ended {} bytes short", expected - written),
         };
@@ -1657,10 +1971,7 @@ async fn download_range_resumable(
             start + written
         );
         // The SDK's own backoff shape: 1s doubling to a 16s ceiling.
-        tokio::time::sleep(std::time::Duration::from_secs(
-            1u64 << (attempt - 1).min(4),
-        ))
-        .await;
+        tokio::time::sleep(std::time::Duration::from_secs(1u64 << (attempt - 1).min(4))).await;
         attempt += 1;
     }
 }
@@ -1789,7 +2100,7 @@ async fn verify_download(
     layout: &crate::verify::ObjectLayout,
     part_digests: &[[u8; 16]],
 ) -> Result<()> {
-    use crate::verify::{composite_etag, hex, ObjectLayout};
+    use crate::verify::{ContentMismatch, ObjectLayout, composite_etag, hex};
     match layout {
         ObjectLayout::Opaque { .. } => Ok(()),
         ObjectLayout::Single { expected_md5 } => {
@@ -1800,12 +2111,12 @@ async fn verify_download(
             let actual = md5_of_file(tmp).await?;
             match actual == *expected_md5 {
                 true => Ok(()),
-                false => Err(anyhow!(
+                false => Err(anyhow!(ContentMismatch(format!(
                     "`{bucket}/{key}`: content check failed -- the server's ETag is {} but the \
                      downloaded bytes are {}",
                     hex(expected_md5),
                     hex(&actual)
-                )),
+                )))),
             }
         }
         ObjectLayout::Multipart {
@@ -1818,21 +2129,21 @@ async fn verify_download(
                 if let Some(expected) = part.expected_md5
                     && expected != *digest
                 {
-                    return Err(anyhow!(
+                    return Err(anyhow!(ContentMismatch(format!(
                         "`{bucket}/{key}`: part {} failed its content check -- expected {}, got {}",
                         index + 1,
                         hex(&expected),
                         hex(digest)
-                    ));
+                    ))));
                 }
             }
             let rebuilt = composite_etag(part_digests);
             match rebuilt == *expected_etag {
                 true => Ok(()),
-                false => Err(anyhow!(
+                false => Err(anyhow!(ContentMismatch(format!(
                     "`{bucket}/{key}`: content check failed -- the server's ETag is {expected_etag} \
                      but the downloaded parts rebuild to {rebuilt}"
-                )),
+                )))),
             }
         }
     }
@@ -1875,10 +2186,14 @@ pub(crate) async fn download_object(
         .key
         .ok_or_else(|| anyhow!("object key is required in source `{source}`"))?;
     let (client, _) = client_for_alias(&parsed.alias).await?;
+    // The key's last segment names the local file unless the user named it;
+    // a key ending in `..` (or `/`) must not turn that into the parent (or
+    // the directory itself).
+    let base_name = || safe_relative_path(key.rsplit('/').next().unwrap_or(&key));
     let output = match target {
-        Some(path) if path.is_dir() => path.join(key.rsplit('/').next().unwrap_or(&key)),
+        Some(path) if path.is_dir() => path.join(base_name()?),
         Some(path) => path,
-        None => PathBuf::from(key.rsplit('/').next().unwrap_or(&key)),
+        None => base_name()?,
     };
     let size = download_key_to_path(
         &client,
@@ -1957,6 +2272,79 @@ mod tests {
             parse_staging_owner("__rs3_staging_my_odd_host_4242_beef_0").expect("should parse");
         assert_eq!(host, "my_odd_host");
         assert_eq!(pid, 4242);
+    }
+
+    #[test]
+    fn safe_relative_path_refuses_escapes() {
+        for bad in [
+            "x/../../../home/u/.ssh/authorized_keys",
+            "..",
+            "a/..",
+            "../a",
+            "/etc/passwd",
+            "",
+            "/",
+            "./.",
+        ] {
+            assert!(safe_relative_path(bad).is_err(), "must refuse `{bad}`");
+        }
+        #[cfg(windows)]
+        for bad in ["a\\..\\..\\x", "C:/x", "C:x", "a/b:c"] {
+            assert!(safe_relative_path(bad).is_err(), "must refuse `{bad}`");
+        }
+        assert_eq!(
+            safe_relative_path("a/./b//c.txt").unwrap(),
+            Path::new("a").join("b").join("c.txt")
+        );
+        // Dots inside a name are not traversal.
+        assert_eq!(
+            safe_relative_path("..hidden/x..y").unwrap(),
+            Path::new("..hidden").join("x..y")
+        );
+    }
+
+    #[test]
+    fn effective_part_size_fits_ten_thousand_parts() {
+        let five = 5 * MIB;
+        // Small objects keep the requested size.
+        assert_eq!(effective_part_size(100 * MIB, five).unwrap(), five);
+        // 100 GiB at 5 MiB would be 20,480 parts: raised to a whole MiB.
+        let total = 100 * 1024 * MIB;
+        let ps = effective_part_size(total, five).unwrap();
+        assert_eq!(ps % MIB, 0);
+        assert!(total.div_ceil(ps) <= MAX_PARTS, "{ps}");
+        assert!(ps >= five);
+        // Exactly 5 TiB still fits; one byte more does not.
+        let ps = effective_part_size(MAX_OBJECT_SIZE, five).unwrap();
+        assert!(ps <= MAX_PART_SIZE && MAX_OBJECT_SIZE.div_ceil(ps) <= MAX_PARTS);
+        assert!(effective_part_size(MAX_OBJECT_SIZE + 1, five).is_err());
+        // A part size S3 would reject is refused up front.
+        assert!(effective_part_size(10 * 1024 * MIB, 6 * 1024 * MIB).is_err());
+    }
+
+    #[test]
+    fn stream_part_sizes_reach_multi_terabyte_within_the_part_limit() {
+        let base = 5 * MIB;
+        assert_eq!(stream_part_size(base, 1), base);
+        assert_eq!(stream_part_size(base, 1000), base);
+        assert_eq!(stream_part_size(base, 1001), 2 * base);
+        let reach: u64 = (1..=MAX_PARTS).map(|n| stream_part_size(base, n)).sum();
+        assert!(reach > 4 * 1024 * 1024 * MIB, "only {reach} bytes");
+        // Never above the per-part ceiling, whatever the base.
+        assert!((1..=MAX_PARTS).all(|n| stream_part_size(1024 * MIB, n) <= MAX_PART_SIZE));
+    }
+
+    #[test]
+    fn range_responses_must_be_the_range_asked_for() {
+        assert!(check_range_response(Some("bytes 10-19/100"), Some(10), 10, 19).is_ok());
+        // A server that ignored Range and sent the whole object.
+        assert!(check_range_response(None, Some(100), 10, 19).is_err());
+        assert!(check_range_response(None, Some(100), 0, 19).is_err());
+        // ...which is fine only when the range was the whole object.
+        assert!(check_range_response(None, Some(20), 0, 19).is_ok());
+        // Some other range.
+        assert!(check_range_response(Some("bytes 0-99/100"), Some(100), 10, 19).is_err());
+        assert!(check_range_response(Some("garbage"), Some(10), 10, 19).is_err());
     }
 
     #[test]

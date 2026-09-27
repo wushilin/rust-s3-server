@@ -40,7 +40,10 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 fn md5_hex(bytes: &[u8]) -> String {
-    Md5::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 fn md5_raw(bytes: &[u8]) -> Vec<u8> {

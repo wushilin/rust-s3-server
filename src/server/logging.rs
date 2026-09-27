@@ -39,6 +39,25 @@ pub const TARGET_AUTHZ: &str = "rusts3::authz";
 /// Log target for the operation audit trail (who did what, success or failure).
 pub const TARGET_AUDIT: &str = "rusts3::audit";
 
+/// Makes untrusted text (a login name, an object key) safe to embed in a log
+/// line: control characters — CR, LF, ESC, … — are escaped (`\n`, `\u{1b}`),
+/// so a crafted value cannot forge extra log lines or inject terminal escape
+/// sequences. Borrows when there is nothing to escape.
+pub fn escape_control(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S%.3f)} {l:<5} {m}{n}";
 
 fn encoder() -> Box<PatternEncoder> {
@@ -133,4 +152,19 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Er
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::escape_control;
+
+    #[test]
+    fn control_characters_cannot_forge_log_lines() {
+        assert_eq!(escape_control("alice"), "alice");
+        assert!(matches!(escape_control("a/b c"), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            escape_control("x\n2026-01-01 INFO ui login user=admin\r\u{1b}[2J"),
+            "x\\n2026-01-01 INFO ui login user=admin\\r\\u{1b}[2J"
+        );
+    }
 }

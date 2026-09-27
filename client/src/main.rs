@@ -1421,9 +1421,36 @@ async fn mv(args: CpArgs) -> Result<()> {
     // Up-front, mv-only guard ([SEM] §3): only checked when there's exactly
     // one source and one target (2 positional args total).
     if args.paths.len() == 2 {
-        check_mv_subdirectory_guard(&args.paths[0], &args.paths[1])?;
+        let source_remote = is_remote_spec(&args.paths[0]).await;
+        let target_remote = is_remote_spec(&args.paths[1]).await;
+        check_mv_subdirectory_guard(&args.paths[0], source_remote, &args.paths[1], target_remote)?;
     }
     run_cp_or_mv(args, true).await
+}
+
+/// Whether a `cp`/`mv` operand names an S3 location rather than a local
+/// path. `ALIAS/...`-shaped strings are ambiguous with relative local paths
+/// (`data/file.txt`), so -- like mc, which resolves the first segment
+/// against its configured aliases -- the operand is remote only when that
+/// segment is a configured alias and the path does not exist locally
+/// (the same exists-wins rule `mirror`'s `resolve_side` applies).
+async fn is_remote_spec(spec: &str) -> bool {
+    if !is_s3_url(spec) || Path::new(spec).exists() {
+        return false;
+    }
+    let alias = spec.split('/').next().unwrap_or_default();
+    crate::config::alias_is_configured(alias).await
+}
+
+/// A local operand spelled so every downstream `is_s3_url`/`resolve_side`
+/// check also reads it as local: relative paths that look like
+/// `ALIAS/BUCKET` get a `./` prefix.
+fn local_spec(spec: &str) -> String {
+    if is_s3_url(spec) {
+        format!("./{spec}")
+    } else {
+        spec.to_string()
+    }
 }
 
 /// `mv`-only guard: fatal if `source`/`target` are subdirectories of each
@@ -1431,15 +1458,20 @@ async fn mv(args: CpArgs) -> Result<()> {
 /// sides are S3 URLs (string-prefix compare on the raw alias/bucket/key
 /// path with a `/` boundary) or both are local paths (`Path::starts_with`
 /// both directions) -- a mixed local/S3 pair can never collide this way.
-fn check_mv_subdirectory_guard(source: &str, target: &str) -> Result<()> {
-    let conflict = if is_s3_url(source) && is_s3_url(target) {
+fn check_mv_subdirectory_guard(
+    source: &str,
+    source_remote: bool,
+    target: &str,
+    target_remote: bool,
+) -> Result<()> {
+    let conflict = if source_remote && target_remote {
         let a = source.trim_end_matches('/');
         let b = target.trim_end_matches('/');
         a == b || b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/"))
-    } else if !is_s3_url(source) && !is_s3_url(target) {
+    } else if !source_remote && !target_remote {
         let a = Path::new(source);
         let b = Path::new(target);
-        a.starts_with(b) || b.starts_with(a)
+        a.starts_with(b) || b.starts_with(a) || local_dir_move_onto_itself(a, b)
     } else {
         false
     };
@@ -1449,6 +1481,54 @@ fn check_mv_subdirectory_guard(source: &str, target: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The spelling-based check above misses aliases of the same directory
+/// (`mv dir ./`, `mv dir .`, `mv dir ./dir/sub`), and a recursive move of a
+/// directory onto itself copies nothing new and then deletes the source.
+/// Compare resolved paths instead. (A *file* moved onto itself -- `mv
+/// file.txt ./` -- is refused by `copy_local_path`'s same-file check.)
+fn local_dir_move_onto_itself(source: &Path, target: &Path) -> bool {
+    let Ok(src) = std::fs::canonicalize(source) else {
+        return false;
+    };
+    if !src.is_dir() {
+        return false;
+    }
+    let dst = canonicalize_lenient(target);
+    if dst.starts_with(&src) {
+        return true;
+    }
+    // `mv dir PARENT/` where PARENT already holds `dir`: the destination
+    // directory resolves to the source itself.
+    dst.is_dir() && src.parent() == Some(dst.as_path())
+}
+
+/// `fs::canonicalize` for a path whose trailing components may not exist
+/// yet: canonicalizes the longest existing ancestor and re-appends the rest.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&cur) {
+            let mut out = canon;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (cur.file_name().map(|n| n.to_os_string()), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                cur = if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                };
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
@@ -1466,6 +1546,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
         None => BTreeMap::new(),
     };
     let target = args.paths.last().unwrap().clone();
+    let target_remote = is_remote_spec(&target).await;
     // Lazy: creating a `TransferSession` on a TTY immediately draws its
     // idle `TOTAL 0/0 objects` bar, and the `--recursive` branches below
     // delegate to `run_mirror`, which builds its own session -- an eager
@@ -1478,7 +1559,8 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
     let stream_budget = crate::budget::StreamBudget::new(args.parallel);
     let mut used_session = false;
     for source in &args.paths[..args.paths.len() - 1] {
-        if is_s3_url(source) && is_s3_url(&target) {
+        let source_remote = is_remote_spec(source).await;
+        if source_remote && target_remote {
             if args.recursive {
                 cp_or_mv_recursive(source, &target, &args, is_mv).await?;
             } else {
@@ -1499,9 +1581,9 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                 .await?;
                 used_session = true;
             }
-        } else if is_s3_url(source) && !is_s3_url(&target) {
+        } else if source_remote && !target_remote {
             if args.recursive {
-                cp_or_mv_recursive(source, &target, &args, is_mv).await?;
+                cp_or_mv_recursive(source, &local_spec(&target), &args, is_mv).await?;
             } else {
                 let parsed = parse_s3_url(source)?;
                 let bucket = parsed
@@ -1566,7 +1648,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                 }
                 used_session = true;
             }
-        } else if !is_s3_url(source) && is_s3_url(&target) {
+        } else if !source_remote && target_remote {
             let source_path = Path::new(source);
             if source_path.is_dir() {
                 if !args.recursive {
@@ -1574,7 +1656,7 @@ async fn run_cp_or_mv(args: CpArgs, is_mv: bool) -> Result<()> {
                         "source `{source}` is a directory; use --recursive to copy it"
                     ));
                 }
-                cp_or_mv_recursive(source, &target, &args, is_mv).await?;
+                cp_or_mv_recursive(&local_spec(source), &target, &args, is_mv).await?;
             } else {
                 let metadata = fs::metadata(source_path)
                     .await
@@ -1665,6 +1747,8 @@ async fn cp_or_mv_recursive(source: &str, target: &str, args: &CpArgs, is_mv: bo
         target: target.to_string(),
     };
     mirror::run_mirror(&mirror_args).await?;
+    // Callers pass local operands through `local_spec`, so a local source
+    // never looks like an S3 URL here.
     if is_mv && !is_s3_url(source) {
         prune_empty_dirs(Path::new(source)).await;
     }
@@ -1867,17 +1951,58 @@ async fn copy_local_path(
             )),
             None => crate::progress::ProgressNotifier::noop(),
         };
-        let mut planned: Vec<(PathBuf, u64)> = Vec::new();
+        if canonicalize_lenient(target) == canonicalize_lenient(source) {
+            return Err(anyhow!(
+                "Source `{}` and target `{}` are the same directory",
+                source.display(),
+                target.display()
+            ));
+        }
+        // `(path, size, reached through a directory symlink)`.
+        let mut planned: Vec<(PathBuf, u64, bool)> = Vec::new();
         let mut planned_bytes = 0u64;
-        let mut dirs = VecDeque::from([source.to_path_buf()]);
+        let mut dirs = VecDeque::from([(source.to_path_buf(), false)]);
         let mut dirs_seen = 1u64;
+        // Directory symlinks met directly in the tree. `mv` removes these
+        // links rather than the files behind them, which live elsewhere.
+        let mut dir_links: Vec<PathBuf> = Vec::new();
+        // Symlinks are followed (as mc does); every directory is entered
+        // at most once by its resolved path, so a link back up the tree
+        // cannot loop forever.
+        let mut visited = std::collections::HashSet::new();
+        if let Ok(canon) = std::fs::canonicalize(source) {
+            visited.insert(canon);
+        }
         scan.set_total(dirs_seen);
-        while let Some(dir) = dirs.pop_front() {
+        while let Some((dir, via_link)) = dirs.pop_front() {
             let mut entries = fs::read_dir(&dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                let metadata = entry.metadata().await?;
+                let metadata = match fs::metadata(&path).await {
+                    Ok(m) => m,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // A dangling symlink: nothing to copy, but say so
+                        // rather than dropping it silently. (Anything else
+                        // that vanished mid-walk is simply gone.)
+                        if entry.file_type().await.is_ok_and(|t| t.is_symlink()) {
+                            print_error(
+                                &format!("Unable to copy broken symlink `{}`", path.display()),
+                                &err.to_string(),
+                                false,
+                            );
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("stat {}", path.display()));
+                    }
+                };
                 if metadata.is_dir() {
+                    if let Ok(canon) = std::fs::canonicalize(&path)
+                        && !visited.insert(canon)
+                    {
+                        continue;
+                    }
                     // rs3's own download staging is not content, and never
                     // descended into -- see `is_staging_dir_name`. A `cp`
                     // already writes, so it also reclaims the abandoned ones.
@@ -1888,7 +2013,11 @@ async fn copy_local_path(
                         crate::transfer::reclaim_staging_dir(&path, &name).await;
                         continue;
                     }
-                    dirs.push_back(path);
+                    let is_link = entry.file_type().await.is_ok_and(|t| t.is_symlink());
+                    if is_link && !via_link {
+                        dir_links.push(path.clone());
+                    }
+                    dirs.push_back((path, via_link || is_link));
                     dirs_seen += 1;
                     scan.set_total(dirs_seen);
                 } else if metadata.is_file() {
@@ -1897,7 +2026,7 @@ async fn copy_local_path(
                         continue;
                     }
                     planned_bytes += metadata.len();
-                    planned.push((path, metadata.len()));
+                    planned.push((path, metadata.len(), via_link));
                 }
             }
             scan.advance(1);
@@ -1906,7 +2035,7 @@ async fn copy_local_path(
         if let Some(ui) = session.ui() {
             ui.declare_total(planned.len() as u64, planned_bytes);
         }
-        for (path, size) in planned {
+        for (path, size, via_link) in planned {
             let rel = path.strip_prefix(source)?;
             let output = target.join(rel);
             if let Some(parent) = output.parent() {
@@ -1928,7 +2057,7 @@ async fn copy_local_path(
                 )),
                 None => crate::progress::ProgressNotifier::noop(),
             };
-            fs::copy(&path, &output).await?;
+            copy_file_replacing(&path, &output).await?;
             unit.advance(size);
             unit.finish();
             session.add_total(size);
@@ -1941,11 +2070,25 @@ async fn copy_local_path(
                 total_size,
             };
             session.object_done(&msg, size);
-            if delete_after && let Err(err) = fs::remove_file(&path).await {
+            if delete_after
+                && !via_link
+                && let Err(err) = fs::remove_file(&path).await
+            {
                 ui_eprintln!("mv: remove `{}` failed: {err}", path.display());
             }
         }
         if delete_after {
+            for link in &dir_links {
+                // Windows directory symlinks are removed with `remove_dir`.
+                let removed = match fs::remove_file(link).await {
+                    Ok(()) => Ok(()),
+                    Err(_) if cfg!(windows) => fs::remove_dir(link).await,
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = removed {
+                    ui_eprintln!("mv: remove `{}` failed: {err}", link.display());
+                }
+            }
             prune_empty_dirs(source).await;
         }
     } else {
@@ -1967,7 +2110,7 @@ async fn copy_local_path(
         {
             fs::create_dir_all(parent).await?;
         }
-        fs::copy(source, &output).await?;
+        copy_file_replacing(source, &output).await?;
         let size = metadata.len();
         session.add_total(size);
         let (total_count, total_size) = session.totals();
@@ -1984,6 +2127,67 @@ async fn copy_local_path(
         }
     }
     Ok(())
+}
+
+/// True when `a` and `b` name the same existing file (same device and
+/// inode on Unix; same canonical path elsewhere), whatever their spelling.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        }
+    }
+}
+
+/// Local-to-local file copy that never damages the destination: refuses
+/// a source that *is* the destination (`fs::copy` onto itself truncates
+/// it to 0 bytes, and `mv` would then delete it), and otherwise copies to
+/// a temp file beside `output` and renames it into place, so a failed copy
+/// leaves any existing destination untouched.
+async fn copy_file_replacing(source: &Path, output: &Path) -> Result<()> {
+    if is_same_file(source, output) {
+        return Err(anyhow!(
+            "Source `{}` and target `{}` are the same file",
+            source.display(),
+            output.display()
+        ));
+    }
+    let dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = output
+        .file_name()
+        .ok_or_else(|| anyhow!("invalid target filename `{}`", output.display()))?
+        .to_string_lossy()
+        .into_owned();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.rs3-part-{}-{seq}", std::process::id()));
+    let result = async {
+        fs::copy(source, &tmp)
+            .await
+            .with_context(|| format!("copy {} to {}", source.display(), tmp.display()))?;
+        fs::rename(&tmp, output)
+            .await
+            .with_context(|| format!("rename {} to {}", tmp.display(), output.display()))?;
+        anyhow::Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp).await;
+    }
+    result
 }
 
 async fn get(args: GetArgs) -> Result<()> {
@@ -2208,19 +2412,26 @@ where
 {
     let mut stdout = tokio::io::stdout();
     let mut count = 0i64;
-    while count < lines {
-        let mut buf = Vec::new();
-        let n = reader.read_until(b'\n', &mut buf).await?;
-        if n == 0 {
-            break;
+    let result: std::io::Result<()> = async {
+        while count < lines {
+            let mut buf = Vec::new();
+            let n = reader.read_until(b'\n', &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let buf = strip_line_terminator(buf);
+            stdout.write_all(&buf).await?;
+            stdout.write_all(b"\n").await?;
+            count += 1;
         }
-        let buf = strip_line_terminator(buf);
-        stdout.write_all(&buf).await?;
-        stdout.write_all(b"\n").await?;
-        count += 1;
+        stdout.flush().await
     }
-    stdout.flush().await?;
-    Ok(())
+    .await;
+    // Same EPIPE-is-success rule as `cat` ([SEM] §12).
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
 }
 
 /// Same line-limited read loop as [`head_stream_async`], but over a
@@ -2231,19 +2442,24 @@ fn head_stream_sync<R: std::io::BufRead>(reader: &mut R, lines: i64) -> Result<(
     use std::io::Write;
     let mut stdout = std::io::stdout();
     let mut count = 0i64;
-    while count < lines {
-        let mut buf = Vec::new();
-        let n = reader.read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            break;
+    let result = (|| -> std::io::Result<()> {
+        while count < lines {
+            let mut buf = Vec::new();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let buf = strip_line_terminator(buf);
+            stdout.write_all(&buf)?;
+            stdout.write_all(b"\n")?;
+            count += 1;
         }
-        let buf = strip_line_terminator(buf);
-        stdout.write_all(&buf)?;
-        stdout.write_all(b"\n")?;
-        count += 1;
+        stdout.flush()
+    })();
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
     }
-    stdout.flush()?;
-    Ok(())
 }
 
 /// `head`: full un-ranged GET per target, then a client-side first-N-lines

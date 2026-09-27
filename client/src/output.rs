@@ -105,7 +105,7 @@ pub(crate) fn print_msg(msg: &dyn McMessage) {
         let v = msg.json();
         render_json(&v, msg.json_style(), opts.stdout_tty)
     };
-    crate::progress::suspend_bars(|| println!("{line}"));
+    crate::progress::suspend_bars(|| crate::progress::stdout_line(&line));
 }
 
 /// mc's punctuation rule for joining an error's context message with its
@@ -166,7 +166,7 @@ pub(crate) fn print_error(context_msg: &str, cause: &str, fatal: bool) {
             }
         });
         let line = render_json(&envelope, JsonStyle::Standard, opts.stdout_tty);
-        crate::progress::suspend_bars(|| println!("{line}"));
+        crate::progress::suspend_bars(|| crate::progress::stdout_line(&line));
     }
 }
 

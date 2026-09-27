@@ -48,20 +48,25 @@ pub fn parse_range_header(header: Option<&str>, total_size: u64) -> RangeSelecti
     let Ok(start) = start_raw.parse::<u64>() else {
         return RangeSelection::Full;
     };
-    if total_size == 0 || start >= total_size {
-        return RangeSelection::Unsatisfiable { total_size };
-    }
-    let end_inclusive = if end_raw.is_empty() {
-        total_size - 1
+    // A last-byte-pos below the first-byte-pos makes the whole spec
+    // syntactically invalid (RFC 7233 §2.1), and an invalid Range header is
+    // ignored -- full body, 200 -- not answered with 416. Checked before the
+    // size test so `bytes=200-100` on a small object is ignored too.
+    let end = if end_raw.is_empty() {
+        None
     } else {
         let Ok(end) = end_raw.parse::<u64>() else {
             return RangeSelection::Full;
         };
         if end < start {
-            return RangeSelection::Unsatisfiable { total_size };
+            return RangeSelection::Full;
         }
-        end.min(total_size - 1)
+        Some(end)
     };
+    if total_size == 0 || start >= total_size {
+        return RangeSelection::Unsatisfiable { total_size };
+    }
+    let end_inclusive = end.map_or(total_size - 1, |end| end.min(total_size - 1));
     RangeSelection::Single {
         start,
         end_inclusive,
@@ -99,6 +104,23 @@ mod tests {
                 start: 90,
                 end_inclusive: 99
             }
+        );
+    }
+
+    #[test]
+    fn reversed_range_is_ignored_not_unsatisfiable() {
+        assert_eq!(
+            parse_range_header(Some("bytes=5-3"), 100),
+            RangeSelection::Full
+        );
+        assert_eq!(
+            parse_range_header(Some("bytes=200-100"), 100),
+            RangeSelection::Full
+        );
+        // start past the end is still a real 416.
+        assert_eq!(
+            parse_range_header(Some("bytes=200-300"), 100),
+            RangeSelection::Unsatisfiable { total_size: 100 }
         );
     }
 

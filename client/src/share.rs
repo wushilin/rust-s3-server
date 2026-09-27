@@ -184,6 +184,18 @@ fn validate_expire(raw: &str) -> Result<u64> {
 async fn run_download(args: ShareDownloadArgs) -> Result<()> {
     let expire_secs = validate_expire(&args.expire)?;
     let mut db = load_db(ShareKind::Download).await?;
+    // Persist whatever was already shared (and printed) even when a later
+    // target fails -- those links are live.
+    let result = share_downloads(&args, expire_secs, &mut db).await;
+    save_db(ShareKind::Download, &db).await?;
+    result
+}
+
+async fn share_downloads(
+    args: &ShareDownloadArgs,
+    expire_secs: u64,
+    db: &mut ShareDb,
+) -> Result<()> {
     for target in &args.targets {
         let parsed = parse_s3_url(target)?;
         let bucket = parsed.bucket.clone().ok_or_else(|| {
@@ -194,8 +206,7 @@ async fn run_download(args: ShareDownloadArgs) -> Result<()> {
         if args.recursive {
             let prefix = parsed.key.clone().unwrap_or_default();
             for obj in collect_objects(&client, &bucket, &prefix).await? {
-                share_one_download(&client, &endpoint, &bucket, &obj.key, expire_secs, &mut db)
-                    .await?;
+                share_one_download(&client, &endpoint, &bucket, &obj.key, expire_secs, db).await?;
             }
         } else {
             let key = parsed.key.clone().ok_or_else(|| {
@@ -208,10 +219,9 @@ async fn run_download(args: ShareDownloadArgs) -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("Unable to stat `{target}`"))?;
-            share_one_download(&client, &endpoint, &bucket, &key, expire_secs, &mut db).await?;
+            share_one_download(&client, &endpoint, &bucket, &key, expire_secs, db).await?;
         }
     }
-    save_db(ShareKind::Download, &db).await?;
     Ok(())
 }
 
@@ -252,6 +262,13 @@ async fn share_one_download(
 async fn run_upload(args: ShareUploadArgs) -> Result<()> {
     let expire_secs = validate_expire(&args.expire)?;
     let mut db = load_db(ShareKind::Upload).await?;
+    // As for downloads: save already-generated shares on the error path too.
+    let result = share_uploads(&args, expire_secs, &mut db).await;
+    save_db(ShareKind::Upload, &db).await?;
+    result
+}
+
+async fn share_uploads(args: &ShareUploadArgs, expire_secs: u64, db: &mut ShareDb) -> Result<()> {
     for target in &args.targets {
         let parsed = parse_s3_url(target)?;
         let bucket = parsed.bucket.clone().ok_or_else(|| {
@@ -304,7 +321,6 @@ async fn run_upload(args: ShareUploadArgs) -> Result<()> {
             content_type: args.content_type.clone(),
         });
     }
-    save_db(ShareKind::Upload, &db).await?;
     Ok(())
 }
 
@@ -461,14 +477,18 @@ async fn run_list(args: ShareListArgs) -> Result<()> {
             ));
         }
     };
-    let db = load_db(kind).await?;
+    let mut db = load_db(kind).await?;
     let now = Utc::now();
+    // Like mc, expired shares are dropped from the DB rather than listed
+    // with a negative time left.
+    let before = db.entries.len();
+    db.entries
+        .retain(|entry| entry_time_left_ns(entry, now) > 0);
+    if db.entries.len() != before {
+        save_db(kind, &db).await?;
+    }
     for entry in &db.entries {
-        let elapsed_ns = now
-            .signed_duration_since(entry.date)
-            .num_nanoseconds()
-            .unwrap_or(0);
-        let time_left_ns = entry.expiry_ns - elapsed_ns;
+        let time_left_ns = entry_time_left_ns(entry, now);
         print_msg(&ShareMessage {
             object_url: entry.url.clone(),
             share_url: entry.share.clone(),
@@ -477,6 +497,15 @@ async fn run_list(args: ShareListArgs) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// `expiry - (now - date)`, saturating; `<= 0` means expired.
+fn entry_time_left_ns(entry: &ShareEntry, now: DateTime<Utc>) -> i64 {
+    let elapsed_ns = now
+        .signed_duration_since(entry.date)
+        .num_nanoseconds()
+        .unwrap_or(i64::MAX);
+    entry.expiry_ns.saturating_sub(elapsed_ns)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -495,7 +524,7 @@ struct ShareEntry {
     /// The share's total validity window, in nanoseconds. `list` recomputes
     /// `expiry_ns - (now - date)` live, mirroring mc's own `TimeLeft:
     /// share.Expiry - time.Since(share.Date)` ([SEM] §10) -- expired
-    /// entries (a negative result) are still listed, never pruned.
+    /// entries (a non-positive result) are pruned from the DB, as mc does.
     expiry_ns: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
@@ -550,35 +579,13 @@ async fn secure_share_dir(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-async fn write_share_db_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .await?;
-    file.write_all(data).await?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn write_share_db_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    fs::write(path, data).await?;
-    Ok(())
-}
-
 async fn save_db(kind: ShareKind, db: &ShareDb) -> Result<()> {
     let path = share_db_path(kind)?;
     if let Some(parent) = path.parent() {
         secure_share_dir(parent).await?;
     }
     let data = serde_json::to_vec_pretty(db)?;
-    write_share_db_file(&path, &data).await?;
-    Ok(())
+    crate::config::write_private_file(&path, &data).await
 }
 
 #[cfg(test)]

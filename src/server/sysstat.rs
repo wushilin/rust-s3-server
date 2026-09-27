@@ -193,10 +193,10 @@ fn parse_diskstats(text: &str) -> Option<(u64, u64)> {
         read_sectors += f[5].parse::<u64>().unwrap_or(0);
         write_sectors += f[9].parse::<u64>().unwrap_or(0);
     }
-    // A readable diskstats with no recognized whole disk is a real zero, not an
-    // error — only a missing/unreadable file yields None (handled by the caller).
-    let _ = matched;
-    Some((read_sectors * 512, write_sectors * 512))
+    // No recognized whole disk (an unusual device naming, a container with a
+    // filtered view) means we cannot measure disk I/O: report it as unknown
+    // rather than as a flat, misleading zero.
+    matched.then_some((read_sectors * 512, write_sectors * 512))
 }
 
 // ── sampling ─────────────────────────────────────────────────────────────────
@@ -406,6 +406,15 @@ mod tests {
         // sectors_read: sda 100 + nvme0n1 8 = 108; sectors_written: 200 + 16 = 216.
         assert_eq!(r, 108 * 512);
         assert_eq!(w, 216 * 512);
+    }
+
+    #[test]
+    fn diskstats_without_a_whole_disk_is_unknown() {
+        let text = "\
+   8       1 sda1 5 0 50 2 10 0 100 4 0 6 7
+   7       0 loop0 1 0 999 0 0 0 999 0 0 0 0";
+        assert_eq!(parse_diskstats(text), None);
+        assert_eq!(parse_diskstats(""), None);
     }
 
     #[test]

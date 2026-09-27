@@ -659,7 +659,10 @@ impl IamStore {
             return Err(StorageError::Io("password must be at least 8 characters".into()));
         }
         let salt = random_hex(16);
-        let hash = pbkdf2_hex(password, &salt);
+        let hash = {
+            let (password, salt) = (password.to_string(), salt.clone());
+            blocking(move || Ok(pbkdf2_hex(&password, &salt))).await?
+        };
         let db = self.db.clone();
         let username_owned = username.to_string();
         blocking(move || {
@@ -686,7 +689,10 @@ impl IamStore {
             return Err(StorageError::Io("password must be at least 8 characters".into()));
         }
         let salt = random_hex(16);
-        let hash = pbkdf2_hex(password, &salt);
+        let hash = {
+            let (password, salt) = (password.to_string(), salt.clone());
+            blocking(move || Ok(pbkdf2_hex(&password, &salt))).await?
+        };
         let db = self.db.clone();
         let username_owned = username.to_string();
         blocking(move || {
@@ -1019,11 +1025,21 @@ impl IamStore {
             }
         })
         .await?;
-        let Some((hash, salt)) = stored else {
-            return Ok(false);
-        };
-        let candidate = pbkdf2_hex(password, &salt);
-        Ok(constant_time_eq(&candidate, &hash))
+        // PBKDF2 is deliberately slow (~100k HMAC rounds): run it on the
+        // blocking pool, never on an async worker. An unknown user still pays
+        // the full derivation against a dummy salt, so response time does not
+        // reveal whether the account exists.
+        let password = password.to_string();
+        blocking(move || {
+            Ok(match stored {
+                Some((hash, salt)) => constant_time_eq(&pbkdf2_hex(&password, &salt), &hash),
+                None => {
+                    let _ = pbkdf2_hex(&password, "0000000000000000unknown-user");
+                    false
+                }
+            })
+        })
+        .await
     }
 
     // ── access keys ───────────────────────────────────────────────────────────
@@ -1190,6 +1206,16 @@ impl IamStore {
 
     pub fn destroy_session(&self, token: &str) {
         self.sessions.lock().unwrap().remove(token);
+    }
+
+    /// Drops every IAM (non-built-in) session for which `stale(username)` is
+    /// true — e.g. after an IAM import replaced or removed the user. Built-in
+    /// config users are not IAM rows, so an import never affects them.
+    pub fn purge_iam_sessions(&self, stale: impl Fn(&str) -> bool) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .retain(|_, s| s.is_root || !stale(&s.username));
     }
 }
 
@@ -1498,6 +1524,20 @@ mod tests {
         assert!(!iam.verify_password("erin", "old-password").await.unwrap());
         assert!(iam.verify_password("erin", "new-password").await.unwrap());
         assert_eq!(iam.resolve_session(&token), None);
+    }
+
+    #[tokio::test]
+    async fn unknown_user_never_verifies_and_purge_spares_builtin_sessions() {
+        let (_tmp, iam) = open_tmp().await;
+        assert!(!iam.verify_password("nobody", "password123").await.unwrap());
+        iam.create_user("fay", "password123").await.unwrap();
+        let fay = iam.create_session("fay", false);
+        let gus = iam.create_session("gus", false);
+        let root = iam.create_session("fay", true);
+        iam.purge_iam_sessions(|name| name == "fay");
+        assert_eq!(iam.resolve_session(&fay), None);
+        assert!(iam.resolve_session(&gus).is_some());
+        assert!(iam.resolve_session(&root).is_some(), "built-in sessions are not IAM rows");
     }
 
     #[test]

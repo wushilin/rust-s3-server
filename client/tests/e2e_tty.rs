@@ -298,7 +298,14 @@ fn recursive_cp_declares_its_whole_total_before_transferring() {
 
     let painted = run_in_pty(
         &server,
-        &["cp", "-r", "-P", "2", dir.to_str().unwrap(), "test/plan/dest"],
+        &[
+            "cp",
+            "-r",
+            "-P",
+            "2",
+            dir.to_str().unwrap(),
+            "test/plan/dest",
+        ],
     );
 
     let denominators = total_denominators(&painted);

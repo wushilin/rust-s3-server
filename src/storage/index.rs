@@ -457,6 +457,21 @@ impl ObjectIndex {
         .await;
     }
 
+    /// Syncs the write-ahead log to stable storage. Relaxed-durability writes
+    /// leave the WAL in the OS page cache; callers that are about to act on a
+    /// commit irreversibly (e.g. retire the blob it displaced) sync it first.
+    pub async fn sync_wal(&self) -> Result<()> {
+        let db = self.db.clone();
+        run_blocking(move || Ok(db.flush_wal(true)?)).await
+    }
+
+    /// Number of live handles (clones of this index, plus in-flight blocking
+    /// calls) sharing the underlying database. Used to drain in-flight users
+    /// before the database is swapped out or deleted.
+    pub fn handle_count(&self) -> usize {
+        Arc::strong_count(&self.db)
+    }
+
     pub async fn checkpoint_truncate(&self) -> Result<()> {
         self.close().await;
         Ok(())
@@ -545,14 +560,23 @@ impl ObjectIndex {
     /// Up to `limit` keys still on the legacy 4-level fanout layout
     /// (`objects/xx/xx/xx/xx/…`). Empty once migration is complete. Only
     /// consulted after the cheap root-dir check finds legacy structure, so it
-    /// never scans a clean bucket.
-    pub async fn legacy_layout_keys(&self, limit: usize) -> Result<Vec<String>> {
+    /// never scans a clean bucket. Resumes strictly after `after`, so a caller
+    /// can walk past keys whose migration keeps failing.
+    pub async fn legacy_layout_keys(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
         let db = self.db.clone();
+        let after = after.map(str::to_string);
         run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
             let mut keys = Vec::new();
-            for item in db.iterator_cf(&objects, IteratorMode::Start) {
+            let mode = match &after {
+                Some(after) => IteratorMode::From(after.as_bytes(), Direction::Forward),
+                None => IteratorMode::Start,
+            };
+            for item in db.iterator_cf(&objects, mode) {
                 let (key, value) = item?;
+                if after.as_deref().is_some_and(|after| key.as_ref() == after.as_bytes()) {
+                    continue; // `after` is exclusive
+                }
                 let record = decode_object(&key, &value)?;
                 if is_legacy_layout(&record.blob_dir) {
                     keys.push(record.object_key);
@@ -766,13 +790,31 @@ impl ObjectIndex {
     /// with a large retire backlog. The collected page is sorted by
     /// `(created_at_ms, id)` to match the previous ordering exactly.
     pub async fn stale_intents(&self, now_ms: i64, min_age_ms: i64, limit: i64) -> Result<Vec<IntentRecord>> {
+        self.stale_intents_after(now_ms, min_age_ms, limit, None).await
+    }
+
+    /// [`Self::stale_intents`] resuming strictly after intent id `after_id`,
+    /// so a resolution pass can walk past intents that keep failing instead of
+    /// re-selecting them forever (they sit at the front of the id order).
+    pub async fn stale_intents_after(
+        &self,
+        now_ms: i64,
+        min_age_ms: i64,
+        limit: i64,
+        after_id: Option<i64>,
+    ) -> Result<Vec<IntentRecord>> {
         let db = self.db.clone();
         let cutoff = now_ms.saturating_sub(min_age_ms);
         let limit = limit.max(1) as usize;
         run_blocking(move || {
             let intents = cf(&db, CF_INTENTS)?;
             let mut out = Vec::new();
-            for item in db.iterator_cf(&intents, IteratorMode::Start) {
+            let start = after_id.map(|id| id_key(id.saturating_add(1)));
+            let mode = match &start {
+                Some(start) => IteratorMode::From(start, Direction::Forward),
+                None => IteratorMode::Start,
+            };
+            for item in db.iterator_cf(&intents, mode) {
                 let (key, value) = item?;
                 let record = decode_intent(id_from_key(&key), &value)?;
                 if record.created_at_ms <= cutoff {
@@ -938,60 +980,82 @@ fn list_blocking(
     }
 
     let mut entries = Vec::new();
-    let mut common_prefixes = Vec::new();
+    let mut common_prefixes: Vec<String> = Vec::new();
     let mut next_after = None;
-    let mut skipped_common_prefixes = std::collections::HashSet::new();
+    // A cursor that falls inside a rolled-up group (S3 hands back the common
+    // prefix itself as NextMarker / NextContinuationToken; older pages handed
+    // back the group's last key) resumes past the whole group.
+    let mut seek_to = start.as_bytes().to_vec();
     if let (Some(delimiter), Some(after)) = (delimiter, after) {
         if let Some(rest) = after.strip_prefix(prefix) {
             if let Some(idx) = rest.find(delimiter) {
-                skipped_common_prefixes.insert(format!("{}{}", prefix, &rest[..idx + delimiter.len()]));
+                let group = format!("{}{}", prefix, &rest[..idx + delimiter.len()]);
+                if let Some(past) = prefix_successor(group.as_bytes()) {
+                    if past > seek_to {
+                        seek_to = past;
+                    }
+                }
             }
         }
     }
     let mut more_matching = false;
-    let iter = db.iterator_cf(&objects, IteratorMode::From(start.as_bytes(), Direction::Forward));
-    for item in iter {
-        let (key, value) = item?;
-        if after.is_some() && key.as_ref() == after_str.as_bytes() {
+    let mut it = db.raw_iterator_cf(&objects);
+    it.seek(&seek_to);
+    loop {
+        let Some(key) = it.key() else {
+            it.status()?;
+            break;
+        };
+        if after.is_some() && key == after_str.as_bytes() {
+            it.next();
             continue; // `after` is exclusive
+        }
+        if !key.starts_with(prefix.as_bytes()) {
+            break;
+        }
+        if let Some(delimiter) = delimiter {
+            let object_key = String::from_utf8_lossy(key);
+            let rest = &object_key[prefix.len()..];
+            if let Some(idx) = rest.find(delimiter) {
+                // Roll the whole group up into one common prefix: the limit is
+                // checked only for a group not yet emitted, and the scan then
+                // seeks straight past the group instead of walking its keys.
+                let common = format!("{}{}", prefix, &rest[..idx + delimiter.len()]);
+                if entries.len() + common_prefixes.len() >= max_keys {
+                    more_matching = true;
+                    break;
+                }
+                let past = prefix_successor(common.as_bytes());
+                next_after = Some(common.clone());
+                common_prefixes.push(common);
+                match past {
+                    Some(past) => it.seek(&past),
+                    None => break, // nothing sorts after the group
+                }
+                continue;
+            }
         }
         // One undecodable row (corrupt JSON, or a value stamped with a newer
         // entity version) must not blind the whole bucket's listing — skip and
         // log it rather than failing the entire request.
-        let entry = match decode_object(&key, &value) {
+        let entry = match decode_object(key, it.value().unwrap_or_default()) {
             Ok(entry) => entry,
             Err(err) => {
                 log::warn!(
                     "skipping undecodable object row during list key={} error={err}",
-                    String::from_utf8_lossy(&key)
+                    String::from_utf8_lossy(key)
                 );
+                it.next();
                 continue;
             }
         };
-        if !entry.object_key.starts_with(prefix) {
-            break;
-        }
         if entries.len() + common_prefixes.len() >= max_keys {
             more_matching = true;
             break;
         }
-        if let Some(delimiter) = delimiter {
-            let rest = &entry.object_key[prefix.len()..];
-            if let Some(idx) = rest.find(delimiter) {
-                let common = format!("{}{}", prefix, &rest[..idx + delimiter.len()]);
-                if !skipped_common_prefixes.insert(common.clone()) {
-                    next_after = Some(entry.object_key);
-                    continue;
-                }
-                if common_prefixes.last() != Some(&common) {
-                    common_prefixes.push(common);
-                }
-                next_after = Some(entry.object_key);
-                continue;
-            }
-        }
         next_after = Some(entry.object_key.clone());
         entries.push(entry);
+        it.next();
     }
 
     Ok(ListPage {
@@ -1000,6 +1064,33 @@ fn list_blocking(
         is_truncated: more_matching,
         next_after,
     })
+}
+
+/// The smallest byte string greater than every string starting with `prefix`
+/// (strip trailing `0xFF`s, then increment the last byte). `None` if no such
+/// bound exists (empty or all-`0xFF` prefix).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(&last) = bound.last() {
+        if last == 0xFF {
+            bound.pop();
+        } else {
+            *bound.last_mut().unwrap() += 1;
+            return Some(bound);
+        }
+    }
+    None
+}
+
+/// Whether two relative blob dirs name the same directory, ignoring the
+/// separator style: an index written on Windows may hold `objects\ab\…`
+/// where the scanner derives `objects/ab/…`. A plain string compare would call
+/// a live object's dir "not referenced" and let it be trashed.
+pub(crate) fn same_blob_dir(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(x, y)| x == y || (matches!(x, b'/' | b'\\') && matches!(y, b'/' | b'\\')))
 }
 
 /// Matches the legacy 4-level fanout layout `objects/xx/xx/xx/xx/…` (four
@@ -1150,7 +1241,7 @@ mod tests {
         let index = open_tmp(&tmp).await;
         put(&index, "legacy", "objects/aa/bb/cc/dd/V1_9F00", 1).await;
         put(&index, "modern", "objects/aabb/V1_9F00", 1).await;
-        let keys = index.legacy_layout_keys(100).await.unwrap();
+        let keys = index.legacy_layout_keys(None, 100).await.unwrap();
         assert_eq!(keys, vec!["legacy".to_string()]);
     }
 
@@ -1306,6 +1397,157 @@ mod tests {
         let page = index.list("a/", Some("/"), None, 2).await.unwrap();
         assert_eq!(page.common_prefixes, vec!["a/large/", "a/next/"]);
         assert!(!page.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn delimiter_listing_single_group_is_not_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        for key in ["a/b/1", "a/b/2"] {
+            put(&index, key, "d", 1).await;
+        }
+        let page = index.list("a/", Some("/"), None, 1).await.unwrap();
+        assert_eq!(page.common_prefixes, vec!["a/b/"]);
+        assert!(page.entries.is_empty());
+        assert!(!page.is_truncated, "the rest of the group is not a further page");
+        // S3 hands the common prefix itself back as NextMarker / token.
+        assert_eq!(page.next_after.as_deref(), Some("a/b/"));
+    }
+
+    /// S3's listing semantics, computed naively: every key under `prefix`,
+    /// rolled up at the first `delimiter` after it. `Ok` = key, `Err` = prefix.
+    fn reference_listing(keys: &[&str], prefix: &str, delimiter: Option<&str>) -> Vec<std::result::Result<String, String>> {
+        let mut sorted: Vec<&str> = keys.to_vec();
+        sorted.sort();
+        let mut out: Vec<std::result::Result<String, String>> = Vec::new();
+        for key in sorted.into_iter().filter(|k| k.starts_with(prefix)) {
+            let rest = &key[prefix.len()..];
+            match delimiter.and_then(|d| rest.find(d).map(|i| (d, i))) {
+                Some((d, i)) => {
+                    let common = format!("{prefix}{}", &rest[..i + d.len()]);
+                    if out.last() != Some(&Err(common.clone())) {
+                        out.push(Err(common));
+                    }
+                }
+                None => out.push(Ok(key.to_string())),
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn delimiter_pagination_matches_s3_for_every_page_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        let keys = [
+            "a", "a/", "a/0", "a/b/1", "a/b/2", "a/b/c/3", "a/b0", "a/c", "a/d/1", "a/d/2", "a/d/3", "a/e",
+            "a/f/", "a/f/x", "b/1", "b/2", "c",
+        ];
+        for key in keys {
+            put(&index, key, "d", 1).await;
+        }
+        for (prefix, delimiter) in [("", Some("/")), ("a/", Some("/")), ("a/b", Some("/")), ("a/", Some("b/")), ("a/", None)] {
+            let expected = reference_listing(&keys, prefix, delimiter);
+            for max_keys in 1..=expected.len() + 1 {
+                let mut got: Vec<std::result::Result<String, String>> = Vec::new();
+                let mut after: Option<String> = None;
+                let mut pages = 0;
+                loop {
+                    let page = index.list(prefix, delimiter, after.as_deref(), max_keys).await.unwrap();
+                    pages += 1;
+                    let count = page.entries.len() + page.common_prefixes.len();
+                    assert!(count <= max_keys);
+                    // Merge the two lists back into key order.
+                    let mut items: Vec<std::result::Result<String, String>> = page
+                        .entries
+                        .iter()
+                        .map(|e| Ok(e.object_key.clone()))
+                        .chain(page.common_prefixes.iter().cloned().map(Err))
+                        .collect();
+                    items.sort_by(|x, y| {
+                        let k = |v: &std::result::Result<String, String>| match v {
+                            Ok(s) | Err(s) => s.clone(),
+                        };
+                        k(x).cmp(&k(y))
+                    });
+                    let last = items.last().map(|v| match v {
+                        Ok(s) | Err(s) => s.clone(),
+                    });
+                    got.extend(items);
+                    if !page.is_truncated {
+                        break;
+                    }
+                    assert_eq!(count, max_keys, "a truncated page is full");
+                    assert_eq!(page.next_after, last, "cursor is the last item (key or prefix)");
+                    after = page.next_after;
+                    assert!(pages <= expected.len() + 1, "pagination did not terminate");
+                }
+                assert_eq!(got, expected, "prefix={prefix:?} delimiter={delimiter:?} max_keys={max_keys}");
+                assert_eq!(pages, expected.len().div_ceil(max_keys).max(1), "no empty trailing page");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delimiter_cursor_inside_a_group_resumes_past_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        for key in ["a/b/1", "a/b/2", "a/b/3", "a/c"] {
+            put(&index, key, "d", 1).await;
+        }
+        // A start-after / legacy token naming a key inside a rolled-up group
+        // (and the group itself, as S3's NextMarker does) skips the group.
+        for after in ["a/b/1", "a/b/3", "a/b/"] {
+            let page = index.list("a/", Some("/"), Some(after), 10).await.unwrap();
+            assert!(page.common_prefixes.is_empty(), "after={after}");
+            assert_eq!(page.entries.iter().map(|e| e.object_key.as_str()).collect::<Vec<_>>(), vec!["a/c"]);
+        }
+        // A cursor sorting just before the group still emits it.
+        let page = index.list("a/", Some("/"), Some("a/b"), 10).await.unwrap();
+        assert_eq!(page.common_prefixes, vec!["a/b/"]);
+    }
+
+    #[test]
+    fn prefix_successor_bounds_the_group() {
+        assert_eq!(prefix_successor(b"a/b/"), Some(b"a/b0".to_vec()));
+        assert_eq!(prefix_successor(&[b'a', 0xFF]), Some(b"b".to_vec()));
+        assert_eq!(prefix_successor(&[0xFF]), None);
+    }
+
+    #[test]
+    fn same_blob_dir_ignores_separator_style() {
+        assert!(same_blob_dir("objects/AB12/leaf", "objects/AB12/leaf"));
+        assert!(same_blob_dir("objects\\AB12\\leaf", "objects/AB12/leaf"));
+        assert!(!same_blob_dir("objects/AB12/leaf", "objects/AB12/leaf2"));
+        assert!(!same_blob_dir("objects/AB12/leaf", "objects/AB13/leaf"));
+    }
+
+    #[tokio::test]
+    async fn stale_intents_after_resumes_past_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            ids.push(index.insert_publish_intent(&format!("k{n}"), "d", 10).await.unwrap());
+        }
+        let first = index.stale_intents_after(100, 0, 2, None).await.unwrap();
+        assert_eq!(first.iter().map(|r| r.id).collect::<Vec<_>>(), ids[..2]);
+        let next = index.stale_intents_after(100, 0, 2, Some(ids[1])).await.unwrap();
+        assert_eq!(next.iter().map(|r| r.id).collect::<Vec<_>>(), ids[2..4]);
+        let last = index.stale_intents_after(100, 0, 2, Some(ids[4])).await.unwrap();
+        assert!(last.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_layout_keys_resumes_after_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        for key in ["a", "b", "c"] {
+            put(&index, key, &format!("objects/aa/bb/cc/dd/{key}"), 1).await;
+        }
+        assert_eq!(index.legacy_layout_keys(Some("a"), 10).await.unwrap(), vec!["b", "c"]);
+        assert_eq!(index.legacy_layout_keys(Some("b"), 1).await.unwrap(), vec!["c"]);
+        assert!(index.legacy_layout_keys(Some("c"), 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

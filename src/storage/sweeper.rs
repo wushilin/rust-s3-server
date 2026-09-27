@@ -22,6 +22,7 @@ use std::time::SystemTime;
 use tokio::task::yield_now;
 
 use super::errors::Result;
+use super::metadata::UploadMeta;
 use super::staging::epoch_ms_from_staging_id;
 use super::store::LocalObjectStore;
 
@@ -67,14 +68,19 @@ pub async fn resolve_intents_bucket(
 ) -> Result<usize> {
     let batch_size = config.intent_batch_size.max(1);
     let mut resolved = 0;
+    let mut after_id = None;
     loop {
         let outcome = store
-            .resolve_stale_intents(bucket, config.intent_grace_period_ms, batch_size)
+            .resolve_stale_intents(bucket, config.intent_grace_period_ms, batch_size, after_id)
             .await?;
         resolved += outcome.resolved;
-        if outcome.selected < batch_size || outcome.failed > 0 {
+        // Walk past failed intents with the id cursor: they are the oldest, so
+        // restarting from the front would re-select them and starve the rest.
+        // Each is retried once per pass.
+        if outcome.selected < batch_size || outcome.last_id.is_none() {
             break;
         }
+        after_id = outcome.last_id;
         yield_now().await;
     }
     Ok(resolved)
@@ -91,7 +97,7 @@ pub async fn delete_staging_bucket(
 ) -> Result<usize> {
     let mut stats = SweepStats::default();
     let bucket_dir = store.layout().bucket_dir(bucket)?;
-    sweep_staging(&bucket_dir.join("staging"), config, now_ms, &mut stats).await?;
+    sweep_staging(store, bucket, &bucket_dir.join("staging"), config, now_ms, &mut stats).await?;
     Ok(stats.staging_dirs_removed)
 }
 
@@ -110,6 +116,8 @@ pub async fn delete_trash_bucket(
 }
 
 async fn sweep_staging(
+    store: &LocalObjectStore,
+    bucket: &str,
     staging_dir: &Path,
     config: &SweepConfig,
     now_ms: i64,
@@ -149,6 +157,23 @@ async fn sweep_staging(
             });
             let staging_age = now_ms.saturating_sub(created_ms);
             if staging_age >= expiry_ms && all_files_old_enough(&path, now_ms, expiry_ms) {
+                // A multipart upload can be Completed at any moment, and
+                // Complete's renames don't bump mtimes: take the same locks
+                // Complete/Abort hold (upload lock, then the key lock), then
+                // re-check idleness under them before reaping.
+                let _locks = if kind == "multipart" {
+                    let upload_guard = store.lock_multipart_upload(bucket, name).await;
+                    let key_guard = match read_upload_key(&path).await {
+                        Some(key) => Some(store.lock_object_key(bucket, &key).await),
+                        None => None,
+                    };
+                    if !path.is_dir() || !all_files_old_enough(&path, now_ms, expiry_ms) {
+                        continue;
+                    }
+                    Some((upload_guard, key_guard))
+                } else {
+                    None
+                };
                 match tokio::fs::remove_dir_all(&path).await {
                     Ok(()) => {
                         stats.staging_dirs_removed += 1;
@@ -223,6 +248,14 @@ async fn sweep_trash(
     Ok(())
 }
 
+/// The object key a multipart upload targets, from its `upload.json`.
+async fn read_upload_key(upload_dir: &Path) -> Option<String> {
+    let bytes = tokio::fs::read(upload_dir.join("upload.json")).await.ok()?;
+    serde_json::from_slice::<UploadMeta>(&bytes)
+        .ok()
+        .map(|upload| upload.object_key)
+}
+
 fn all_files_old_enough(dir: &Path, now_ms: i64, expiry_ms: i64) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return true;
@@ -270,6 +303,50 @@ mod tests {
             staging_dirs_removed: delete_staging_bucket(store, bucket, config, now_ms).await?,
             trash_dirs_removed: delete_trash_bucket(store, bucket, config, now_ms).await?,
         })
+    }
+
+    /// Intents that fail every time sit at the front of the id order; with at
+    /// least a batch of them, the pass must still walk past to the rest.
+    #[tokio::test]
+    async fn failing_intents_do_not_starve_resolvable_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bucket").await.unwrap();
+        let index = store.index("bucket").await.unwrap();
+        let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
+        let old = now_ms() - 60_000;
+
+        // Unresolvable: a blob sits at the path, but trash is a plain file so
+        // the move to trash fails every time.
+        let trash = store.layout().trash_dir("bucket").unwrap();
+        let _ = std::fs::remove_dir_all(&trash);
+        std::fs::write(&trash, b"not a dir").unwrap();
+        let mut stuck = Vec::new();
+        for n in 0..5 {
+            let rel = format!("objects/ZZ0{n}/stuck");
+            std::fs::create_dir_all(bucket_dir.join(&rel)).unwrap();
+            std::fs::write(bucket_dir.join(&rel).join("meta.json"), b"{}").unwrap();
+            stuck.push(index.insert_publish_intent(&format!("stuck{n}"), &rel, old).await.unwrap());
+        }
+        // Resolvable: nothing at the recorded path.
+        for n in 0..3 {
+            index
+                .insert_publish_intent(&format!("gone{n}"), &format!("objects/ZZ9{n}/gone"), old)
+                .await
+                .unwrap();
+        }
+
+        let config = SweepConfig {
+            intent_batch_size: 2,
+            intent_grace_period_ms: 1,
+            ..SweepConfig::default()
+        };
+        assert_eq!(resolve_intents_bucket(&store, "bucket", &config).await.unwrap(), 3);
+        let left = index.stale_intents(now_ms(), 0, 100).await.unwrap();
+        assert_eq!(left.iter().map(|r| r.id).collect::<Vec<_>>(), stuck);
+        assert!(left.iter().all(|r| r.attempts == 1), "each failure retried once per pass");
+        // The startup drain walks past them too, and terminates.
+        assert_eq!(store.drain_intents("bucket").await.unwrap(), 0);
     }
 
     #[tokio::test]

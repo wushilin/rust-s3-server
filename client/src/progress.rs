@@ -121,10 +121,27 @@ pub(crate) use ui_eprintln;
 /// zero-match notice).
 macro_rules! ui_println {
     ($($arg:tt)*) => {
-        $crate::progress::suspend_bars(|| println!($($arg)*))
+        $crate::progress::suspend_bars(|| $crate::progress::stdout_line(&format!($($arg)*)))
     };
 }
 pub(crate) use ui_println;
+
+/// `println!` without its panic on a closed stdout. When the reader has
+/// gone away (`rs3 ls -r x | head`), there is nobody left to tell anything
+/// to, so -- like `cat`'s EPIPE handling ([SEM] §12) -- exit quietly with
+/// success instead of dying with "failed printing to stdout: Broken pipe".
+pub(crate) fn stdout_line(line: &str) {
+    use std::io::Write;
+    let result = {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{line}").and_then(|()| out.flush())
+    };
+    match result {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => panic!("failed printing to stdout: {e}"),
+    }
+}
 
 /// Classic-terminal fallback lane count when the terminal's row count can't
 /// be detected (e.g. a hidden test target, or a genuinely weird TTY).
@@ -568,7 +585,7 @@ pub(crate) fn simple_progress_eof() {
     let mut eof = lock_simple_out();
     if !*eof {
         *eof = true;
-        println!("EOF");
+        stdout_line("EOF");
     }
 }
 
@@ -976,8 +993,7 @@ impl ProgressUi {
                     watch,
                 }),
                 bars_id,
-                simple: simple
-                    .then(|| (Instant::now(), std::sync::atomic::AtomicBool::new(false))),
+                simple: simple.then(|| (Instant::now(), std::sync::atomic::AtomicBool::new(false))),
             }),
         };
         ui.spawn_stall_ticker();
@@ -1026,7 +1042,7 @@ impl ProgressUi {
             started.elapsed(),
             finished,
         );
-        println!("{line}");
+        stdout_line(&line);
     }
 
     /// Starts the thread that keeps a stalled task's row honest.

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use aws_config::{BehaviorVersion, Region};
@@ -99,12 +99,21 @@ pub(crate) fn env_alias(name: &str) -> Option<Alias> {
         .ok()?;
     let value = value.trim_end_matches('/');
     let (scheme, rest) = value.split_once("://")?;
-    let (access_key, rest) = rest.split_once(':')?;
-    let (secret_key, host) = rest.split_once('@')?;
+    // The host never contains `@`, but a secret key may: split the
+    // userinfo off at the *last* `@`, then access/secret at the first `:`,
+    // and percent-decode both (mc parses this with Go's `url.Parse`).
+    let (userinfo, host) = rest.rsplit_once('@')?;
+    let (access_key, secret_key) = userinfo.split_once(':')?;
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8()
+            .map(|c| c.into_owned())
+            .ok()
+    };
     Some(Alias {
         url: format!("{scheme}://{host}"),
-        access_key: access_key.into(),
-        secret_key: secret_key.into(),
+        access_key: decode(access_key)?,
+        secret_key: decode(secret_key)?,
         api: default_api(),
         path: default_path(),
         extra: BTreeMap::new(),
@@ -112,6 +121,19 @@ pub(crate) fn env_alias(name: &str) -> Option<Alias> {
             .ok()
             .or_else(|| std::env::var("AWS_REGION").ok()),
     })
+}
+
+/// Whether `name` is a configured alias (config file or `MC_HOST_*` /
+/// `RS3_HOST_*`). An unreadable config answers `true`, so the operand keeps
+/// its alias meaning and the real config error surfaces when it is used.
+pub(crate) async fn alias_is_configured(name: &str) -> bool {
+    if env_alias(name).is_some() {
+        return true;
+    }
+    match load_config().await {
+        Ok(cfg) => cfg.aliases.contains_key(name),
+        Err(_) => true,
+    }
 }
 
 pub(crate) async fn load_config() -> Result<McConfig> {
@@ -129,8 +151,67 @@ pub(crate) async fn save_config(cfg: &McConfig) -> Result<()> {
         fs::create_dir_all(parent).await?;
     }
     let data = serde_json::to_vec_pretty(cfg)?;
-    fs::write(path, data).await?;
-    Ok(())
+    write_private_file(&path, &data).await
+}
+
+/// Atomically replaces `path` with `data`, readable by the owner only:
+/// the bytes go to a mode-0600 temp file in the same directory, are
+/// fsynced, and are then renamed over `path`. The file holds secret keys
+/// (config) or live presigned credentials (share DB), so it must never be
+/// world-readable -- not even briefly -- and a crash mid-write must never
+/// leave a truncated file behind.
+pub(crate) async fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
+    let path = path.to_path_buf();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || write_private_file_sync(&path, &data)).await?
+}
+
+fn write_private_file_sync(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("invalid file path `{}`", path.display()))?
+        .to_string_lossy();
+    let mut attempt = 0u32;
+    let (tmp, mut file) = loop {
+        let tmp = dir.join(format!(".{name}.tmp-{}-{attempt}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e).with_context(|| format!("create {}", tmp.display())),
+        }
+    };
+    let result = (|| -> Result<()> {
+        #[cfg(unix)]
+        {
+            // `mode` is filtered through the umask; force 0600 exactly.
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("write {}", path.display()))
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {
@@ -206,5 +287,42 @@ mod tests {
             !out.contains("\"region\""),
             "region must be omitted when None: {out}"
         );
+    }
+
+    #[test]
+    fn env_alias_splits_at_last_at_and_percent_decodes() {
+        // SAFETY: test-only env mutation with a unique variable name.
+        unsafe {
+            std::env::set_var(
+                "MC_HOST_RS3TESTATSIGN",
+                "https://AK%2Fx:se@cr%3Aet@example.com:9000",
+            );
+        }
+        let alias = env_alias("rs3testatsign").unwrap();
+        assert_eq!(alias.url, "https://example.com:9000");
+        assert_eq!(alias.access_key, "AK/x");
+        assert_eq!(alias.secret_key, "se@cr:et");
+    }
+
+    #[test]
+    fn write_private_file_is_owner_only_and_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        write_private_file_sync(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(leftovers.len(), 1, "no temp files left behind");
     }
 }

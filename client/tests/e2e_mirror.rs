@@ -65,7 +65,11 @@ fn mirror_never_uploads_download_staging() {
     server.rs3_ok(&["mb", "test/mbscr"]);
     let src = server.dir.path().join("srcstaging");
     write(&src, "real.txt", b"real");
-    write(&src, "notes.rs3.part", b"a real file that looks like scratch");
+    write(
+        &src,
+        "notes.rs3.part",
+        b"a real file that looks like scratch",
+    );
     write(&src, "__rs3_staging_1234_abc_0/big.bin", b"half a download");
     write(&src, "sub/__rs3_staging_9_def_1/other.bin", b"another");
 

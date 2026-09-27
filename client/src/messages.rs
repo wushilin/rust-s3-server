@@ -589,7 +589,8 @@ pub(crate) struct ShareMessage {
 /// plural ("1 seconds", not "1 second") -- ground-truth confirmed, not a
 /// rs3 simplification.
 fn humanize_expiry(time_left_ns: i64) -> String {
-    let total_seconds = time_left_ns / 1_000_000_000;
+    // An already-expired share never renders a negative duration.
+    let total_seconds = time_left_ns.max(0) / 1_000_000_000;
     let days = total_seconds / 86400;
     let hours = (total_seconds % 86400) / 3600;
     let minutes = (total_seconds % 3600) / 60;
@@ -926,6 +927,8 @@ mod tests {
         assert_eq!(humanize_expiry(1_800_000_000_000), "30 minutes 0 seconds");
         assert_eq!(humanize_expiry(90_000_000_000), "1 minutes 30 seconds");
         assert_eq!(humanize_expiry(1_000_000_000), "1 seconds");
+        assert_eq!(humanize_expiry(-90_000_000_000), "0 seconds");
+        assert_eq!(humanize_expiry(i64::MIN), "0 seconds");
         assert_eq!(
             humanize_expiry(3_661_000_000_000),
             "1 hours 1 minutes 1 seconds"

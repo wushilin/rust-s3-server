@@ -53,7 +53,9 @@ pub(crate) fn parse_size(input: &str) -> Result<u64> {
         "g" | "gb" | "gib" => 1024 * 1024 * 1024,
         _ => return Err(anyhow!("unsupported size unit `{}`", &s[split..])),
     };
-    let result = number * multiplier;
+    let result = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("size `{s}` is too large"))?;
     if result == 0 {
         return Err(anyhow!("size must be greater than zero"));
     }
@@ -110,5 +112,11 @@ mod tests {
     #[test]
     fn parse_size_rejects_zero_with_unit() {
         assert!(parse_size("0MiB").is_err());
+    }
+
+    #[test]
+    fn parse_size_rejects_overflow() {
+        assert!(parse_size("18446744073709551615GiB").is_err());
+        assert!(parse_size("17179869184GiB").is_err());
     }
 }

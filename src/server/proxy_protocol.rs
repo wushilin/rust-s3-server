@@ -238,10 +238,27 @@ async fn read_header(stream: &mut TcpStream) -> io::Result<Option<Source>> {
 
 /// Resolves the address to serve `stream` as, consuming its PROXY header.
 async fn client_addr(stream: &mut TcpStream, peer: SocketAddr, mode: ProxyProtocolMode) -> io::Result<SocketAddr> {
+    client_addr_within(stream, peer, mode, HEADER_TIMEOUT * 2).await
+}
+
+/// [`client_addr`] with the header deadline as a parameter. The deadline
+/// starts at the connection's first byte, not at accept: a client may open a
+/// connection and leave it idle (a pooled keep-alive connection that has not
+/// been used yet) for as long as HTTP's own idle handling allows, exactly as
+/// with the PROXY protocol switched off.
+async fn client_addr_within(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    mode: ProxyProtocolMode,
+    limit: Duration,
+) -> io::Result<SocketAddr> {
     if mode == ProxyProtocolMode::Off {
         return Ok(peer);
     }
-    let header = tokio::time::timeout(HEADER_TIMEOUT * 2, read_header(stream))
+    // Waits for the first byte (or EOF) for as long as it takes.
+    let mut first = [0u8; 1];
+    stream.peek(&mut first).await?;
+    let header = tokio::time::timeout(limit, read_header(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "PROXY header was not completed in time"))??;
     effective_addr(peer, header)
@@ -588,6 +605,26 @@ mod tests {
         // An idle keep-alive connection does not hold shutdown up.
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), task).await.expect("server drains").unwrap().unwrap();
+    }
+
+    // The header deadline must not count the time before the first byte: an
+    // idle-but-open connection is not a slow PROXY header.
+    #[tokio::test]
+    async fn header_deadline_starts_at_the_first_byte() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(bound).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            stream.write_all(b"PROXY TCP4 203.0.113.7 10.0.0.1 56324 443\r\n").await.unwrap();
+            stream
+        });
+        let (mut stream, peer) = listener.accept().await.unwrap();
+        let resolved = client_addr_within(&mut stream, peer, ProxyProtocolMode::Auto, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert_eq!(resolved, addr("203.0.113.7:56324"));
+        drop(client.await.unwrap());
     }
 
     #[tokio::test]

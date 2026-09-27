@@ -160,8 +160,57 @@
     fn delete_xml_entities_are_decoded_exactly_once() {
         let (keys, _) = parse_delete_objects_xml(
             "<Delete><Object><Key>&amp;lt;</Key></Object></Delete>",
-        );
+        )
+        .unwrap();
         assert_eq!(keys, vec!["&lt;"]);
+    }
+
+    #[test]
+    fn delete_xml_keeps_key_whitespace_and_decodes_numeric_refs() {
+        let (keys, quiet) = parse_delete_objects_xml(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Quiet> true </Quiet>
+  <Object><Key>report </Key></Object>
+  <Object><Key> a&#10;b&#x41;&#X42;</Key><VersionId>null</VersionId></Object>
+  <!-- comment <Object><Key>no</Key></Object> -->
+  <Object><Key><![CDATA[x</Key>&amp;]]></Key></Object>
+  <Object><Key>&unknown; & &#xZZ;</Key></Object>
+</Delete>"#,
+        )
+        .unwrap();
+        assert!(quiet);
+        assert_eq!(
+            keys,
+            vec!["report ", " a\nbAB", "x</Key>&amp;", "&unknown; & &#xZZ;"]
+        );
+    }
+
+    #[test]
+    fn delete_xml_rejects_malformed_and_oversized_requests() {
+        assert!(parse_delete_objects_xml("<Delete><Object><Key>a</Key></Delete>").is_err());
+        assert!(parse_delete_objects_xml("<Delete></Delete>").is_err());
+        assert!(parse_delete_objects_xml(
+            "<!DOCTYPE d [<!ENTITY x \"y\">]><Delete><Object><Key>&x;</Key></Object></Delete>"
+        )
+        .is_err());
+        let body = |n: usize| {
+            format!(
+                "<Delete>{}</Delete>",
+                "<Object><Key>k</Key></Object>".repeat(n)
+            )
+        };
+        assert_eq!(parse_delete_objects_xml(&body(1000)).unwrap().0.len(), 1000);
+        assert!(parse_delete_objects_xml(&body(1001)).is_err());
+    }
+
+    #[test]
+    fn complete_parts_xml_accepts_hex_entity_etags() {
+        let parts = parse_complete_parts_xml(
+            r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&#x22;abc&#x22;</ETag></Part></CompleteMultipartUpload>"#,
+        )
+        .unwrap();
+        assert_eq!(parts[0].etag, "abc");
     }
 
         

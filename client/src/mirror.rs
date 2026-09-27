@@ -89,18 +89,73 @@ pub(crate) async fn collect_local_entries(
     scan: &crate::progress::ProgressNotifier,
     reclaim: bool,
 ) -> Result<Vec<Entry>> {
+    Ok(collect_local_tree(root, scan, reclaim).await?.entries)
+}
+
+/// What a local walk found: the files, plus the relative names it saw but
+/// could not resolve (broken symlinks). Those names exist on the source side
+/// even though they cannot be copied, so a `--remove` must never treat their
+/// remote twins as extraneous.
+#[derive(Debug, Default)]
+pub(crate) struct LocalTree {
+    pub entries: Vec<Entry>,
+    pub unresolved: Vec<String>,
+}
+
+/// [`collect_local_entries`], also reporting unresolvable names.
+///
+/// Symlinks are followed, like mc: a link to a file is mirrored as that
+/// file, a link to a directory is walked. `DirEntry::metadata` does not
+/// follow links, and treating a link as neither file nor directory used to
+/// drop it silently -- after which `mirror --remove` deleted its remote copy.
+/// A directory link that resolves to one of its own ancestors is a loop and
+/// is skipped with a warning.
+pub(crate) async fn collect_local_tree(
+    root: &Path,
+    scan: &crate::progress::ProgressNotifier,
+    reclaim: bool,
+) -> Result<LocalTree> {
     use std::collections::VecDeque;
+    use std::sync::Arc;
     let mut entries = Vec::new();
-    let mut dirs = VecDeque::from([root.to_path_buf()]);
+    let mut unresolved = Vec::new();
+    let rel_of = |path: &Path| -> Result<String> {
+        Ok(path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/"))
+    };
+    // Each queued directory carries the canonical paths of itself and every
+    // ancestor on the walk that reached it -- the set a symlink must not
+    // point back into.
+    let root_canon = tokio::fs::canonicalize(root)
+        .await
+        .unwrap_or_else(|_| root.to_path_buf());
+    let mut dirs: VecDeque<(std::path::PathBuf, Arc<Vec<std::path::PathBuf>>)> =
+        VecDeque::from([(root.to_path_buf(), Arc::new(vec![root_canon]))]);
     let mut discovered = 1u64;
     scan.set_total(discovered);
-    while let Some(dir) = dirs.pop_front() {
+    while let Some((dir, ancestors)) = dirs.pop_front() {
         let mut rd = tokio::fs::read_dir(&dir)
             .await
             .with_context(|| format!("read {}", dir.display()))?;
         while let Some(item) = rd.next_entry().await? {
             let path = item.path();
-            let meta = item.metadata().await?;
+            let is_link = item.file_type().await?.is_symlink();
+            let meta = match is_link {
+                false => item.metadata().await?,
+                true => match tokio::fs::metadata(&path).await {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        ui_eprintln!(
+                            "rs3: warning: skipping broken symlink `{}`: {err}",
+                            path.display()
+                        );
+                        unresolved.push(rel_of(&path)?);
+                        continue;
+                    }
+                },
+            };
             if meta.is_dir() {
                 // rs3's own download staging is not content, and never
                 // descended into -- see `is_staging_dir_name`. A walk that
@@ -116,14 +171,41 @@ pub(crate) async fn collect_local_entries(
                     }
                     continue;
                 }
-                dirs.push_back(path);
+                let canon = match is_link {
+                    // A plain directory's name is not a link, so its
+                    // canonical path is its parent's plus that name.
+                    false => ancestors
+                        .last()
+                        .map(|p| p.join(&name))
+                        .unwrap_or(path.clone()),
+                    true => match tokio::fs::canonicalize(&path).await {
+                        Ok(canon) => canon,
+                        Err(err) => {
+                            ui_eprintln!(
+                                "rs3: warning: skipping unresolvable symlink `{}`: {err}",
+                                path.display()
+                            );
+                            unresolved.push(rel_of(&path)?);
+                            continue;
+                        }
+                    },
+                };
+                if ancestors.contains(&canon) {
+                    ui_eprintln!(
+                        "rs3: warning: skipping symlink loop `{}` -> `{}`",
+                        path.display(),
+                        canon.display()
+                    );
+                    continue;
+                }
+                let mut chain = Vec::with_capacity(ancestors.len() + 1);
+                chain.extend(ancestors.iter().cloned());
+                chain.push(canon);
+                dirs.push_back((path, Arc::new(chain)));
                 discovered += 1;
                 scan.set_total(discovered);
             } else if meta.is_file() {
-                let rel = path
-                    .strip_prefix(root)?
-                    .to_string_lossy()
-                    .replace(std::path::MAIN_SEPARATOR, "/");
+                let rel = rel_of(&path)?;
                 entries.push(Entry {
                     etag: None,
                     rel,
@@ -136,7 +218,27 @@ pub(crate) async fn collect_local_entries(
         scan.set_detail(format!("{} files", entries.len()));
     }
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(entries)
+    Ok(LocalTree {
+        entries,
+        unresolved,
+    })
+}
+
+/// Drops planned deletes that an unresolvable source name still accounts
+/// for. A broken link may have been a file or a directory, so both the name
+/// itself and everything under it are kept.
+fn protect_unresolved(deletes: &mut Vec<String>, unresolved: &[String]) {
+    if unresolved.is_empty() {
+        return;
+    }
+    deletes.retain(|rel| {
+        !unresolved.iter().any(|name| {
+            rel == name
+                || rel
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    });
 }
 
 pub(crate) async fn collect_s3_entries(
@@ -201,7 +303,13 @@ pub(crate) enum Side {
 
 pub(crate) async fn resolve_side(spec: &str) -> Result<Side> {
     let path = Path::new(spec);
-    if path.exists() || !crate::urls::is_s3_url(spec) {
+    // A relative local path such as `out/x` also parses as ALIAS/BUCKET, so
+    // it is S3 only when its first segment names a configured alias.
+    let alias = spec.split('/').next().unwrap_or_default();
+    if path.exists()
+        || !crate::urls::is_s3_url(spec)
+        || !crate::config::alias_is_configured(alias).await
+    {
         return Ok(Side::Local(path.to_path_buf()));
     }
     let url = crate::urls::parse_s3_url(spec)?;
@@ -275,6 +383,7 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         )),
         None => crate::progress::ProgressNotifier::noop(),
     };
+    let mut source_unresolved: Vec<String> = Vec::new();
     let source_entries = match &source {
         Side::Local(root) => {
             if !root.is_dir() {
@@ -284,9 +393,10 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
                 ));
             }
             let scan = scan_task(root);
-            let entries = collect_local_entries(root, &scan, true).await?;
+            let tree = collect_local_tree(root, &scan, true).await?;
             scan.finish();
-            entries
+            source_unresolved = tree.unresolved;
+            tree.entries
         }
         Side::S3 {
             client,
@@ -328,6 +438,9 @@ pub(crate) async fn run_mirror(args: &crate::MirrorArgs) -> Result<()> {
         args.overwrite,
         args.remove,
     );
+    // A source name that exists but could not be read (a broken symlink) is
+    // not evidence that its target twin is extraneous.
+    protect_unresolved(&mut plan.deletes, &source_unresolved);
     if args.older_than.is_some() || args.newer_than.is_some() {
         let mut kept = Vec::with_capacity(plan.copies.len());
         for entry in plan.copies {
@@ -676,7 +789,9 @@ async fn copy_entry(
             Side::Local(dst_root),
         ) => {
             let key = s3_key(prefix, &entry.rel);
-            let output = dst_root.join(&entry.rel);
+            // The key is attacker-controllable; never let it climb out of
+            // the destination directory.
+            let output = dst_root.join(crate::transfer::safe_relative_path(&entry.rel)?);
             crate::transfer::download_key_to_path(
                 client,
                 bucket,
@@ -805,6 +920,49 @@ mod tests {
         let src = [entry("a", 5, Some(100))];
         let dst = [entry("a", 5, Some(200))];
         assert_eq!(plan_mirror(&src, &dst, true, false).copies.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_source_names_are_never_deleted() {
+        let mut deletes = vec![
+            "link".to_string(),
+            "link/inner.txt".to_string(),
+            "linkage.txt".to_string(),
+            "stale".to_string(),
+        ];
+        protect_unresolved(&mut deletes, &["link".to_string()]);
+        assert_eq!(
+            deletes,
+            vec!["linkage.txt".to_string(), "stale".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_walk_follows_symlinks_and_survives_loops() {
+        let tmp = std::env::temp_dir().join(format!("rs3-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let outside = tmp.join("outside");
+        let root = tmp.join("root");
+        std::fs::create_dir_all(outside.join("d")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(outside.join("f.txt"), b"file").unwrap();
+        std::fs::write(outside.join("d/g.txt"), b"in dir").unwrap();
+        std::fs::write(root.join("plain.txt"), b"p").unwrap();
+        std::os::unix::fs::symlink(outside.join("f.txt"), root.join("flink")).unwrap();
+        std::os::unix::fs::symlink(outside.join("d"), root.join("dlink")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("nowhere"), root.join("broken")).unwrap();
+        // A loop back to the root.
+        std::os::unix::fs::symlink(&root, root.join("sub/up")).unwrap();
+
+        let tree = collect_local_tree(&root, &crate::progress::ProgressNotifier::noop(), false)
+            .await
+            .unwrap();
+        let rels: Vec<&str> = tree.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, vec!["dlink/g.txt", "flink", "plain.txt"]);
+        assert_eq!(tree.entries[1].size, 4);
+        assert_eq!(tree.unresolved, vec!["broken".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

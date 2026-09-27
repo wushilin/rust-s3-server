@@ -38,6 +38,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     // Conditional request checks. Per RFC 7232 the precedence is:
     //   1. If-Match             -> 412 when it does not match
     //   2. If-Unmodified-Since  -> 412 when the object was modified after
+    //                              (ignored if If-Match present, RFC 7232 §6)
     //   3. If-None-Match        -> 304 when it matches
     //   4. If-Modified-Since    -> 304 when not modified (ignored if If-None-Match present)
     let etag_quoted = quote_etag(&object.meta.etag);
@@ -61,9 +62,14 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         }
     }
 
-    // 2. If-Unmodified-Since: 412 if the object was modified after the given date.
+    // 2. If-Unmodified-Since: 412 if the object was modified after the given
+    // date -- only consulted when If-Match is absent. When both are sent and
+    // If-Match holds, the ETag is the stronger validator and S3 serves the
+    // object even though the date check alone would fail.
+    let has_if_match = headers.contains_key(header::IF_MATCH);
     if let Some(ius) = headers
         .get(header::IF_UNMODIFIED_SINCE)
+        .filter(|_| !has_if_match)
         .and_then(|v| v.to_str().ok())
     {
         if let Some(since_ms) = parse_http_date_ms(ius) {
@@ -230,11 +236,41 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         },
     };
 
+    // `response-*` overrides arrive percent-decoded from the query string and
+    // may hold bytes no header value can carry (CR, LF, NUL, ...). Validate
+    // every one up front: an invalid one is the caller's mistake (400), and
+    // letting it reach the response builder would make the build fail.
+    let mut overrides: Vec<(HeaderName, HeaderValue)> = Vec::new();
+    for (param, name) in [
+        ("response-content-type", header::CONTENT_TYPE),
+        ("response-content-language", header::CONTENT_LANGUAGE),
+        ("response-cache-control", header::CACHE_CONTROL),
+        ("response-content-disposition", header::CONTENT_DISPOSITION),
+        ("response-content-encoding", header::CONTENT_ENCODING),
+        ("response-expires", header::EXPIRES),
+    ] {
+        let Some(raw) = query.get(param) else {
+            continue;
+        };
+        match HeaderValue::from_str(raw) {
+            Ok(value) => overrides.push((name, value)),
+            Err(_) => {
+                return srv::s3_error_detailed(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Header value cannot be represented using ISO-8859-1.",
+                    &format!("/{bucket}/{key}"),
+                    vec![
+                        ("ArgumentName".to_string(), param.to_string()),
+                        ("ArgumentValue".to_string(), raw.to_string()),
+                    ],
+                )
+            }
+        }
+    }
+
     let etag = etag_quoted;
-    let content_type = query
-        .get("response-content-type")
-        .cloned()
-        .unwrap_or_else(|| object.meta.content_type.clone());
+    let content_type = object.meta.content_type.clone();
     let content_encoding = object.meta.content_encoding.clone();
     let content_language = object.meta.content_language.clone();
     let storage_class = object.meta.storage_class.clone();
@@ -260,24 +296,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     if let Some(content_language) = content_language {
         builder = builder.header(header::CONTENT_LANGUAGE, content_language);
     }
-    if let Some(value) = query.get("response-content-language") {
-        builder = builder.header(header::CONTENT_LANGUAGE, value);
-    }
-    if let Some(value) = query.get("response-cache-control") {
-        builder = builder.header(header::CACHE_CONTROL, value);
-    }
-    if let Some(value) = query.get("response-content-disposition") {
-        builder = builder.header(header::CONTENT_DISPOSITION, value);
-    }
-    if let Some(value) = query.get("response-content-encoding") {
-        builder = builder.header(header::CONTENT_ENCODING, value);
-    }
-    if let Some(value) = query.get("response-expires") {
-        builder = builder.header(header::EXPIRES, value);
-    }
     for (key, value) in user_meta {
-        if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{key}").as_bytes()) {
-            builder = builder.header(header_name, value);
+        if let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::from_bytes(format!("x-amz-meta-{key}").as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            builder = builder.header(header_name, header_value);
         }
     }
     if let Some(cr) = content_range {
@@ -305,7 +329,23 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             Err(err) => return srv::storage_error_response(err, &format!("/{bucket}/{key}")),
         }
     };
-    builder.body(body).unwrap()
+    let mut resp = match builder.body(body) {
+        Ok(resp) => resp,
+        Err(_) => {
+            return srv::s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "We encountered an internal error. Please try again.",
+                &format!("/{bucket}/{key}"),
+            )
+        }
+    };
+    // Overrides replace the stored values (`insert`, not `append`), so a
+    // `response-content-type` never leaves the stored type alongside it.
+    for (name, value) in overrides {
+        resp.headers_mut().insert(name, value);
+    }
+    resp
 }
 
 /// The byte span one `partNumber` resolves to.

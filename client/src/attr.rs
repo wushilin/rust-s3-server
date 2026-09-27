@@ -176,7 +176,7 @@ fn parse_sec_nsec(v: &str) -> Option<std::time::SystemTime> {
     if sec >= 0 {
         base.checked_add(std::time::Duration::new(sec as u64, nsec))
     } else {
-        base.checked_sub(std::time::Duration::new((-sec) as u64, 0))
+        base.checked_sub(std::time::Duration::new(sec.unsigned_abs(), 0))
             .and_then(|t| t.checked_add(std::time::Duration::new(0, nsec)))
     }
 }
@@ -189,7 +189,8 @@ fn parse_sec_nsec(v: &str) -> Option<std::time::SystemTime> {
 /// default to "leave unchanged" on parse failure, and mc's own
 /// `probe.Error` from these calls is logged, not fatal, at the call site).
 ///
-/// Order matters: atime/mtime are applied *before* mode. Setting times
+/// Order matters: atime/mtime are applied *before* mode, and uid/gid
+/// (chown) before mode too, since chown clears setuid/setgid. Setting times
 /// needs the file opened `write(true)`, and a preserved read-only mode
 /// (e.g. `0o444`) would make that open fail (`EACCES`) if mode were
 /// applied first -- silently dropping the timestamp restore along with it,
@@ -230,14 +231,16 @@ pub(crate) fn apply_fs_attrs(path: &std::path::Path, encoded: &str) -> Result<()
         let _ = file.set_times(times);
     }
 
-    if let Some(mode) = fields.get("mode").and_then(|v| parse_uint_auto(v)) {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
-    }
-
+    // chown before chmod: a successful chown clears the setuid/setgid bits,
+    // so chmod-ing first would silently strip them from the restored mode.
     let uid = fields.get("uid").and_then(|v| v.parse::<u32>().ok());
     let gid = fields.get("gid").and_then(|v| v.parse::<u32>().ok());
     if uid.is_some() || gid.is_some() {
         let _ = std::os::unix::fs::chown(path, uid, gid);
+    }
+
+    if let Some(mode) = fields.get("mode").and_then(|v| parse_uint_auto(v)) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
     }
 
     Ok(())
@@ -417,5 +420,27 @@ mod tests {
             pinned,
             "mtime must be restored even though the encoded mode is read-only"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn negative_min_timestamp_does_not_overflow() {
+        // Must not panic (overflowed `-sec` before); the result is platform-dependent.
+        let _ = parse_sec_nsec(&i64::MIN.to_string());
+        assert!(parse_sec_nsec("-1").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setuid_mode_survives_chown() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let encoded = format!("mode:{}/uid:{}/gid:{}", 0o104755, meta.uid(), meta.gid());
+        apply_fs_attrs(&path, &encoded).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o4755, "setuid must survive: {mode:o}");
     }
 }

@@ -161,3 +161,79 @@ fn share_list_unknown_kind_is_rejected() {
     let out = server.rs3(&["share", "list", "bogus"]);
     assert!(!out.status.success(), "only upload|download are valid");
 }
+
+#[test]
+fn share_download_saves_db_even_when_a_later_target_fails() {
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/she"]);
+    let src = server.dir.path().join("ok.txt");
+    std::fs::write(&src, b"x").unwrap();
+    server.rs3_ok(&["put", src.to_str().unwrap(), "test/she/ok.txt"]);
+    let out = server.rs3(&[
+        "share",
+        "download",
+        "test/she/ok.txt",
+        "test/she/missing.txt",
+    ]);
+    assert!(!out.status.success(), "second target must fail");
+    let list = server.rs3_ok(&["share", "list", "download"]);
+    assert!(
+        list.contains("ok.txt"),
+        "first share must be persisted: {list}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn share_db_is_forced_to_0600_even_if_it_existed() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = TestServer::start();
+    server.rs3_ok(&["mb", "test/shf"]);
+    let share_dir = server.dir.path().join("mc-config").join("share");
+    std::fs::create_dir_all(&share_dir).unwrap();
+    let db = share_dir.join("uploads.json");
+    std::fs::write(&db, b"").unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+    server.rs3_ok(&["share", "upload", "test/shf/up.bin"]);
+    let mode = std::fs::metadata(&db).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+}
+
+#[test]
+fn share_list_prunes_expired_entries() {
+    let server = TestServer::start();
+    let share_dir = server.dir.path().join("mc-config").join("share");
+    std::fs::create_dir_all(&share_dir).unwrap();
+    let db = share_dir.join("downloads.json");
+    let live = chrono_like_now();
+    std::fs::write(
+        &db,
+        format!(
+            r#"{{"entries":[
+                {{"url":"http://h/b/expired.txt","share":"http://x","date":"2020-01-01T00:00:00Z","expiry_ns":1000000000}},
+                {{"url":"http://h/b/live.txt","share":"http://y","date":"{live}","expiry_ns":604800000000000}}
+            ]}}"#
+        ),
+    )
+    .unwrap();
+    let out = server.rs3_ok(&["share", "list", "download"]);
+    assert!(!out.contains("expired.txt"), "expired entry listed: {out}");
+    assert!(out.contains("live.txt"), "live entry missing: {out}");
+    assert!(!out.contains("Expire: -"), "no negative durations: {out}");
+    let saved = std::fs::read_to_string(&db).unwrap();
+    assert!(
+        !saved.contains("expired.txt"),
+        "expired entry must be pruned from the DB"
+    );
+    assert!(saved.contains("live.txt"));
+}
+
+fn chrono_like_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    chrono::DateTime::from_timestamp(secs, 0)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
