@@ -311,6 +311,25 @@ batch/grace settings.
 
 </details>
 
+<details>
+<summary><strong>Changelog, webhooks and replication</strong></summary>
+
+| Field | Default | Description |
+|---|---:|---|
+| `changelog.retention_days` | `14` | Changelog entries older than this are trimmed, whether or not every subscription has read them. |
+| `changelog.trim_interval_secs` | `600` | How often the trim runs. |
+| `webhooks.check_interval_secs` | `5` | Checker tick: muted webhooks whose mute has passed resume on the next tick. |
+| `webhooks.mute_secs` | `30` | Mute after any unsuccessful delivery (per-webhook override). A longer `Retry-After` wins. |
+| `webhooks.max_mute_secs` | `900` | Cap on a receiver's `Retry-After`. |
+| `webhooks.request_timeout_secs` | `10` | Per-delivery HTTP timeout. |
+| `webhooks.max_concurrent_deliveries` | `16` | Deliveries in flight across all webhooks (each webhook has at most one). |
+| `webhooks.batch_max_events` | `500` | Events per batch (per-subscription override). |
+| `webhooks.batch_max_bytes` | `1048576` | Approximate bytes per batch (per-subscription override). |
+| `webhooks.allow_http` | `false` | Allow plain `http://` webhook URLs. |
+| `webhooks.allow_private_addresses` | `false` | Allow webhook URLs resolving to loopback / private / link-local addresses (SSRF guard). |
+
+</details>
+
 ## CLI
 
 ```text
@@ -451,6 +470,113 @@ password to bootstrap administration. The console supports:
 
 Share links carry the creator's current authority — deleting the user or
 narrowing their policy revokes or narrows existing links.
+
+## Changelog, webhooks and replication
+
+Every bucket keeps a **changelog**: each committed PUT, copy, multipart
+completion and delete is recorded, in the same atomic write as the change
+itself, with a per-bucket sequence number (`seq`). Sequence numbers increase
+strictly but are not contiguous. Entries are kept for
+`changelog.retention_days` (14 by default).
+
+Admins subscribe to a bucket's changelog in the console (**Webhooks &
+Replication**), in one of two ways:
+
+- **Webhook**: the server POSTs batches to a URL.
+- **Replication token**: a replicator pulls batches from the S3 port.
+
+Each subscription keeps its own position, can filter by key prefix, key suffix
+and operation, and can optionally start with a **snapshot** of the objects
+already in the bucket before switching to live changes.
+
+### Batch format
+
+Webhooks receive this as the POST body. Pull responses add an `ack` field.
+
+```json
+{
+  "subscription": "wh_3f2a…", "bucket": "photos",
+  "phase": "live", "from_seq": 101, "to_seq": 250,
+  "snapshot_begin": false, "snapshot_end": false,
+  "events": [
+    {"seq": 117, "op": "put", "key": "2026/a.jpg", "etag": "9b2c…", "size": 482113,
+     "last_modified_ms": 1791800000123, "version": "V1A9F3K2_7Q1M",
+     "origin": "client", "ts_ms": 1791800000130}
+  ]
+}
+```
+
+- `version` identifies the exact object state. It changes on every write, even
+  when the ETag does not.
+  - GET and HEAD return it as `x-rs3-version`.
+  - Sending `x-rs3-if-version: <version>` on a GET makes it fail with `412` if
+    the object has changed since. A replicator can therefore fetch exactly the
+    state an event names.
+- `origin` is `client` or `repair`. A `repair` delete means the health scan
+  removed an index row whose data was lost. It does not mean a client deleted
+  the object.
+- A snapshot arrives as `phase: "snapshot"` batches of `op: "exists"` entries,
+  which have no `seq`:
+  - The first batch has `snapshot_begin`; the last has `snapshot_end`.
+  - Live changes then continue after `snapshot_through`.
+  - A receiver that mirrors the bucket should delete any key it did not see
+    between `snapshot_begin` and `snapshot_end`.
+- `[from_seq, to_seq]` is the range a batch covers. Changes that a filter
+  excludes still advance the subscription's position, so consecutive batches
+  can leave gaps between them.
+- Delivery is **at least once**, in order. Receivers should skip any event whose
+  `seq` is at or below the last one they applied.
+
+### Webhooks
+
+Each webhook delivers batches one at a time, and every request is signed:
+
+- `X-RS3-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`
+- `X-RS3-Delivery`, `X-RS3-Subscription`
+- any custom headers configured on the webhook. Header values are stored as
+  secrets and masked in the console.
+
+The signing secret is shown once, when the webhook is created and each time it
+is rotated.
+
+Delivery and failure handling:
+
+- A commit wakes its bucket's webhooks. One that is up to date delivers
+  immediately. One that is muted or busy picks the change up later, from its
+  backlog.
+- **Any** unsuccessful delivery (a non-2xx response, a timeout, or a connection
+  error) mutes the webhook for `mute_secs`. A longer `Retry-After` from the
+  receiver takes precedence. The checker tick resumes the webhook afterwards,
+  and it drains the backlog in back-to-back batches.
+- Webhook URLs must be `https://` and must not resolve to internal addresses.
+  Both rules can be relaxed in the config. Redirects are not followed.
+
+### Pulling with a replication token
+
+All requests go to the S3 port with `Authorization: Bearer rs3cl_…`. The token
+only works for these two endpoints. Use path-style addressing: a bucket name
+can't start with `_`, so `/_rs3/` never clashes with a bucket. On a
+virtual-hosted request (`<bucket>.<public_hostname>/_rs3/changelog`), the path
+is an ordinary object key and goes to S3.
+
+```text
+GET  /_rs3/changelog[?wait=<secs>]          next batch (long-polls up to 60s when idle)
+POST /_rs3/changelog/ack  {"ack": "<ack>"}  acknowledge it once applied
+```
+
+### Falling behind retention
+
+If a subscription's position falls behind what retention has kept, the events
+it missed are gone, so it **pauses** instead of skipping them silently:
+
+- **Resume** is refused with an explanation.
+- A paused replication token answers `410 Gone`.
+- The admin chooses one of: **resume from oldest retained**, **re-snapshot**,
+  **skip to head**, or **set offset**.
+
+The console warns when a subscription's oldest pending change is close to
+expiring. A bucket cannot be deleted while it has subscriptions. An index
+rebuild carries the changelog over, so positions stay valid.
 
 ## Health and metrics
 

@@ -37,6 +37,11 @@ use sha2::Sha256;
 /// Multi-threaded RocksDB handle (see the same alias in `storage::index`).
 type Db = DBWithThreadMode<MultiThreaded>;
 
+/// The admin database handle, shared with other admin-owned stores (the
+/// changelog subscriptions in [`super::notify`]) — RocksDB allows one open
+/// per process.
+pub(crate) type AdminDb = Db;
+
 use super::identity::Identity;
 use super::policy::{Effect, OneOrMany, PolicyDocument, Statement};
 use crate::storage::errors::{Result, StorageError};
@@ -374,6 +379,7 @@ impl IamStore {
             opts.create_missing_column_families(true);
             let cfs = [CF_USERS, CF_GROUPS, CF_ACCESS_KEYS, CF_WEB_KEYS, CF_USER_GROUPS]
                 .into_iter()
+                .chain(super::notify::ADMIN_DB_FAMILIES)
                 .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
             let db = Db::open_cf_descriptors(&opts, &db_path, cfs)?;
             // Seed the built-in admin group if absent. Scoped so the CF handle
@@ -1179,6 +1185,11 @@ impl IamStore {
         .await?;
         self.reload().await?;
         Ok(report)
+    }
+
+    /// The shared admin database handle (see [`AdminDb`]).
+    pub(crate) fn admin_db(&self) -> Arc<AdminDb> {
+        self.db.clone()
     }
 
     // ── web sessions ──────────────────────────────────────────────────────────

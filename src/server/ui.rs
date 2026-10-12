@@ -51,6 +51,9 @@ pub struct UiState {
     pub(crate) scans: Arc<super::jobs::perf_scan::ScanService>,
     /// Runtime stats time-series. `None` when the feature is disabled by config.
     pub(crate) stats: Option<super::stats_store::StatsStore>,
+    /// Changelog subscriptions (webhooks / replication tokens). `None` in
+    /// tests that do not exercise them.
+    pub(crate) notify: Option<super::notify::NotifyService>,
 }
 
 /// A resolved UI session. Managed admin membership is resolved on every
@@ -91,6 +94,15 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/{name}/stats", get(bucket_stats))
         .route("/api/buckets/{name}/rebuild", post(rebuild_bucket))
         .route("/api/buckets/{name}/cors", get(get_bucket_cors).put(set_bucket_cors))
+        // Changelog subscriptions: webhooks and replication tokens (admin only).
+        .route("/api/subscriptions", get(list_subscriptions).post(create_subscription))
+        .route(
+            "/api/subscriptions/{id}",
+            get(get_subscription)
+                .put(update_subscription)
+                .delete(delete_subscription),
+        )
+        .route("/api/subscriptions/{id}/action", post(subscription_action))
         .route("/api/admin/export", get(export_iam))
         // Import buffers and fully validates the dump before an atomic apply, so
         // the body is held in memory. The global IAM database is small by nature
@@ -342,6 +354,7 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
         "keys.js" => include_str!("assets/keys.js"),
         "export_import.js" => include_str!("assets/export_import.js"),
         "perf.js" => include_str!("assets/perf.js"),
+        "subscriptions.js" => include_str!("assets/subscriptions.js"),
         // Vendored charting library (single IIFE build) + the stats tab logic.
         "uPlot.iife.min.js" => include_str!("assets/uPlot.iife.min.js"),
         "stats.js" => include_str!("assets/stats.js"),
@@ -667,7 +680,7 @@ fn storage_error(err: StorageError) -> Response {
             StatusCode::NOT_FOUND
         }
         StorageError::BucketRebuilding(_) => StatusCode::SERVICE_UNAVAILABLE,
-        StorageError::InvalidMultipartUpload(_) => StatusCode::CONFLICT,
+        StorageError::InvalidMultipartUpload(_) | StorageError::BucketInUse(_) => StatusCode::CONFLICT,
         StorageError::InvalidBucketName(_) | StorageError::InvalidObjectKey(_) => {
             StatusCode::BAD_REQUEST
         }
@@ -3442,5 +3455,164 @@ mod throttle_tests {
             throttle.record_failure(&LoginThrottle::keys("1.2.3.4", &format!("u{i}")), i as i64);
         }
         assert!(throttle.entries.lock().unwrap().len() <= LOGIN_THROTTLE_CAPACITY);
+    }
+}
+
+// ── changelog subscriptions (admin only) ─────────────────────────────────────
+
+fn notify_service(state: &UiState) -> Result<&super::notify::NotifyService, Response> {
+    state
+        .notify
+        .as_ref()
+        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "subscriptions are not available"))
+}
+
+#[derive(Deserialize)]
+struct SubscriptionListQuery {
+    #[serde(default)]
+    bucket: Option<String>,
+}
+
+async fn list_subscriptions(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<SubscriptionListQuery>,
+) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    let service = match notify_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.list(query.bucket.as_deref().filter(|b| !b.is_empty())).await {
+        Ok(views) => Json(json!({ "subscriptions": views })).into_response(),
+        Err(err) => super::notify::pull::error_response(err),
+    }
+}
+
+async fn create_subscription(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(request): Json<super::notify::CreateRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match notify_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    let bucket = request.bucket.clone();
+    match service.create(request, &session.username).await {
+        Ok(created) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                "create_subscription",
+                format!("/{bucket} {}", created.subscription.id),
+            );
+            Json(created).into_response()
+        }
+        Err(err) => super::notify::pull::error_response(err),
+    }
+}
+
+async fn get_subscription(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    let service = match notify_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.view(&id).await {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => super::notify::pull::error_response(err),
+    }
+}
+
+async fn update_subscription(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+    Json(request): Json<super::notify::UpdateRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match notify_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.update(&id, request).await {
+        Ok(view) => {
+            audit(&state, &rid.0, &session.username, "update_subscription", id);
+            Json(view).into_response()
+        }
+        Err(err) => super::notify::pull::error_response(err),
+    }
+}
+
+async fn delete_subscription(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match notify_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.delete(&id).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "delete_subscription", id);
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(err) => super::notify::pull::error_response(err),
+    }
+}
+
+async fn subscription_action(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+    Json(action): Json<super::notify::Action>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match notify_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    let label = format!("{action:?}");
+    match service.act(&id, action).await {
+        Ok(result) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                "subscription_action",
+                format!("{id} {label}"),
+            );
+            Json(result).into_response()
+        }
+        Err(err) => super::notify::pull::error_response(err),
     }
 }

@@ -25,6 +25,9 @@ pub enum StorageError {
     /// A conditional write's precondition (If-None-Match / If-Match) was not
     /// met against the object currently at the key. Maps to HTTP 412.
     PreconditionFailed { bucket: String, key: String },
+    /// The bucket cannot be deleted while something still depends on it
+    /// (changelog subscriptions). Maps to HTTP 409.
+    BucketInUse(String),
 }
 
 impl fmt::Display for StorageError {
@@ -62,6 +65,7 @@ impl fmt::Display for StorageError {
             StorageError::PreconditionFailed { bucket, key } => {
                 write!(f, "precondition failed for {bucket}/{key}")
             }
+            StorageError::BucketInUse(v) => write!(f, "{v}"),
         }
     }
 }

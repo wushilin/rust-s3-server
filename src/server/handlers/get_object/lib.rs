@@ -43,6 +43,23 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     //   4. If-Modified-Since    -> 304 when not modified (ignored if If-None-Match present)
     let etag_quoted = quote_etag(&object.meta.etag);
     let server_etag = object.meta.etag.trim_matches('"');
+    // The exact object state, as named by changelog events (`version`).
+    let version = crate::storage::changelog::version_of(&object.object_dir.to_string_lossy());
+
+    // 0. x-rs3-if-version: a replicator pins the exact state a changelog
+    // event named. Anything else (overwritten since, even with the same
+    // ETag) is a 412, so it never tags newer data with an older version.
+    if let Some(want) = headers.get("x-rs3-if-version").and_then(|v| v.to_str().ok()) {
+        if want.trim() != version {
+            return srv::s3_error_detailed(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                "At least one of the pre-conditions you specified did not hold",
+                &format!("/{bucket}/{key}"),
+                vec![("Condition".to_string(), "x-rs3-if-version".to_string())],
+            );
+        }
+    }
 
     // 1. If-Match: the client pins a specific ETag (or `*` = "any current
     // version"). A mismatch means the object changed under it -> 412.
@@ -284,6 +301,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         .header(header::CONTENT_LENGTH, range_len.to_string())
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::LAST_MODIFIED, last_modified)
+        .header("x-rs3-version", version)
         .header("x-amz-request-id", "rust-s3-server");
     // AWS sends this header only for a non-default class; a STANDARD object
     // carries no `x-amz-storage-class` at all.

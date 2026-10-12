@@ -35,6 +35,7 @@ const icons = {
   list:'<svg viewBox="0 0 24 24" class="icon"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>',
   activity:'<svg viewBox="0 0 24 24" class="icon"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>',
   check:'<svg viewBox="0 0 24 24" class="icon"><path d="M20 6 9 17l-5-5"/></svg>',
+  send:'<svg viewBox="0 0 24 24" class="icon"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7Z"/></svg>',
   external:'<svg viewBox="0 0 24 24" class="icon"><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>'
 };
 const $ = id => document.getElementById(id);
@@ -106,12 +107,12 @@ function onLoggedIn(){
 }
 function toggleSidebar(){const c=document.body.classList.toggle('sidebar-collapsed');localStorage.setItem('sidebarCollapsed',c?'1':'0');}
 function toggleProfile(){$('profilePopover').classList.toggle('hidden');}
-const pageMeta={objects:['Object Browser','Manage buckets and objects'],users:['IAM Users','Manage users and policies'],groups:['IAM Groups','Reuse policies and assign administrative access'],keys:['My Access Keys','Manage your application credentials'],backup:['Backup & Restore','Export and import the global IAM database'],perf:['Storage Scan','Audit disk usage and object health, and repair what it finds'],stats:['Runtime Stats','System & process health over time']};
+const pageMeta={objects:['Object Browser','Manage buckets and objects'],users:['IAM Users','Manage users and policies'],groups:['IAM Groups','Reuse policies and assign administrative access'],keys:['My Access Keys','Manage your application credentials'],backup:['Backup & Restore','Export and import the global IAM database'],subs:['Webhooks & Replication','Changelog subscriptions per bucket'],perf:['Storage Scan','Audit disk usage and object health, and repair what it finds'],stats:['Runtime Stats','System & process health over time']};
 function showTab(tab){
-  if((tab==='users'||tab==='groups'||tab==='backup'||tab==='perf'||tab==='stats')&&!me?.is_admin)return;
+  if((tab==='users'||tab==='groups'||tab==='backup'||tab==='subs'||tab==='perf'||tab==='stats')&&!me?.is_admin)return;
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
-  ['objects','users','groups','keys','backup','perf','stats'].forEach(t=>$('tab_'+t).classList.toggle('hidden',t!==tab));
+  ['objects','users','groups','keys','backup','subs','perf','stats'].forEach(t=>$('tab_'+t).classList.toggle('hidden',t!==tab));
   $('pageTitle').textContent=pageMeta[tab][0];$('pageSubtitle').textContent=pageMeta[tab][1];closeDetails();
-  if(tab==='users')loadUsers();if(tab==='groups')loadGroups();if(tab==='keys')loadMyKeys();if(tab==='backup')resetBackupPanel();if(tab==='perf')initPerf();if(tab==='stats')initStats();
+  if(tab==='users')loadUsers();if(tab==='groups')loadGroups();if(tab==='keys')loadMyKeys();if(tab==='backup')resetBackupPanel();if(tab==='subs')loadSubs();if(tab==='perf')initPerf();if(tab==='stats')initStats();
 }
 async function pingServer(){try{const resp=await fetch('/api/ping',{cache:'no-store'});const data=await resp.json().catch(()=>({}));if(!resp.ok){if(resp.status===401&&me)location.reload();throw new Error('ping failed');}$('serverState').classList.remove('offline');$('serverStateText').textContent='Server connected';$('serverVersion').textContent='RustS3 v'+data.version;}catch{$('serverState').classList.add('offline');$('serverStateText').textContent='Connection interrupted';}}

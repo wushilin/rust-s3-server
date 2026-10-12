@@ -82,6 +82,10 @@
     {
       "op": "mpu_attributes_parts_paged", "kind": "xml", "contains": "ObjectParts",
       "why": "Same deliberate superset as mpu_attributes_all."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "x-rs3-version",
+      "why": "rusts3 extension: names the exact object state (the changelog's version) so a replicator can pin a GET with x-rs3-if-version. S3 clients ignore unknown headers."
     }
   ]
 }

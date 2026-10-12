@@ -65,6 +65,27 @@ const COPY_BUFFER_SIZE: usize = 256 * 1024;
 /// not be swapped out or deleted while anyone can still commit to it).
 const INDEX_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Commit listener: called with `(bucket, changelog watermark)` after every
+/// commit that appended a changelog entry. Must be cheap and non-blocking.
+#[derive(Clone)]
+pub struct ChangeListener(pub Arc<dyn Fn(&str, u64) + Send + Sync>);
+
+impl std::fmt::Debug for ChangeListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChangeListener")
+    }
+}
+
+/// Bucket-deletion veto: returns why `bucket` may not be deleted, if so.
+#[derive(Clone)]
+pub struct DeleteGuard(pub Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for DeleteGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeleteGuard")
+    }
+}
+
 /// Filesystem-backed S3-compatible object store.
 ///
 /// Cheap to clone — all inner state is wrapped in `Arc`.
@@ -92,6 +113,12 @@ pub struct LocalObjectStore {
     rebuild_progress: Arc<Mutex<HashMap<String, RebuildProgress>>>,
     /// Cooperative shutdown signal — cancel this to stop all background tasks.
     shutdown: CancellationToken,
+    /// Told `(bucket, changelog watermark)` after every logged commit; the
+    /// webhook dispatcher installs itself here.
+    change_listener: Arc<std::sync::RwLock<Option<ChangeListener>>>,
+    /// Vetoes bucket deletion (returns the reason) — the changelog
+    /// subscriptions refuse while any subscription targets the bucket.
+    delete_guard: Arc<std::sync::RwLock<Option<DeleteGuard>>>,
     #[cfg(test)]
     crash_points: Arc<Mutex<HashSet<String>>>,
 }
@@ -262,9 +289,34 @@ impl LocalObjectStore {
             rebuilding: Arc::new(Mutex::new(HashSet::new())),
             rebuild_progress: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
+            change_listener: Arc::new(std::sync::RwLock::new(None)),
+            delete_guard: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Installs the commit listener (replacing any previous one). Every
+    /// index reads the slot on each commit, so this also covers indexes
+    /// opened earlier.
+    pub fn set_change_listener(&self, listener: ChangeListener) {
+        *self.change_listener.write().unwrap() = Some(listener);
+    }
+
+    /// Installs the bucket-deletion veto (replacing any previous one).
+    pub fn set_delete_guard(&self, guard: DeleteGuard) {
+        *self.delete_guard.write().unwrap() = Some(guard);
+    }
+
+    /// Wraps a freshly opened index with the bucket's commit notification.
+    fn attach_change_hook(&self, bucket: &str, index: ObjectIndex) -> ObjectIndex {
+        let slot = self.change_listener.clone();
+        let bucket = bucket.to_string();
+        index.with_commit_hook(Arc::new(move |watermark| {
+            if let Some(listener) = slot.read().unwrap().as_ref() {
+                listener.0(&bucket, watermark);
+            }
+        }))
     }
 
     /// Returns a clone of the shutdown token. Call `.cancel()` on it to stop all background tasks.
@@ -427,6 +479,10 @@ impl LocalObjectStore {
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
+        let veto = self.delete_guard.read().unwrap().as_ref().and_then(|g| g.0(bucket));
+        if let Some(reason) = veto {
+            return Err(StorageError::BucketInUse(reason));
+        }
         // Open through the normal path first (surfaces rebuild-needed etc.).
         drop(self.index(bucket).await?);
         // Raise the data-plane gate so no new request can pick up the index,
@@ -507,7 +563,7 @@ impl LocalObjectStore {
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
         }
         let index = match ObjectIndex::open(&bucket_dir, self.durability).await {
-            Ok(index) => index,
+            Ok(index) => self.attach_change_hook(bucket, index),
             Err(StorageError::IndexOutdated(_)) => {
                 self.start_rebuild_background(bucket);
                 return Err(StorageError::BucketRebuilding(bucket.to_string()));
@@ -2427,19 +2483,28 @@ impl LocalObjectStore {
                 }
             }
         }
-        if let Some(old) = old {
-            old.close().await;
-            // Drop the last handle so RocksDB releases its directory lock
-            // before the live directory is replaced.
-            drop(old);
-        }
-
         // A RocksDB "database" is a directory, so the temp index is a directory
         // built alongside the live one and swapped in wholesale at the end.
         let tmp_path = bucket_dir.join("index.rebuild.rocksdb");
         let _ = tokio::fs::remove_dir_all(&tmp_path).await;
         let tmp = ObjectIndex::open_at(&tmp_path, Durability::Relaxed).await?;
         tmp.create_schema().await?;
+
+        if let Some(old) = old {
+            // Carry the changelog across so webhook / replication offsets stay
+            // valid. If it cannot be read, the new index keeps its own fresh
+            // log id and consumers detect the switch and pause.
+            match old.copy_changelog_into(&tmp).await {
+                Ok(n) => log::info!("rebuild carried changelog bucket={bucket} entries={n}"),
+                Err(err) => log::warn!(
+                    "rebuild could not carry changelog bucket={bucket} error={err}; consumers will pause"
+                ),
+            }
+            old.close().await;
+            // Drop the last handle so RocksDB releases its directory lock
+            // before the live directory is replaced.
+            drop(old);
+        }
 
         // One pool of workers traverses and parses concurrently over a
         // work-stealing frontier. A serial walker starves on hash-fanout

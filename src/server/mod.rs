@@ -10,6 +10,7 @@ pub(crate) mod handlers;
 pub mod iam;
 pub(crate) mod jobs;
 pub mod identity;
+pub mod notify;
 pub mod key_usage;
 pub mod logging;
 pub(crate) mod pipeline;
@@ -242,6 +243,19 @@ fn router_with_metrics(
     metrics: Arc<TrafficMetrics>,
     tasks: Arc<registry::TaskRegistry>,
 ) -> Router {
+    router_with_notify(store, auth_state, metrics, tasks, None)
+}
+
+/// [`router_with_metrics`] plus the replication pull API, which sits beside
+/// the S3 router (its own token auth; no S3 middleware) when subscriptions
+/// are enabled.
+pub(crate) fn router_with_notify(
+    store: LocalObjectStore,
+    auth_state: AuthState,
+    metrics: Arc<TrafficMetrics>,
+    tasks: Arc<registry::TaskRegistry>,
+    notify: Option<notify::NotifyService>,
+) -> Router {
     let host_style_config = auth_state.config.clone();
     let cors_state = CorsMiddlewareState {
         config: auth_state.config.clone(),
@@ -283,9 +297,18 @@ fn router_with_metrics(
     // `Router::layer` middleware runs only after a route has been matched, so
     // the host-style URI rewrite must wrap the finished router to influence
     // routing (and the auth layer's policy path) at all.
+    // The pull API is matched *after* the host-style rewrite: on a
+    // virtual-hosted request (`bucket.<public_hostname>/_rs3/changelog`) the
+    // path is an object key, which the rewrite turns into
+    // `/bucket/_rs3/changelog` so it reaches S3. Path-style `/_rs3/…` can
+    // never be a bucket (bucket names start with a letter or digit).
+    let routed = match notify {
+        Some(service) => notify::pull::router(service).fallback_service(inner),
+        None => Router::new().fallback_service(inner),
+    };
     Router::new().fallback_service(tower::Layer::layer(
         &middleware::from_fn_with_state(host_style_config, host_style_middleware),
-        inner,
+        routed,
     ))
 }
 
@@ -1144,6 +1167,17 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     // "Last used" stamps for access keys: their own database (high-churn,
     // derived — not part of the IAM export), updated in memory on the request
     // path and flushed in the background.
+    // Changelog subscriptions (webhooks + replication tokens) live in the
+    // admin database; the service runs whether or not the UI is enabled.
+    let notify = notify::NotifyService::start(
+        store.clone(),
+        notify::db::NotifyDb::new(iam.admin_db()),
+        config.app_config.webhooks.clone(),
+        config.app_config.changelog.clone(),
+        shutdown.clone(),
+    )
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
     let key_usage = key_usage::KeyUsageStore::open(FsPath::new(&config.root)).await?;
     key_usage.spawn_flusher(shutdown.clone());
     let auth_state = AuthState {
@@ -1186,6 +1220,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             tasks: tasks.clone(),
             scans,
             stats,
+            notify: Some(notify.clone()),
         };
         let ui_bind = format!(
             "{}:{}",
@@ -1216,7 +1251,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         });
     }
 
-    let app = router_with_metrics(store, auth_state, metrics, tasks);
+    let app = router_with_notify(store, auth_state, metrics, tasks, Some(notify));
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     let drain = shutdown.clone();
     // Our own accept loop rather than `axum::serve`: it reads an optional PROXY
@@ -2314,6 +2349,12 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             response
         }
+        StorageError::BucketInUse(message) => s3_error(
+            StatusCode::CONFLICT,
+            "OperationAborted",
+            message,
+            resource,
+        ),
         StorageError::PreconditionFailed { .. } => s3_error(
             StatusCode::PRECONDITION_FAILED,
             "PreconditionFailed",

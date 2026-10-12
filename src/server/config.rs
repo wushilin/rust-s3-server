@@ -305,6 +305,103 @@ fn default_stats_retention_days() -> u64 {
     7
 }
 
+/// The per-bucket changelog (see `storage::changelog`). Entries older than
+/// `retention_days` are trimmed whether or not every consumer has read them;
+/// a consumer left behind the trim point is paused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangelogConfig {
+    #[serde(default = "default_changelog_retention_days")]
+    pub retention_days: u64,
+    /// How often the trim pass runs.
+    #[serde(default = "default_changelog_trim_interval_secs")]
+    pub trim_interval_secs: u64,
+}
+
+impl Default for ChangelogConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_changelog_retention_days(),
+            trim_interval_secs: default_changelog_trim_interval_secs(),
+        }
+    }
+}
+
+fn default_changelog_retention_days() -> u64 {
+    14
+}
+fn default_changelog_trim_interval_secs() -> u64 {
+    600
+}
+
+/// Webhook delivery. Each webhook can override the batch limits and
+/// `mute_secs`; everything else is server-wide.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// How often muted webhooks are checked for resumption.
+    #[serde(default = "default_webhook_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// How long a webhook is muted after an unsuccessful delivery.
+    #[serde(default = "default_webhook_mute_secs")]
+    pub mute_secs: u64,
+    /// Upper bound for a receiver's `Retry-After`.
+    #[serde(default = "default_webhook_max_mute_secs")]
+    pub max_mute_secs: u64,
+    #[serde(default = "default_webhook_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Deliveries in flight across all webhooks.
+    #[serde(default = "default_webhook_max_concurrent")]
+    pub max_concurrent_deliveries: usize,
+    #[serde(default = "default_webhook_batch_max_events")]
+    pub batch_max_events: usize,
+    #[serde(default = "default_webhook_batch_max_bytes")]
+    pub batch_max_bytes: usize,
+    /// Allow plain `http://` webhook URLs.
+    #[serde(default)]
+    pub allow_http: bool,
+    /// Allow webhook URLs that resolve to loopback / private / link-local
+    /// addresses (SSRF guard). Off by default.
+    #[serde(default)]
+    pub allow_private_addresses: bool,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: default_webhook_check_interval_secs(),
+            mute_secs: default_webhook_mute_secs(),
+            max_mute_secs: default_webhook_max_mute_secs(),
+            request_timeout_secs: default_webhook_request_timeout_secs(),
+            max_concurrent_deliveries: default_webhook_max_concurrent(),
+            batch_max_events: default_webhook_batch_max_events(),
+            batch_max_bytes: default_webhook_batch_max_bytes(),
+            allow_http: false,
+            allow_private_addresses: false,
+        }
+    }
+}
+
+fn default_webhook_check_interval_secs() -> u64 {
+    5
+}
+fn default_webhook_mute_secs() -> u64 {
+    30
+}
+fn default_webhook_max_mute_secs() -> u64 {
+    900
+}
+fn default_webhook_request_timeout_secs() -> u64 {
+    10
+}
+fn default_webhook_max_concurrent() -> usize {
+    16
+}
+fn default_webhook_batch_max_events() -> usize {
+    500
+}
+fn default_webhook_batch_max_bytes() -> usize {
+    1024 * 1024
+}
+
 /// Root configuration object, deserialised from `config.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -322,6 +419,10 @@ pub struct AppConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub stats: StatsConfig,
+    #[serde(default)]
+    pub changelog: ChangelogConfig,
+    #[serde(default)]
+    pub webhooks: WebhookConfig,
 }
 
 /// Deserializes a list of strings, dropping entries that were never filled in.
@@ -563,6 +664,8 @@ impl Default for AppConfig {
             sweeper: SweeperConfig::default(),
             ui: UiConfig::default(),
             stats: StatsConfig::default(),
+            changelog: ChangelogConfig::default(),
+            webhooks: WebhookConfig::default(),
         }
     }
 }

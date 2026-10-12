@@ -135,6 +135,7 @@ impl Harness {
                 scan_store::ScanStore::open(tmp.path()).await.unwrap(),
             ),
             stats: None,
+            notify: None,
         });
         Self {
             _tmp: tmp,

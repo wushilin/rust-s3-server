@@ -30,6 +30,11 @@
 //! | `intents`   | id (8-byte big-endian) | [`IntentValueV1`] JSON      |
 //! | `counters`  | `objects`              | i64 LE, summed via merge    |
 //! | `meta`      | `schema_version`       | i64 LE                      |
+//! | `changelog` | seq (8-byte big-endian)| changelog entry JSON        |
+//!
+//! The `changelog` family (and its `meta` keys) is described in
+//! [`super::changelog`]. It is additive — opening an older index creates it
+//! empty — so it does not bump the schema version.
 //!
 //! Object keys are stored as raw UTF-8 bytes, so RocksDB's bytewise ordering is
 //! exactly S3 lexicographic listing order — prefix/`start-after`/delimiter
@@ -49,6 +54,10 @@ use rocksdb::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::changelog::{
+    self, ChangeEvent, ChangeOp, ChangeOrigin, ChangelogPage, ChangelogStatus, SeqTracker,
+    CF_CHANGELOG, KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH,
+};
 use super::errors::{Result, StorageError};
 
 /// Multi-threaded RocksDB handle: `cf_handle` yields an `Arc<BoundColumnFamily>`
@@ -266,7 +275,16 @@ pub struct ObjectIndex {
     /// Single-process (guaranteed by the data-root process lock), so an atomic
     /// counter is a sound stand-in for SQLite's AUTOINCREMENT.
     intent_seq: Arc<AtomicI64>,
+    /// Changelog seq allocator + commit-order watermark.
+    changes: Arc<SeqTracker>,
+    /// This log's identity (`meta.changelog_id`).
+    log_id: Arc<String>,
+    /// Called with the new watermark after every commit that logged a change.
+    commit_hook: Option<CommitHook>,
 }
+
+/// Notified after a change commits (with the new changelog watermark).
+pub type CommitHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 impl std::fmt::Debug for ObjectIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -295,6 +313,7 @@ fn column_families() -> Vec<ColumnFamilyDescriptor> {
         ColumnFamilyDescriptor::new(CF_INTENTS, Options::default()),
         ColumnFamilyDescriptor::new(CF_COUNTERS, counter_opts),
         ColumnFamilyDescriptor::new(CF_META, Options::default()),
+        ColumnFamilyDescriptor::new(CF_CHANGELOG, Options::default()),
     ]
 }
 
@@ -323,6 +342,41 @@ fn max_intent_id(db: &Db) -> Result<i64> {
         Some(k) => id_from_key(k),
         None => 0,
     })
+}
+
+/// Highest changelog seq ever allocated: the newest entry, or the trim
+/// floor when every entry has been trimmed.
+fn last_change_seq(db: &Db) -> Result<u64> {
+    let log = cf(db, CF_CHANGELOG)?;
+    let mut it = db.raw_iterator_cf(&log);
+    it.seek_to_last();
+    it.status()?;
+    let newest = it.key().map(changelog::seq_from_key).unwrap_or(0);
+    Ok(newest.max(trimmed_through(db)?))
+}
+
+fn trimmed_through(db: &Db) -> Result<u64> {
+    let meta = cf(db, CF_META)?;
+    Ok(db
+        .get_cf(&meta, KEY_TRIMMED_THROUGH)?
+        .map(|b| changelog::decode_u64(&b))
+        .unwrap_or(0))
+}
+
+/// Reads the log id, minting one on first open.
+fn ensure_log_id(db: &Db) -> Result<String> {
+    let meta = cf(db, CF_META)?;
+    if let Some(bytes) = db.get_cf(&meta, KEY_CHANGELOG_ID)? {
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    use rand::Rng;
+    let mut buf = [0u8; 8];
+    rand::rng().fill_bytes(&mut buf);
+    let id: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    let mut opts = WriteOptions::default();
+    opts.set_sync(true);
+    db.put_cf_opt(&meta, KEY_CHANGELOG_ID, id.as_bytes(), &opts)?;
+    Ok(id)
 }
 
 /// Returns true when the bucket needs a (blocking) rebuild before it can serve:
@@ -400,17 +454,35 @@ impl ObjectIndex {
     /// call [`create_schema`](Self::create_schema) for that.
     pub async fn open_at(db_path: &Path, durability: Durability) -> Result<Self> {
         let path = db_path.to_path_buf();
-        let (db, seed) = run_blocking(move || {
+        let (db, seed, last_change, log_id) = run_blocking(move || {
             let db = open_db(&path)?;
             let seed = max_intent_id(&db)?;
-            Ok((db, seed))
+            let last_change = last_change_seq(&db)?;
+            let log_id = ensure_log_id(&db)?;
+            Ok((db, seed, last_change, log_id))
         })
         .await?;
         Ok(Self {
             db: Arc::new(db),
             durability,
             intent_seq: Arc::new(AtomicI64::new(seed)),
+            changes: Arc::new(SeqTracker::new(last_change)),
+            log_id: Arc::new(log_id),
+            commit_hook: None,
         })
+    }
+
+    /// Installs the post-commit notification (the store wires this to the
+    /// webhook dispatcher when it opens a bucket's index).
+    pub fn with_commit_hook(mut self, hook: CommitHook) -> Self {
+        self.commit_hook = Some(hook);
+        self
+    }
+
+    fn notify_commit(&self) {
+        if let Some(hook) = &self.commit_hook {
+            hook(self.changes.watermark());
+        }
     }
 
     async fn schema_version(&self) -> Result<Option<i64>> {
@@ -446,7 +518,7 @@ impl ObjectIndex {
         let db = self.db.clone();
         let _ = run_blocking(move || {
             let _ = db.flush();
-            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META] {
+            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META, CF_CHANGELOG] {
                 if let Ok(handle) = cf(&db, name) {
                     let _ = db.flush_cf(&handle);
                 }
@@ -539,7 +611,8 @@ impl ObjectIndex {
         let key = key.to_string();
         let expected = expected_blob_dir.to_string();
         let etag = etag.to_string();
-        run_blocking(move || {
+        let changes = self.changes.clone();
+        let updated = run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
             let Some(value) = db.get_cf(&objects, key.as_bytes())? else {
                 return Ok(false);
@@ -551,10 +624,23 @@ impl ObjectIndex {
             record.size = size;
             record.etag = etag;
             record.last_modified_ms = last_modified_ms;
-            db.put_cf_opt(&objects, key.as_bytes(), encode_object(&record), &write_opts(durability))?;
+            let log = cf(&db, CF_CHANGELOG)?;
+            let mut batch = WriteBatch::default();
+            batch.put_cf(&objects, key.as_bytes(), encode_object(&record));
+            let guard = changes.begin();
+            batch.put_cf(
+                &log,
+                changelog::seq_key(guard.seq),
+                changelog::encode_change(&change_for(guard.seq, ChangeOp::Put, &record, ChangeOrigin::Repair)),
+            );
+            db.write_opt(batch, &write_opts(durability))?;
             Ok(true)
         })
-        .await
+        .await;
+        if matches!(updated, Ok(true)) {
+            self.notify_commit();
+        }
+        updated
     }
 
     /// Up to `limit` keys still on the legacy 4-level fanout layout
@@ -654,15 +740,31 @@ impl ObjectIndex {
         displaced_blob_dir: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<i64>> {
+        self.commit_publish_from(record, publish_intent_id, displaced_blob_dir, now_ms, ChangeOrigin::Client)
+            .await
+    }
+
+    /// [`Self::commit_publish`] recording who caused the change in the
+    /// changelog entry it appends to the same batch.
+    pub async fn commit_publish_from(
+        &self,
+        record: &ObjectRecord,
+        publish_intent_id: i64,
+        displaced_blob_dir: Option<&str>,
+        now_ms: i64,
+        origin: ChangeOrigin,
+    ) -> Result<Option<i64>> {
         let db = self.db.clone();
         let durability = self.durability;
         let record = record.clone();
         let displaced = displaced_blob_dir.map(str::to_string);
         let retire_id = displaced.as_ref().map(|_| self.next_intent_id());
-        run_blocking(move || {
+        let changes = self.changes.clone();
+        let committed = run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
             let intents = cf(&db, CF_INTENTS)?;
             let counters = cf(&db, CF_COUNTERS)?;
+            let log = cf(&db, CF_CHANGELOG)?;
             let existed = db.get_cf(&objects, record.object_key.as_bytes())?.is_some();
 
             let mut batch = WriteBatch::default();
@@ -675,37 +777,78 @@ impl ObjectIndex {
             if !existed {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, 1i64.to_le_bytes());
             }
+            let guard = changes.begin();
+            let mut change = change_for(guard.seq, ChangeOp::Put, &record, origin);
+            change.ts_ms = now_ms;
+            batch.put_cf(&log, changelog::seq_key(guard.seq), changelog::encode_change(&change));
             db.write_opt(batch, &write_opts(durability))?;
             Ok(retire_id)
         })
-        .await
+        .await;
+        if committed.is_ok() {
+            self.notify_commit();
+        }
+        committed
     }
 
     /// The atomic commit point of a DELETE: removes the object and records a
     /// `retire` intent for its blob dir in one write batch.
     pub async fn commit_delete(&self, key: &str, blob_dir: &str, now_ms: i64) -> Result<i64> {
+        self.commit_delete_from(key, blob_dir, now_ms, ChangeOrigin::Client).await
+    }
+
+    /// [`Self::commit_delete`] recording who caused the change. A changelog
+    /// entry is appended only when a row was actually removed.
+    pub async fn commit_delete_from(
+        &self,
+        key: &str,
+        blob_dir: &str,
+        now_ms: i64,
+        origin: ChangeOrigin,
+    ) -> Result<i64> {
         let db = self.db.clone();
         let durability = self.durability;
         let id = self.next_intent_id();
         let key = key.to_string();
         let blob_dir = blob_dir.to_string();
-        run_blocking(move || {
+        let changes = self.changes.clone();
+        let committed = run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
             let intents = cf(&db, CF_INTENTS)?;
             let counters = cf(&db, CF_COUNTERS)?;
-            let existed = db.get_cf(&objects, key.as_bytes())?.is_some();
+            let log = cf(&db, CF_CHANGELOG)?;
+            let existing = db
+                .get_cf(&objects, key.as_bytes())?
+                .map(|v| decode_object(key.as_bytes(), &v))
+                .transpose()?;
 
             let mut batch = WriteBatch::default();
             batch.delete_cf(&objects, key.as_bytes());
             let value = encode_intent(INTENT_RETIRE, &key, &blob_dir, now_ms, 0);
             batch.put_cf(&intents, id_key(id), value);
-            if existed {
+            let mut guard = None;
+            if let Some(existing) = &existing {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, (-1i64).to_le_bytes());
+                let g = changes.begin();
+                let mut change = change_for(g.seq, ChangeOp::Delete, existing, origin);
+                change.ts_ms = now_ms;
+                batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
+                guard = Some(g);
             }
             db.write_opt(batch, &write_opts(durability))?;
-            Ok(id)
+            drop(guard);
+            Ok((id, existing.is_some()))
         })
-        .await
+        .await;
+        match committed {
+            Ok((id, logged)) => {
+                if logged {
+                    self.notify_commit();
+                }
+                Ok(id)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn delete_intent(&self, id: i64) -> Result<()> {
@@ -889,6 +1032,169 @@ impl ObjectIndex {
             Ok(outcome)
         })
         .await
+    }
+
+    // ── changelog ─────────────────────────────────────────────────────────────
+
+    /// This log's identity; see [`super::changelog`].
+    pub fn changelog_id(&self) -> &str {
+        &self.log_id
+    }
+
+    /// The commit-order watermark: the newest seq a reader may see.
+    pub fn changelog_head(&self) -> u64 {
+        self.changes.watermark()
+    }
+
+    pub async fn changelog_status(&self) -> Result<ChangelogStatus> {
+        let db = self.db.clone();
+        let head = self.changes.watermark();
+        let log_id = self.log_id.to_string();
+        run_blocking(move || {
+            let log = cf(&db, CF_CHANGELOG)?;
+            let mut it = db.raw_iterator_cf(&log);
+            it.seek_to_first();
+            it.status()?;
+            let oldest_ts_ms = match (it.key(), it.value()) {
+                (Some(k), Some(v)) => Some(changelog::decode_change(changelog::seq_from_key(k), v)?.ts_ms),
+                _ => None,
+            };
+            Ok(ChangelogStatus {
+                log_id,
+                head,
+                trimmed_through: trimmed_through(&db)?,
+                oldest_ts_ms,
+            })
+        })
+        .await
+    }
+
+    /// Reads entries with `seq > after`, never past the watermark, stopping
+    /// after `limit` entries or once `max_bytes` of encoded entries were read
+    /// (always at least one entry).
+    pub async fn read_changelog(&self, after: u64, limit: usize, max_bytes: usize) -> Result<ChangelogPage> {
+        let db = self.db.clone();
+        let head = self.changes.watermark();
+        let limit = limit.max(1);
+        run_blocking(move || {
+            let mut page = ChangelogPage {
+                covered_through: after.max(0),
+                ..ChangelogPage::default()
+            };
+            if after >= head {
+                page.covered_through = after;
+                return Ok(page);
+            }
+            let log = cf(&db, CF_CHANGELOG)?;
+            let mut it = db.raw_iterator_cf(&log);
+            it.seek(changelog::seq_key(after.saturating_add(1)));
+            let mut bytes = 0usize;
+            loop {
+                let Some(key) = it.key() else {
+                    it.status()?;
+                    page.covered_through = head;
+                    break;
+                };
+                let seq = changelog::seq_from_key(key);
+                if seq > head {
+                    page.covered_through = head;
+                    break;
+                }
+                if page.events.len() >= limit || (bytes >= max_bytes && !page.events.is_empty()) {
+                    page.more = true;
+                    break;
+                }
+                let value = it.value().unwrap_or_default();
+                bytes += value.len() + key.len();
+                page.events.push(changelog::decode_change(seq, value)?);
+                page.covered_through = seq;
+                it.next();
+            }
+            Ok(page)
+        })
+        .await
+    }
+
+    /// Removes entries committed before `cutoff_ms`, at most `max_entries`
+    /// per call, never past the watermark. Raises `trimmed_through` in the
+    /// same batch. Returns how many entries were removed.
+    pub async fn trim_changelog(&self, cutoff_ms: i64, max_entries: usize) -> Result<usize> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let head = self.changes.watermark();
+        run_blocking(move || {
+            let log = cf(&db, CF_CHANGELOG)?;
+            let meta = cf(&db, CF_META)?;
+            let mut it = db.raw_iterator_cf(&log);
+            it.seek_to_first();
+            let mut first = None;
+            let mut last = None;
+            let mut removed = 0usize;
+            while removed < max_entries {
+                let (Some(key), Some(value)) = (it.key(), it.value()) else {
+                    it.status()?;
+                    break;
+                };
+                let seq = changelog::seq_from_key(key);
+                if seq > head {
+                    break;
+                }
+                // Undecodable rows are trimmed by position, not age.
+                let expired = changelog::decode_change(seq, value)
+                    .map(|change| change.ts_ms < cutoff_ms)
+                    .unwrap_or(true);
+                if !expired {
+                    break;
+                }
+                first.get_or_insert(seq);
+                last = Some(seq);
+                removed += 1;
+                it.next();
+            }
+            let (Some(first), Some(last)) = (first, last) else {
+                return Ok(0);
+            };
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(&log, changelog::seq_key(first), changelog::seq_key(last + 1));
+            let floor = trimmed_through(&db)?.max(last);
+            batch.put_cf(&meta, KEY_TRIMMED_THROUGH, floor.to_le_bytes());
+            db.write_opt(batch, &write_opts(durability))?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    /// Copies this log (entries, id and trim floor) into `dst` — the rebuild
+    /// pipeline carries the changelog across the index swap so consumers'
+    /// offsets stay valid. Returns the number of entries copied.
+    pub async fn copy_changelog_into(&self, dst: &ObjectIndex) -> Result<usize> {
+        let src = self.db.clone();
+        let dst_db = dst.db.clone();
+        let copied = run_blocking(move || {
+            let src_log = cf(&src, CF_CHANGELOG)?;
+            let dst_log = cf(&dst_db, CF_CHANGELOG)?;
+            let dst_meta = cf(&dst_db, CF_META)?;
+            let src_meta = cf(&src, CF_META)?;
+            let mut copied = 0usize;
+            let mut batch = WriteBatch::default();
+            for item in src.iterator_cf(&src_log, IteratorMode::Start) {
+                let (key, value) = item?;
+                batch.put_cf(&dst_log, key, value);
+                copied += 1;
+                if batch.len() >= 10_000 {
+                    dst_db.write(std::mem::take(&mut batch))?;
+                }
+            }
+            for key in [KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH] {
+                if let Some(value) = src.get_cf(&src_meta, key)? {
+                    batch.put_cf(&dst_meta, key, value);
+                }
+            }
+            dst_db.write(batch)?;
+            Ok(copied)
+        })
+        .await?;
+        Ok(copied)
     }
 
     // ── listing ───────────────────────────────────────────────────────────────
@@ -1093,6 +1399,21 @@ pub(crate) fn same_blob_dir(a: &str, b: &str) -> bool {
             .all(|(x, y)| x == y || (matches!(x, b'/' | b'\\') && matches!(y, b'/' | b'\\')))
 }
 
+/// The changelog entry for a commit of `record` (`ts_ms` defaults to now).
+fn change_for(seq: u64, op: ChangeOp, record: &ObjectRecord, origin: ChangeOrigin) -> ChangeEvent {
+    ChangeEvent {
+        seq,
+        op,
+        key: record.object_key.clone(),
+        etag: record.etag.clone(),
+        size: record.size,
+        last_modified_ms: record.last_modified_ms,
+        version: changelog::version_of(&record.blob_dir),
+        origin,
+        ts_ms: super::time::now_ms(),
+    }
+}
+
 /// Matches the legacy 4-level fanout layout `objects/xx/xx/xx/xx/…` (four
 /// exactly-two-char levels, then at least a trailing slash). Equivalent to the
 /// old `blob_dir LIKE 'objects/__/__/__/__/%'`.
@@ -1144,6 +1465,93 @@ mod tests {
             .commit_publish(&record(key, blob_dir, lm), intent, None, lm)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_commit_appends_one_changelog_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        put(&index, "a", "objects/aa/V1A_1", 1).await;
+        put(&index, "b", "objects/bb/V1B_1", 2).await;
+        index.commit_delete("a", "objects/aa/V1A_1", 3).await.unwrap();
+        // Deleting an absent key logs nothing.
+        index.commit_delete("zz", "objects/zz/V1Z_1", 4).await.unwrap();
+        assert_eq!(index.changelog_head(), 3);
+        let page = index.read_changelog(0, 100, usize::MAX).await.unwrap();
+        let ops: Vec<_> = page.events.iter().map(|e| (e.seq, e.op, e.key.as_str(), e.version.as_str())).collect();
+        assert_eq!(
+            ops,
+            [
+                (1, ChangeOp::Put, "a", "V1A_1"),
+                (2, ChangeOp::Put, "b", "V1B_1"),
+                (3, ChangeOp::Delete, "a", "V1A_1"),
+            ]
+        );
+        assert_eq!(page.covered_through, 3);
+        assert!(!page.more);
+        // Paging.
+        let first = index.read_changelog(0, 2, usize::MAX).await.unwrap();
+        assert_eq!((first.events.len(), first.covered_through, first.more), (2, 2, true));
+        let rest = index.read_changelog(2, 2, usize::MAX).await.unwrap();
+        assert_eq!((rest.events.len(), rest.covered_through, rest.more), (1, 3, false));
+    }
+
+    #[tokio::test]
+    async fn trimming_keeps_the_sequence_and_log_id_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        let log_id = index.changelog_id().to_string();
+        for (i, key) in ["a", "b", "c"].iter().enumerate() {
+            put(&index, key, &format!("objects/x/V1{key}_1"), i as i64).await;
+        }
+        // Trim everything: the floor remembers where the log was.
+        assert_eq!(index.trim_changelog(i64::MAX, 100).await.unwrap(), 3);
+        let status = index.changelog_status().await.unwrap();
+        assert_eq!((status.head, status.trimmed_through, status.oldest_ts_ms), (3, 3, None));
+        index.close().await;
+        drop(index);
+
+        let index = open_tmp(&tmp).await;
+        assert_eq!(index.changelog_id(), log_id, "log id is stable");
+        put(&index, "d", "objects/x/V1d_1", 9).await;
+        let page = index.read_changelog(3, 10, usize::MAX).await.unwrap();
+        assert_eq!(page.events[0].seq, 4, "sequence continues after a full trim + reopen");
+    }
+
+    #[tokio::test]
+    async fn trimming_is_by_age_and_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        for (i, key) in ["a", "b", "c", "d"].iter().enumerate() {
+            put(&index, key, &format!("objects/x/V1{key}_1"), i as i64 * 1000).await;
+        }
+        // Entries carry their commit time (`now_ms` passed to the commit).
+        assert_eq!(index.trim_changelog(1500, 100).await.unwrap(), 2);
+        assert_eq!(index.changelog_status().await.unwrap().trimmed_through, 2);
+        assert_eq!(index.trim_changelog(i64::MAX, 1).await.unwrap(), 1, "bounded per call");
+        let page = index.read_changelog(0, 10, usize::MAX).await.unwrap();
+        assert_eq!(page.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [4]);
+    }
+
+    #[tokio::test]
+    async fn changelog_copies_into_a_rebuilt_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        put(&index, "a", "objects/x/V1a_1", 1).await;
+        put(&index, "b", "objects/x/V1b_1", 2).await;
+        index.trim_changelog(2, 10).await.unwrap(); // trims seq 1
+        let dst = ObjectIndex::open_at(&tmp.path().join("other.rocksdb"), Durability::Relaxed)
+            .await
+            .unwrap();
+        assert_ne!(dst.changelog_id(), index.changelog_id());
+        assert_eq!(index.copy_changelog_into(&dst).await.unwrap(), 1);
+        dst.close().await;
+        let path = tmp.path().join("other.rocksdb");
+        drop(dst);
+        let reopened = ObjectIndex::open_at(&path, Durability::Relaxed).await.unwrap();
+        assert_eq!(reopened.changelog_id(), index.changelog_id());
+        let status = reopened.changelog_status().await.unwrap();
+        assert_eq!((status.head, status.trimmed_through), (2, 1));
     }
 
     #[tokio::test]

@@ -70,6 +70,7 @@ use tokio::task::yield_now;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{Result, StorageError};
+use super::changelog::ChangeOrigin;
 use super::index::{same_blob_dir, ObjectRecord};
 use super::metadata::ObjectMeta;
 use super::store::{move_object_dir_to_trash, LocalObjectStore};
@@ -1191,7 +1192,9 @@ impl LocalObjectStore {
     /// either already gone or handled by the caller.
     async fn delete_row(&self, bucket: &str, key: &str, row: &ObjectRecord) -> Result<()> {
         let index = self.index(bucket).await?;
-        let retire_id = index.commit_delete(key, &row.blob_dir, now_ms()).await?;
+        let retire_id = index
+            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Repair)
+            .await?;
         self.forget_cached_meta(bucket, key);
         let _ = index.delete_intent(retire_id).await;
         Ok(())

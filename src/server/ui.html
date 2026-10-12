@@ -61,6 +61,7 @@
     <div class="nav-label" data-admin-only>Maintenance</div>
     <button class="nav-item" data-tab="backup" id="backupTabBtn" data-admin-only><span data-icon="database"></span> Backup &amp; Restore</button>
     <div class="nav-label" data-admin-only>Health &amp; Hygiene</div>
+    <button class="nav-item" data-tab="subs" id="subsTabBtn" data-admin-only><span data-icon="send"></span> Webhooks &amp; Replication</button>
     <button class="nav-item" data-tab="perf" id="perfTabBtn" data-admin-only><span data-icon="activity"></span> Storage Scan</button>
     <button class="nav-item" data-tab="stats" id="statsTabBtn" data-admin-only><span data-icon="zap"></span> Runtime Stats</button>
     <div class="nav-label">Open Source</div>
@@ -175,6 +176,15 @@
             <button class="btn primary" id="importBtn" onclick="importIam()"><span data-icon="search"></span> Review &amp; Import</button>
             <div id="importResult" class="hidden" style="margin-top:18px"></div>
           </div>
+        </div>
+      </section>
+
+      <section id="tab_subs" class="page hidden">
+        <div class="content-head"><div><h2>Webhooks &amp; Replication</h2><p>Stream each bucket's changelog to webhooks, or to replicators that pull it with a replication token.</p></div><span class="spacer"></span><button class="btn" onclick="loadSubs()"><span data-icon="refresh"></span> Refresh</button><button class="btn primary" onclick="openSubDialog()"><span data-icon="plus"></span> New subscription</button></div>
+        <div class="panel">
+          <div class="panel-title"><div><h3>Subscriptions</h3><p>Every subscription belongs to one bucket and keeps its own position in that bucket's changelog. Undelivered changes are kept for the changelog retention period; a subscription that falls further behind pauses.</p></div><span class="spacer"></span><span class="badge" id="subCount"></span></div>
+          <div class="table-wrap"><table><thead><tr><th>Subscription</th><th>Bucket / filter</th><th>Status</th><th>Position</th><th>Last delivery</th><th style="width:150px"></th></tr></thead><tbody id="subRows"></tbody></table></div>
+          <div id="subEmpty" class="empty hidden"></div>
         </div>
       </section>
 
@@ -405,6 +415,52 @@
   </form>
 </dialog>
 
+<dialog id="subDlg">
+  <form onsubmit="saveSub(event)">
+    <div class="dialog-head"><div><h3 id="sub_title">New subscription</h3><p id="sub_subtitle">Webhooks receive signed batches of changes; replication tokens pull them.</p></div><button type="button" class="dialog-close" onclick="subDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body">
+      <div class="field"><label for="sub_kind">Type</label><select class="input" id="sub_kind" onchange="subKindChanged()"><option value="webhook">Webhook (push)</option><option value="pull">Replication token (pull)</option></select></div>
+      <div class="field"><label for="sub_name">Name</label><input class="input" id="sub_name" placeholder="e.g. search-indexer" autocomplete="off"></div>
+      <div class="field"><label for="sub_bucket">Bucket</label><select class="input" id="sub_bucket"></select></div>
+      <div class="field sub-webhook"><label for="sub_url">Webhook URL</label><input class="input" id="sub_url" placeholder="https://example.com/hooks/s3" autocomplete="off"></div>
+      <div class="field sub-webhook"><label for="sub_headers">Custom headers</label><textarea class="input code-area" id="sub_headers" rows="3" placeholder="Authorization: Bearer …&#10;X-Tenant: acme"></textarea><span class="muted" style="font-size:11.5px">One <code>Name: value</code> per line. Values are stored as secrets and shown masked; leave a masked value as is to keep it.</span></div>
+      <div class="field"><label for="sub_prefix">Key prefix filter</label><input class="input" id="sub_prefix" placeholder="(all keys)" autocomplete="off"></div>
+      <div class="field"><label for="sub_suffix">Key suffix filter</label><input class="input" id="sub_suffix" placeholder="(any)" autocomplete="off"></div>
+      <div class="field"><label for="sub_ops">Changes</label><select class="input" id="sub_ops"><option value="">Puts and deletes</option><option value="put">Puts only</option><option value="delete">Deletes only</option></select></div>
+      <div class="field"><label for="sub_batch">Max events per batch</label><input class="input" id="sub_batch" type="number" min="1" max="10000" placeholder="server default"></div>
+      <div class="field sub-webhook"><label for="sub_mute">Mute after a failed delivery (seconds)</label><input class="input" id="sub_mute" type="number" min="1" placeholder="server default"></div>
+      <label class="field sub-create" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="sub_snapshot"> Start with a snapshot of the objects already in the bucket</label>
+      <div id="subError" class="inline-error"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="subDlg.close()">Cancel</button><button class="btn primary" type="submit" id="sub_submit">Create</button></div>
+  </form>
+</dialog>
+
+<dialog id="subSecretDlg">
+  <div class="dialog-head"><div><h3 id="ss_title">Subscription created</h3><p>Copy this now. It will not be shown again.</p></div></div>
+  <div class="dialog-body"><div class="danger-callout" id="ss_hint"></div><div class="secret-box" id="ss_text"></div></div>
+  <div class="dialog-actions"><button class="btn" onclick="copySubSecret()"><span data-icon="copy"></span> Copy</button><button class="btn primary" onclick="subSecretDlg.close()">I have saved it</button></div>
+</dialog>
+
+<dialog id="subActionDlg">
+  <div class="dialog-head"><div><h3>Subscription <span id="sa_name"></span></h3><p id="sa_status"></p></div><button type="button" class="dialog-close" onclick="subActionDlg.close()"><span data-icon="x"></span></button></div>
+  <div class="dialog-body">
+    <div class="danger-callout hidden" id="sa_pause"></div>
+    <div class="secret-box" id="sa_detail" style="white-space:pre-wrap"></div>
+    <div class="field" style="margin-top:12px"><label for="sa_offset">Set offset (replay or skip to a seq)</label><div style="display:flex;gap:8px"><input class="input" id="sa_offset" type="number" min="0"><button class="btn" onclick="subAction('set_offset')">Set</button></div></div>
+    <div id="saError" class="inline-error"></div>
+  </div>
+  <div class="dialog-actions" style="flex-wrap:wrap">
+    <button class="btn" onclick="subAction('pause')">Pause</button>
+    <button class="btn primary" onclick="subAction('resume')">Resume</button>
+    <button class="btn" onclick="subAction('unmute')">Unmute now</button>
+    <button class="btn" onclick="subAction('resume_from_oldest')">Resume from oldest retained</button>
+    <button class="btn" onclick="subAction('resnapshot')">Re-snapshot</button>
+    <button class="btn" onclick="subAction('skip_to_head')">Skip to head</button>
+    <button class="btn" id="sa_rotate" onclick="subRotate()">Rotate secret</button>
+  </div>
+</dialog>
+
 <dialog id="secretDlg">
   <div class="dialog-head"><div><h3>Access key created</h3><p>Copy these credentials now. The secret will not be shown again.</p></div></div>
   <div class="dialog-body"><div class="danger-callout">Treat the secret key like a password. Store it in a secure secrets manager.</div><div class="secret-box" id="sd_text"></div></div>
@@ -440,6 +496,7 @@
 <script src="/assets/policy.js"></script>
 <script src="/assets/keys.js"></script>
 <script src="/assets/export_import.js"></script>
+<script src="/assets/subscriptions.js"></script>
 <script src="/assets/perf.js"></script>
 <script src="/assets/uPlot.iife.min.js"></script>
 <script src="/assets/stats.js"></script>
