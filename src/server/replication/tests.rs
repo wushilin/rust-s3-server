@@ -122,6 +122,9 @@ impl Site {
     /// Stops this site and starts it again on the same data.
     async fn restart(self) -> Self {
         self.shutdown.cancel();
+        // As the real server does: the store's token is the process one, and
+        // it ends long polls so the shutdown is not held up.
+        self.store.shutdown_token().cancel();
         tokio::time::sleep(Duration::from_millis(300)).await;
         let Site { tmp, name, store, iam, notify, replication, endpoint, .. } = self;
         drop((store, iam, notify, replication));
@@ -1195,4 +1198,36 @@ async fn the_last_error_clears_once_the_link_works_again() {
         async move { view.status.last_error.is_none() && view.status.last_error_ms == 0 }
     })
     .await;
+}
+
+#[tokio::test]
+async fn the_error_clears_promptly_even_with_a_long_poll() {
+    let a = Site::start("site-a").await;
+    // Production-like long poll: 20s.
+    let b = Site::start_with("site-b", Timing { long_poll: Duration::from_secs(20), ..fast_timing() }).await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "live", || {
+        let view = b.link(&id);
+        async move { view.status.state == "live" }
+    })
+    .await;
+    // The peer goes away (its long poll is cut) and comes back.
+    let a = a.restart().await;
+    eventually(30, "the outage is reported", || {
+        let view = b.link(&id);
+        async move { view.status.last_error.is_some() }
+    })
+    .await;
+    let back = Instant::now();
+    eventually(15, "cleared once the peer answers", || {
+        let view = b.link(&id);
+        async move { view.status.last_error.is_none() }
+    })
+    .await;
+    assert!(back.elapsed() < Duration::from_secs(10), "not held for a full long poll: {:?}", back.elapsed());
+    a.put("data", "after", b"v").await;
+    eventually(30, "replicating", || same(&a, &b, "data")).await;
 }

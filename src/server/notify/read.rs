@@ -232,6 +232,8 @@ pub fn snapshot_params(query: &HashMap<String, String>) -> Result<SnapshotParams
 pub async fn read(store: &LocalObjectStore, bucket: &str, params: &ReadParams) -> Result<ReadResponse, ReadError> {
     let deadline = tokio::time::Instant::now() + params.wait;
     let signal = store.change_signal(bucket);
+    // A long poll must not hold up a shutdown.
+    let shutdown = store.shutdown_token();
     loop {
         // Arm the wake-up before reading so a commit landing between the
         // read and the wait is not missed.
@@ -249,6 +251,7 @@ pub async fn read(store: &LocalObjectStore, bucket: &str, params: &ReadParams) -
         tokio::select! {
             _ = &mut changed => {}
             _ = tokio::time::sleep_until(deadline) => return Ok(response),
+            _ = shutdown.cancelled() => return Ok(response),
         }
     }
 }

@@ -103,13 +103,7 @@ impl Worker {
             match self.step().await {
                 Ok(()) => {
                     backoff = Duration::from_secs(1);
-                    // Working again: an error from before is no longer news.
-                    self.update(|s| {
-                        if s.last_error.is_some() {
-                            s.last_error = None;
-                            s.last_error_ms = 0;
-                        }
-                    });
+                    self.peer_answered();
                 }
                 Err(StepError::Resnapshot(reason)) => {
                     log::warn!("replication {} re-snapshots: {reason}", self.link.id);
@@ -136,6 +130,18 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// The peer answered (or a step completed): an error from before is no
+    /// longer news. Cleared as soon as the answer arrives, not when a long
+    /// poll eventually ends; a failure applying it sets a new one.
+    fn peer_answered(&self) {
+        self.update(|s| {
+            if s.last_error.is_some() {
+                s.last_error = None;
+                s.last_error_ms = 0;
+            }
+        });
     }
 
     fn record_error(&self, reason: &str) {
@@ -196,6 +202,7 @@ impl Worker {
         let Some(mut checkpoint) = checkpoint else {
             // Start: the first snapshot page fixes where live replay begins.
             let page = self.peer.snapshot(None, SNAPSHOT_PAGE, &prefix, false).await?;
+            self.peer_answered();
             self.check_site(&page.site_id)?;
             let mut checkpoint = Checkpoint {
                 v: RECORD_VERSION,
@@ -216,6 +223,7 @@ impl Worker {
             Phase::Snapshot { cursor, tombstones: false, .. } => {
                 self.update(|s| s.state = "snapshot".to_string());
                 let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, &prefix, false).await?;
+                self.peer_answered();
                 if page.log_id != checkpoint.peer_log_id {
                     return Err(StepError::Resnapshot("the peer's changelog changed mid-snapshot".to_string()));
                 }
@@ -226,6 +234,7 @@ impl Worker {
                 // Merge mode: the peer's remembered deletes, so a key deleted
                 // there does not survive here.
                 let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, &prefix, true).await?;
+                self.peer_answered();
                 self.apply_all(&page.entries, &checkpoint.peer_site).await?;
                 checkpoint.phase = match page.next_after {
                     Some(next) => Phase::Snapshot { through, cursor: Some(next), tombstones: true },
@@ -239,10 +248,16 @@ impl Worker {
                     s.position = Some(after);
                     s.snapshot_cursor = None;
                 });
+                // Right after an error, ask without waiting: a quick answer
+                // confirms the peer is back (and clears the error) instead of
+                // a long poll holding it for up to `long_poll`.
+                let recovering = self.status.lock().unwrap().last_error.is_some();
+                let wait = if recovering { Duration::ZERO } else { self.long_poll };
                 let page = tokio::select! {
                     _ = self.cancel.cancelled() => return Ok(()),
-                    page = self.peer.changes(after, CHANGES_PAGE, self.long_poll, &prefix, Some(&checkpoint.peer_log_id)) => page?,
+                    page = self.peer.changes(after, CHANGES_PAGE, wait, &prefix, Some(&checkpoint.peer_log_id)) => page?,
                 };
+                self.peer_answered();
                 self.check_site(&page.site_id)?;
                 self.apply_all(&page.events, &checkpoint.peer_site).await?;
                 checkpoint.phase = Phase::Live { after: page.next };
