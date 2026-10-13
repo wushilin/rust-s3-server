@@ -922,6 +922,7 @@ async fn server_ping(State(state): State<UiState>, headers: HeaderMap) -> Respon
     let mut response = Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "site_id": state.store.site_id(),
         "now_ms": crate::storage::time::now_ms(),
     }))
     .into_response();

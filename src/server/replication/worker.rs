@@ -199,9 +199,9 @@ impl Worker {
         // syncs both ways, so one of them stands down — the one on the
         // higher site id, so exactly one keeps running.
         if self.link.mode == Mode::Merge && local.as_str() > peer_site {
-            if let Some(back) = self.peer.merge_back() {
-                let (id, name) = back.split_once(';').unwrap_or((back.as_str(), ""));
-                let name = urlencoding::decode(name).map(|n| n.into_owned()).unwrap_or_default();
+            if let Some(super::peer::MergeBack { link: id, name }) =
+                self.peer.merge_back().as_deref().and_then(super::peer::MergeBack::parse)
+            {
                 return Err(StepError::Fatal(format!(
                     "site {peer_site} already merges this bucket pair with link \"{name}\" ({id}), which syncs both \
                      ways; this link stands down. Delete one of the two."

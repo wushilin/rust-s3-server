@@ -322,28 +322,17 @@ fn peer_config(link: &Link, site: &str) -> PeerConfig {
         access_key: link.access_key.clone(),
         secret_key: link.secret_key.clone(),
         region: link.region.clone(),
-        replicator: Some(format!(
-            "{site};{mode};{};{};{}",
-            urlencoding::encode(&link.local_bucket),
-            link.id,
-            urlencoding::encode(&link.name)
-        )),
+        replicator: Some(
+            peer::Replicator {
+                site: site.to_string(),
+                mode: mode.to_string(),
+                bucket: link.local_bucket.clone(),
+                link: link.id.clone(),
+                name: link.name.clone(),
+            }
+            .to_header(),
+        ),
     }
-}
-
-/// Parses an `x-rs3-replicator` header:
-/// `<site>;<mode>;<bucket>;<link id>;<name>`.
-fn parse_replicator(value: &str) -> Option<(String, String, String, String, String)> {
-    let mut parts = value.splitn(5, ';');
-    let site = parts.next()?.to_string();
-    let mode = parts.next()?.to_string();
-    let bucket = urlencoding::decode(parts.next()?).ok()?.into_owned();
-    let id = parts.next()?.to_string();
-    let name = urlencoding::decode(parts.next()?).ok()?.into_owned();
-    if site.is_empty() || site.len() > 64 || id.len() > 64 || name.len() > 256 || bucket.len() > 63 {
-        return None;
-    }
-    Some((site, mode, bucket, id, name))
 }
 
 /// Whether a worker slot needs a (new) worker: none yet, exited (fatal
@@ -434,7 +423,8 @@ impl ReplicationService {
         let weak = Arc::downgrade(&service.inner);
         service.inner.store.set_replica_reader(crate::storage::store::ReplicaReader(Arc::new(move |bucket, header, record| {
             let inner = weak.upgrade()?;
-            let (site, mode, peer_bucket, link_id, link_name) = parse_replicator(header)?;
+            let peer::Replicator { site, mode, bucket: peer_bucket, link: link_id, name: link_name } =
+                peer::Replicator::parse(header)?;
             let now = now_ms();
             if record {
                 let mut incoming = inner.incoming.lock().unwrap();
@@ -463,7 +453,7 @@ impl ReplicationService {
                     && link.local_bucket == bucket
                     && link.peer_bucket == peer_bucket
                     && rt.status.lock().unwrap().peer_site.as_deref() == Some(site.as_str());
-                paired.then(|| format!("{};{}", link.id, urlencoding::encode(&link.name)))
+                paired.then(|| peer::MergeBack { link: link.id.clone(), name: link.name.clone() }.to_header())
             })
         })));
         service.spawn_supervisor();
@@ -691,9 +681,9 @@ impl ReplicationService {
                 "{at} is read-only (a mirror replica?): a merge link would write into it"
             )));
         }
-        if let (Mode::Merge, Some(back)) = (link.mode, &report.merge_back) {
-            let (id, name) = back.split_once(';').unwrap_or((back.as_str(), ""));
-            let name = urlencoding::decode(name).map(|n| n.into_owned()).unwrap_or_default();
+        if let (Mode::Merge, Some(peer::MergeBack { link: id, name })) =
+            (link.mode, report.merge_back.as_deref().and_then(peer::MergeBack::parse))
+        {
             return Err(LinkError::BadRequest(format!(
                 "site {} already merges {} with this bucket through its link \"{name}\" ({id}), which syncs both \
                  ways: no link is needed here",

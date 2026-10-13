@@ -17,8 +17,8 @@ use crate::server::notify::read::{ReadResponse, SnapshotResponse};
 use crate::server::notify::model::WireEvent;
 use crate::storage::stamp::{Rank, Stamp};
 
-/// Request header naming the replication link that reads a changelog:
-/// `<site>;<mode>;<link id>;<url-encoded link name>`.
+/// Request header naming the replication link that reads a changelog — a
+/// [`Replicator`] in the [`encode_fields`] form.
 pub const HEADER_REPLICATOR: &str = "x-rs3-replicator";
 /// Query selecting the access report (`GET /{bucket}?x-rs3-access`): what
 /// the caller's key may do on the bucket, as [`AccessReport`].
@@ -39,14 +39,110 @@ pub struct AccessReport {
     /// (and on every key in it)?
     pub actions: BTreeMap<String, bool>,
     /// A merge link on the answering site already pairs this bucket with the
-    /// caller's (`<link id>;<url-encoded name>`).
+    /// caller's: a [`MergeBack`] in the [`encode_fields`] form.
     #[serde(default)]
     pub merge_back: Option<String>,
 }
 
 /// Response header: the answering site already has a merge link pairing
-/// this bucket with the reader's site (`<link id>;<url-encoded name>`).
+/// this bucket with the reader's site — a [`MergeBack`] in the
+/// [`encode_fields`] form.
 pub const HEADER_MERGE_BACK: &str = "x-rs3-merge-back";
+
+/// A header value with named fields: `key=value;key=value`, keys and
+/// values URL-encoded (so a value may contain anything, `;` and `=`
+/// included). Extensible: readers look fields up by name, ignore ones they
+/// do not know, and do not depend on the order.
+pub fn encode_fields(fields: &[(&str, &str)]) -> String {
+    fields
+        .iter()
+        .map(|(key, value)| format!("{}={}", urlencoding::encode(key), urlencoding::encode(value)))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Parses [`encode_fields`]. Parts without `=` or that do not decode are
+/// skipped; for a repeated key the first wins.
+pub fn parse_fields(value: &str) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    for part in value.split(';') {
+        let Some((key, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let (Ok(key), Ok(value)) = (urlencoding::decode(key), urlencoding::decode(value)) else {
+            continue;
+        };
+        fields.entry(key.into_owned()).or_insert_with(|| value.into_owned());
+    }
+    fields
+}
+
+/// Who reads a changelog ([`HEADER_REPLICATOR`]): `site`, `mode`
+/// (`mirror` | `merge`), `bucket` (the link's bucket on its site), `link`
+/// (its id) and `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replicator {
+    pub site: String,
+    pub mode: String,
+    pub bucket: String,
+    pub link: String,
+    pub name: String,
+}
+
+impl Replicator {
+    pub fn to_header(&self) -> String {
+        encode_fields(&[
+            ("site", &self.site),
+            ("mode", &self.mode),
+            ("bucket", &self.bucket),
+            ("link", &self.link),
+            ("name", &self.name),
+        ])
+    }
+
+    /// `None` unless `site`, `mode`, `bucket` and `link` are present and
+    /// sane (`name` may be missing).
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut fields = parse_fields(value);
+        let mut take = |key: &str| fields.remove(key);
+        let replicator = Self {
+            site: take("site")?,
+            mode: take("mode")?,
+            bucket: take("bucket")?,
+            link: take("link")?,
+            name: take("name").unwrap_or_default(),
+        };
+        let sane = !replicator.site.is_empty()
+            && replicator.site.len() <= 64
+            && replicator.mode.len() <= 16
+            && !replicator.bucket.is_empty()
+            && replicator.bucket.len() <= 63
+            && !replicator.link.is_empty()
+            && replicator.link.len() <= 64
+            && replicator.name.len() <= 256;
+        sane.then_some(replicator)
+    }
+}
+
+/// The answering site's own merge link for the pair ([`HEADER_MERGE_BACK`],
+/// and [`AccessReport::merge_back`]): `link` (its id) and `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeBack {
+    pub link: String,
+    pub name: String,
+}
+
+impl MergeBack {
+    pub fn to_header(&self) -> String {
+        encode_fields(&[("link", &self.link), ("name", &self.name)])
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut fields = parse_fields(value);
+        let link = fields.remove("link").filter(|l| !l.is_empty())?;
+        Some(Self { link, name: fields.remove("name").unwrap_or_default() })
+    }
+}
 
 /// Where a link reads from.
 #[derive(Debug, Clone)]
@@ -552,6 +648,34 @@ pub fn event_stamp(event: &WireEvent, peer_site: &str) -> crate::storage::stamp:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_fields_are_named_encoded_and_extensible() {
+        let r = Replicator {
+            site: "site-b".into(),
+            mode: "merge".into(),
+            bucket: "photos".into(),
+            link: "rl_1".into(),
+            name: "a;b=c %d ✓".into(),
+        };
+        let header = r.to_header();
+        assert_eq!(header.split(';').count(), 5, "separators in values are encoded: {header}");
+        assert!(header.is_ascii(), "a valid header value: {header}");
+        assert_eq!(Replicator::parse(&header), Some(r.clone()));
+        // Any order, unknown fields ignored, a missing name tolerated.
+        assert_eq!(
+            Replicator::parse("future=1;link=rl_1;bucket=photos;mode=merge;site=site-b;name=x"),
+            Some(Replicator { name: "x".into(), ..r.clone() })
+        );
+        assert_eq!(Replicator::parse("site=s;mode=m;bucket=b;link=l").unwrap().name, "");
+        // Required fields missing, or junk: ignored.
+        assert_eq!(Replicator::parse("site=s;mode=m;bucket=b"), None);
+        assert_eq!(Replicator::parse("site-b;merge;photos;rl_1;name"), None);
+        assert_eq!(Replicator::parse(""), None);
+        let back = MergeBack { link: "rl_2".into(), name: "x;y".into() };
+        assert_eq!(MergeBack::parse(&back.to_header()), Some(back));
+        assert_eq!(MergeBack::parse("name=x"), None);
+    }
 
     #[test]
     fn paths_are_aws_encoded_and_never_normalised() {
