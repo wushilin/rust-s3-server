@@ -688,6 +688,13 @@ How it works:
   match.
 - Deletes caused by the peer's health-scan repair (`origin: repair`) are never
   replicated. The local copy is kept.
+- **Restore from peer.** When the storage scan finds an object whose bytes are
+  missing or corrupt in a bucket that a link pulls into, the recommended repair
+  is **Restore from replication peer**. It fetches the object back with its
+  original stamp, layout and metadata. Deleting the row is the last resort.
+  - It only restores the lost version or a newer one.
+  - If the peer has only an older version, the repair fails and explains why.
+    **Restore older version from peer** accepts the rollback explicitly.
 
 Operation:
 

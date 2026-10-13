@@ -507,3 +507,144 @@ async fn a_target_bucket_cannot_be_deleted_under_a_link() {
     b.replication.delete(&id).await.unwrap();
     b.store.delete_bucket("data").await.unwrap();
 }
+
+// ── restoring lost objects from a peer (health-scan repair) ────────────────
+
+use crate::storage::scan::{Finding, FindingKind, FindingState, RepairAction, ScanProgress};
+
+async fn findings(store: &LocalObjectStore, bucket: &str) -> Vec<Finding> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let collector = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Some(finding) = rx.recv().await {
+            out.push(finding);
+        }
+        out
+    });
+    store
+        .scan_bucket(bucket, &CancellationToken::new(), &ScanProgress::default(), &tx)
+        .await
+        .unwrap();
+    drop(tx);
+    collector.await.unwrap()
+}
+
+/// Writes `key` as if written `age_ms` ago on this site (the health scan
+/// does not judge objects younger than its grace window).
+async fn put_aged(site: &Site, bucket: &str, key: &str, body: &[u8], age_ms: i64) {
+    let stamp = crate::storage::stamp::Stamp { ms: crate::storage::time::now_ms() - age_ms, c: 0, site: site.name.clone() };
+    let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(body))));
+    site.store
+        .put_object_stream_with_metadata(
+            bucket,
+            key,
+            stream,
+            Some("text/plain"),
+            None,
+            None,
+            None,
+            &BTreeMap::from([("owner".to_string(), "x".to_string())]),
+            false,
+            None,
+            None,
+            crate::storage::store::PublishOptions { stamp: Some(stamp), ..Default::default() },
+        )
+        .await
+        .unwrap();
+}
+
+/// Destroys `key`'s bytes on disk, as a failed disk would.
+async fn lose(site: &Site, bucket: &str, key: &str) {
+    let row = site.store.index(bucket).await.unwrap().get(key).await.unwrap().unwrap();
+    std::fs::remove_dir_all(site.tmp.path().join("buckets").join(bucket).join(&row.blob_dir)).unwrap();
+    site.store.forget_cached_meta(bucket, key);
+}
+
+#[tokio::test]
+async fn a_lost_object_is_restored_from_the_peer() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    put_aged(&a, "data", "doc.txt", b"precious", 60_000).await;
+    // A multipart object, also old enough to be judged.
+    let upload = a.store.initiate_multipart("data", "big.bin", None, None).await.unwrap();
+    let mut done = Vec::new();
+    for (i, part) in [vec![7u8; MIB], vec![8u8; 9]].iter().enumerate() {
+        let number = (i + 1) as u16;
+        let put = a.store.put_multipart_part("data", "big.bin", &upload, number, part, false).await.unwrap();
+        done.push(CompletePartRequest { number, etag: put.etag });
+    }
+    let old = crate::storage::stamp::Stamp { ms: crate::storage::time::now_ms() - 60_000, c: 1, site: "site-a".into() };
+    let etag = a
+        .store
+        .complete_multipart_with("data", "big.bin", &upload, &done, crate::storage::store::PublishOptions { stamp: Some(old), ..Default::default() })
+        .await
+        .unwrap()
+        .etag;
+    b.pull_from(&a, "data", Mode::Mirror).await;
+    eventually(30, "mirrored", || same(&a, &b, "data")).await;
+    let before = b.contents("data").await;
+
+    // b's disk loses both objects.
+    lose(&b, "data", "doc.txt").await;
+    lose(&b, "data", "big.bin").await;
+    let found = findings(&b.store, "data").await;
+    let missing: Vec<&Finding> = found.iter().filter(|f| f.kind == FindingKind::MissingBlob).collect();
+    assert_eq!(missing.len(), 2, "{found:?}");
+    assert_eq!(FindingKind::MissingBlob.actions()[0], RepairAction::RestoreFromPeer, "restore is recommended");
+    for finding in missing {
+        let (state, message) = b.store.repair_finding(finding, RepairAction::RestoreFromPeer).await;
+        assert_eq!(state, FindingState::Repaired, "{message}");
+        assert!(message.contains("restored from"), "{message}");
+    }
+    let after = b.contents("data").await;
+    assert_eq!(after, before, "bytes, ETag (incl. multipart), metadata and stamp all back");
+    assert_eq!(after["big.bin"].0, etag);
+    assert!(findings(&b.store, "data").await.iter().all(|f| f.kind != FindingKind::MissingBlob));
+}
+
+#[tokio::test]
+async fn restoring_never_rolls_back_silently() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    put_aged(&a, "data", "k", b"v1", 60_000).await;
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "merged", || same(&a, &b, "data")).await;
+    // Stop pulling, then b writes a newer version that a never gets.
+    b.replication.act(&id, LinkAction::Pause).await.unwrap();
+    put_aged(&b, "data", "k", b"v2 only on b", 30_000).await;
+    b.replication.act(&id, LinkAction::Resume).await.unwrap();
+    lose(&b, "data", "k").await;
+    let finding = findings(&b.store, "data")
+        .await
+        .into_iter()
+        .find(|f| f.kind == FindingKind::MissingBlob)
+        .unwrap();
+
+    // a only has the older v1: refused, with the reason.
+    let (state, message) = b.store.repair_finding(&finding, RepairAction::RestoreFromPeer).await;
+    assert_eq!(state, FindingState::Failed);
+    assert!(message.contains("older version"), "{message}");
+    // Explicitly accepting the rollback restores v1.
+    let (state, message) = b.store.repair_finding(&finding, RepairAction::RestoreOlderFromPeer).await;
+    assert_eq!(state, FindingState::Repaired, "{message}");
+    assert_eq!(b.contents("data").await["k"].5, b"v1");
+
+    // A bucket nothing replicates into has no peer to restore from.
+    b.store.create_bucket("local-only").await.unwrap();
+    put_aged(&b, "local-only", "x", b"x", 60_000).await;
+    lose(&b, "local-only", "x").await;
+    let finding = findings(&b.store, "local-only")
+        .await
+        .into_iter()
+        .find(|f| f.kind == FindingKind::MissingBlob)
+        .unwrap();
+    let (state, message) = b.store.repair_finding(&finding, RepairAction::RestoreFromPeer).await;
+    assert_eq!(state, FindingState::Failed);
+    assert!(message.contains("no enabled replication link"), "{message}");
+}

@@ -37,7 +37,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         Ok(stamp) => stamp,
         Err(response) => return response,
     };
-    let options = crate::storage::store::PublishOptions { precondition: None, stamp };
+    let options = crate::storage::store::PublishOptions { precondition: None, stamp, ..Default::default() };
     match store
         .complete_multipart_with(&ctx.bucket, &ctx.key, &upload_id, &parts, options)
         .await

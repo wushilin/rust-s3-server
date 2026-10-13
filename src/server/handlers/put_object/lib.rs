@@ -80,7 +80,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             aws_chunked,
             expected_sha256.as_deref(),
             expected_decoded_len,
-            PublishOptions { precondition, stamp },
+            PublishOptions { precondition, stamp, ..Default::default() },
         )
         .await
     {

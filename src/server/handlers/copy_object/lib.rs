@@ -96,7 +96,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             user_meta.as_ref(),
             replacement_content_type,
             replacement_content_language,
-            crate::storage::store::PublishOptions { precondition: None, stamp },
+            crate::storage::store::PublishOptions { precondition: None, stamp, ..Default::default() },
         )
         .await
     {

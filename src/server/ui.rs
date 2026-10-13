@@ -3131,6 +3131,8 @@ fn parse_repair_action(value: &str) -> Option<crate::storage::scan::RepairAction
         "quarantine" => Some(RepairAction::Quarantine),
         "resync_row" => Some(RepairAction::ResyncRow),
         "reclaim_empty_dirs" => Some(RepairAction::ReclaimEmptyDirs),
+        "restore_from_peer" => Some(RepairAction::RestoreFromPeer),
+        "restore_older_from_peer" => Some(RepairAction::RestoreOlderFromPeer),
         _ => None,
     }
 }

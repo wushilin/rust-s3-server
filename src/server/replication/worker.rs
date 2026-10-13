@@ -339,7 +339,7 @@ impl Worker {
                     .await
                     .map(|_| self.update(|s| s.deleted += 1))
             }
-            _ => match self.apply_put(event, stamp).await {
+            _ => match self.apply_put(event, stamp, true).await {
                 Ok(()) => Ok(()),
                 Err(PutError::Peer(PeerError::Superseded | PeerError::NotFound)) => {
                     // Changed or deleted on the peer since: a later event
@@ -362,11 +362,23 @@ impl Worker {
         }
     }
 
-    async fn apply_put(&self, event: &WireEvent, stamp: crate::storage::stamp::Stamp) -> Result<(), PutError> {
+    /// Restores a lost object from this link's peer: the bytes of the peer's
+    /// state `event`, published with `options` (a restore stamp, guarded).
+    pub async fn restore(&self, event: &WireEvent, options: PublishOptions) -> Result<(), String> {
+        let stamp = options.stamp.clone().ok_or("a restore needs the stamp")?;
+        match self.copy(event, stamp, options).await {
+            Ok(()) => Ok(()),
+            Err(PutError::Peer(err)) => Err(format!("peer: {err}")),
+            Err(PutError::Local(err)) => Err(format!("local: {err}")),
+        }
+    }
+
+    async fn apply_put(&self, event: &WireEvent, stamp: crate::storage::stamp::Stamp, metadata_only_ok: bool) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
         let key = &event.key;
         let local = self.store.index(bucket).await.map_err(PutError::Local)?.get(key).await.map_err(PutError::Local)?;
-        if let Some(local) = local.filter(|row| row.etag == event.etag && row.size == event.size) {
+        let same_bytes = local.filter(|row| metadata_only_ok && row.etag == event.etag && row.size == event.size);
+        if let Some(local) = same_bytes {
             // Same bytes here already: adopt the peer's metadata and stamp
             // without moving data.
             let _ = local;
@@ -381,15 +393,24 @@ impl Worker {
                     Some(&headers.user_meta),
                     headers.content_type.as_deref(),
                     headers.content_language.as_deref(),
-                    PublishOptions { precondition: None, stamp: Some(stamp) },
+                    PublishOptions { precondition: None, stamp: Some(stamp), ..Default::default() },
                 )
                 .await
                 .map_err(PutError::Local)?;
             self.update(|s| s.metadata_only += 1);
             return Ok(());
         }
+        let options = PublishOptions { precondition: None, stamp: Some(stamp.clone()), ..Default::default() };
+        self.copy(event, stamp, options).await
+    }
+
+    /// Copies the bytes of the peer's state `event` (with its layout).
+    async fn copy(&self, event: &WireEvent, stamp: crate::storage::stamp::Stamp, options: PublishOptions) -> Result<(), PutError> {
+        let bucket = &self.link.local_bucket;
+        let key = &event.key;
+        let _ = &stamp;
         match event.parts.as_ref().filter(|layout| layout.multipart) {
-            Some(layout) => self.copy_multipart(event, layout, stamp).await,
+            Some(layout) => self.copy_multipart(event, layout, options).await,
             None => {
                 let (headers, stream) = self.peer.body(key, &event.version, None).await.map_err(PutError::Peer)?;
                 self.store
@@ -405,7 +426,7 @@ impl Worker {
                         false,
                         None,
                         None,
-                        PublishOptions { precondition: None, stamp: Some(stamp) },
+                        options,
                     )
                     .await
                     .map_err(PutError::Local)?;
@@ -424,7 +445,7 @@ impl Worker {
         &self,
         event: &WireEvent,
         layout: &crate::storage::changelog::PartLayout,
-        stamp: crate::storage::stamp::Stamp,
+        options: PublishOptions,
     ) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
         let key = &event.key;
@@ -460,7 +481,7 @@ impl Worker {
             }
             let done = self
                 .store
-                .complete_multipart_with(bucket, key, &upload_id, &parts, PublishOptions { precondition: None, stamp: Some(stamp) })
+                .complete_multipart_with(bucket, key, &upload_id, &parts, options)
                 .await
                 .map_err(PutError::Local)?;
             if done.etag != event.etag {

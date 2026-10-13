@@ -162,11 +162,19 @@ impl FindingKind {
             // is to act on. If a row *does* point here, that row shows up
             // separately as a missing blob, with its own row-deleting repair.
             FindingKind::UnreadableBlob => &[RepairAction::TrashBlob],
-            FindingKind::MissingBlob => &[RepairAction::DeleteRow],
+            // Lost bytes: fetch them back from a replication peer first; a
+            // row delete is the last resort.
+            FindingKind::MissingBlob => &[
+                RepairAction::RestoreFromPeer,
+                RepairAction::DeleteRow,
+                RepairAction::RestoreOlderFromPeer,
+            ],
             FindingKind::CorruptObject => &[
+                RepairAction::RestoreFromPeer,
                 RepairAction::Quarantine,
                 RepairAction::TrashBlob,
                 RepairAction::DeleteRow,
+                RepairAction::RestoreOlderFromPeer,
             ],
             FindingKind::IndexDrift => &[RepairAction::ResyncRow],
             FindingKind::EmptyFanout => &[RepairAction::ReclaimEmptyDirs],
@@ -206,6 +214,13 @@ pub enum RepairAction {
     ResyncRow,
     /// Run one empty-fanout reclamation pass over the bucket.
     ReclaimEmptyDirs,
+    /// Fetch the object back from a replication peer that holds the lost
+    /// version or a newer one (keeping that version's stamp).
+    RestoreFromPeer,
+    /// As [`Self::RestoreFromPeer`], but also accept a peer that only has an
+    /// older version — rolling the key back to it. Never chosen
+    /// automatically.
+    RestoreOlderFromPeer,
 }
 
 impl RepairAction {
@@ -216,6 +231,8 @@ impl RepairAction {
             RepairAction::Quarantine => "quarantine",
             RepairAction::ResyncRow => "resync_row",
             RepairAction::ReclaimEmptyDirs => "reclaim_empty_dirs",
+            RepairAction::RestoreFromPeer => "restore_from_peer",
+            RepairAction::RestoreOlderFromPeer => "restore_older_from_peer",
         }
     }
 }
@@ -1028,6 +1045,42 @@ impl LocalObjectStore {
             return self.trash_unreadable_blob(finding).await;
         }
 
+        // Restoring publishes through the normal write path, which takes the
+        // key lock itself; so verify here without it. The publish is guarded
+        // by If-Match on the lost version's ETag, so a write that lands in
+        // between is never clobbered (the restore then fails instead).
+        if matches!(action, RepairAction::RestoreFromPeer | RepairAction::RestoreOlderFromPeer) {
+            let Some(object_key) = finding.object_key.clone() else {
+                return Ok((FindingState::Failed, "finding has no object key".to_string()));
+            };
+            let index = self.index(bucket).await?;
+            let Some(row) = index.get(&object_key).await? else {
+                return Ok((FindingState::Stale, "the index row is gone".to_string()));
+            };
+            if let Some(rel) = &finding.blob_dir {
+                if !same_blob_dir(&row.blob_dir, rel) {
+                    return Ok((FindingState::Stale, format!("the row now points at {}, not {rel}", row.blob_dir)));
+                }
+            }
+            if finding.kind == FindingKind::MissingBlob
+                && self.read_object(bucket, &object_key).await.is_ok()
+            {
+                return Ok((FindingState::Stale, "the object is readable again".to_string()));
+            }
+            let lost = self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms);
+            let request = super::store::RestoreRequest {
+                bucket: bucket.clone(),
+                key: object_key,
+                lost_stamp: lost,
+                lost_etag: row.etag.clone(),
+                allow_older: action == RepairAction::RestoreOlderFromPeer,
+            };
+            return Ok(match self.restore_from_peer(request).await {
+                Ok(message) => (FindingState::Repaired, message),
+                Err(message) => (FindingState::Failed, message),
+            });
+        }
+
         let Some(object_key) = finding.object_key.clone() else {
             return Ok((
                 FindingState::Failed,
@@ -1155,7 +1208,9 @@ impl LocalObjectStore {
                     Ok((FindingState::Stale, "the row moved under us".to_string()))
                 }
             }
-            RepairAction::ReclaimEmptyDirs => unreachable!("handled above"),
+            RepairAction::ReclaimEmptyDirs
+            | RepairAction::RestoreFromPeer
+            | RepairAction::RestoreOlderFromPeer => unreachable!("handled above"),
         }
     }
 

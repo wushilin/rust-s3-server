@@ -222,6 +222,16 @@ impl ReplicationService {
                 )
             })
         })));
+        let weak = Arc::downgrade(&service.inner);
+        service.inner.store.set_peer_restorer(crate::storage::store::PeerRestorer(Arc::new(move |request| {
+            let inner = weak.upgrade();
+            Box::pin(async move {
+                match inner {
+                    Some(inner) => ReplicationService { inner }.restore(request).await,
+                    None => Err("replication is shutting down".to_string()),
+                }
+            })
+        })));
         service.spawn_supervisor();
         Ok(service)
     }
@@ -502,6 +512,82 @@ impl ReplicationService {
             .collect();
         ids.sort();
         ids.into_iter().filter_map(|(_, id)| self.view(&id).ok()).collect()
+    }
+
+    /// Restores a lost object from the first peer (a link pulling into its
+    /// bucket) that holds the lost version or a newer one — or, with
+    /// `allow_older`, any version. The peer's state keeps its stamp; the
+    /// publish is guarded by If-Match on the lost version's ETag, so a write
+    /// that landed meanwhile is never clobbered.
+    pub async fn restore(&self, request: crate::storage::store::RestoreRequest) -> Result<String, String> {
+        let links = self.peers_for(&request.bucket);
+        if links.is_empty() {
+            return Err(format!(
+                "no enabled replication link pulls into bucket {}: nothing to restore from",
+                request.bucket
+            ));
+        }
+        let mut notes = Vec::new();
+        for link in links {
+            let peer = match PeerClient::new(peer_config(&link)) {
+                Ok(peer) => peer,
+                Err(err) => {
+                    notes.push(format!("{}: {err}", link.name));
+                    continue;
+                }
+            };
+            // The peer's current state of the key: the first entry of a
+            // listing under the key itself.
+            let page = match peer.snapshot(None, 1, &request.key, false).await {
+                Ok(page) => page,
+                Err(err) => {
+                    notes.push(format!("{}: {err}", link.name));
+                    continue;
+                }
+            };
+            let Some(entry) = page.entries.into_iter().find(|e| e.key == request.key) else {
+                notes.push(format!("{}: the peer does not have it", link.name));
+                continue;
+            };
+            let stamp = peer::event_stamp(&entry, &page.site_id);
+            if stamp < request.lost_stamp && !request.allow_older {
+                notes.push(format!(
+                    "{}: the peer only has an older version (stamp {}, lost {}); restoring it would roll the \
+                     key back — use \"restore older from peer\" to accept that",
+                    link.name,
+                    stamp.to_header(),
+                    request.lost_stamp.to_header()
+                ));
+                continue;
+            }
+            let worker = worker::Worker {
+                store: self.inner.store.clone(),
+                link: link.clone(),
+                peer,
+                status: Arc::new(Mutex::new(LinkStatus::default())),
+                heartbeat: Arc::new(AtomicI64::new(now_ms())),
+                cancel: CancellationToken::new(),
+                max_checkpoint_age_ms: i64::MAX,
+                long_poll: self.inner.timing.long_poll,
+            };
+            let options = crate::storage::store::PublishOptions {
+                precondition: Some(crate::storage::store::Precondition::IfMatch(request.lost_etag.clone())),
+                stamp: Some(stamp.clone()),
+                restore: true,
+            };
+            match worker.restore(&entry, options).await {
+                Ok(()) => {
+                    return Ok(format!(
+                        "restored from {} (site {}, stamp {})",
+                        link.name,
+                        page.site_id,
+                        stamp.to_header()
+                    ))
+                }
+                Err(err) => notes.push(format!("{}: {err}", link.name)),
+            }
+        }
+        Err(format!("not restored: {}", notes.join("; ")))
     }
 
     /// The enabled links whose local bucket is `bucket` — for restoring a

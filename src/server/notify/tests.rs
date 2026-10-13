@@ -1413,7 +1413,7 @@ async fn a_replicated_multipart_upload_is_stamped_at_completion() {
             "big",
             &upload_id,
             &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
-            crate::storage::store::PublishOptions { precondition: None, stamp: Some(origin.clone()) },
+            crate::storage::store::PublishOptions { precondition: None, stamp: Some(origin.clone()), ..Default::default() },
         )
         .await
         .unwrap();
@@ -1644,7 +1644,7 @@ async fn put_stamped(store: &LocalObjectStore, bucket: &str, key: &str, body: &[
             false,
             None,
             None,
-            PublishOptions { precondition: None, stamp },
+            PublishOptions { precondition: None, stamp, ..Default::default() },
         )
         .await
 }
@@ -1749,7 +1749,7 @@ async fn a_stale_replicated_multipart_upload_is_refused_before_assembly() {
             "k",
             &upload_id,
             &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
-            PublishOptions { precondition: None, stamp: Some(st(1, "a")) },
+            PublishOptions { precondition: None, stamp: Some(st(1, "a")), ..Default::default() },
         )
         .await
         .unwrap_err();

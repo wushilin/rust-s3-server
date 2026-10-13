@@ -78,6 +78,31 @@ impl std::fmt::Debug for ChangeListener {
     }
 }
 
+/// What a "restore from peer" repair asks for.
+#[derive(Debug, Clone)]
+pub struct RestoreRequest {
+    pub bucket: String,
+    pub key: String,
+    /// The lost version's stamp and ETag.
+    pub lost_stamp: Stamp,
+    pub lost_etag: String,
+    /// Accept a peer that only has an older version.
+    pub allow_older: bool,
+}
+
+/// Fetches a lost object back from a replication peer (installed by the
+/// replication service): `Ok(message)` once restored, `Err(why not)`.
+#[derive(Clone)]
+pub struct PeerRestorer(
+    pub Arc<dyn Fn(RestoreRequest) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> + Send + Sync>,
+);
+
+impl std::fmt::Debug for PeerRestorer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerRestorer")
+    }
+}
+
 /// Bucket-deletion veto: returns why `bucket` may not be deleted, if so.
 #[derive(Clone)]
 pub struct DeleteGuard(pub Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
@@ -121,6 +146,8 @@ pub struct LocalObjectStore {
     /// Vetoes bucket deletion (returns the reason) — the changelog
     /// subscriptions refuse while any subscription targets the bucket.
     delete_guard: Arc<std::sync::RwLock<Vec<DeleteGuard>>>,
+    /// Restores lost objects from replication peers (health-scan repair).
+    peer_restorer: Arc<std::sync::RwLock<Option<PeerRestorer>>>,
     /// Per-bucket "the changelog moved" signal, for long-polling readers.
     change_signals: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// This site's identity and version-stamp clock. Opened by
@@ -153,6 +180,9 @@ pub struct PublishOptions {
     /// A replicated write: keep this stamp (the writing site's) instead of
     /// minting a local one. Last-Modified becomes `stamp.ms`.
     pub stamp: Option<Stamp>,
+    /// Restoring a lost object: apply `stamp` even if it is not newer than
+    /// the (broken) current state. Guard with a precondition.
+    pub restore: bool,
 }
 
 impl PublishOptions {
@@ -160,6 +190,7 @@ impl PublishOptions {
         Self {
             precondition,
             stamp: None,
+            restore: false,
         }
     }
 }
@@ -318,6 +349,7 @@ impl LocalObjectStore {
             change_listener: Arc::new(std::sync::RwLock::new(None)),
             delete_guard: Arc::new(std::sync::RwLock::new(Vec::new())),
             change_signals: Arc::new(Mutex::new(HashMap::new())),
+            peer_restorer: Arc::new(std::sync::RwLock::new(None)),
             clock: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
@@ -329,6 +361,20 @@ impl LocalObjectStore {
     /// opened earlier.
     pub fn set_change_listener(&self, listener: ChangeListener) {
         *self.change_listener.write().unwrap() = Some(listener);
+    }
+
+    /// Installs the peer restorer (the replication service).
+    pub fn set_peer_restorer(&self, restorer: PeerRestorer) {
+        *self.peer_restorer.write().unwrap() = Some(restorer);
+    }
+
+    /// Fetches a lost object back from a replication peer.
+    pub(crate) async fn restore_from_peer(&self, request: RestoreRequest) -> std::result::Result<String, String> {
+        let restorer = self.peer_restorer.read().unwrap().clone();
+        match restorer {
+            Some(restorer) => restorer.0(request).await,
+            None => Err("replication is not available on this server".to_string()),
+        }
     }
 
     /// Adds a bucket-deletion veto. Any one refusing blocks the delete.
@@ -1126,7 +1172,7 @@ impl LocalObjectStore {
         mut object_meta: ObjectMeta,
         options: PublishOptions,
     ) -> Result<PutResult> {
-        let PublishOptions { precondition, stamp: replicated } = options;
+        let PublishOptions { precondition, stamp: replicated, restore } = options;
         let replicated_for_check = replicated.clone();
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if self.durability == Durability::Full {
@@ -1163,7 +1209,7 @@ impl LocalObjectStore {
         let current = self.current_stamp(&index, key, old.as_ref()).await?;
         // A replicated state applies only over an older one, so the higher
         // stamp wins on every site, whatever order the changes arrive in.
-        if let Some(incoming) = &replicated_for_check {
+        if let Some(incoming) = replicated_for_check.as_ref().filter(|_| !restore) {
             if let Some(current) = current.as_ref().filter(|current| incoming <= *current) {
                 let _ = index.delete_intent(intent_id).await;
                 let _ = tokio::fs::remove_dir_all(publish_dir).await;
@@ -2121,7 +2167,7 @@ impl LocalObjectStore {
         // A replicated upload older than what is here is refused before
         // anything is assembled, leaving the upload intact (to abort). The
         // publish re-checks under the key lock.
-        if let Some(incoming) = &options.stamp {
+        if let Some(incoming) = options.stamp.as_ref().filter(|_| !options.restore) {
             if let Some((current, _)) = self.key_stamp(bucket, key).await? {
                 if incoming <= &current {
                     return Err(StorageError::StaleStamp {
