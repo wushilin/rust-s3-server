@@ -65,6 +65,9 @@ pub enum RuleAccess {
     Read,
     Write,
     ReadWrite,
+    /// What a replication link's key needs on a whole bucket: read it and
+    /// its changelog, and write it with the changes' original stamps.
+    Replication,
 }
 
 /// The deliberately small, safe rule model exposed by the management UI.
@@ -90,6 +93,18 @@ const WRITE_OBJECT_ACTIONS: &[&str] = &[
     "s3:ListMultipartUploadParts",
 ];
 
+/// A replication rule: the changelog (bucket level), and object reads and
+/// stamped writes. Multipart helpers let a pushed multipart copy clean up
+/// after a failure.
+const REPLICATION_BUCKET_ACTIONS: &[&str] = &["s3:GetBucketChangelog"];
+const REPLICATION_OBJECT_ACTIONS: &[&str] = &[
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:ReplicateWrite",
+    "s3:AbortMultipartUpload",
+];
+
 pub fn compile_rules(rules: &[PolicyRule]) -> Result<PolicyDocument, String> {
     let mut statement = Vec::with_capacity(rules.len() * 2);
     for (index, rule) in rules.iter().enumerate() {
@@ -100,6 +115,12 @@ pub fn compile_rules(rules: &[PolicyRule]) -> Result<PolicyDocument, String> {
         }
         if bucket.contains('/') {
             return Err(format!("Rule {}: bucket must not contain '/'", index + 1));
+        }
+        if rule.access == RuleAccess::Replication && !prefix.is_empty() {
+            return Err(format!(
+                "Rule {}: replication covers the whole bucket; leave the prefix empty",
+                index + 1
+            ));
         }
         if bucket == "*" && !prefix.is_empty() {
             return Err(format!(
@@ -122,6 +143,15 @@ pub fn compile_rules(rules: &[PolicyRule]) -> Result<PolicyDocument, String> {
             )]),
             ..Condition::default()
         });
+        if rule.access == RuleAccess::Replication {
+            statement.push(Statement {
+                sid: Some(format!("RustS3Rule{}ReplicationBucket", index + 1)),
+                effect: rule.effect,
+                action: strings(REPLICATION_BUCKET_ACTIONS.to_vec()),
+                resource: OneOrMany::One(bucket_resource.clone()),
+                condition: None,
+            });
+        }
         if matches!(rule.access, RuleAccess::Read | RuleAccess::ReadWrite) {
             statement.push(Statement {
                 sid: Some(format!("RustS3Rule{}ReadBucket", index + 1)),
@@ -166,8 +196,12 @@ pub fn decompile_rules(policy: &PolicyDocument) -> Result<Vec<PolicyRule>, Strin
         let first = &policy.statement[cursor];
         let read_sid = format!("RustS3Rule{rule_number}ReadBucket");
         let write_sid = format!("RustS3Rule{rule_number}WriteBucket");
+        let replication_sid = format!("RustS3Rule{rule_number}ReplicationBucket");
         let (access, bucket_statement, write_statement) =
-            if first.sid.as_deref() == Some(read_sid.as_str()) {
+            if first.sid.as_deref() == Some(replication_sid.as_str()) {
+                cursor += 1;
+                (RuleAccess::Replication, first, None)
+            } else if first.sid.as_deref() == Some(read_sid.as_str()) {
                 cursor += 1;
                 if policy
                     .statement
@@ -241,6 +275,7 @@ fn rule_actions(access: RuleAccess) -> (Vec<&'static str>, Vec<&'static str>) {
     match access {
         RuleAccess::Read => (READ_BUCKET_ACTIONS.to_vec(), READ_OBJECT_ACTIONS.to_vec()),
         RuleAccess::Write => (WRITE_BUCKET_ACTIONS.to_vec(), WRITE_OBJECT_ACTIONS.to_vec()),
+        RuleAccess::Replication => (REPLICATION_BUCKET_ACTIONS.to_vec(), REPLICATION_OBJECT_ACTIONS.to_vec()),
         RuleAccess::ReadWrite => (
             READ_BUCKET_ACTIONS
                 .iter()
@@ -963,6 +998,38 @@ mod tests {
             r#"{"Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::b","Condition":{"StringEquals":{"aws:username":"alice"}}}]}"#,
         );
         assert!(unsupported_key.validate().is_err());
+    }
+
+    #[test]
+    fn a_replication_rule_grants_exactly_what_a_link_key_needs_and_round_trips() {
+        let rules = vec![PolicyRule { effect: Effect::Allow, access: RuleAccess::Replication, bucket: "photos".into(), prefix: String::new() }];
+        let policy = compile_rules(&rules).unwrap();
+        // Everything a merge link needs on the bucket (a mirror's local key
+        // needs a subset)...
+        for action in ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ReplicateWrite"] {
+            assert!(is_authorized(&policy, &[Requirement::object(action, "photos", "*")]), "{action}");
+            assert!(is_authorized(&policy, &[Requirement::object(action, "photos", "a/b.jpg")]), "{action}");
+        }
+        assert!(is_authorized(&policy, &[Requirement::bucket("s3:GetBucketChangelog", "photos")]));
+        // ...and nothing else: no listing, no other bucket.
+        assert!(!is_authorized(&policy, &[Requirement::bucket("s3:ListBucket", "photos")]));
+        assert!(!is_authorized(&policy, &[Requirement::object("s3:GetObject", "other", "k")]));
+        assert_eq!(decompile_rules(&policy).unwrap(), rules);
+        // Mixed with other rules, still round-trips.
+        let mixed = vec![
+            PolicyRule { effect: Effect::Allow, access: RuleAccess::Read, bucket: "logs".into(), prefix: "app/".into() },
+            rules[0].clone(),
+        ];
+        assert_eq!(decompile_rules(&compile_rules(&mixed).unwrap()).unwrap(), mixed);
+        // Every bucket.
+        let all = vec![PolicyRule { bucket: "*".into(), ..rules[0].clone() }];
+        let policy = compile_rules(&all).unwrap();
+        assert!(is_authorized(&policy, &[Requirement::bucket("s3:GetBucketChangelog", "any")]));
+        assert!(is_authorized(&policy, &[Requirement::object("s3:ReplicateWrite", "any", "*")]));
+        assert_eq!(decompile_rules(&policy).unwrap(), all);
+        // Replication is whole-bucket.
+        let prefixed = PolicyRule { prefix: "x/".into(), ..rules[0].clone() };
+        assert!(compile_rules(&[prefixed]).unwrap_err().contains("whole bucket"));
     }
 
     #[test]

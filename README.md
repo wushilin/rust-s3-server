@@ -707,6 +707,12 @@ Each action is needed on the whole bucket (every key). `s3:ReplicateWrite` is
 the permission to write with a change's original stamp: replicated writes keep
 the stamp of the site that made them, which is what decides conflicts, so
 setting it is a privilege of its own. Admin keys (`s3:*`) have everything.
+In the console's policy editor, the rule builder's **Replication** access
+level grants exactly these on a whole bucket (bucket `*` for every bucket),
+and the JSON presets **Replicate all buckets** (`ReplicateAllBuckets`) and
+**Replicate one bucket** (`ReplicateOneBucket`) do the same. Both cover
+either key of either mode; `s3:AbortMultipartUpload` is included so a failed
+pushed multipart copy can clean up.
 
 - **Checked when the link is created** (and when its peer or keys change): the
   peer must answer, not be this server, have the bucket, and its key must have
