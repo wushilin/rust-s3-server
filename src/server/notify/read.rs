@@ -19,7 +19,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::model::{Filter, WireEvent};
 use crate::storage::changelog::ChangeOp;
@@ -63,7 +63,7 @@ pub struct SnapshotParams {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResponse {
     pub bucket: String,
     /// This server's site id: a replicator refuses to copy between two
@@ -82,7 +82,7 @@ pub struct ReadResponse {
     pub events: Vec<WireEvent>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotResponse {
     pub bucket: String,
     /// This server's site id (see `storage::stamp`).

@@ -289,7 +289,7 @@ impl NotifyService {
                 }
             })));
         let weak = Arc::downgrade(&service.inner);
-        service.inner.store.set_delete_guard(DeleteGuard(Arc::new(move |bucket| {
+        service.inner.store.add_delete_guard(DeleteGuard(Arc::new(move |bucket| {
             let inner = weak.upgrade()?;
             let names: Vec<String> = inner
                 .subs

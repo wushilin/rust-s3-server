@@ -91,6 +91,9 @@ const CF_META: &str = "meta";
 const CF_TOMBSTONES: &str = "tombstones";
 
 const KEY_OBJECT_COUNT: &[u8] = b"objects";
+/// `meta` keys `repl_ckpt/<link id>`: a replication link's checkpoint (its
+/// position in the peer's changelog), kept beside the data it describes.
+const CHECKPOINT_PREFIX: &str = "repl_ckpt/";
 const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -941,6 +944,35 @@ impl ObjectIndex {
         }
     }
 
+    // ── replication checkpoints ─────────────────────────────────────────────
+
+    /// A replication link's checkpoint, stored in this (the target) bucket's
+    /// index: it rolls back with the data if the index is restored, and an
+    /// index rebuild carries it over.
+    pub async fn get_checkpoint(&self, link_id: &str) -> Result<Option<Vec<u8>>> {
+        let db = self.db.clone();
+        let key = format!("{CHECKPOINT_PREFIX}{link_id}");
+        run_blocking(move || Ok(db.get_cf(&cf(&db, CF_META)?, key.as_bytes())?)).await
+    }
+
+    /// Saves (`Some`) or clears (`None`) a link's checkpoint. Synced: a
+    /// checkpoint ahead of applied data would skip changes.
+    pub async fn put_checkpoint(&self, link_id: &str, value: Option<Vec<u8>>) -> Result<()> {
+        let db = self.db.clone();
+        let key = format!("{CHECKPOINT_PREFIX}{link_id}");
+        run_blocking(move || {
+            let meta = cf(&db, CF_META)?;
+            let mut opts = WriteOptions::default();
+            opts.set_sync(true);
+            match value {
+                Some(value) => db.put_cf_opt(&meta, key.as_bytes(), value, &opts)?,
+                None => db.delete_cf_opt(&meta, key.as_bytes(), &opts)?,
+            }
+            Ok(())
+        })
+        .await
+    }
+
     // ── tombstones ──────────────────────────────────────────────────────────
 
     pub async fn get_tombstone(&self, key: &str) -> Result<Option<Tombstone>> {
@@ -1453,6 +1485,16 @@ impl ObjectIndex {
                 if batch.len() >= 10_000 {
                     dst_db.write(std::mem::take(&mut batch))?;
                 }
+            }
+            for item in src.iterator_cf(
+                &src_meta,
+                IteratorMode::From(CHECKPOINT_PREFIX.as_bytes(), Direction::Forward),
+            ) {
+                let (key, value) = item?;
+                if !key.starts_with(CHECKPOINT_PREFIX.as_bytes()) {
+                    break;
+                }
+                batch.put_cf(&dst_meta, key, value);
             }
             for key in [KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH, KEY_TRIMMED_TS] {
                 if let Some(value) = src.get_cf(&src_meta, key)? {

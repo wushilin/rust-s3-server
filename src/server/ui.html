@@ -186,6 +186,11 @@
           <div class="table-wrap"><table><thead><tr><th>Subscription</th><th>Bucket / filter</th><th>Status</th><th>Position</th><th>Last delivery</th><th style="width:150px"></th></tr></thead><tbody id="subRows"></tbody></table></div>
           <div id="subEmpty" class="empty hidden"></div>
         </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="panel-title"><div><h3>Replication links</h3><p>Pull a bucket from another rusts3 site into a local bucket. <b>Mirror</b> makes the local bucket a copy of the peer's; <b>merge</b> keeps both sides' objects — configure a merge link on each site for two-way replication. This site's id: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Link</th><th>Local ← peer</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
+          <div id="linkEmpty" class="empty hidden"></div>
+        </div>
       </section>
 
       <section id="tab_perf" class="page hidden">
@@ -433,6 +438,24 @@
       <div id="subError" class="inline-error"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="subDlg.close()">Cancel</button><button class="btn primary" type="submit" id="sub_submit">Create</button></div>
+  </form>
+</dialog>
+
+<dialog id="linkDlg">
+  <form onsubmit="saveLink(event)">
+    <div class="dialog-head"><div><h3>New replication link</h3><p>Runs on this site and pulls from the peer. Use a peer key with s3:GetObject and s3:GetBucketChangelog on the peer bucket.</p></div><button type="button" class="dialog-close" onclick="linkDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body">
+      <div class="field"><label for="ln_name">Name</label><input class="input" id="ln_name" placeholder="e.g. sg-to-jp" autocomplete="off"></div>
+      <div class="field"><label for="ln_bucket">Local bucket</label><select class="input" id="ln_bucket"></select></div>
+      <div class="field"><label for="ln_endpoint">Peer S3 endpoint</label><input class="input" id="ln_endpoint" placeholder="https://s3.other-site.example.com" autocomplete="off"></div>
+      <div class="field"><label for="ln_peer_bucket">Peer bucket</label><input class="input" id="ln_peer_bucket" autocomplete="off"></div>
+      <div class="field"><label for="ln_ak">Peer access key</label><input class="input" id="ln_ak" autocomplete="off"></div>
+      <div class="field"><label for="ln_sk">Peer secret key</label><input class="input" id="ln_sk" type="password" autocomplete="new-password"></div>
+      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode"><option value="mirror">Mirror (one-way: local becomes a copy)</option><option value="merge">Merge (two-way member: keep both sides)</option></select></div>
+      <div class="field"><label for="ln_prefix">Key prefix (optional)</label><input class="input" id="ln_prefix" placeholder="(all keys)" autocomplete="off"></div>
+      <div id="linkError" class="inline-error"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="linkDlg.close()">Cancel</button><button class="btn primary" type="submit">Create link</button></div>
   </form>
 </dialog>
 

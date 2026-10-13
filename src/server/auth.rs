@@ -1696,8 +1696,8 @@ pub(crate) fn compute_auth_header_with_headers(
 }
 
 /// Returns `(authorization, seed_signature)` for a request whose
-/// `x-amz-content-sha256` is `payload_hash`.
-#[cfg(test)]
+/// `x-amz-content-sha256` is `payload_hash`. Also the outbound signer of the
+/// replication client (a peer verifies it with the same canonical forms).
 pub(crate) fn compute_auth_header_payload(
     method: &str,
     path: &str,

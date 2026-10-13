@@ -11,6 +11,7 @@ pub mod iam;
 pub(crate) mod jobs;
 pub mod identity;
 pub mod notify;
+pub mod replication;
 pub mod key_usage;
 pub mod logging;
 pub(crate) mod pipeline;
@@ -1180,6 +1181,20 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?;
+    // Replication links: workers pulling peers' buckets into local ones.
+    let replication = replication::ReplicationService::start(
+        store.clone(),
+        replication::db::LinkDb::new(iam.admin_db()),
+        replication::Timing {
+            check_interval: std::time::Duration::from_secs(config.app_config.replication.check_interval_secs.max(1)),
+            stale_after: std::time::Duration::from_secs(config.app_config.replication.worker_stale_secs.max(30)),
+            max_checkpoint_age: std::time::Duration::from_secs(config.app_config.changelog.tombstone_days.max(1) * 86_400),
+            long_poll: std::time::Duration::from_secs(20),
+        },
+        shutdown.clone(),
+    )
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
     let key_usage = key_usage::KeyUsageStore::open(FsPath::new(&config.root)).await?;
     key_usage.spawn_flusher(shutdown.clone());
     let auth_state = AuthState {
@@ -1223,6 +1238,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             scans,
             stats,
             notify: Some(notify.clone()),
+            replication: Some(replication.clone()),
         };
         let ui_bind = format!(
             "{}:{}",

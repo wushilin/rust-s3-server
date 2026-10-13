@@ -54,6 +54,8 @@ pub struct UiState {
     /// Changelog subscriptions (webhooks / replication tokens). `None` in
     /// tests that do not exercise them.
     pub(crate) notify: Option<super::notify::NotifyService>,
+    /// Replication links. `None` in tests that do not exercise them.
+    pub(crate) replication: Option<super::replication::ReplicationService>,
 }
 
 /// A resolved UI session. Managed admin membership is resolved on every
@@ -103,6 +105,10 @@ pub fn router(state: UiState) -> Router {
                 .delete(delete_subscription),
         )
         .route("/api/subscriptions/{id}/action", post(subscription_action))
+        // Replication links (admin only).
+        .route("/api/replication", get(list_links).post(create_link))
+        .route("/api/replication/{id}", get(get_link).put(update_link).delete(delete_link))
+        .route("/api/replication/{id}/action", post(link_action))
         .route("/api/admin/export", get(export_iam))
         // Import buffers and fully validates the dump before an atomic apply, so
         // the body is held in memory. The global IAM database is small by nature
@@ -3615,5 +3621,143 @@ async fn subscription_action(
             Json(result).into_response()
         }
         Err(err) => super::notify::pull::error_response(err),
+    }
+}
+
+// ── replication links (admin only) ───────────────────────────────────────────
+
+fn replication_service(state: &UiState) -> Result<&super::replication::ReplicationService, Response> {
+    state
+        .replication
+        .as_ref()
+        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "replication is not available"))
+}
+
+fn link_error(err: super::replication::LinkError) -> Response {
+    use super::replication::LinkError;
+    let status = match &err {
+        LinkError::NotFound(_) => StatusCode::NOT_FOUND,
+        LinkError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        LinkError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, err.to_string())
+}
+
+async fn list_links(State(state): State<UiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    match replication_service(&state) {
+        Ok(service) => Json(json!({ "links": service.list(), "site_id": state.store.site_id() })).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+async fn create_link(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(request): Json<super::replication::LinkRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    let bucket = request.local_bucket.clone();
+    match service.create(request, &session.username).await {
+        Ok(view) => {
+            audit(&state, &rid.0, &session.username, "create_replication_link", format!("/{bucket} {}", view.id));
+            Json(view).into_response()
+        }
+        Err(err) => link_error(err),
+    }
+}
+
+async fn get_link(State(state): State<UiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    match replication_service(&state) {
+        Ok(service) => match service.view(&id) {
+            Ok(view) => Json(view).into_response(),
+            Err(err) => link_error(err),
+        },
+        Err(resp) => resp,
+    }
+}
+
+async fn update_link(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+    Json(update): Json<super::replication::LinkUpdate>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.update(&id, update).await {
+        Ok(view) => {
+            audit(&state, &rid.0, &session.username, "update_replication_link", id);
+            Json(view).into_response()
+        }
+        Err(err) => link_error(err),
+    }
+}
+
+async fn delete_link(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.delete(&id).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "delete_replication_link", id);
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(err) => link_error(err),
+    }
+}
+
+async fn link_action(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+    Json(action): Json<super::replication::LinkAction>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    let label = format!("{action:?}");
+    match service.act(&id, action).await {
+        Ok(view) => {
+            audit(&state, &rid.0, &session.username, "replication_link_action", format!("{id} {label}"));
+            Json(view).into_response()
+        }
+        Err(err) => link_error(err),
     }
 }

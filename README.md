@@ -319,6 +319,8 @@ batch/grace settings.
 |---|---:|---|
 | `changelog.retention_days` | `14` | Changelog entries older than this are trimmed, whether or not every subscription has read them. |
 | `changelog.trim_interval_secs` | `600` | How often the trim and the tombstone purge run. |
+| `replication.check_interval_secs` | `5` | Supervisor tick: an enabled replication link without a live worker gets one within this. |
+| `replication.worker_stale_secs` | `300` | A link worker silent for this long is replaced. |
 | `changelog.tombstone_days` | `14` | How long a delete's tombstone (its stamp) is kept, so an older replicated write cannot bring the object back. |
 | `webhooks.check_interval_secs` | `5` | Checker tick: muted webhooks whose mute has passed resume on the next tick. |
 | `webhooks.mute_secs` | `30` | Mute after any unsuccessful delivery (per-webhook override). A longer `Retry-After` wins. |
@@ -656,6 +658,54 @@ addressing. A bucket name can't start with `_`, so `/_rs3/` never clashes with
 a bucket. On a virtual-hosted request (`<bucket>.<public_hostname>/_rs3/…`) the
 path is an ordinary object key and goes to S3. Pausing a token in the console
 disables it (`403`).
+
+### Replication links
+
+A replication link copies a bucket from another rusts3 site (the peer) into a
+local bucket. It is configured in the console (**Webhooks & Replication →
+Replication links**) on the **receiving** site, and that site's server runs it.
+
+- The peer only needs to grant a key `s3:GetObject` and `s3:GetBucketChangelog`
+  on its bucket. Nothing is configured on the peer.
+- **Mirror** (one-way): the local bucket becomes an exact copy of the peer's.
+  Its initial snapshot also deletes local objects the peer doesn't have.
+- **Merge** (two-way): configure a merge link on each site, each pulling from
+  the other. Both buckets end up as the union of their objects, with every key
+  at its highest-stamped state. Deletes win or lose by stamp as well, via
+  tombstones.
+
+How it works:
+
+- The link first walks the peer's snapshot, then follows its changelog.
+- Every change is applied with its original stamp, under last-writer-wins.
+  - A change whose stamp is not newer than the local state is skipped without
+    fetching anything. This is also how echoes in two-way replication stop.
+  - Identical content with a newer stamp becomes a metadata-only update; no
+    bytes move.
+  - Object data is read pinned to the change's version (`x-rs3-if-version`),
+    so changes the peer has since superseded are skipped.
+- Multipart objects are re-uploaded with the peer's part layout, so ETags
+  match.
+- Deletes caused by the peer's health-scan repair (`origin: repair`) are never
+  replicated. The local copy is kept.
+
+Operation:
+
+- **Position:** each link's position is stored in the local bucket's own index,
+  next to the data it describes, and is carried across index rebuilds.
+- **Re-snapshot triggers:** a link re-snapshots on its own when the peer's
+  changelog no longer has its position (`410`), when the peer's log was
+  replaced, or when its checkpoint is older than the tombstone retention.
+- **Supervision:** a supervisor checks every `replication.check_interval_secs`
+  (5s) and starts a worker for every enabled link that lacks one, for example
+  after a crash or a restart. It replaces a worker that has been silent for
+  `replication.worker_stale_secs` (300s), and never runs two workers for one
+  link.
+- **Safety:**
+  - A link whose peer reports this server's own site id (a copied data
+    directory) stops with an error.
+  - A bucket that is the target of a link can't be deleted until the link is
+    removed.
 
 ### Falling behind retention
 

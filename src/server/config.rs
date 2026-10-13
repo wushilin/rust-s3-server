@@ -346,6 +346,33 @@ fn default_tombstone_days() -> u64 {
     14
 }
 
+/// Server-side replication links (see `server::replication`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationConfig {
+    /// Supervisor tick: a link without a live worker gets one within this.
+    #[serde(default = "default_replication_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// A worker silent (no heartbeat) for this long is replaced.
+    #[serde(default = "default_replication_stale_secs")]
+    pub worker_stale_secs: u64,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: default_replication_check_interval_secs(),
+            worker_stale_secs: default_replication_stale_secs(),
+        }
+    }
+}
+
+fn default_replication_check_interval_secs() -> u64 {
+    5
+}
+fn default_replication_stale_secs() -> u64 {
+    300
+}
+
 /// Webhook delivery. Each webhook can override the batch limits and
 /// `mute_secs`; everything else is server-wide.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +463,8 @@ pub struct AppConfig {
     pub changelog: ChangelogConfig,
     #[serde(default)]
     pub webhooks: WebhookConfig,
+    #[serde(default)]
+    pub replication: ReplicationConfig,
 }
 
 /// Deserializes a list of strings, dropping entries that were never filled in.
@@ -683,6 +712,7 @@ impl Default for AppConfig {
             stats: StatsConfig::default(),
             changelog: ChangelogConfig::default(),
             webhooks: WebhookConfig::default(),
+            replication: ReplicationConfig::default(),
         }
     }
 }

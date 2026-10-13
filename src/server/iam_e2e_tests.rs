@@ -136,6 +136,7 @@ impl Harness {
             ),
             stats: None,
             notify: None,
+            replication: None,
         });
         Self {
             _tmp: tmp,

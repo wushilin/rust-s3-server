@@ -120,7 +120,7 @@ pub struct LocalObjectStore {
     change_listener: Arc<std::sync::RwLock<Option<ChangeListener>>>,
     /// Vetoes bucket deletion (returns the reason) — the changelog
     /// subscriptions refuse while any subscription targets the bucket.
-    delete_guard: Arc<std::sync::RwLock<Option<DeleteGuard>>>,
+    delete_guard: Arc<std::sync::RwLock<Vec<DeleteGuard>>>,
     /// Per-bucket "the changelog moved" signal, for long-polling readers.
     change_signals: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// This site's identity and version-stamp clock. Opened by
@@ -316,7 +316,7 @@ impl LocalObjectStore {
             rebuild_progress: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             change_listener: Arc::new(std::sync::RwLock::new(None)),
-            delete_guard: Arc::new(std::sync::RwLock::new(None)),
+            delete_guard: Arc::new(std::sync::RwLock::new(Vec::new())),
             change_signals: Arc::new(Mutex::new(HashMap::new())),
             clock: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
@@ -331,9 +331,9 @@ impl LocalObjectStore {
         *self.change_listener.write().unwrap() = Some(listener);
     }
 
-    /// Installs the bucket-deletion veto (replacing any previous one).
-    pub fn set_delete_guard(&self, guard: DeleteGuard) {
-        *self.delete_guard.write().unwrap() = Some(guard);
+    /// Adds a bucket-deletion veto. Any one refusing blocks the delete.
+    pub fn add_delete_guard(&self, guard: DeleteGuard) {
+        self.delete_guard.write().unwrap().push(guard);
     }
 
     /// Opens this site's identity and clock (`<root>/site.json`), with an
@@ -560,7 +560,7 @@ impl LocalObjectStore {
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        let veto = self.delete_guard.read().unwrap().as_ref().and_then(|g| g.0(bucket));
+        let veto = self.delete_guard.read().unwrap().iter().find_map(|g| g.0(bucket));
         if let Some(reason) = veto {
             return Err(StorageError::BucketInUse(reason));
         }
