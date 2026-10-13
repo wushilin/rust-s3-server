@@ -205,6 +205,10 @@ pub struct WireEvent {
     pub origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ts_ms: Option<i64>,
+    /// Upload layout to reproduce for an identical ETag; absent for objects
+    /// indexed before layouts were recorded (ask GetObjectAttributes).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parts: Option<crate::storage::changelog::PartLayout>,
 }
 
 impl From<&ChangeEvent> for WireEvent {
@@ -225,6 +229,7 @@ impl From<&ChangeEvent> for WireEvent {
                 .to_string(),
             ),
             ts_ms: Some(event.ts_ms),
+            parts: event.parts.clone(),
         }
     }
 }

@@ -1189,6 +1189,7 @@ impl LocalObjectStore {
             size: object_meta.size,
             etag: object_meta.etag.clone(),
             last_modified_ms,
+            parts: Some(crate::storage::changelog::PartLayout::of(&object_meta)),
         };
         let retire_id = index
             .commit_publish(
@@ -2844,6 +2845,7 @@ async fn rebuild_classify_dir(dir: &Path, bucket_dir: &Path) -> Result<RebuildDi
                 size: meta.size,
                 etag: meta.etag.clone(),
                 last_modified_ms: meta.last_modified_ms,
+                parts: Some(crate::storage::changelog::PartLayout::of(&meta)),
             },
             dir.to_path_buf(),
         )));
@@ -3573,6 +3575,7 @@ mod tests {
                                     size: meta.size,
                                     etag: meta.etag.clone(),
                                     last_modified_ms: meta.last_modified_ms,
+                                    parts: None,
                                 })
                                 .await;
                         }

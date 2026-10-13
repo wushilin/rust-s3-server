@@ -1137,6 +1137,7 @@ impl LocalObjectStore {
                         meta.size,
                         meta.etag.trim_matches('"'),
                         meta.last_modified_ms,
+                        Some(crate::storage::changelog::PartLayout::of(&meta)),
                     )
                     .await?;
                 self.forget_cached_meta(bucket, &object_key);

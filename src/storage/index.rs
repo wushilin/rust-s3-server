@@ -55,7 +55,7 @@ use rocksdb::{
 use serde::{Deserialize, Serialize};
 
 use super::changelog::{
-    self, ChangeEvent, ChangeOp, ChangeOrigin, ChangelogPage, ChangelogStatus, SeqTracker,
+    self, ChangeEvent, ChangeOp, ChangeOrigin, ChangelogPage, ChangelogStatus, PartLayout, SeqTracker,
     CF_CHANGELOG, KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH,
 };
 use super::errors::{Result, StorageError};
@@ -94,6 +94,8 @@ pub struct ObjectRecord {
     pub size: u64,
     pub etag: String,
     pub last_modified_ms: i64,
+    /// Upload layout; `None` on rows indexed before layouts were recorded.
+    pub parts: Option<PartLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +155,8 @@ struct ObjectValueV1 {
     etag: String,
     #[serde(default)]
     last_modified_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parts: Option<PartLayout>,
 }
 
 /// The `intents` family value. The id is the RocksDB key.
@@ -190,6 +194,7 @@ fn encode_object(record: &ObjectRecord) -> Vec<u8> {
         size: record.size,
         etag: record.etag.clone(),
         last_modified_ms: record.last_modified_ms,
+        parts: record.parts.clone(),
     })
     .expect("ObjectValueV1 serializes")
 }
@@ -203,6 +208,7 @@ fn decode_object(key: &[u8], value: &[u8]) -> Result<ObjectRecord> {
         size: v.size,
         etag: v.etag,
         last_modified_ms: v.last_modified_ms,
+        parts: v.parts,
     })
 }
 
@@ -605,6 +611,7 @@ impl ObjectIndex {
         size: u64,
         etag: &str,
         last_modified_ms: i64,
+        parts: Option<PartLayout>,
     ) -> Result<bool> {
         let db = self.db.clone();
         let durability = self.durability;
@@ -624,6 +631,7 @@ impl ObjectIndex {
             record.size = size;
             record.etag = etag;
             record.last_modified_ms = last_modified_ms;
+            record.parts = parts;
             let log = cf(&db, CF_CHANGELOG)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&objects, key.as_bytes(), encode_object(&record));
@@ -1411,6 +1419,7 @@ fn change_for(seq: u64, op: ChangeOp, record: &ObjectRecord, origin: ChangeOrigi
         version: changelog::version_of(&record.blob_dir),
         origin,
         ts_ms: super::time::now_ms(),
+        parts: record.parts.clone(),
     }
 }
 
@@ -1451,6 +1460,7 @@ mod tests {
             size: 1,
             etag: "e".to_string(),
             last_modified_ms: lm,
+            parts: None,
         }
     }
 

@@ -1186,3 +1186,127 @@ async fn pull_prefix_never_shadows_object_keys() {
     let api = send("GET", "s3.example.com", "").await.unwrap();
     assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ── part layouts ────────────────────────────────────────────────────────────
+
+async fn multipart_upload(store: &LocalObjectStore, bucket: &str, key: &str, parts: &[Vec<u8>]) -> String {
+    let upload_id = store.initiate_multipart(bucket, key, None, None).await.unwrap();
+    let mut done = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let number = (i + 1) as u16;
+        let put = store
+            .put_multipart_part(bucket, key, &upload_id, number, part, false)
+            .await
+            .unwrap();
+        done.push(crate::storage::store::CompletePartRequest { number, etag: put.etag });
+    }
+    store.complete_multipart(bucket, key, &upload_id, &done).await.unwrap().etag
+}
+
+/// What a replicator does with an event: split the bytes by the event's
+/// layout and upload them the same way. Returns the destination ETag.
+async fn replicate_by_layout(
+    store: &LocalObjectStore,
+    bucket: &str,
+    key: &str,
+    bytes: &[u8],
+    layout: &crate::storage::changelog::PartLayout,
+) -> String {
+    if !layout.multipart {
+        return store.put_object(bucket, key, bytes, None, None, false).await.unwrap().etag;
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 0usize;
+    for size in layout.part_sizes(bytes.len() as u64) {
+        chunks.push(bytes[offset..offset + size as usize].to_vec());
+        offset += size as usize;
+    }
+    assert_eq!(offset, bytes.len(), "layout covers the whole object");
+    multipart_upload(store, bucket, key, &chunks).await
+}
+
+#[tokio::test]
+async fn part_layouts_let_a_replica_reproduce_every_etag() {
+    const MIB: usize = 5 * 1024 * 1024;
+    let h = Harness::new().await;
+    h.store.create_bucket("src-bkt").await.unwrap();
+    h.store.create_bucket("dst-bkt").await.unwrap();
+    let objects: Vec<(&str, Vec<Vec<u8>>, bool)> = vec![
+        ("uniform", vec![vec![1u8; MIB], vec![2u8; MIB], vec![3u8; 3]], true),
+        ("irregular", vec![vec![4u8; MIB + 1024], vec![5u8; MIB], vec![6u8; 10]], true),
+        ("one-part", vec![vec![7u8; 10]], true),
+        ("single", vec![b"single put body".to_vec()], false),
+    ];
+    let mut source_etags = std::collections::HashMap::new();
+    for (key, parts, multipart) in &objects {
+        let etag = if *multipart {
+            multipart_upload(&h.store, "src-bkt", key, parts).await
+        } else {
+            h.put("src-bkt", key, &parts[0]).await;
+            h.store.index("src-bkt").await.unwrap().get(key).await.unwrap().unwrap().etag
+        };
+        source_etags.insert(key.to_string(), etag);
+    }
+
+    let page = read::read(&h.store, "src-bkt", &read::ReadParams { limit: 100, ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), objects.len());
+    for event in &page.events {
+        let layout = event.parts.as_ref().expect("new objects carry a layout");
+        let (_, parts, multipart) = objects.iter().find(|(k, _, _)| *k == event.key).unwrap();
+        assert_eq!(layout.multipart, *multipart, "{}", event.key);
+        assert_eq!(layout.count as usize, parts.len());
+        let bytes: Vec<u8> = parts.concat();
+        let replica = replicate_by_layout(&h.store, "dst-bkt", &event.key, &bytes, layout).await;
+        assert_eq!(replica, event.etag, "{}: same layout + same bytes = same ETag", event.key);
+        assert_eq!(replica, source_etags[&event.key]);
+    }
+    let uniform = page.events.iter().find(|e| e.key == "uniform").unwrap().parts.clone().unwrap();
+    assert_eq!((uniform.size, uniform.last, uniform.sizes.clone()), (Some(MIB as u64), Some(3), None));
+    let irregular = page.events.iter().find(|e| e.key == "irregular").unwrap().parts.clone().unwrap();
+    assert_eq!(irregular.sizes, Some(vec![(MIB + 1024) as u64, MIB as u64, 10]));
+    let one = page.events.iter().find(|e| e.key == "one-part").unwrap();
+    assert!(one.etag.ends_with("-1"), "one-part multipart ETag: {}", one.etag);
+
+    // Snapshot entries carry it too, and an index rebuild restores it from
+    // meta.json.
+    h.store.rebuild_index("src-bkt").await.unwrap();
+    let snap = read::snapshot(&h.store, "src-bkt", &read::SnapshotParams { limit: 100, ..Default::default() })
+        .await
+        .unwrap();
+    for entry in &snap.entries {
+        let live = page.events.iter().find(|e| e.key == entry.key).unwrap();
+        assert_eq!(entry.parts, live.parts, "{} after rebuild", entry.key);
+    }
+    // Deletes carry the removed version's layout.
+    h.store.delete_object("src-bkt", "uniform").await.unwrap();
+    let after = read::read(&h.store, "src-bkt", &read::ReadParams { after: page.next, limit: 10, ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(after.events[0].op, "delete");
+    assert_eq!(after.events[0].parts.as_ref(), Some(&uniform));
+}
+
+#[tokio::test]
+async fn rows_without_a_layout_omit_it() {
+    // Rows indexed before layouts were recorded: the field is absent (the
+    // replicator asks GetObjectAttributes), never a wrong guess.
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    h.put("bkt", "k", b"x").await;
+    let index = h.store.index("bkt").await.unwrap();
+    let row = index.get("k").await.unwrap().unwrap();
+    let intent = index.insert_publish_intent("k", &row.blob_dir, now_ms()).await.unwrap();
+    index
+        .commit_publish(&crate::storage::index::ObjectRecord { parts: None, ..row }, intent, None, now_ms())
+        .await
+        .unwrap();
+    let app = s3_app(&h);
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1", None, None).await;
+    assert!(page["events"][0].get("parts").is_none(), "{page}");
+    let (_, snap) = call(&app, "GET", "/bkt?x-rs3-changelog-snapshot", None, None).await;
+    assert!(snap["entries"][0].get("parts").is_none());
+    let (_, first) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=1", None, None).await;
+    assert_eq!(first["events"][0]["parts"], serde_json::json!({"count": 1}));
+}

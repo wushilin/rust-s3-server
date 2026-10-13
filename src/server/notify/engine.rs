@@ -192,6 +192,7 @@ async fn next_snapshot(
                     version: crate::storage::changelog::version_of(&record.blob_dir),
                     origin: None,
                     ts_ms: None,
+                    parts: record.parts.clone(),
                 });
                 if bytes >= limits.max_bytes {
                     break;

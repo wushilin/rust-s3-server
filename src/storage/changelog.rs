@@ -66,6 +66,84 @@ pub enum ChangeOrigin {
     Repair,
 }
 
+/// How an object's bytes were uploaded — what a replicator must reproduce
+/// to get the identical ETag on the other side. A single PUT is
+/// `{"count": 1}` (ETag = MD5 of the content). A multipart upload carries
+/// `multipart: true` (its ETag is the MD5 of the part MD5s plus `-N`, so even
+/// one part differs from a single PUT) and either a uniform layout
+/// (`size` for every part but the `last`) or every part's `sizes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartLayout {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multipart: bool,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Vec<u64>>,
+}
+
+impl PartLayout {
+    pub fn single() -> Self {
+        Self {
+            multipart: false,
+            count: 1,
+            size: None,
+            last: None,
+            sizes: None,
+        }
+    }
+
+    /// A multipart layout from its part sizes, compact when uniform.
+    pub fn multipart(sizes: &[u64]) -> Self {
+        let count = sizes.len() as u32;
+        let uniform = sizes.len() >= 1 && sizes[..sizes.len() - 1].iter().all(|s| *s == sizes[0]);
+        if uniform {
+            Self {
+                multipart: true,
+                count,
+                size: Some(sizes[0]),
+                last: sizes.last().copied(),
+                sizes: None,
+            }
+        } else {
+            Self {
+                multipart: true,
+                count,
+                size: None,
+                last: None,
+                sizes: Some(sizes.to_vec()),
+            }
+        }
+    }
+
+    /// The layout of a stored object.
+    pub fn of(meta: &super::metadata::ObjectMeta) -> Self {
+        match meta.storage {
+            super::metadata::ObjectStorageKind::Single => Self::single(),
+            super::metadata::ObjectStorageKind::Multipart => {
+                Self::multipart(&meta.parts.iter().map(|p| p.size).collect::<Vec<_>>())
+            }
+        }
+    }
+
+    /// Every part's size (a single PUT is one part of the whole object).
+    pub fn part_sizes(&self, total: u64) -> Vec<u64> {
+        if let Some(sizes) = &self.sizes {
+            return sizes.clone();
+        }
+        if !self.multipart {
+            return vec![total];
+        }
+        let size = self.size.unwrap_or(total);
+        let mut out = vec![size; self.count.saturating_sub(1) as usize];
+        out.push(self.last.unwrap_or(size));
+        out
+    }
+}
+
 /// One changelog entry as stored and as delivered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeEvent {
@@ -83,6 +161,9 @@ pub struct ChangeEvent {
     /// When the change committed (server clock; informational only — order
     /// by `seq`).
     pub ts_ms: i64,
+    /// The object's upload layout (for `delete`, the removed version's).
+    /// `None` for objects indexed before layouts were recorded.
+    pub parts: Option<PartLayout>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,6 +185,8 @@ struct ChangeValueV1 {
     origin: ChangeOrigin,
     #[serde(default)]
     ts_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parts: Option<PartLayout>,
 }
 
 fn default_version() -> u32 {
@@ -131,6 +214,7 @@ pub fn encode_change(event: &ChangeEvent) -> Vec<u8> {
         version: event.version.clone(),
         origin: event.origin,
         ts_ms: event.ts_ms,
+        parts: event.parts.clone(),
     })
     .expect("ChangeValueV1 serializes")
 }
@@ -153,6 +237,7 @@ pub fn decode_change(seq: u64, value: &[u8]) -> Result<ChangeEvent> {
         version: v.version,
         origin: v.origin,
         ts_ms: v.ts_ms,
+        parts: v.parts,
     })
 }
 
@@ -280,6 +365,25 @@ mod tests {
     }
 
     #[test]
+    fn part_layouts_are_compact_and_reversible() {
+        let uniform = PartLayout::multipart(&[8, 8, 8, 3]);
+        assert_eq!((uniform.size, uniform.last, uniform.sizes.is_none()), (Some(8), Some(3), true));
+        assert_eq!(uniform.part_sizes(27), [8, 8, 8, 3]);
+        let one = PartLayout::multipart(&[7]);
+        assert!(one.multipart, "one-part multipart is not a single PUT (its ETag ends in -1)");
+        assert_eq!(one.part_sizes(7), [7]);
+        let irregular = PartLayout::multipart(&[8, 5, 8]);
+        assert_eq!(irregular.sizes.as_deref(), Some(&[8, 5, 8][..]));
+        assert_eq!(irregular.part_sizes(21), [8, 5, 8]);
+        assert_eq!(PartLayout::single().part_sizes(42), [42]);
+        assert_eq!(serde_json::to_string(&PartLayout::single()).unwrap(), r#"{"count":1}"#);
+        assert_eq!(
+            serde_json::to_string(&uniform).unwrap(),
+            r#"{"multipart":true,"count":4,"size":8,"last":3}"#
+        );
+    }
+
+    #[test]
     fn change_round_trips() {
         let event = ChangeEvent {
             seq: 7,
@@ -291,6 +395,7 @@ mod tests {
             version: "V1".into(),
             origin: ChangeOrigin::Repair,
             ts_ms: 9,
+            parts: Some(PartLayout::multipart(&[5, 5, 2])),
         };
         assert_eq!(decode_change(7, &encode_change(&event)).unwrap(), event);
     }

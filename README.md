@@ -503,7 +503,8 @@ below).
   "events": [
     {"seq": 117, "op": "put", "key": "2026/a.jpg", "etag": "9b2c…", "size": 482113,
      "last_modified_ms": 1791800000123, "version": "V1A9F3K2_7Q1M",
-     "origin": "client", "ts_ms": 1791800000130}
+     "origin": "client", "ts_ms": 1791800000130,
+     "parts": {"multipart": true, "count": 3, "size": 8388608, "last": 1048576}}
   ]
 }
 ```
@@ -514,6 +515,15 @@ below).
   - Sending `x-rs3-if-version: <version>` on a GET makes it fail with `412` if
     the object has changed since. A replicator can therefore fetch exactly the
     state an event names.
+- `parts` is how the object was uploaded. Upload the same bytes the same way
+  and the other side computes the identical ETag:
+  - `{"count": 1}`: a single PUT (ETag = MD5 of the content).
+  - `"multipart": true`: a multipart upload with `count` parts. Every part is
+    `size` except the `last`, or the parts are listed in `sizes` when they are
+    irregular. Even a one-part multipart upload differs from a single PUT (its
+    ETag ends in `-1`).
+  - Absent for objects stored before layouts were recorded; use
+    GetObjectAttributes for those.
 - `origin` is `client` or `repair`. A `repair` delete means the health scan
   removed an index row whose data was lost. It does not mean a client deleted
   the object.
