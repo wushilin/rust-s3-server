@@ -161,8 +161,19 @@ pub struct PeerConfig {
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
-    /// Sent as [`HEADER_REPLICATOR`] on changelog reads.
-    pub replicator: Option<String>,
+    /// Sent as [`HEADER_REPLICATOR`] on changelog reads — built per
+    /// request, so a renamed site is known by its new name at once.
+    pub replicator: Option<ReplicatorHeader>,
+}
+
+/// Builds the [`HEADER_REPLICATOR`] value.
+#[derive(Clone)]
+pub struct ReplicatorHeader(pub std::sync::Arc<dyn Fn() -> String + Send + Sync>);
+
+impl std::fmt::Debug for ReplicatorHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplicatorHeader")
+    }
 }
 
 #[derive(Debug)]
@@ -317,7 +328,7 @@ impl PeerClient {
         let path = format!("/{}", encode_segment(&self.config.bucket));
         let mut request = self.signed(Method::GET, &path, query, &[]).timeout(timeout);
         if let Some(replicator) = &self.config.replicator {
-            request = request.header(HEADER_REPLICATOR, replicator);
+            request = request.header(HEADER_REPLICATOR, (replicator.0)());
         }
         let response = request
             .send()

@@ -245,7 +245,7 @@ HMAC key.
 | `server.bind_address` | `0.0.0.0` | S3 API listen address. |
 | `server.bind_port` | `8002` | S3 API listen port. |
 | `server.base_dir` | `./rusts3-data` | Object, index, and IAM data root. |
-| `server.site_name` | unset | A readable name for this site, shown in the console and to replication peers. Only a label: change it any time. Unset, the site id is shown instead. (The **site id** itself is not configurable: it is generated on first start, kept in `<base_dir>/site.json`, and never changes — it is in every version stamp the site writes and is how replication peers know it. A config that still sets `server.site_id` is refused at start.) |
+| `server.site_name` | unset | This site's readable name, shown in the console and to replication peers. Only a label. Without this setting, a two-word name (like `quiet-falcon`) is generated on first start and an admin can change it any time in the console ("Change", bottom of the sidebar), effective at once; with it, the configured name is applied at every start and the console cannot change it. (The **site id** itself is not configurable: it is generated on first start, kept in `<base_dir>/site.json`, and never changes — it is in every version stamp the site writes and is how replication peers know it. A config that still sets `server.site_id` is refused at start.) |
 | `server.proxy_protocol` | `auto` | PROXY protocol v1/v2 on both listeners. `auto` detects it per connection — a header from a loopback/private peer names the real client, a connection without one is plain HTTP; a header from a public peer is dropped. `off` never looks for one. |
 | `ui.enabled` | `true` | Enable the management console. |
 | `ui.bind_address` | S3 bind address | Optional separate console listen address. |
@@ -699,7 +699,9 @@ filter by prefix).
 **Site ids and names.** Each server has a site id, generated on its first
 start (16 hex characters, kept in `<base_dir>/site.json`) and never changed:
 every version stamp carries the id of the site that wrote it, and peers know a
-site's changelog by it. `server.site_name` is a free label shown beside it. A
+site's changelog by it. The site name is a free label shown beside it
+(generated as two words, changeable in the console or set by
+`server.site_name`). A
 copy of a data directory carries `site.json` along and is the same site;
 links refuse to run between two servers reporting one id. To set up a new
 site, start it from an empty data directory and let a link fill it.

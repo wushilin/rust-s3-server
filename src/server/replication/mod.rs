@@ -317,28 +317,29 @@ fn mirror_links_into(inner: &Inner, bucket: &str) -> Vec<String> {
         .collect()
 }
 
-fn peer_config(link: &Link, site: &str, site_name: &str) -> PeerConfig {
+fn peer_config(link: &Link, store: &LocalObjectStore) -> PeerConfig {
     let mode = match link.mode {
         Mode::Mirror => "mirror",
         Mode::Merge => "merge",
     };
+    let (store, bucket, id, name) = (store.clone(), link.local_bucket.clone(), link.id.clone(), link.name.clone());
     PeerConfig {
         endpoint: link.peer_endpoint.clone(),
         bucket: link.peer_bucket.clone(),
         access_key: link.access_key.clone(),
         secret_key: link.secret_key.clone(),
         region: link.region.clone(),
-        replicator: Some(
+        replicator: Some(peer::ReplicatorHeader(Arc::new(move || {
             peer::Replicator {
-                site: site.to_string(),
-                site_name: site_name.to_string(),
+                site: store.site_id(),
+                site_name: store.site_name(),
                 mode: mode.to_string(),
-                bucket: link.local_bucket.clone(),
-                link: link.id.clone(),
-                name: link.name.clone(),
+                bucket: bucket.clone(),
+                link: id.clone(),
+                name: name.clone(),
             }
-            .to_header(),
-        ),
+            .to_header()
+        }))),
     }
 }
 
@@ -631,7 +632,7 @@ impl ReplicationService {
     }
 
     fn peer_client(&self, rt: &Runtime, now: i64) -> Option<PeerClient> {
-        match PeerClient::new(peer_config(&rt.link, &self.inner.store.site_id(), &self.inner.store.site_name())) {
+        match PeerClient::new(peer_config(&rt.link, &self.inner.store)) {
             Ok(peer) => Some(peer),
             Err(err) => {
                 let mut status = rt.status.lock().unwrap();
@@ -679,7 +680,7 @@ impl ReplicationService {
         }
         crate::storage::encoding::validate_bucket_name(&link.peer_bucket)
             .map_err(|_| LinkError::BadRequest(format!("invalid peer bucket {:?}", link.peer_bucket)))?;
-        PeerClient::new(peer_config(link, &self.inner.store.site_id(), &self.inner.store.site_name())).map_err(LinkError::BadRequest)?;
+        PeerClient::new(peer_config(link, &self.inner.store)).map_err(LinkError::BadRequest)?;
         Ok(())
     }
 
@@ -689,7 +690,7 @@ impl ReplicationService {
     /// the changes' own stamps. A merge link the peer already runs for this
     /// pair makes a second one pointless: refused.
     async fn verify(&self, link: &Link) -> Result<peer::AccessReport, LinkError> {
-        let peer = PeerClient::new(peer_config(link, &self.inner.store.site_id(), &self.inner.store.site_name())).map_err(LinkError::BadRequest)?;
+        let peer = PeerClient::new(peer_config(link, &self.inner.store)).map_err(LinkError::BadRequest)?;
         let at = format!("bucket {} at {}", link.peer_bucket, link.peer_endpoint);
         let report = match peer.access().await {
             Ok(report) => report,
@@ -1010,7 +1011,7 @@ impl ReplicationService {
         }
         let mut notes = Vec::new();
         for link in links {
-            let peer = match PeerClient::new(peer_config(&link, &self.inner.store.site_id(), &self.inner.store.site_name())) {
+            let peer = match PeerClient::new(peer_config(&link, &self.inner.store)) {
                 Ok(peer) => peer,
                 Err(err) => {
                     notes.push(format!("{}: {err}", link.name));

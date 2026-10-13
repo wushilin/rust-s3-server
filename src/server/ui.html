@@ -67,7 +67,7 @@
     <div class="nav-label">Open Source</div>
     <a class="nav-item nav-link" href="https://github.com/wushilin/rust-s3-server" target="_blank" rel="noopener"><span data-icon="database"></span> Source Code<span class="nav-ext" data-icon="external"></span></a>
     <a class="nav-item nav-link" href="https://github.com/wushilin/rust-s3-server/blob/main/LICENSE" target="_blank" rel="noopener"><span data-icon="shield"></span> Apache-2.0 License<span class="nav-ext" data-icon="external"></span></a>
-    <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span><span class="server-version" id="serverSite"></span></div></div></div>
+    <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span><span class="server-version" id="serverSite"></span></div><button type="button" class="site-change hidden" id="siteChangeBtn" data-admin-only onclick="openSiteDialog()" title="Change this site's name">Change</button></div></div>
   </aside>
 
   <div class="app-main">
@@ -444,6 +444,18 @@
       <div id="subError" class="inline-error"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="subDlg.close()">Cancel</button><button class="btn primary" type="submit" id="sub_submit">Create</button></div>
+  </form>
+</dialog>
+
+<dialog id="siteDlg">
+  <form onsubmit="saveSiteName(event)">
+    <div class="dialog-head"><div><h3>Site name</h3><p>A readable label for this server, shown here and to replication peers. Changing it changes nothing else.</p></div><button type="button" class="dialog-close" onclick="siteDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body">
+      <div class="field"><label for="site_name_input">Name</label><input class="input" id="site_name_input" maxlength="64" autocomplete="off"></div>
+      <div class="muted" style="font-size:11.5px">Site id <code id="site_id_text"></code> stays as it is: it is generated once and never changes (it is in every version stamp, and is how peers know this site).</div>
+      <div id="siteError" class="inline-error"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="siteDlg.close()">Cancel</button><button class="btn primary" type="submit">Save</button></div>
   </form>
 </dialog>
 

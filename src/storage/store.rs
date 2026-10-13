@@ -171,8 +171,8 @@ pub struct LocalObjectStore {
     /// This site's identity and version-stamp clock. Opened by
     /// [`Self::init_site`] at startup; tests get an ephemeral one lazily.
     clock: Arc<std::sync::OnceLock<Arc<SiteClock>>>,
-    /// `server.site_name` (set by [`Self::init_site`]).
-    site_name: Arc<std::sync::OnceLock<Option<String>>>,
+    /// The name is set by `server.site_name` (set by [`Self::init_site`]).
+    site_name_locked: Arc<std::sync::OnceLock<bool>>,
     #[cfg(test)]
     crash_points: Arc<Mutex<HashSet<String>>>,
 }
@@ -373,7 +373,7 @@ impl LocalObjectStore {
             peer_restorer: Arc::new(std::sync::RwLock::new(None)),
             replica_reader: Arc::new(std::sync::RwLock::new(None)),
             clock: Arc::new(std::sync::OnceLock::new()),
-            site_name: Arc::new(std::sync::OnceLock::new()),
+            site_name_locked: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -425,11 +425,24 @@ impl LocalObjectStore {
 
     /// Opens this site's identity and clock (`<root>/site.json`), with an
     /// optional configured site id. Call once at startup, before any write.
-    pub fn init_site(&self, site_name: Option<&str>) -> Result<()> {
+    /// `configured_name` (`server.site_name`), when set, is applied at every
+    /// start and locks the name; otherwise the stored (first: generated)
+    /// name stands and can be changed with [`Self::set_site_name`].
+    pub fn init_site(&self, configured_name: Option<&str>) -> Result<()> {
         let clock = SiteClock::open(self.layout.root())?;
-        let name = site_name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
-        log::info!("site id {} name {}", clock.site_id(), name.as_deref().unwrap_or("(unset)"));
-        let _ = self.site_name.set(name);
+        let configured = configured_name.map(str::trim).filter(|n| !n.is_empty());
+        if let Some(name) = configured {
+            if clock.site_name() != name {
+                clock.set_site_name(name)?;
+            }
+        }
+        let _ = self.site_name_locked.set(configured.is_some());
+        log::info!(
+            "site id {} name {:?}{}",
+            clock.site_id(),
+            clock.site_name(),
+            if configured.is_some() { " (server.site_name)" } else { "" }
+        );
         self.clock
             .set(Arc::new(clock))
             .map_err(|_| StorageError::Io("site clock already initialised".to_string()))
@@ -451,10 +464,27 @@ impl LocalObjectStore {
         self.clock().site_id().to_string()
     }
 
-    /// This site's readable name (`server.site_name`), or its id when none
-    /// is configured. A label only: free to change.
+    /// This site's readable name: a label only, free to change.
     pub fn site_name(&self) -> String {
-        self.site_name.get().cloned().flatten().unwrap_or_else(|| self.site_id())
+        self.clock().site_name()
+    }
+
+    /// Whether the name is set by `server.site_name` (then it can only be
+    /// changed there).
+    pub fn site_name_locked(&self) -> bool {
+        self.site_name_locked.get().copied().unwrap_or(false)
+    }
+
+    /// Renames this site (persisted; takes effect at once). Refused when
+    /// `server.site_name` sets it.
+    pub fn set_site_name(&self, name: &str) -> Result<String> {
+        if self.site_name_locked() {
+            return Err(StorageError::Io(
+                "the site name is set by server.site_name in the config; change it there".to_string(),
+            ));
+        }
+        self.clock().set_site_name(name)?;
+        Ok(self.site_name())
     }
 
     /// The next local version stamp.

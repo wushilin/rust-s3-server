@@ -1134,3 +1134,55 @@ async fn setting_a_version_stamp_needs_replicate_write() {
     let (status, _) = h.s3_full(&replicator, "DELETE", "/data/k", "", &newer, b"").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+// ═══ the site name: a label an admin can change ═══════════════════════════════
+
+#[tokio::test]
+async fn an_admin_renames_the_site_and_nothing_else_changes() {
+    let h = Harness::new().await;
+    let admin = h.session(ROOT_USER, true);
+    let (status, ping) = h.console(Some(&admin), "GET", "/api/ping", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (id, generated) = (ping["site_id"].as_str().unwrap().to_string(), ping["site_name"].as_str().unwrap().to_string());
+    assert_eq!(generated.split('-').count(), 2, "a two-word default: {generated}");
+    assert_eq!(ping["site_name_locked"], false);
+
+    let (status, body) = h.console(Some(&admin), "PUT", "/api/site", Some(json!({"site_name": "Singapore DC-1"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, ping) = h.console(Some(&admin), "GET", "/api/ping", None).await;
+    assert_eq!((ping["site_id"].as_str(), ping["site_name"].as_str()), (Some(id.as_str()), Some("Singapore DC-1")));
+    // Shown to changelog readers at once.
+    h.seed("docs", &["a.txt"]).await;
+    let (_, page) = h.s3_full(&root_cred(), "GET", "/docs", "x-rs3-changelog=&wait=0", &[], b"").await;
+    let page: Value = serde_json::from_str(&page).unwrap();
+    assert_eq!((page["site_id"].as_str(), page["site_name"].as_str()), (Some(id.as_str()), Some("Singapore DC-1")));
+
+    // Invalid names are refused with the reason.
+    let (status, body) = h.console(Some(&admin), "PUT", "/api/site", Some(json!({"site_name": "  "}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("1-64"), "{body}");
+    // Only admins.
+    h.user("alice").await;
+    let alice = h.session("alice", false);
+    let (status, _) = h.console(Some(&alice), "PUT", "/api/site", Some(json!({"site_name": "mine"}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(h.store.site_name(), "Singapore DC-1");
+}
+
+#[tokio::test]
+async fn a_configured_site_name_wins_and_locks_the_console() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = crate::storage::store::LocalObjectStore::new(tmp.path());
+    store.init_site(Some("From config")).unwrap();
+    assert_eq!(store.site_name(), "From config");
+    assert!(store.site_name_locked());
+    let err = store.set_site_name("other").unwrap_err().to_string();
+    assert!(err.contains("server.site_name"), "{err}");
+    let id = store.site_id();
+    drop(store);
+    // Without the setting, the last name stays and can be changed again.
+    let store = crate::storage::store::LocalObjectStore::new(tmp.path());
+    store.init_site(None).unwrap();
+    assert_eq!((store.site_id(), store.site_name()), (id, "From config".to_string()));
+    assert_eq!(store.set_site_name("renamed").unwrap(), "renamed");
+}

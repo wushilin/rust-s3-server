@@ -1475,7 +1475,8 @@ async fn the_site_id_and_clock_survive_a_restart() {
     let named = LocalObjectStore::new(tmp.path());
     named.init_site(Some("Singapore")).unwrap();
     assert_eq!((named.site_id(), named.site_name()), (site.clone(), "Singapore".to_string()));
-    assert_eq!(reopened.site_name(), site, "no name: the id is shown");
+    let generated = reopened.site_name();
+    assert!(generated != site && generated.split('-').count() == 2, "no name configured: a generated two-word name, not the id: {generated}");
 }
 
 #[tokio::test]

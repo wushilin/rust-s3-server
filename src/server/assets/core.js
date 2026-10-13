@@ -115,4 +115,17 @@ function showTab(tab){
   $('pageTitle').textContent=pageMeta[tab][0];$('pageSubtitle').textContent=pageMeta[tab][1];closeDetails();
   if(tab==='users')loadUsers();if(tab==='groups')loadGroups();if(tab==='keys')loadMyKeys();if(tab==='backup')resetBackupPanel();if(tab==='subs')loadSubs();if(tab==='perf')initPerf();if(tab==='stats')initStats();
 }
-async function pingServer(){try{const resp=await fetch('/api/ping',{cache:'no-store'});const data=await resp.json().catch(()=>({}));if(!resp.ok){if(resp.status===401&&me)location.reload();throw new Error('ping failed');}$('serverState').classList.remove('offline');$('serverStateText').textContent='Server connected';$('serverVersion').textContent='RustS3 v'+data.version;$('serverSite').textContent=data.site_id?(data.site_name&&data.site_name!==data.site_id?`${data.site_name} · ${data.site_id}`:`site ${data.site_id}`):'';$('serverSite').title=data.site_id?`Site name: ${data.site_name||'(not set)'} — a label, set by server.site_name.\nSite id: ${data.site_id} — generated on first start, never changes; it is in every version stamp and is how replication peers know this site.`:'';}catch{$('serverState').classList.add('offline');$('serverStateText').textContent='Connection interrupted';}}
+let siteInfo=null;
+function openSiteDialog(){
+  if(!siteInfo)return;
+  setInlineError('siteError');$('site_id_text').textContent=siteInfo.site_id;$('site_name_input').value=siteInfo.site_name||'';
+  $('site_name_input').disabled=!!siteInfo.site_name_locked;
+  if(siteInfo.site_name_locked)setInlineError('siteError','The name is set by server.site_name in the config: change it there (and restart).');
+  $('siteDlg').showModal();setTimeout(()=>$('site_name_input').select(),50);
+}
+async function saveSiteName(event){
+  event.preventDefault();setInlineError('siteError');
+  try{const r=await api('PUT','/api/site',{site_name:$('site_name_input').value});$('siteDlg').close();toast('Site renamed',r.site_name);await pingServer();if(typeof loadLinks==='function'&&$('siteId'))loadLinks();}
+  catch(e){setInlineError('siteError',e.message);}
+}
+async function pingServer(){try{const resp=await fetch('/api/ping',{cache:'no-store'});const data=await resp.json().catch(()=>({}));if(!resp.ok){if(resp.status===401&&me)location.reload();throw new Error('ping failed');}$('serverState').classList.remove('offline');$('serverStateText').textContent='Server connected';$('serverVersion').textContent='RustS3 v'+data.version;siteInfo=data;$('serverSite').textContent=data.site_id?(data.site_name&&data.site_name!==data.site_id?`${data.site_name} · ${data.site_id}`:`site ${data.site_id}`):'';$('serverSite').title=data.site_id?`Site name: ${data.site_name} — a label${data.site_name_locked?', set by server.site_name in the config':', change it with "Change"'}.\nSite id: ${data.site_id} — generated on first start, never changes; it is in every version stamp and is how replication peers know this site.`:'';$('siteChangeBtn').classList.toggle('hidden',!data.site_id||!(me&&me.is_admin));$('siteChangeBtn').title=data.site_name_locked?'The name is set by server.site_name in the config':'Change this site\'s name';}catch{$('serverState').classList.add('offline');$('serverStateText').textContent='Connection interrupted';}}

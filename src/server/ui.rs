@@ -77,6 +77,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/ping", get(server_ping))
+        .route("/api/site", axum::routing::put(rename_site))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{name}", delete(delete_user))
         .route("/api/users/{name}/password", put(reset_password))
@@ -924,6 +925,7 @@ async fn server_ping(State(state): State<UiState>, headers: HeaderMap) -> Respon
         "version": env!("CARGO_PKG_VERSION"),
         "site_id": state.store.site_id(),
         "site_name": state.store.site_name(),
+        "site_name_locked": state.store.site_name_locked(),
         "now_ms": crate::storage::time::now_ms(),
     }))
     .into_response();
@@ -3796,6 +3798,36 @@ async fn link_action(
             Json(view).into_response()
         }
         Err(err) => link_error(err),
+    }
+}
+
+// ── site name (admin only) ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SiteRename {
+    site_name: String,
+}
+
+/// Renames this site: a label only (the site id never changes). Takes
+/// effect at once; peers see it on their next changelog read.
+async fn rename_site(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(request): Json<SiteRename>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let before = state.store.site_name();
+    match state.store.set_site_name(&request.site_name) {
+        Ok(name) => {
+            audit(&state, &rid.0, &session.username, "rename_site", format!("{before:?} -> {name:?}"));
+            Json(json!({ "site_id": state.store.site_id(), "site_name": name })).into_response()
+        }
+        Err(crate::storage::errors::StorageError::Io(message)) => error_response(StatusCode::BAD_REQUEST, message),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 

@@ -57,10 +57,10 @@ impl Site {
         // whatever site.json records is the id, so seed it.
         let site_file = tmp.path().join("site.json");
         if !site_file.exists() {
-            std::fs::write(&site_file, format!(r#"{{"site_id":"{name}"}}"#)).unwrap();
+            std::fs::write(&site_file, format!(r#"{{"site_id":"{name}","site_name":"{name} (name)"}}"#)).unwrap();
         }
         let store = LocalObjectStore::new(tmp.path());
-        store.init_site(Some(&format!("{name} (name)"))).unwrap();
+        store.init_site(None).unwrap();
         let iam = IamStore::open(tmp.path()).await.unwrap();
         let shutdown = CancellationToken::new();
         let notify = NotifyService::start(
@@ -534,6 +534,33 @@ async fn a_link_is_bound_to_the_peer_site_and_stops_if_another_answers() {
         async move { view.status.site_changed.is_none() && view.status.last_error.is_none() }
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_renamed_site_is_known_by_its_new_name_at_once() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    let incoming_name = |site: &Site| site.replication.incoming().first().map(|i| i.site_name.clone());
+    eventually(30, "a sees b's link", || async { incoming_name(&a).as_deref() == Some("site-b (name)") }).await;
+    // Both rename while the link runs: no restart, no effect on anything
+    // but the labels.
+    b.store.set_site_name("Tokyo").unwrap();
+    a.store.set_site_name("Singapore").unwrap();
+    a.put("data", "k", b"v").await;
+    eventually(30, "a lists b's link under its new name", || async { incoming_name(&a).as_deref() == Some("Tokyo") }).await;
+    eventually(30, "b shows a's new name", || {
+        let view = b.link(&id);
+        async move { view.status.peer_site_name.as_deref() == Some("Singapore") }
+    })
+    .await;
+    eventually(30, "still replicating", || same(&a, &b, "data")).await;
+    let view = b.link(&id);
+    assert_eq!((view.local_site_id.as_str(), view.peer_site_id.as_str()), ("site-b", "site-a"), "ids untouched");
+    assert!(view.status.site_changed.is_none() && view.status.last_error.is_none());
 }
 
 #[tokio::test]

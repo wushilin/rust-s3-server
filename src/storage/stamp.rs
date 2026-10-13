@@ -111,6 +111,37 @@ impl Rank {
     }
 }
 
+/// A site name: trimmed, 1–64 characters, no control characters. Returns
+/// the trimmed name.
+pub fn validate_site_name(name: &str) -> std::result::Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("a site name is 1-64 characters, without control characters".to_string());
+    }
+    Ok(name.to_string())
+}
+
+/// A friendly default site name: two random words, like `quiet-falcon`.
+pub fn generate_site_name() -> String {
+    const ADJECTIVES: &[&str] = &[
+        "amber", "bold", "brave", "bright", "calm", "clever", "crisp", "daring", "eager", "fancy", "gentle",
+        "glad", "golden", "grand", "happy", "hidden", "humble", "jolly", "keen", "kind", "lively", "lucky",
+        "mellow", "merry", "mighty", "misty", "noble", "patient", "polar", "proud", "quick", "quiet", "rapid",
+        "rosy", "rustic", "silent", "silver", "sleek", "snowy", "solar", "steady", "stellar", "sunny", "swift",
+        "tidy", "vivid", "warm", "wise",
+    ];
+    const NOUNS: &[&str] = &[
+        "badger", "beacon", "birch", "canyon", "cedar", "comet", "coral", "crane", "delta", "dolphin", "eagle",
+        "falcon", "fern", "fjord", "forest", "fox", "glacier", "harbor", "hawk", "heron", "island", "lagoon",
+        "lantern", "maple", "meadow", "mesa", "otter", "owl", "panda", "pebble", "pine", "prairie", "raven",
+        "reef", "river", "robin", "sparrow", "spruce", "summit", "tiger", "tundra", "valley", "willow", "wolf",
+        "wren", "yak", "zephyr", "orchid",
+    ];
+    use rand::seq::IndexedRandom;
+    let mut rng = rand::rng();
+    format!("{}-{}", ADJECTIVES.choose(&mut rng).unwrap(), NOUNS.choose(&mut rng).unwrap())
+}
+
 /// Site ids are 1–64 characters of `[A-Za-z0-9_-]` (no dots: they end the
 /// header form).
 pub fn validate_site_id(site: &str) -> std::result::Result<(), String> {
@@ -137,6 +168,10 @@ struct SiteFile {
     /// start.)
     #[serde(default)]
     site_id: String,
+    /// The site's readable name: a label, free to change (console, or
+    /// `server.site_name`). Generated as two words on first start.
+    #[serde(default)]
+    site_name: String,
     /// No stamp at or below this was ever issued... or above it: every
     /// issued `ms` is `<=` this.
     #[serde(default)]
@@ -148,6 +183,8 @@ struct ClockState {
     last_ms: i64,
     last_c: u32,
     reserved_until: i64,
+    /// The site name (kept here so every rewrite of site.json carries it).
+    name: String,
 }
 
 #[derive(Debug)]
@@ -178,6 +215,9 @@ impl SiteClock {
             rand::rng().fill_bytes(&mut buf);
             file.generated_site_id = buf.iter().map(|b| format!("{b:02x}")).collect();
         }
+        if file.site_name.trim().is_empty() {
+            file.site_name = generate_site_name();
+        }
         // The recorded id (a file from before it was recorded: the
         // generated one).
         let site = match file.site_id.as_str() {
@@ -197,6 +237,7 @@ impl SiteClock {
                 last_ms: file.high_water_ms,
                 last_c: 0,
                 reserved_until: file.high_water_ms,
+                name: file.site_name.clone(),
             }),
         };
         // Persist the id (and an initial reservation) right away.
@@ -218,12 +259,31 @@ impl SiteClock {
                 last_ms: 0,
                 last_c: 0,
                 reserved_until: i64::MAX,
+                name: site.to_string(),
             }),
         }
     }
 
     pub fn site_id(&self) -> &str {
         &self.site
+    }
+
+    /// The site's readable name.
+    pub fn site_name(&self) -> String {
+        self.state.lock().unwrap().name.clone()
+    }
+
+    /// Renames the site (a label: nothing else changes), persisted.
+    pub fn set_site_name(&self, name: &str) -> Result<()> {
+        let name = validate_site_name(name).map_err(StorageError::Io)?;
+        let mut state = self.state.lock().unwrap();
+        let previous = std::mem::replace(&mut state.name, name);
+        let until = state.reserved_until - RESERVE_MS;
+        if let Err(err) = self.reserve(&mut state, until) {
+            state.name = previous;
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Persists `high_water_ms = until + RESERVE_MS`.
@@ -235,6 +295,7 @@ impl SiteClock {
         let body = serde_json::to_vec_pretty(&SiteFile {
             generated_site_id: self.generated.clone(),
             site_id: self.site.clone(),
+            site_name: state.name.clone(),
             high_water_ms: high_water,
         })?;
         let tmp = path.with_extension("json.tmp");
@@ -354,6 +415,25 @@ mod tests {
         let legacy = tempfile::tempdir().unwrap();
         std::fs::write(legacy.path().join(SITE_FILE), r#"{"generated_site_id":"0011223344556677","high_water_ms":5}"#).unwrap();
         assert_eq!(SiteClock::open(legacy.path()).unwrap().site_id(), "0011223344556677");
+        // A two-word name is generated once, kept, and can be changed —
+        // without touching the id.
+        let name = SiteClock::open(tmp.path()).unwrap().site_name();
+        assert!(name.split('-').count() == 2 && name.chars().all(|c| c.is_ascii_lowercase() || c == '-'), "{name}");
+        let clock = SiteClock::open(tmp.path()).unwrap();
+        assert_eq!(clock.site_name(), name, "kept");
+        clock.set_site_name("  Singapore DC 1  ").unwrap();
+        assert_eq!(clock.site_name(), "Singapore DC 1", "trimmed");
+        assert!(clock.set_site_name("").is_err() && clock.set_site_name(&"x".repeat(65)).is_err());
+        assert_eq!(clock.site_name(), "Singapore DC 1", "a refused name changes nothing");
+        drop(clock);
+        let reopened = SiteClock::open(tmp.path()).unwrap();
+        assert_eq!((reopened.site_id(), reopened.site_name().as_str()), (id.as_str(), "Singapore DC 1"));
+        // The clock's rewrites of site.json keep the name.
+        for _ in 0..3 {
+            reopened.next();
+        }
+        assert_eq!(SiteClock::open(tmp.path()).unwrap().site_name(), "Singapore DC 1");
+
         // A recorded id that is not valid is refused, not replaced.
         std::fs::write(legacy.path().join(SITE_FILE), r#"{"generated_site_id":"0011223344556677","site_id":"bad.id"}"#).unwrap();
         assert!(SiteClock::open(legacy.path()).is_err());
@@ -366,7 +446,7 @@ mod tests {
         // (relative to the wall clock now — as after a backwards step).
         fs::write(
             tmp.path().join(SITE_FILE),
-            serde_json::to_vec(&SiteFile { generated_site_id: "abc".into(), site_id: String::new(), high_water_ms: now_ms() + 60_000 }).unwrap(),
+            serde_json::to_vec(&SiteFile { generated_site_id: "abc".into(), site_id: String::new(), site_name: String::new(), high_water_ms: now_ms() + 60_000 }).unwrap(),
         )
         .unwrap();
         let clock = SiteClock::open(tmp.path()).unwrap();
