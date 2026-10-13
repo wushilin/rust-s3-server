@@ -46,11 +46,12 @@ impl Site {
 
     async fn start_with(name: &str, timing: Timing) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        Self::open(tmp, name, timing).await
+        Self::open(tmp, name, timing, "127.0.0.1:0").await
     }
 
-    /// Opens a site on an existing data directory (also: a restart).
-    async fn open(tmp: tempfile::TempDir, name: &str, timing: Timing) -> Self {
+    /// Opens a site on an existing data directory (also: a restart), on
+    /// `bind` (a restart keeps its address, as a real deployment does).
+    async fn open(tmp: tempfile::TempDir, name: &str, timing: Timing, bind: &str) -> Self {
         let store = LocalObjectStore::new(tmp.path());
         store.init_site(Some(name)).unwrap();
         let iam = IamStore::open(tmp.path()).await.unwrap();
@@ -84,7 +85,20 @@ impl Site {
             crate::server::registry::TaskRegistry::new(),
             Some(notify.clone()),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = {
+            let mut tries = 0;
+            loop {
+                match tokio::net::TcpListener::bind(bind).await {
+                    Ok(listener) => break listener,
+                    // The old listener's socket may linger briefly.
+                    Err(_) if tries < 50 => {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(err) => panic!("cannot bind {bind}: {err}"),
+                }
+            }
+        };
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let stop = shutdown.clone();
         tokio::spawn(async move {
@@ -108,10 +122,11 @@ impl Site {
     async fn restart(self) -> Self {
         self.shutdown.cancel();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let Site { tmp, name, store, iam, notify, replication, .. } = self;
+        let Site { tmp, name, store, iam, notify, replication, endpoint, .. } = self;
         drop((store, iam, notify, replication));
         tokio::time::sleep(Duration::from_millis(300)).await;
-        Self::open(tmp, &name, fast_timing()).await
+        let bind = endpoint.trim_start_matches("http://").to_string();
+        Self::open(tmp, &name, fast_timing(), &bind).await
     }
 
     /// A link on this site pulling `bucket` from `peer`.
@@ -647,4 +662,163 @@ async fn restoring_never_rolls_back_silently() {
     let (state, message) = b.store.repair_finding(&finding, RepairAction::RestoreFromPeer).await;
     assert_eq!(state, FindingState::Failed);
     assert!(message.contains("no enabled replication link"), "{message}");
+}
+
+// ── chaos: everything at once ───────────────────────────────────────────────
+
+/// A tiny deterministic generator (xorshift) so failures reproduce.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// Random puts, deletes, metadata-only updates and the odd multipart upload
+/// on a shared key space. `skew_ms` stamps writes as a site whose clock is
+/// off by that much would.
+async fn writer(store: LocalObjectStore, site: String, seed: u64, ops: usize, skew_ms: i64) {
+    let mut rng = Rng(seed);
+    for i in 0..ops {
+        let key = format!("k{}", rng.below(12));
+        let stamp = (skew_ms != 0).then(|| crate::storage::stamp::Stamp {
+            ms: crate::storage::time::now_ms() + skew_ms,
+            c: 0,
+            site: site.clone(),
+        });
+        match rng.below(10) {
+            0..=4 => {
+                let body = format!("{site}-{i}-{}", rng.next()).into_bytes();
+                let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(bytes::Bytes::from(body))));
+                let _ = store
+                    .put_object_stream_with_metadata(
+                        "chaos",
+                        &key,
+                        stream,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &BTreeMap::new(),
+                        false,
+                        None,
+                        None,
+                        crate::storage::store::PublishOptions { stamp, ..Default::default() },
+                    )
+                    .await;
+            }
+            5..=6 => {
+                let _ = store.delete_object_stamped("chaos", &key, stamp).await;
+            }
+            7..=8 => {
+                let meta = BTreeMap::from([("rev".to_string(), format!("{site}-{i}"))]);
+                let _ = store
+                    .copy_object_with_metadata(
+                        "chaos",
+                        &key,
+                        "chaos",
+                        &key,
+                        None,
+                        Some(&meta),
+                        None,
+                        None,
+                        crate::storage::store::PublishOptions { stamp, ..Default::default() },
+                    )
+                    .await;
+            }
+            _ if i % 40 == 9 => {
+                // Occasionally a real multipart object.
+                if let Ok(upload) = store.initiate_multipart("chaos", &key, None, None).await {
+                    let mut done = Vec::new();
+                    for (n, part) in [vec![i as u8; MIB], vec![1u8; 33]].iter().enumerate() {
+                        let number = (n + 1) as u16;
+                        if let Ok(put) = store.put_multipart_part("chaos", &key, &upload, number, part, false).await {
+                            done.push(CompletePartRequest { number, etag: put.etag });
+                        }
+                    }
+                    let options = crate::storage::store::PublishOptions { stamp, ..Default::default() };
+                    if store.complete_multipart_with("chaos", &key, &upload, &done, options).await.is_err() {
+                        let _ = store.abort_multipart("chaos", &key, &upload).await;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if i % 7 == 0 {
+            tokio::time::sleep(Duration::from_millis(rng.below(15))).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn two_way_chaos_converges_exactly() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("chaos").await.unwrap();
+    }
+    let id_b = b.pull_from(&a, "chaos", Mode::Merge).await;
+    a.pull_from(&b, "chaos", Mode::Merge).await;
+
+    // Two writers on each site, one of b's with a clock 1.5s fast, all on
+    // the same twelve keys, while replication runs both ways.
+    let writers = vec![
+        tokio::spawn(writer(a.store.clone(), "site-a".into(), 1, 150, 0)),
+        tokio::spawn(writer(a.store.clone(), "site-a".into(), 2, 150, 0)),
+        tokio::spawn(writer(b.store.clone(), "site-b".into(), 3, 150, 0)),
+        tokio::spawn(writer(b.store.clone(), "site-b".into(), 4, 150, 1_500)),
+    ];
+    // Mid-run: b's index is rebuilt (its changelog and checkpoints carry over).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    b.store.rebuild_index("chaos").await.unwrap();
+    for w in writers {
+        w.await.unwrap();
+    }
+    // And b restarts.
+    let b = b.restart().await;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !same(&a, &b, "chaos").await {
+        if Instant::now() > deadline {
+            let (ca, cb) = (a.contents("chaos").await, b.contents("chaos").await);
+            let keys: std::collections::BTreeSet<&String> = ca.keys().chain(cb.keys()).collect();
+            for key in keys {
+                let (x, y) = (ca.get(key), cb.get(key));
+                if x != y {
+                    let fmt = |v: Option<&(String, u64, String, String, BTreeMap<String, String>, Vec<u8>)>| {
+                        v.map(|v| format!("etag={} size={} stamp={} meta={:?}", v.0, v.1, v.2, v.4)).unwrap_or("absent".into())
+                    };
+                    let ta = a.store.index("chaos").await.unwrap().get_tombstone(key).await.unwrap().map(|t| t.stamp.to_header());
+                    let tb = b.store.index("chaos").await.unwrap().get_tombstone(key).await.unwrap().map(|t| t.stamp.to_header());
+                    eprintln!("DIFF {key}\n  a: {} tomb={ta:?}\n  b: {} tomb={tb:?}", fmt(x), fmt(y));
+                }
+            }
+            for view in a.replication.list().into_iter().chain(b.replication.list()) {
+                eprintln!("LINK {} {:?}", view.name, view.status);
+            }
+            panic!("sites did not converge");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let final_state = a.contents("chaos").await;
+    assert!(!final_state.is_empty());
+    // Every surviving key on both sides carries exactly the same stamp, ETag,
+    // metadata and bytes: that is what `same` compares.
+    // Quiet afterwards: no change bounces between the sites.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let head = |site: &Site| {
+        let store = site.store.clone();
+        async move { store.index("chaos").await.unwrap().changelog_head() }
+    };
+    let before = (head(&a).await, head(&b).await);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!((head(&a).await, head(&b).await), before, "no ping-pong");
+    let status = b.link(&id_b).status;
+    assert_eq!(status.state, "live", "{status:?}");
 }
