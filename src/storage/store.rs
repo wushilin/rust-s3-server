@@ -2173,6 +2173,89 @@ impl LocalObjectStore {
         .await
     }
 
+    /// A metadata-only update of `key` (CopyObject onto itself): a new blob
+    /// dir whose part files are **hardlinks** to the current ones, with a new
+    /// `meta.json`, published through the normal commit (new version, new
+    /// stamp, a changelog `put`). No byte is copied, and the part layout and
+    /// ETag are kept — a multipart object keeps its `-N` ETag. The old dir is
+    /// retired as usual; its files live on through the links.
+    ///
+    /// `Ok(None)` when the files cannot be hardlinked (e.g. a filesystem
+    /// without hardlinks): the caller falls back to copying the bytes.
+    /// Refuses (412) if the object changed after it was read, rather than
+    /// republishing the older bytes over a concurrent write.
+    #[allow(clippy::too_many_arguments)]
+    async fn republish_metadata_only(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_class: Option<&str>,
+        replacement_user_meta: Option<&BTreeMap<String, String>>,
+        replacement_content_type: Option<&str>,
+        replacement_content_language: Option<&str>,
+        options: PublishOptions,
+    ) -> Result<Option<PutResult>> {
+        // A concurrent overwrite between reading and publishing makes the
+        // guard below refuse; re-read and try again (the caller asked for no
+        // precondition, so a race must not surface as a 412).
+        let guarded = options.precondition.is_none();
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let staging_id = new_staging_id(now_ms());
+            let staging_dir = self.layout.put_staging_dir(bucket, &staging_id)?;
+            let publish_dir = staging_dir.join("object");
+            let meta = {
+                // Link under the key lock: the source files cannot be retired
+                // mid-link, and once linked they outlive any later retire.
+                let _guard = self.locks.lock(bucket, key).await;
+                let src = self.read_object(bucket, key).await?;
+                tokio::fs::create_dir_all(&publish_dir).await?;
+                for part in &src.meta.parts {
+                    if let Err(err) =
+                        tokio::fs::hard_link(src.object_dir.join(&part.file), publish_dir.join(&part.file)).await
+                    {
+                        log::info!(
+                            "metadata-only copy falls back to a byte copy bucket={bucket} key={key}: cannot hardlink ({err})"
+                        );
+                        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                        return Ok(None);
+                    }
+                }
+                let mut meta = src.meta.clone();
+                if let Some(content_type) = replacement_content_type {
+                    meta.content_type = content_type.to_string();
+                }
+                if let Some(language) = replacement_content_language {
+                    meta.content_language = Some(language.to_string());
+                }
+                if let Some(class) = storage_class {
+                    meta.storage_class = class.to_string();
+                }
+                if let Some(user_meta) = replacement_user_meta {
+                    meta.user_meta = user_meta.clone();
+                }
+                meta
+            };
+            let cleanup = StagingDirGuard::new(&staging_dir);
+            write_json_atomic(&publish_dir.join("meta.json"), &meta).await?;
+            let mut attempt_options = options.clone();
+            if guarded {
+                // Only republish over the state that was read.
+                attempt_options.precondition = Some(Precondition::IfMatch(meta.etag.clone()));
+            }
+            let result = self
+                .publish_prepared_dir(bucket, key, &publish_dir, meta, attempt_options)
+                .await;
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            cleanup.disarm();
+            match result {
+                Err(StorageError::PreconditionFailed { .. }) if guarded && attempt < 5 => continue,
+                other => return other.map(Some),
+            }
+        }
+    }
+
     pub async fn copy_object_with_metadata(
         &self,
         src_bucket: &str,
@@ -2186,6 +2269,24 @@ impl LocalObjectStore {
         options: PublishOptions,
     ) -> Result<PutResult> {
         self.ensure_bucket_and_key(dst_bucket, dst_key).await?;
+        if src_bucket == dst_bucket && src_key == dst_key {
+            // Copy onto itself = a metadata update: keep the bytes, the part
+            // layout and the ETag (hardlinks, constant cost).
+            if let Some(result) = self
+                .republish_metadata_only(
+                    dst_bucket,
+                    dst_key,
+                    storage_class,
+                    replacement_user_meta,
+                    replacement_content_type,
+                    replacement_content_language,
+                    options.clone(),
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
         let _source_guard = self.locks.lock(src_bucket, src_key).await;
         let src = self.read_object(src_bucket, src_key).await?;
         let content_type = replacement_content_type

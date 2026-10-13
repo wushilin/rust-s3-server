@@ -611,6 +611,13 @@ decrease in seq order, so the server finds the position with a binary search.
 If changes from that time may already have been removed by retention, the
 response is `410`. Responses also carry the server's `site_id`.
 
+**Metadata updates keep the bytes.** A CopyObject onto the same key (S3's way
+of changing metadata) doesn't copy any data. The new version hardlinks the
+existing part files, so the update costs the same regardless of object size and
+keeps the part layout and the ETag, including a multipart `-N` ETag. If the
+filesystem can't hardlink, it falls back to a byte copy. A copy to a different
+key is still a full copy, stored as a single part.
+
 **Replicated writes.** A PUT, CompleteMultipartUpload or CopyObject that sends
 `x-rs3-stamp: <ms>.<c>.<site>` keeps that stamp instead of getting a new local
 one, and its `Last-Modified` becomes the stamp's time. This is how a replica

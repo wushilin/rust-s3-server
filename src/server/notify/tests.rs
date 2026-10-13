@@ -1507,3 +1507,120 @@ async fn reading_from_a_point_in_time() {
     assert_eq!(status, StatusCode::OK, "everything from t is still retained");
     assert_eq!(keys_of(&page, "events"), ["c", "d", "e"]);
 }
+
+// ── metadata-only updates ───────────────────────────────────────────────────
+
+async fn object_bytes(store: &LocalObjectStore, bucket: &str, key: &str) -> Vec<u8> {
+    let object = store.read_object(bucket, key).await.unwrap();
+    let mut out = Vec::new();
+    for part in &object.meta.parts {
+        out.extend(std::fs::read(object.object_dir.join(&part.file)).unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn copying_onto_itself_updates_metadata_without_touching_the_bytes() {
+    const MIB: usize = 5 * 1024 * 1024;
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let parts = vec![vec![1u8; MIB], vec![2u8; MIB], vec![3u8; 7]];
+    let etag = multipart_upload(&h.store, "bkt", "big", &parts).await;
+    assert!(etag.ends_with("-3"));
+    let before = h.store.index("bkt").await.unwrap().get("big").await.unwrap().unwrap();
+
+    let meta = BTreeMap::from([("owner".to_string(), "team-a".to_string())]);
+    let result = h
+        .store
+        .copy_object_with_metadata(
+            "bkt",
+            "big",
+            "bkt",
+            "big",
+            None,
+            Some(&meta),
+            Some("application/x-test"),
+            None,
+            crate::storage::store::PublishOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.etag, etag, "the multipart ETag is kept");
+    let after = h.store.index("bkt").await.unwrap().get("big").await.unwrap().unwrap();
+    assert_eq!(after.parts, before.parts, "the part layout is kept");
+    assert_ne!(after.blob_dir, before.blob_dir, "a new version");
+    assert!(after.stamp > before.stamp, "with a new stamp");
+    let object = h.store.read_object("bkt", "big").await.unwrap();
+    assert_eq!(object.meta.user_meta, meta);
+    assert_eq!(object.meta.content_type, "application/x-test");
+    assert_eq!(object_bytes(&h.store, "bkt", "big").await, parts.concat());
+
+    // The part files are hardlinks: purging the retired dir from trash leaves
+    // the object intact.
+    let trash = h.tmp.path().join("buckets").join("bkt").join("trash");
+    assert!(trash.exists(), "the old version was retired to trash");
+    std::fs::remove_dir_all(&trash).unwrap();
+    assert_eq!(object_bytes(&h.store, "bkt", "big").await, parts.concat());
+
+    // It is a normal change: logged as a put with the same ETag.
+    let page = read::read(&h.store, "bkt", &read::ReadParams { limit: 10, ..Default::default() }).await.unwrap();
+    let last = page.events.last().unwrap();
+    assert_eq!((last.op.as_str(), last.etag.as_str()), ("put", etag.as_str()));
+    assert_eq!(last.parts, before.parts);
+
+    // Copying to a different key is still a byte copy (one part, plain MD5).
+    let copy = h.store.copy_object("bkt", "big", "bkt", "other").await.unwrap();
+    assert!(!copy.etag.contains('-'), "{}", copy.etag);
+}
+
+#[tokio::test]
+async fn self_copy_over_http_and_stamp_only_updates() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let upload_id = h.store.initiate_multipart("bkt", "k", None, None).await.unwrap();
+    let part = h.store.put_multipart_part("bkt", "k", &upload_id, 1, b"only part", false).await.unwrap();
+    let etag = h
+        .store
+        .complete_multipart("bkt", "k", &upload_id, &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }])
+        .await
+        .unwrap()
+        .etag;
+    let app = s3_app(&h);
+
+    // An S3 client's metadata update.
+    let response = send_put(
+        &app,
+        "/bkt/k",
+        "",
+        &[
+            ("x-amz-copy-source", "/bkt/k"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("x-amz-meta-color", "blue"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains(&etag), "CopyObjectResult keeps the -1 ETag");
+
+    // A replicator adopting the origin's stamp for identical content and
+    // metadata: no bytes move, the stamp changes.
+    let origin = Stamp { ms: now_ms() + 1_000, c: 0, site: "site-a".into() };
+    let response = send_put(
+        &app,
+        "/bkt/k",
+        "",
+        &[
+            ("x-amz-copy-source", "/bkt/k"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("x-amz-meta-color", "blue"),
+            ("x-rs3-stamp", &origin.to_header()),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(head_stamp(&app, "/bkt/k").await.0, origin);
+    let row = h.store.index("bkt").await.unwrap().get("k").await.unwrap().unwrap();
+    assert_eq!(row.etag, etag);
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"only part");
+}
