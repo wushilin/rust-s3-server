@@ -101,7 +101,16 @@ impl Worker {
             }
             self.beat();
             match self.step().await {
-                Ok(()) => backoff = Duration::from_secs(1),
+                Ok(()) => {
+                    backoff = Duration::from_secs(1);
+                    // Working again: an error from before is no longer news.
+                    self.update(|s| {
+                        if s.last_error.is_some() {
+                            s.last_error = None;
+                            s.last_error_ms = 0;
+                        }
+                    });
+                }
                 Err(StepError::Resnapshot(reason)) => {
                     log::warn!("replication {} re-snapshots: {reason}", self.link.id);
                     self.record_error(&reason);

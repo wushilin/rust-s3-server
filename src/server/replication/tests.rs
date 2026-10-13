@@ -1165,3 +1165,34 @@ async fn a_prefix_filtered_two_way_merge_exchanges_only_that_prefix() {
     eventually(30, "the delete crossed over", || async { !shared(&b).await.contains(&"shared/from-b".to_string()) }).await;
     assert!(!shared(&a).await.contains(&"private/another".to_string()));
 }
+
+#[tokio::test]
+async fn the_last_error_clears_once_the_link_works_again() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    a.store.create_bucket("data").await.unwrap();
+    b.store.create_bucket("data").await.unwrap();
+    a.put("data", "k", b"v").await;
+    let id = b
+        .replication
+        .create(LinkRequest { secret_key: "wrong".into(), ..request("data", &a, Mode::Merge, "", false) }, "t")
+        .await
+        .unwrap()
+        .id;
+    eventually(10, "the error shows", || {
+        let view = b.link(&id);
+        async move { view.status.last_error.is_some_and(|e| e.contains("403")) }
+    })
+    .await;
+    // Fixed: the error goes away with the first successful step.
+    b.replication
+        .update(&id, LinkUpdate { secret_key: Some(SK.into()), ..LinkUpdate::default() })
+        .await
+        .unwrap();
+    eventually(30, "replicating", || same(&a, &b, "data")).await;
+    eventually(10, "the error is cleared", || {
+        let view = b.link(&id);
+        async move { view.status.last_error.is_none() && view.status.last_error_ms == 0 }
+    })
+    .await;
+}
