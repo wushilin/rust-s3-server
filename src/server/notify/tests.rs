@@ -1471,11 +1471,11 @@ async fn the_site_id_and_clock_survive_a_restart() {
     reopened.init_site(None).unwrap();
     assert_eq!(reopened.site_id(), site);
     assert!(reopened.next_stamp() > before);
-    // The id is fixed: configuring another one later is refused (only
-    // `rusts3 change-site-id` changes it).
+    // A name is only a label: it changes freely, the id never does.
     let named = LocalObjectStore::new(tmp.path());
-    let err = named.init_site(Some("sg-1")).unwrap_err().to_string();
-    assert!(err.contains("change-site-id"), "{err}");
+    named.init_site(Some("Singapore")).unwrap();
+    assert_eq!((named.site_id(), named.site_name()), (site.clone(), "Singapore".to_string()));
+    assert_eq!(reopened.site_name(), site, "no name: the id is shown");
 }
 
 #[tokio::test]

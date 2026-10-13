@@ -149,6 +149,9 @@ pub struct LinkStatus {
     /// `idle` | `snapshot` | `live` | `error` | `paused` | `stopped`
     pub state: String,
     pub peer_site: Option<String>,
+    /// The peer's readable name, as it last reported it (a label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_site_name: Option<String>,
     pub position: Option<u64>,
     pub peer_head: Option<u64>,
     pub snapshot_cursor: Option<String>,

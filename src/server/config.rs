@@ -22,10 +22,16 @@ pub struct ServerConfig {
     /// PROXY protocol handling on both listeners (S3 API and console).
     #[serde(default)]
     pub proxy_protocol: ProxyProtocolMode,
-    /// This site's id for replication (1-64 of `[A-Za-z0-9_-]`). Unset: an
-    /// id generated on first start and kept in `<base_dir>/site.json`.
-    #[serde(default)]
+    /// No longer configurable (refused when set): the site id is generated
+    /// on first start, kept in `<base_dir>/site.json`, and never changes.
+    /// Use `site_name` for a readable name.
+    #[serde(default, skip_serializing)]
     pub site_id: Option<String>,
+    /// A readable name for this site, shown in the console and to
+    /// replication peers. A label only — change it any time. Unset: the
+    /// site id is shown instead.
+    #[serde(default)]
+    pub site_name: Option<String>,
 }
 
 /// Whether the listeners read a PROXY protocol header (v1 or v2) ahead of HTTP.
@@ -634,8 +640,16 @@ impl AppConfig {
             }
         }
         // An empty value means "not configured" (container templating).
-        if let Some(site) = self.server.site_id.as_deref().filter(|v| !v.is_empty()) {
-            crate::storage::stamp::validate_site_id(site).map_err(|err| format!("server.site_id: {err}"))?;
+        if self.server.site_id.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            return Err("server.site_id is no longer configurable: the site id is generated on first start and \
+                        never changes (it is in every version stamp). Remove it, and use server.site_name for a \
+                        readable name."
+                .to_string());
+        }
+        if let Some(name) = self.server.site_name.as_deref() {
+            if name.chars().count() > 64 || name.chars().any(char::is_control) {
+                return Err("server.site_name must be at most 64 characters, without control characters".to_string());
+            }
         }
         if self.sweeper.trash_expiry_secs < MIN_TRASH_RETENTION_SECS {
             return Err(format!(
@@ -732,6 +746,7 @@ impl Default for ServerConfig {
             base_dir: default_base_dir(),
             proxy_protocol: ProxyProtocolMode::default(),
             site_id: None,
+            site_name: None,
         }
     }
 }
@@ -799,6 +814,24 @@ fn default_trash_expiry_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_site_id_is_not_configurable_but_the_site_name_is() {
+        let mut config = AppConfig::default();
+        config.server.site_name = Some("Singapore DC-1".into());
+        config.validate().unwrap();
+        config.server.site_id = Some("site-a".into());
+        assert!(config.validate().unwrap_err().contains("site_name"));
+        // Empty (a templated value that was not supplied) is not set.
+        config.server.site_id = Some(String::new());
+        config.validate().unwrap();
+        config.server.site_name = Some("x".repeat(65));
+        assert!(config.validate().is_err());
+        config.server.site_name = Some("bad\nname".into());
+        assert!(config.validate().is_err());
+        // A generated config does not mention site_id.
+        assert!(!AppConfig::default().to_yaml().unwrap().contains("site_id"));
+    }
 
     /// What a container gets when RUSTS3_PUBLIC_HOSTNAME is not supplied:
     /// the placeholder expands to "", which must read as "not configured".

@@ -1445,39 +1445,6 @@ impl ObjectIndex {
         .await
     }
 
-    /// Starts the changelog over (a site id change): drops every entry,
-    /// marks everything up to the head as trimmed and gives the log a new
-    /// id, so every reader sees a replaced log and re-snapshots. Offline
-    /// only — the open index keeps the old id in memory. Returns the new id
-    /// and how many entries were dropped.
-    pub async fn reset_changelog(&self) -> Result<(String, usize)> {
-        let db = self.db.clone();
-        let head = self.changes.watermark();
-        run_blocking(move || {
-            let log = cf(&db, CF_CHANGELOG)?;
-            let meta = cf(&db, CF_META)?;
-            let mut removed = 0usize;
-            let mut batch = WriteBatch::default();
-            for item in db.iterator_cf(&log, IteratorMode::Start) {
-                let (key, _) = item?;
-                batch.delete_cf(&log, key);
-                removed += 1;
-            }
-            use rand::Rng;
-            let mut buf = [0u8; 8];
-            rand::rng().fill_bytes(&mut buf);
-            let id: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-            batch.put_cf(&meta, KEY_CHANGELOG_ID, id.as_bytes());
-            batch.put_cf(&meta, KEY_TRIMMED_THROUGH, head.max(trimmed_through(&db)?).to_le_bytes());
-            batch.put_cf(&meta, KEY_TRIMMED_TS, (super::time::now_ms() as u64).to_le_bytes());
-            let mut opts = WriteOptions::default();
-            opts.set_sync(true);
-            db.write_opt(batch, &opts)?;
-            Ok((id, removed))
-        })
-        .await
-    }
-
     /// Removes entries committed before `cutoff_ms`, at most `max_entries`
     /// per call, never past the watermark. Raises `trimmed_through` in the
     /// same batch. Returns how many entries were removed.

@@ -53,8 +53,14 @@ impl Site {
     /// Opens a site on an existing data directory (also: a restart), on
     /// `bind` (a restart keeps its address, as a real deployment does).
     async fn open(tmp: tempfile::TempDir, name: &str, timing: Timing, bind: &str) -> Self {
+        // Readable ids in tests: a site id is generated at first start, but
+        // whatever site.json records is the id, so seed it.
+        let site_file = tmp.path().join("site.json");
+        if !site_file.exists() {
+            std::fs::write(&site_file, format!(r#"{{"site_id":"{name}"}}"#)).unwrap();
+        }
         let store = LocalObjectStore::new(tmp.path());
-        store.init_site(Some(name)).unwrap();
+        store.init_site(Some(&format!("{name} (name)"))).unwrap();
         let iam = IamStore::open(tmp.path()).await.unwrap();
         let shutdown = CancellationToken::new();
         let notify = NotifyService::start(
@@ -147,20 +153,17 @@ impl Site {
         self.link_with(peer, bucket, mode, ak, sk, true).await.unwrap()
     }
 
-    /// Stops this site, gives it a new site id as `rusts3 change-site-id`
-    /// does (every changelog starts over), and starts it as `name`.
-    async fn restart_as(self, name: &str) -> Self {
+    /// Stops this site and starts a different, empty one (site id `name`)
+    /// at the same address: the endpoint now reaches another site.
+    async fn replace_with_fresh(self, name: &str) -> Self {
         self.shutdown.cancel();
         self.store.shutdown_token().cancel();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let Site { tmp, store, iam, notify, replication, endpoint, .. } = self;
+        let Site { store, iam, notify, replication, endpoint, .. } = self;
         drop((store, iam, notify, replication));
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let offline = LocalObjectStore::new(tmp.path());
-        offline.change_site_id(name).await.unwrap();
-        drop(offline);
         let bind = endpoint.trim_start_matches("http://").to_string();
-        Self::open(tmp, name, fast_timing(), &bind).await
+        Self::open(tempfile::tempdir().unwrap(), name, fast_timing(), &bind).await
     }
 
     /// A link here with `bucket` on `peer`, with the peer key `ak`/`sk`;
@@ -376,6 +379,13 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     assert_eq!(merged["both"].5, b"a again");
     assert!(!merged.contains_key("only-a"));
     assert_eq!(a.contents("shared").await["big"].0, etag);
+    // Counters move just after the peer applied a change: wait until the
+    // multipart copy is counted before taking the baseline.
+    eventually(10, "the multipart copy is counted", || {
+        let view = b.link(&id);
+        async move { view.status.push.is_some_and(|p| p.copied_bytes >= (MIB + 1000) as u64) }
+    })
+    .await;
     let copied = b.link(&id).status.push.unwrap().copied_bytes;
     b.store
         .copy_object_with_metadata("shared", "big", "shared", "big", None, None, Some("text/v2"), None, Default::default())
@@ -484,7 +494,7 @@ async fn a_delete_of_a_key_absent_here_still_reaches_the_peer() {
 }
 
 #[tokio::test]
-async fn a_link_is_bound_to_both_site_ids_and_stops_when_either_changes() {
+async fn a_link_is_bound_to_the_peer_site_and_stops_if_another_answers() {
     let a = Site::start("site-a").await;
     let b = Site::start("site-b").await;
     for site in [&a, &b] {
@@ -496,51 +506,34 @@ async fn a_link_is_bound_to_both_site_ids_and_stops_when_either_changes() {
     let view = b.link(&id);
     assert_eq!((view.local_site_id.as_str(), view.peer_site_id.as_str()), ("site-b", "site-a"), "bound at creation");
     eventually(30, "merged", || same(&a, &b, "data")).await;
+    let peer_name = b.link(&id).status.peer_site_name;
+    assert_eq!(peer_name.as_deref(), Some("site-a (name)"), "the peer's name is shown");
 
-    // The peer changes its id: the link stops and says so; nothing moves.
-    let a = a.restart_as("site-a2").await;
-    eventually(30, "stopped on the peer's new id", || {
+    // The endpoint now reaches a different site (a fresh server): the link
+    // stops and says so; nothing moves either way.
+    let a = a.replace_with_fresh("site-c").await;
+    a.store.create_bucket("data").await.unwrap();
+    eventually(30, "stopped on another site answering", || {
         let view = b.link(&id);
         async move {
             view.status.state == "stopped"
-                && view.status.site_changed.as_deref().is_some_and(|c| c.contains("from site-a to site-a2"))
+                && view.status.site_changed.as_deref().is_some_and(|c| c.contains("from site-a to site-c"))
         }
     })
     .await;
-    a.put("data", "after-a-renamed", b"a2").await;
-    b.put("data", "while-a-renamed", b"b2").await;
+    b.put("data", "while-stopped", b"b2").await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(!b.contents("data").await.contains_key("after-a-renamed"), "held");
-    assert!(!a.contents("data").await.contains_key("while-a-renamed"), "held both ways");
-    // Accepted: bound to the new id, replicating again.
+    assert!(a.contents("data").await.is_empty(), "nothing pushed to the stranger");
+    // Accepted: bound to the new site, which gets everything.
     let view = b.replication.act(&id, LinkAction::AcceptSiteIds).await.unwrap();
-    assert_eq!(view.peer_site_id, "site-a2");
-    eventually(30, "converged after accepting", || same(&a, &b, "data")).await;
+    assert_eq!(view.peer_site_id, "site-c");
+    eventually(30, "converged with the new site", || same(&a, &b, "data")).await;
+    assert!(a.contents("data").await.contains_key("from-b"));
     eventually(10, "no error", || {
         let view = b.link(&id);
         async move { view.status.site_changed.is_none() && view.status.last_error.is_none() }
     })
     .await;
-
-    // The site running the link changes its id: stopped too, until accepted.
-    let b = b.restart_as("site-b2").await;
-    eventually(30, "stopped on this site's new id", || {
-        let view = b.link(&id);
-        async move { view.status.site_changed.as_deref().is_some_and(|c| c.contains("this site's id changed")) }
-    })
-    .await;
-    b.store.delete_object("data", "from-a").await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(a.contents("data").await.contains_key("from-a"), "held");
-    b.replication.act(&id, LinkAction::AcceptSiteIds).await.unwrap();
-    assert_eq!(b.link(&id).local_site_id, "site-b2");
-    eventually(30, "converged after accepting", || same(&a, &b, "data")).await;
-    assert!(!a.contents("data").await.contains_key("from-a"));
-    // Stamps written before keep the old ids and still order correctly.
-    assert!(a.contents("data").await["from-b"].2.ends_with(".site-b"));
-    // And a configured id that differs from the recorded one is refused.
-    let err = crate::storage::stamp::SiteClock::open(a.tmp.path(), Some("site-a")).unwrap_err().to_string();
-    assert!(err.contains("change-site-id"), "{err}");
 }
 
 #[tokio::test]

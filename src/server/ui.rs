@@ -923,6 +923,7 @@ async fn server_ping(State(state): State<UiState>, headers: HeaderMap) -> Respon
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "site_id": state.store.site_id(),
+        "site_name": state.store.site_name(),
         "now_ms": crate::storage::time::now_ms(),
     }))
     .into_response();
@@ -3682,6 +3683,7 @@ async fn list_links(State(state): State<UiState>, headers: HeaderMap) -> Respons
             "links": service.list(),
             "incoming": service.incoming(),
             "site_id": state.store.site_id(),
+            "site_name": state.store.site_name(),
             "local_keys": local_keys,
         })).into_response(),
         Err(resp) => resp,

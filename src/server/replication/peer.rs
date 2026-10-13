@@ -33,6 +33,9 @@ pub const WRITE_ACTIONS: [&str; 3] = ["s3:PutObject", "s3:DeleteObject", "s3:Rep
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccessReport {
     pub site_id: String,
+    /// The answering site's readable name (a label).
+    #[serde(default)]
+    pub site_name: String,
     pub bucket: String,
     pub read_only: bool,
     /// Each of [`READ_ACTIONS`] and [`WRITE_ACTIONS`]: allowed on the bucket
@@ -83,6 +86,8 @@ pub fn parse_fields(value: &str) -> BTreeMap<String, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replicator {
     pub site: String,
+    /// The reading site's readable name (optional field).
+    pub site_name: String,
     pub mode: String,
     pub bucket: String,
     pub link: String,
@@ -93,6 +98,7 @@ impl Replicator {
     pub fn to_header(&self) -> String {
         encode_fields(&[
             ("site", &self.site),
+            ("site_name", &self.site_name),
             ("mode", &self.mode),
             ("bucket", &self.bucket),
             ("link", &self.link),
@@ -107,6 +113,7 @@ impl Replicator {
         let mut take = |key: &str| fields.remove(key);
         let replicator = Self {
             site: take("site")?,
+            site_name: take("site_name").unwrap_or_default(),
             mode: take("mode")?,
             bucket: take("bucket")?,
             link: take("link")?,
@@ -119,7 +126,8 @@ impl Replicator {
             && replicator.bucket.len() <= 63
             && !replicator.link.is_empty()
             && replicator.link.len() <= 64
-            && replicator.name.len() <= 256;
+            && replicator.name.len() <= 256
+            && replicator.site_name.len() <= 256;
         sane.then_some(replicator)
     }
 }
@@ -669,19 +677,20 @@ mod tests {
     fn header_fields_are_named_encoded_and_extensible() {
         let r = Replicator {
             site: "site-b".into(),
+            site_name: "Tokyo; DC=2".into(),
             mode: "merge".into(),
             bucket: "photos".into(),
             link: "rl_1".into(),
             name: "a;b=c %d ✓".into(),
         };
         let header = r.to_header();
-        assert_eq!(header.split(';').count(), 5, "separators in values are encoded: {header}");
+        assert_eq!(header.split(';').count(), 6, "separators in values are encoded: {header}");
         assert!(header.is_ascii(), "a valid header value: {header}");
         assert_eq!(Replicator::parse(&header), Some(r.clone()));
         // Any order, unknown fields ignored, a missing name tolerated.
         assert_eq!(
             Replicator::parse("future=1;link=rl_1;bucket=photos;mode=merge;site=site-b;name=x"),
-            Some(Replicator { name: "x".into(), ..r.clone() })
+            Some(Replicator { name: "x".into(), site_name: String::new(), ..r.clone() })
         );
         assert_eq!(Replicator::parse("site=s;mode=m;bucket=b;link=l").unwrap().name, "");
         // Required fields missing, or junk: ignored.

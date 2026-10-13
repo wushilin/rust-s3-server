@@ -71,6 +71,9 @@ pub struct SnapshotParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResponse {
     pub bucket: String,
+    /// This site's readable name (`server.site_name`, else its id): a label.
+    #[serde(default)]
+    pub site_name: String,
     /// This server's site id: a replicator refuses to copy between two
     /// servers reporting the same one (a cloned data directory).
     pub site_id: String,
@@ -90,6 +93,8 @@ pub struct ReadResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotResponse {
     pub bucket: String,
+    #[serde(default)]
+    pub site_name: String,
     /// This server's site id (see `storage::stamp`).
     pub site_id: String,
     pub log_id: String,
@@ -335,6 +340,7 @@ async fn read_once(store: &LocalObjectStore, bucket: &str, params: &ReadParams) 
     Ok(ReadResponse {
         bucket: bucket.to_string(),
         site_id: store.site_id(),
+            site_name: store.site_name(),
         log_id: status.log_id,
         head: status.head,
         trimmed_through: status.trimmed_through,
@@ -361,6 +367,7 @@ pub async fn snapshot(
         return Ok(SnapshotResponse {
             bucket: bucket.to_string(),
             site_id: store.site_id(),
+            site_name: store.site_name(),
             log_id: index.changelog_id().to_string(),
             head,
             entries: tombstones
@@ -389,6 +396,7 @@ pub async fn snapshot(
         return Ok(SnapshotResponse {
             bucket: bucket.to_string(),
             site_id: store.site_id(),
+            site_name: store.site_name(),
             log_id: index.changelog_id().to_string(),
             head: index.changelog_head(),
             entries: Vec::new(),
@@ -411,6 +419,7 @@ pub async fn snapshot(
     Ok(SnapshotResponse {
         bucket: bucket.to_string(),
         site_id: site,
+        site_name: store.site_name(),
         log_id,
         head,
         entries,

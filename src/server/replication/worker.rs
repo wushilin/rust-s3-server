@@ -53,9 +53,9 @@ pub(super) struct Worker {
 pub(super) type LocalCheck = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 pub(super) type BindPeer = Arc<dyn Fn(String) + Send + Sync>;
 
-/// The link's own site id no longer being this site's: `Err` describing
-/// the change (a site id only changes by `rusts3 change-site-id`, which
-/// starts every changelog over).
+/// The link's own site id no longer being this site's (site ids never
+/// change, so only if site.json was replaced or deleted by hand): what
+/// changed.
 pub(super) fn local_site_changed(link: &Link, current: &str) -> Option<String> {
     (!link.local_site_id.is_empty() && link.local_site_id != current).then(|| {
         format!(
@@ -215,6 +215,17 @@ impl Worker {
         Ok(())
     }
 
+    /// The peer's current name (a label it may change any time).
+    fn peer_named(&self, name: &str) {
+        if !name.is_empty() {
+            self.update(|s| {
+                if s.peer_site_name.as_deref() != Some(name) {
+                    s.peer_site_name = Some(name.to_string());
+                }
+            });
+        }
+    }
+
     fn site_changed(&self, what: String) -> StepError {
         self.update(|s| s.site_changed = Some(what.clone()));
         StepError::Fatal(what)
@@ -230,8 +241,8 @@ impl Worker {
         }
         if peer_site == local {
             return Err(StepError::Fatal(format!(
-                "the peer reports this server's own site id ({local}): a copied data directory? Give one of \
-                 them its own server.site_id."
+                "the peer reports this server's own site id ({local}): a copy of this data directory? A copy \
+                 is the same site; start the second site from an empty data directory."
             )));
         }
         // Both sites configured a merge link for the same pair. One link
@@ -270,6 +281,7 @@ impl Worker {
             let page = self.peer.snapshot(None, SNAPSHOT_PAGE, "", false).await?;
             self.peer_answered();
             self.check_site(&page.site_id)?;
+            self.peer_named(&page.site_name);
             let mut checkpoint = Checkpoint {
                 v: RECORD_VERSION,
                 peer_log_id: page.log_id.clone(),
@@ -333,6 +345,7 @@ impl Worker {
                 };
                 self.peer_answered();
                 self.check_site(&page.site_id)?;
+                self.peer_named(&page.site_name);
                 self.apply_all(&page.events, &checkpoint.peer_site).await?;
                 checkpoint.phase = Phase::Live { after: page.next };
                 self.update(|s| {

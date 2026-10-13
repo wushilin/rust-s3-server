@@ -171,6 +171,8 @@ pub struct LocalObjectStore {
     /// This site's identity and version-stamp clock. Opened by
     /// [`Self::init_site`] at startup; tests get an ephemeral one lazily.
     clock: Arc<std::sync::OnceLock<Arc<SiteClock>>>,
+    /// `server.site_name` (set by [`Self::init_site`]).
+    site_name: Arc<std::sync::OnceLock<Option<String>>>,
     #[cfg(test)]
     crash_points: Arc<Mutex<HashSet<String>>>,
 }
@@ -371,6 +373,7 @@ impl LocalObjectStore {
             peer_restorer: Arc::new(std::sync::RwLock::new(None)),
             replica_reader: Arc::new(std::sync::RwLock::new(None)),
             clock: Arc::new(std::sync::OnceLock::new()),
+            site_name: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -422,34 +425,14 @@ impl LocalObjectStore {
 
     /// Opens this site's identity and clock (`<root>/site.json`), with an
     /// optional configured site id. Call once at startup, before any write.
-    pub fn init_site(&self, configured_site_id: Option<&str>) -> Result<()> {
-        let clock = SiteClock::open(self.layout.root(), configured_site_id)?;
-        log::info!("site id {}", clock.site_id());
+    pub fn init_site(&self, site_name: Option<&str>) -> Result<()> {
+        let clock = SiteClock::open(self.layout.root())?;
+        let name = site_name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        log::info!("site id {} name {}", clock.site_id(), name.as_deref().unwrap_or("(unset)"));
+        let _ = self.site_name.set(name);
         self.clock
             .set(Arc::new(clock))
             .map_err(|_| StorageError::Io("site clock already initialised".to_string()))
-    }
-
-    /// Gives this data directory a new site id (offline, server stopped).
-    /// The site id only matters through the changelogs — peers remember
-    /// which site a log belongs to, and stamps name the site that wrote
-    /// them — so every bucket's changelog starts over first (a new log id:
-    /// every reader re-snapshots and learns the new id), and only then is
-    /// the id recorded. Safe to re-run after an interruption. Objects keep
-    /// their stamps (with the old id): they are only values, and still
-    /// order correctly. Returns `(old id, [(bucket, changes dropped)])`.
-    pub async fn change_site_id(&self, new_site: &str) -> Result<(Option<String>, Vec<(String, usize)>)> {
-        super::stamp::validate_site_id(new_site).map_err(StorageError::Io)?;
-        let root = self.layout.root().to_path_buf();
-        let old = SiteClock::recorded_site_id(&root)?;
-        let mut buckets = Vec::new();
-        for (bucket, _) in self.list_buckets().await? {
-            let index = self.index(&bucket).await?;
-            let (_, removed) = index.reset_changelog().await?;
-            buckets.push((bucket, removed));
-        }
-        SiteClock::record_site_id(&root, new_site)?;
-        Ok((old, buckets))
     }
 
     fn clock(&self) -> &Arc<SiteClock> {
@@ -457,15 +440,21 @@ impl LocalObjectStore {
             // Tests and tools that never call init_site: persisted when the
             // data root is writable, so stamps still survive a reopen.
             Arc::new(
-                SiteClock::open(self.layout.root(), None)
+                SiteClock::open(self.layout.root())
                     .unwrap_or_else(|_| SiteClock::ephemeral("local")),
             )
         })
     }
 
-    /// This site's id (see `storage::stamp`).
+    /// This site's id (see `storage::stamp`): generated, never changes.
     pub fn site_id(&self) -> String {
         self.clock().site_id().to_string()
+    }
+
+    /// This site's readable name (`server.site_name`), or its id when none
+    /// is configured. A label only: free to change.
+    pub fn site_name(&self) -> String {
+        self.site_name.get().cloned().flatten().unwrap_or_else(|| self.site_id())
     }
 
     /// The next local version stamp.

@@ -992,39 +992,6 @@ fn ownership_hint() -> String {
 /// Takes an exclusive advisory lock on `<root>/.rusts3.lock` and refuses to
 /// start if another process holds it. The returned handle must stay alive
 /// for the process lifetime — dropping it releases the lock.
-/// `rusts3 change-site-id`: gives the data directory of `app` a new site id,
-/// with the server stopped (it takes the same process lock). Every bucket's
-/// changelog starts over, so peers and changelog readers re-snapshot and
-/// webhooks behind the head pause. Returns a summary for the operator.
-pub async fn change_site_id(app: &AppConfig, new_site: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let root = FsPath::new(&app.server.base_dir);
-    let _process_lock = acquire_process_lock(root)?;
-    let store = LocalObjectStore::from_storage_config(&app.server.base_dir, &app.storage);
-    let (old, buckets) = store.change_site_id(new_site).await?;
-    let mut out = format!(
-        "site id: {} -> {new_site}\n",
-        old.as_deref().unwrap_or("(not recorded yet)")
-    );
-    for (bucket, removed) in &buckets {
-        out.push_str(&format!("  bucket {bucket}: changelog started over ({removed} changes dropped)\n"));
-    }
-    if buckets.is_empty() {
-        out.push_str("  no buckets\n");
-    }
-    match app.server.site_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(configured) if configured != new_site => out.push_str(&format!(
-            "\nserver.site_id in the config is still {configured:?}: set it to {new_site:?} (or remove it) before \
-             starting the server.\n"
-        )),
-        _ => {}
-    }
-    out.push_str(
-        "\nReplication links (here and on peers) and replication-token readers re-snapshot on their own.\n\
-         Webhooks that were behind the head pause: resume or skip them in the console.\n",
-    );
-    Ok(out)
-}
-
 fn acquire_process_lock(root: &FsPath) -> Result<std::fs::File, Box<dyn std::error::Error>> {
     // Name the directory in any failure here. This is the first thing that
     // touches the data root, so it is where a container with a wrongly-owned
@@ -1071,9 +1038,6 @@ fn acquire_process_lock(root: &FsPath) -> Result<std::fs::File, Box<dyn std::err
 /// staging cleanup, and trash cleanup. Responds to SIGINT (Ctrl-C) by
 /// cancelling all background tasks and draining in-flight HTTP requests before
 /// returning.
-///
-/// (See [`change_site_id`] for the one offline operation on a data
-/// directory's identity.)
 pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error>> {
     config.app_config.validate().map_err(|message| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
@@ -1084,7 +1048,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
 
     let store = LocalObjectStore::from_storage_config(&config.root, &config.app_config.storage);
     // Site identity and version-stamp clock, before anything can write.
-    store.init_site(config.app_config.server.site_id.as_deref())?;
+    store.init_site(config.app_config.server.site_name.as_deref())?;
     let shutdown = store.shutdown_token();
     let metrics = Arc::new(TrafficMetrics::default());
     // One registry of in-flight work, shared by the HTTP handlers and the
@@ -1809,6 +1773,7 @@ async fn access_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Respons
         .and_then(|replicator| store.replica_read(&ctx.bucket, replicator, false));
     axum::Json(AccessReport {
         site_id: store.site_id(),
+        site_name: store.site_name(),
         bucket: ctx.bucket.clone(),
         read_only: meta.read_only,
         actions,
