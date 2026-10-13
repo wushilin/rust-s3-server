@@ -655,11 +655,15 @@ async fn skip_to_head_and_set_offset_replay() {
     let id = h.webhook("ops", "bkt", &rx.url, Filter::default(), false).await.subscription.id;
     h.put("bkt", "a", b"x").await;
     h.put("bkt", "b", b"x").await;
-    wait_until(10, "two events", || rx.live_keys().len() == 2).await;
+    // Waits are generous (this takes ~5s alone, much longer when the whole
+    // suite loads the machine) and for "at least": an extra delivery then
+    // fails the exact assertion below, naming what arrived.
+    wait_until(30, "two events", || rx.live_keys().len() >= 2).await;
+    assert_eq!(rx.live_keys(), ["a", "b"]);
 
     // Rewind and replay from the start of the retained log.
     h.service.act(&id, Action::SetOffset { offset: 0 }).await.unwrap();
-    wait_until(10, "replayed", || rx.live_keys().len() == 4).await;
+    wait_until(30, "replayed", || rx.live_keys().len() >= 4).await;
     assert_eq!(rx.live_keys(), ["a", "b", "a", "b"]);
 
     // Paused + skip to head: the backlog is skipped.
@@ -667,8 +671,8 @@ async fn skip_to_head_and_set_offset_replay() {
     h.put("bkt", "skipped", b"x").await;
     h.service.act(&id, Action::SkipToHead).await.unwrap();
     h.put("bkt", "after", b"x").await;
-    wait_until(10, "post-skip event", || rx.live_keys().len() == 5).await;
-    assert_eq!(rx.live_keys().last().unwrap(), "after");
+    wait_until(30, "post-skip event", || rx.live_keys().len() >= 5).await;
+    assert_eq!(rx.live_keys(), ["a", "b", "a", "b", "after"]);
 }
 
 #[tokio::test]
