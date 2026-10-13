@@ -842,6 +842,14 @@ fn operation_and_target(
             if query.contains_key("location") {
                 return ("GET_BUCKET_LOCATION", format!("/{bucket}"));
             }
+            // A reader of the bucket's changelog — often a replication link
+            // long-polling, so it is in flight most of the time.
+            if query.contains_key(notify::read::QUERY_SNAPSHOT) {
+                return ("CHANGELOG", format!("/{bucket}/ changelog snapshot"));
+            }
+            if query.contains_key(notify::read::QUERY_CHANGELOG) {
+                return ("CHANGELOG", format!("/{bucket}/ changelog"));
+            }
             return ("LIST", target);
         }
         if *method == Method::HEAD {

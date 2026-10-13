@@ -930,53 +930,53 @@ async fn changelog_reads_are_stateless_and_reader_positioned() {
     }
     let app = s3_app(&h);
 
-    let (status, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=2", None, None).await;
+    let (status, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=2&wait=0", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(keys_of(&page, "events"), ["a", "b"]);
     assert_eq!((page["next"].as_u64(), page["more"].as_bool(), page["head"].as_u64()), (Some(2), Some(true), Some(3)));
     let log_id = page["log_id"].as_str().unwrap().to_string();
     // Nothing is stored server-side: the same request returns the same page,
     // and any position the reader chooses works — forward, or replay.
-    let (_, again) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=2", None, None).await;
+    let (_, again) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=2&wait=0", None, None).await;
     assert_eq!(again, page);
-    let (_, rest) = call(&app, "GET", "/bkt?x-rs3-changelog&after=2", None, None).await;
+    let (_, rest) = call(&app, "GET", "/bkt?x-rs3-changelog&after=2&wait=0", None, None).await;
     assert_eq!((keys_of(&rest, "events"), rest["next"].as_u64(), rest["more"].as_bool()), (vec!["c".to_string()], Some(3), Some(false)));
-    let (_, replay) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1", None, None).await;
+    let (_, replay) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1&wait=0", None, None).await;
     assert_eq!(keys_of(&replay, "events"), ["b", "c"]);
     // Caught up: empty, and next stays put.
-    let (_, idle) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3", None, None).await;
+    let (_, idle) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&wait=0", None, None).await;
     assert_eq!((idle["events"].as_array().unwrap().len(), idle["next"].as_u64()), (0, Some(3)));
 
     // Filters move `next` past what they reject.
     h.put("bkt", "logs/1", b"x").await;
     h.put("bkt", "img/1", b"x").await;
-    let (_, filtered) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&prefix=img/", None, None).await;
+    let (_, filtered) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&prefix=img/&wait=0", None, None).await;
     assert_eq!((keys_of(&filtered, "events"), filtered["next"].as_u64()), (vec!["img/1".to_string()], Some(5)));
-    let (_, none) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&prefix=zzz/", None, None).await;
+    let (_, none) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&prefix=zzz/&wait=0", None, None).await;
     assert_eq!((none["events"].as_array().unwrap().len(), none["next"].as_u64()), (0, Some(5)), "skips filtered changes");
-    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&ops=rename", None, None).await;
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&ops=rename&wait=0", None, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // Positions that do not belong to this log are refused.
-    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=999", None, None).await;
+    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=999&wait=0", None, None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&log_id=other", None, None).await;
+    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&log_id=other&wait=0", None, None).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("Re-snapshot"));
-    let (status, _) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&after=0&log_id={log_id}"), None, None).await;
+    let (status, _) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&after=0&log_id={log_id}&wait=0"), None, None).await;
     assert_eq!(status, StatusCode::OK);
 
     // Behind retention: 410 naming the oldest available position.
     h.service.trim_all(now_ms() + 1_000).await;
-    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1", None, None).await;
+    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1&wait=0", None, None).await;
     assert_eq!(status, StatusCode::GONE);
     assert_eq!(body["trimmed_through"], 5);
     assert!(body["error"].as_str().unwrap().contains("after=5"));
-    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&after=5", None, None).await;
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&after=5&wait=0", None, None).await;
     assert_eq!(status, StatusCode::OK);
 
     // Read-only, and other verbs never fall through to bucket create/delete.
-    let (status, _) = call(&app, "DELETE", "/bkt?x-rs3-changelog", None, None).await;
+    let (status, _) = call(&app, "DELETE", "/bkt?x-rs3-changelog&wait=0", None, None).await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert!(h.store.bucket_exists("bkt").await);
 }
@@ -1025,7 +1025,7 @@ async fn snapshot_listing_pages_with_the_head_to_continue_from() {
     let (_, second) = call(&app, "GET", &format!("/bkt?x-rs3-changelog-snapshot&prefix=d/&limit=2&after={after}"), None, None).await;
     assert_eq!(keys_of(&second, "entries"), ["d/3"]);
     assert!(second["next_after"].is_null(), "listing complete");
-    let (_, live) = call(&app, "GET", "/bkt?x-rs3-changelog&after=4&prefix=d/", None, None).await;
+    let (_, live) = call(&app, "GET", "/bkt?x-rs3-changelog&after=4&prefix=d/&wait=0", None, None).await;
     assert_eq!(keys_of(&live, "events"), ["d/0"]);
 }
 
@@ -1061,11 +1061,11 @@ async fn replication_token_reads_its_bucket_and_filter_only() {
     let app = pull::router(h.service.clone());
 
     for bad in [None, Some("rs3cl_wrong"), Some("not-a-token")] {
-        let (status, _) = call(&app, "GET", "/_rs3/changelog", bad, None).await;
+        let (status, _) = call(&app, "GET", "/_rs3/changelog?wait=0", bad, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
     // The token's filter is the scope; a query cannot widen it.
-    let (status, page) = call(&app, "GET", "/_rs3/changelog?after=0&prefix=", Some(&token), None).await;
+    let (status, page) = call(&app, "GET", "/_rs3/changelog?after=0&prefix=&wait=0", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page["bucket"], "bkt");
     assert_eq!(keys_of(&page, "events"), ["in/a"]);
@@ -1075,7 +1075,7 @@ async fn replication_token_reads_its_bucket_and_filter_only() {
     let view = h.view(&created.subscription.id).await;
     assert_eq!(view.offset, 2);
     assert!(view.last_success_ms > 0);
-    let (_, replay) = call(&app, "GET", "/_rs3/changelog?after=0", Some(&token), None).await;
+    let (_, replay) = call(&app, "GET", "/_rs3/changelog?after=0&wait=0", Some(&token), None).await;
     assert_eq!(keys_of(&replay, "events"), ["in/a"], "a reader may always re-read");
 
     // No server-side position: those actions do not apply to tokens.
@@ -1084,19 +1084,19 @@ async fn replication_token_reads_its_bucket_and_filter_only() {
     }
     // Pause disables the token; resume re-enables it.
     h.service.act(&created.subscription.id, Action::Pause).await.unwrap();
-    let (status, body) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
+    let (status, body) = call(&app, "GET", "/_rs3/changelog?wait=0", Some(&token), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     h.service.act(&created.subscription.id, Action::Resume).await.unwrap();
-    let (status, _) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
+    let (status, _) = call(&app, "GET", "/_rs3/changelog?wait=0", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
     // Rotation invalidates the old token.
     let rotated = h.service.act(&created.subscription.id, Action::RotateToken).await.unwrap();
-    let (status, _) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
+    let (status, _) = call(&app, "GET", "/_rs3/changelog?wait=0", Some(&token), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _) = call(&app, "GET", "/_rs3/changelog", Some(rotated.token.as_deref().unwrap()), None).await;
+    let (status, _) = call(&app, "GET", "/_rs3/changelog?wait=0", Some(rotated.token.as_deref().unwrap()), None).await;
     assert_eq!(status, StatusCode::OK);
     // The ack endpoint is gone.
-    let (status, _) = call(&app, "POST", "/_rs3/changelog/ack", Some(rotated.token.as_deref().unwrap()), Some(serde_json::json!({"ack": "x"}))).await;
+    let (status, _) = call(&app, "POST", "/_rs3/changelog/ack?wait=0", Some(rotated.token.as_deref().unwrap()), Some(serde_json::json!({"ack": "x"}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -1106,7 +1106,7 @@ async fn pull_paths_never_reach_s3_handlers() {
     // through to S3 (here: 404 for a missing route in the bare pull router).
     let h = Harness::new().await;
     let app = pull::router(h.service.clone());
-    let (status, _) = call(&app, "GET", "/_rs3/changelog/other", Some("rs3cl_x"), None).await;
+    let (status, _) = call(&app, "GET", "/_rs3/changelog/other?wait=0", Some("rs3cl_x"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let _ = h.tmp.path();
 }
@@ -1169,7 +1169,7 @@ async fn pull_prefix_never_shadows_object_keys() {
     let send = |method: &str, host: &str, body: &'static str| {
         let request = Request::builder()
             .method(method)
-            .uri("/_rs3/changelog")
+            .uri("/_rs3/changelog?wait=0")
             .header("host", host)
             .body(Body::from(body))
             .unwrap();
@@ -1303,11 +1303,11 @@ async fn rows_without_a_layout_omit_it() {
         .await
         .unwrap();
     let app = s3_app(&h);
-    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1", None, None).await;
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1&wait=0", None, None).await;
     assert!(page["events"][0].get("parts").is_none(), "{page}");
     let (_, snap) = call(&app, "GET", "/bkt?x-rs3-changelog-snapshot", None, None).await;
     assert!(snap["entries"][0].get("parts").is_none());
-    let (_, first) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=1", None, None).await;
+    let (_, first) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=1&wait=0", None, None).await;
     assert_eq!(first["events"][0]["parts"], serde_json::json!({"count": 1}));
 }
 
@@ -1350,7 +1350,7 @@ async fn every_state_gets_an_increasing_stamp_from_this_site() {
     h.put("bkt", "k", b"two").await;
     h.store.delete_object("bkt", "k").await.unwrap();
     h.put("bkt", "k", b"three").await;
-    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0", None, None).await;
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&wait=0", None, None).await;
     assert_eq!(page["site_id"], site.as_str());
     let stamps: Vec<Stamp> = page["events"].as_array().unwrap().iter().map(|e| stamp_of(&e["stamp"])).collect();
     assert_eq!(stamps.len(), 4);
@@ -1379,7 +1379,7 @@ async fn a_replicated_write_keeps_its_origin_stamp() {
     let (stamp, last_modified) = head_stamp(&app, "/bkt/k").await;
     assert_eq!(stamp, origin, "kept, not re-stamped");
     assert_eq!(last_modified, crate::storage::time::http_date_ms(origin.ms), "shows the origin's time");
-    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0", None, None).await;
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&wait=0", None, None).await;
     assert_eq!(stamp_of(&page["events"][0]["stamp"]), origin);
 
     // A site whose clock runs ahead: the next local write still outranks it.
@@ -1487,23 +1487,23 @@ async fn reading_from_a_point_in_time() {
     for key in ["c", "d", "e"] {
         h.put("bkt", key, b"x").await;
     }
-    let (status, page) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={t}"), None, None).await;
+    let (status, page) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={t}&wait=0"), None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(keys_of(&page, "events"), ["c", "d", "e"]);
-    let (_, all) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0", None, None).await;
+    let (_, all) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0&wait=0", None, None).await;
     assert_eq!(keys_of(&all, "events"), ["a", "b", "c", "d", "e"]);
-    let (_, none) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={}", now_ms() + 60_000), None, None).await;
+    let (_, none) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={}&wait=0", now_ms() + 60_000), None, None).await;
     assert_eq!((none["events"].as_array().unwrap().len(), none["next"].as_u64()), (0, Some(5)));
     // Commit times never decrease in seq order.
     let ts: Vec<i64> = all["events"].as_array().unwrap().iter().map(|e| e["ts_ms"].as_i64().unwrap()).collect();
     assert!(ts.windows(2).all(|w| w[0] <= w[1]));
-    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0&after=1", None, None).await;
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0&after=1&wait=0", None, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     // Once retention removed changes from that time, the answer is 410.
     h.service.trim_all(t).await;
-    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0", None, None).await;
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0&wait=0", None, None).await;
     assert_eq!(status, StatusCode::GONE);
-    let (status, page) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={t}"), None, None).await;
+    let (status, page) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={t}&wait=0"), None, None).await;
     assert_eq!(status, StatusCode::OK, "everything from t is still retained");
     assert_eq!(keys_of(&page, "events"), ["c", "d", "e"]);
 }
@@ -1822,4 +1822,167 @@ async fn two_sites_converge_whatever_the_delivery_order() {
     for result in results {
         assert_eq!(result, expected);
     }
+}
+
+#[tokio::test]
+async fn reads_wait_for_min_changes_or_the_max_wait() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let app = s3_app(&h);
+    // Three changes arrive 150ms apart; a reader wants at least 3.
+    let writer = {
+        let store = h.store.clone();
+        tokio::spawn(async move {
+            for key in ["a", "b", "c"] {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                store.put_object("bkt", key, b"x", None, None, false).await.unwrap();
+            }
+        })
+    };
+    let started = Instant::now();
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&min=3&wait_ms=5000", None, None).await;
+    writer.await.unwrap();
+    assert_eq!(keys_of(&page, "events"), ["a", "b", "c"], "held until min was reached");
+    assert!(started.elapsed() < Duration::from_secs(3), "returned on min, not the wait");
+
+    // Not enough within the wait: whatever is there comes back after it.
+    let started = Instant::now();
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1&min=10&wait_ms=400", None, None).await;
+    assert_eq!(keys_of(&page, "events"), ["b", "c"]);
+    assert!(started.elapsed() >= Duration::from_millis(380), "{:?}", started.elapsed());
+    // A full page returns at once even below min (min is capped at limit).
+    let started = Instant::now();
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=2&min=50&wait_ms=5000", None, None).await;
+    assert_eq!(keys_of(&page, "events"), ["a", "b"]);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // Defaults: min=1 and a 20s wait — a reader with changes waiting gets
+    // them at once; wait=0 answers a caught-up reader at once.
+    let started = Instant::now();
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=2", None, None).await;
+    assert_eq!(keys_of(&page, "events"), ["c"]);
+    let (_, idle) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&wait=0", None, None).await;
+    assert!(idle["events"].as_array().unwrap().is_empty());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&wait=1&wait_ms=10", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let params = read::read_params(&std::collections::HashMap::from([("min".to_string(), "5".to_string())])).unwrap();
+    assert_eq!((params.min, params.wait), (5, Duration::from_secs(20)));
+}
+
+#[test]
+fn changelog_reads_are_labelled_in_the_task_monitor() {
+    let label = |uri: &str| crate::server::operation_and_target(&axum::http::Method::GET, &uri.parse().unwrap(), false);
+    assert_eq!(label("/photos?x-rs3-changelog&after=5&wait=20"), ("CHANGELOG", "/photos/ changelog".to_string()));
+    assert_eq!(label("/photos?x-rs3-changelog-snapshot"), ("CHANGELOG", "/photos/ changelog snapshot".to_string()));
+    assert_eq!(label("/photos?list-type=2").0, "LIST");
+}
+
+// ── the console API (what the browser calls) ───────────────────────────────
+
+async fn console_app(h: &Harness) -> (Router, String) {
+    let state = crate::server::ui::UiState {
+        store: h.store.clone(),
+        iam: h.iam.clone(),
+        key_usage: crate::server::key_usage::KeyUsageStore::open(h.tmp.path()).await.unwrap(),
+        config: Arc::new(crate::server::config::AppConfig::default()),
+        metrics: Arc::new(crate::server::TrafficMetrics::default()),
+        tasks: crate::server::registry::TaskRegistry::new(),
+        scans: crate::server::jobs::perf_scan::ScanService::new(
+            crate::server::scan_store::ScanStore::open(h.tmp.path()).await.unwrap(),
+        ),
+        stats: None,
+        notify: Some(h.service.clone()),
+        replication: None,
+    };
+    // A built-in (config) admin session, as after a console login.
+    let session = h.iam.create_session("admin", true);
+    (crate::server::ui::router(state), session)
+}
+
+async fn console(app: &Router, session: &str, method: &str, path: &str, body: Option<serde_json::Value>) -> (StatusCode, serde_json::Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("cookie", format!("rusts3_ui_session={session}"));
+    let body = match body {
+        Some(value) => {
+            request = request.header("content-type", "application/json");
+            Body::from(value.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = app.clone().oneshot(request.body(body).unwrap()).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+}
+
+#[tokio::test]
+async fn console_shows_an_expired_webhook_and_recovers_it_by_re_snapshot() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let rx = Receiver::start().await;
+    let (app, session) = console_app(&h).await;
+
+    // Created from the console, like the "New subscription" dialog does.
+    let (status, created) = console(
+        &app,
+        &session,
+        "POST",
+        "/api/subscriptions",
+        Some(serde_json::json!({
+            "name": "console-hook", "bucket": "bkt", "kind": "webhook", "url": rx.url,
+            "headers": {"Authorization": "Bearer x"}, "filter": {"prefix": ""}, "initial_snapshot": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert!(created["secret"].as_str().unwrap().starts_with("whsec_"), "shown once");
+    let id = created["subscription"]["id"].as_str().unwrap().to_string();
+    let path = format!("/api/subscriptions/{id}/action");
+
+    // The receiver is down while changes pile up and expire.
+    rx.always(Reply::Status(503));
+    h.put("bkt", "lost", b"x").await;
+    wait_view(&h, &id, 5, "muted", |v| v.status == "muted").await;
+    h.service.trim_all(now_ms() + 1_000).await;
+    rx.always(Reply::Ok);
+    h.service.act(&id, Action::Unmute).await.unwrap();
+    wait_view(&h, &id, 6, "paused as expired", |v| v.status == "paused").await;
+
+    // The list the console renders shows why.
+    let (_, list) = console(&app, &session, "GET", "/api/subscriptions", None).await;
+    let row = &list["subscriptions"][0];
+    assert_eq!(row["status"], "paused");
+    assert_eq!(row["paused"]["reason"], "expired");
+    assert!(row["paused"]["message"].as_str().unwrap().contains("deleted by retention"));
+    assert_eq!(row["headers"]["Authorization"], MASKED, "secrets stay masked");
+
+    // "Resume" is refused with the explanation the dialog displays.
+    let (status, body) = console(&app, &session, "POST", &path, Some(serde_json::json!({"action": "resume"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let message = body["error"].as_str().unwrap();
+    assert!(message.contains("Cannot resume webhook \"console-hook\""), "{message}");
+    assert!(message.contains("re-snapshot"), "{message}");
+    // "Set offset" outside the retained range is refused too.
+    let (status, _) = console(&app, &session, "POST", &path, Some(serde_json::json!({"action": "set_offset", "offset": 0}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // "Re-snapshot" recovers: a snapshot of the current objects, then live.
+    let (status, body) = console(&app, &session, "POST", &path, Some(serde_json::json!({"action": "resnapshot"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["subscription"]["status"], "snapshot");
+    wait_until(10, "snapshot delivered", || rx.accepted().iter().any(|b| b.snapshot_end)).await;
+    let keys: Vec<String> = rx.accepted().iter().flat_map(|b| b.events.iter().map(|e| e.key.clone())).collect();
+    assert_eq!(keys, ["lost"]);
+    h.put("bkt", "after", b"x").await;
+    wait_until(10, "live again", || rx.live_keys() == ["after"]).await;
+    let (_, view) = console(&app, &session, "GET", &format!("/api/subscriptions/{id}"), None).await;
+    assert_eq!(view["status"], "active");
+
+    // Only admins: an IAM user's session is refused.
+    h.iam.create_user("alice", "password123").await.unwrap();
+    let alice = h.iam.create_session("alice", false);
+    let (status, _) = console(&app, &alice, "GET", "/api/subscriptions", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

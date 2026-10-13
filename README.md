@@ -589,13 +589,18 @@ With SigV4 credentials that have `s3:GetBucketChangelog` (read-only; the admin
 group's `s3:*` includes it):
 
 ```text
-GET /{bucket}?x-rs3-changelog&after=<seq>[&limit=N][&wait=secs][&prefix=][&suffix=][&ops=put,delete][&log_id=]
+GET /{bucket}?x-rs3-changelog&after=<seq>[&limit=N][&min=N][&wait=secs|&wait_ms=N][&prefix=][&suffix=][&ops=put,delete][&log_id=]
 GET /{bucket}?x-rs3-changelog-snapshot[&after=<key>][&limit=N][&prefix=][&suffix=]
 ```
 
 - **Changes:** returns `{bucket, log_id, head, trimmed_through, next, more,
-  events}`. `next` moves past filtered-out changes too. Use `wait` (up to 60s)
-  to long-poll.
+  events}`. `next` moves past filtered-out changes too.
+- **Batching, Kafka-style:** a response holds up to `limit` changes (default
+  500, max 10,000), like `max.poll.records`. The request waits until at least
+  `min` matching changes are available (default 1, like `fetch.min.bytes`) or
+  until the wait passes (`wait` in seconds or `wait_ms`; default 20s, max 60s,
+  like `fetch.max.wait.ms`), then returns what it has. A full page returns
+  immediately. Pass `wait=0` for an immediate answer.
 - **Snapshot listing:** pages through the current objects as `op: "exists"`
   entries. Save the **first** page's `head`, page through to the end
   (`next_after` is null), then read changes with `after=<that head>`. That
@@ -649,7 +654,7 @@ how a replica keeps the origin's stamp.
 without S3 credentials. They are scoped to one bucket and the token's filter:
 
 ```text
-GET /_rs3/changelog?after=<seq>[&limit=N][&wait=secs][&log_id=]
+GET /_rs3/changelog?after=<seq>[&limit=N][&min=N][&wait=secs|&wait_ms=N][&log_id=]
 GET /_rs3/changelog/snapshot[?after=<key>][&limit=N]
 ```
 

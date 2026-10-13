@@ -31,6 +31,7 @@ pub const QUERY_SNAPSHOT: &str = "x-rs3-changelog-snapshot";
 pub const DEFAULT_LIMIT: usize = 500;
 pub const MAX_LIMIT: usize = 10_000;
 pub const MAX_WAIT_SECS: u64 = 60;
+pub const DEFAULT_WAIT_SECS: u64 = 20;
 /// Pages scanned per request when a filter rejects most changes, so a
 /// sparse filter returns a (possibly empty) progress response instead of
 /// walking the whole log in one request.
@@ -44,8 +45,12 @@ pub struct ReadParams {
     /// this time (epoch ms). The response's `next` is a seq as usual.
     pub since_ms: Option<i64>,
     pub limit: usize,
-    /// Long-poll: hold an up-to-date reader until a change arrives.
+    /// Long-poll: hold the request up to this long until at least `min`
+    /// matching changes are available (Kafka's `fetch.max.wait.ms`).
     pub wait: Duration,
+    /// Matching changes to wait for (Kafka's `fetch.min.bytes`, counted in
+    /// changes); at least 1, at most `limit`.
+    pub min: usize,
     pub filter: Filter,
     /// Refuse (409) if the bucket's log is not this one — the reader's
     /// position would be meaningless.
@@ -182,9 +187,22 @@ fn parse_limit(query: &HashMap<String, String>) -> Result<usize, ReadError> {
         .clamp(1, MAX_LIMIT))
 }
 
-/// `after`, `limit`, `wait`, `prefix`, `suffix`, `ops`, `log_id`.
+/// `after` | `since`, `limit`, `min`, `wait` (secs) | `wait_ms`, `prefix`,
+/// `suffix`, `ops`, `log_id`.
 pub fn read_params(query: &HashMap<String, String>) -> Result<ReadParams, ReadError> {
+    let limit = parse_limit(query)?;
+    let wait = match (parse_u64(query, "wait_ms")?, parse_u64(query, "wait")?) {
+        (Some(_), Some(_)) => return Err(ReadError::BadRequest("pass wait or wait_ms, not both".into())),
+        (Some(ms), None) => Duration::from_millis(ms),
+        (None, Some(secs)) => Duration::from_secs(secs),
+        // Kafka-like by default: a caught-up reader is held until a change
+        // arrives (or 20s pass). `wait=0` returns at once.
+        (None, None) => Duration::from_secs(DEFAULT_WAIT_SECS),
+    }
+    .min(Duration::from_secs(MAX_WAIT_SECS));
     Ok(ReadParams {
+        min: parse_u64(query, "min")?.map(|n| n as usize).unwrap_or(1).clamp(1, limit),
+        wait,
         after: parse_u64(query, "after")?.unwrap_or(0),
         since_ms: match parse_u64(query, "since")? {
             Some(_) if query.get("after").is_some_and(|v| !v.is_empty()) => {
@@ -192,8 +210,7 @@ pub fn read_params(query: &HashMap<String, String>) -> Result<ReadParams, ReadEr
             }
             since => since.map(|v| v as i64),
         },
-        limit: parse_limit(query)?,
-        wait: Duration::from_secs(parse_u64(query, "wait")?.unwrap_or(0).min(MAX_WAIT_SECS)),
+        limit,
         filter: parse_filter(query)?,
         expect_log_id: query.get("log_id").cloned().filter(|v| !v.is_empty()),
     })
@@ -223,8 +240,10 @@ pub async fn read(store: &LocalObjectStore, bucket: &str, params: &ReadParams) -
         changed.as_mut().enable();
 
         let response = read_once(store, bucket, params).await?;
-        let caught_up = response.events.is_empty() && !response.more;
-        if !caught_up || params.wait.is_zero() || tokio::time::Instant::now() >= deadline {
+        // Enough to return: `min` matching changes, or a full page (`more`
+        // means the limit or the scan budget was reached).
+        let enough = response.events.len() >= params.min.max(1) || response.more;
+        if enough || params.wait.is_zero() || tokio::time::Instant::now() >= deadline {
             return Ok(response);
         }
         tokio::select! {
