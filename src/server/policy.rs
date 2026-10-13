@@ -716,6 +716,16 @@ pub fn requirements_for_request(
         return Some(vec![Requirement::bucket("s3:RebuildIndex", bucket)]);
     }
 
+    if key.is_none()
+        && (has(super::notify::read::QUERY_CHANGELOG) || has(super::notify::read::QUERY_SNAPSHOT))
+    {
+        // rusts3 extension: reading a bucket's changelog (and its snapshot
+        // listing) reveals every key, size and ETag — a custom action, like
+        // s3:RebuildIndex, so it is granted deliberately (the admin group's
+        // s3:* includes it). The router refuses any verb but GET.
+        return Some(vec![Requirement::bucket("s3:GetBucketChangelog", bucket)]);
+    }
+
     let decoded_key = key.map(|k| {
         urlencoding::decode(k)
             .map(|v| v.into_owned())
@@ -1120,6 +1130,22 @@ mod tests {
             !is_authorized(&read_only, &reqs),
             "a read-only policy cannot rebuild"
         );
+    }
+
+    #[test]
+    fn changelog_reads_map_to_their_own_action() {
+        for query in ["x-rs3-changelog", "x-rs3-changelog-snapshot", "after=5&x-rs3-changelog=&prefix=a/"] {
+            let reqs = requirements_for_request("GET", "/docs", query, None).unwrap();
+            assert_eq!(reqs, vec![Requirement::bucket("s3:GetBucketChangelog", "docs")], "{query}");
+        }
+        // Read rights alone do not include it; s3:* does.
+        let reqs = requirements_for_request("GET", "/docs", "x-rs3-changelog", None).unwrap();
+        assert!(!is_authorized(&policy(READ_ONLY_DOCS), &reqs));
+        let admin = policy(r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::*"}]}"#);
+        assert!(is_authorized(&admin, &reqs));
+        // On an object path the parameter means nothing: an ordinary GET.
+        let reqs = requirements_for_request("GET", "/docs/k", "x-rs3-changelog", None).unwrap();
+        assert_eq!(reqs, vec![Requirement::object("s3:GetObject", "docs", "k")]);
     }
 
     #[test]

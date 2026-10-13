@@ -429,7 +429,7 @@
       <div class="field"><label for="sub_ops">Changes</label><select class="input" id="sub_ops"><option value="">Puts and deletes</option><option value="put">Puts only</option><option value="delete">Deletes only</option></select></div>
       <div class="field"><label for="sub_batch">Max events per batch</label><input class="input" id="sub_batch" type="number" min="1" max="10000" placeholder="server default"></div>
       <div class="field sub-webhook"><label for="sub_mute">Mute after a failed delivery (seconds)</label><input class="input" id="sub_mute" type="number" min="1" placeholder="server default"></div>
-      <label class="field sub-create" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="sub_snapshot"> Start with a snapshot of the objects already in the bucket</label>
+      <label class="field sub-create sub-webhook" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="sub_snapshot"> Start with a snapshot of the objects already in the bucket</label>
       <div id="subError" class="inline-error"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="subDlg.close()">Cancel</button><button class="btn primary" type="submit" id="sub_submit">Create</button></div>
@@ -447,16 +447,16 @@
   <div class="dialog-body">
     <div class="danger-callout hidden" id="sa_pause"></div>
     <div class="secret-box" id="sa_detail" style="white-space:pre-wrap"></div>
-    <div class="field" style="margin-top:12px"><label for="sa_offset">Set offset (replay or skip to a seq)</label><div style="display:flex;gap:8px"><input class="input" id="sa_offset" type="number" min="0"><button class="btn" onclick="subAction('set_offset')">Set</button></div></div>
+    <div class="field sa-webhook" style="margin-top:12px"><label for="sa_offset">Set offset (replay or skip to a seq)</label><div style="display:flex;gap:8px"><input class="input" id="sa_offset" type="number" min="0"><button class="btn" onclick="subAction('set_offset')">Set</button></div></div>
     <div id="saError" class="inline-error"></div>
   </div>
   <div class="dialog-actions" style="flex-wrap:wrap">
     <button class="btn" onclick="subAction('pause')">Pause</button>
     <button class="btn primary" onclick="subAction('resume')">Resume</button>
-    <button class="btn" onclick="subAction('unmute')">Unmute now</button>
-    <button class="btn" onclick="subAction('resume_from_oldest')">Resume from oldest retained</button>
-    <button class="btn" onclick="subAction('resnapshot')">Re-snapshot</button>
-    <button class="btn" onclick="subAction('skip_to_head')">Skip to head</button>
+    <button class="btn sa-webhook" onclick="subAction('unmute')">Unmute now</button>
+    <button class="btn sa-webhook" onclick="subAction('resume_from_oldest')">Resume from oldest retained</button>
+    <button class="btn sa-webhook" onclick="subAction('resnapshot')">Re-snapshot</button>
+    <button class="btn sa-webhook" onclick="subAction('skip_to_head')">Skip to head</button>
     <button class="btn" id="sa_rotate" onclick="subRotate()">Rotate secret</button>
   </div>
 </dialog>

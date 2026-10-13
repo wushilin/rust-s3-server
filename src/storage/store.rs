@@ -119,6 +119,8 @@ pub struct LocalObjectStore {
     /// Vetoes bucket deletion (returns the reason) — the changelog
     /// subscriptions refuse while any subscription targets the bucket.
     delete_guard: Arc<std::sync::RwLock<Option<DeleteGuard>>>,
+    /// Per-bucket "the changelog moved" signal, for long-polling readers.
+    change_signals: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     #[cfg(test)]
     crash_points: Arc<Mutex<HashSet<String>>>,
 }
@@ -291,6 +293,7 @@ impl LocalObjectStore {
             shutdown: CancellationToken::new(),
             change_listener: Arc::new(std::sync::RwLock::new(None)),
             delete_guard: Arc::new(std::sync::RwLock::new(None)),
+            change_signals: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -308,14 +311,28 @@ impl LocalObjectStore {
         *self.delete_guard.write().unwrap() = Some(guard);
     }
 
+    /// The bucket's changelog signal: woken (`notify_waiters`) after every
+    /// logged commit. Long-polling readers `enable()` a `notified()` future
+    /// before reading, then wait on it, so no commit can slip between.
+    pub fn change_signal(&self, bucket: &str) -> Arc<tokio::sync::Notify> {
+        self.change_signals
+            .lock()
+            .unwrap()
+            .entry(bucket.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    }
+
     /// Wraps a freshly opened index with the bucket's commit notification.
     fn attach_change_hook(&self, bucket: &str, index: ObjectIndex) -> ObjectIndex {
         let slot = self.change_listener.clone();
+        let signal = self.change_signal(bucket);
         let bucket = bucket.to_string();
         index.with_commit_hook(Arc::new(move |watermark| {
             if let Some(listener) = slot.read().unwrap().as_ref() {
                 listener.0(&bucket, watermark);
             }
+            signal.notify_waiters();
         }))
     }
 

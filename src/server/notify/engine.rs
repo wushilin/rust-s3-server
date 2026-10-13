@@ -236,25 +236,3 @@ async fn next_snapshot(
     };
     Ok(Next::Deliver { batch, after })
 }
-
-/// Validates a pull consumer's ack against its current position: it must be
-/// in the same log and move forward without passing the head.
-pub fn ack_is_valid(current: &Position, ack: &Position, head: u64) -> bool {
-    if ack.log_id != current.log_id {
-        return false;
-    }
-    match (&current.snapshot, &ack.snapshot) {
-        (None, None) => ack.offset >= current.offset && ack.offset <= head,
-        (Some(cur), Some(next)) => {
-            next.through == cur.through
-                && next.begun
-                && match (&cur.cursor, &next.cursor) {
-                    (Some(a), Some(b)) => b > a,
-                    (None, _) => true,
-                    (Some(_), None) => false,
-                }
-        }
-        (Some(cur), None) => ack.offset == cur.through,
-        (None, Some(_)) => false,
-    }
-}

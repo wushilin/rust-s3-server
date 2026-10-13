@@ -479,19 +479,21 @@ itself, with a per-bucket sequence number (`seq`). Sequence numbers increase
 strictly but are not contiguous. Entries are kept for
 `changelog.retention_days` (14 by default).
 
-Admins subscribe to a bucket's changelog in the console (**Webhooks &
-Replication**), in one of two ways:
+There are two ways to consume it:
 
-- **Webhook**: the server POSTs batches to a URL.
-- **Replication token**: a replicator pulls batches from the S3 port.
+- **Read it** (pull). Any credential granted `s3:GetBucketChangelog` can read
+  a bucket's changelog over the S3 API, and so can a replication token. No
+  setup is needed on the server. The reader keeps its own position.
+- **Webhooks** (push). An admin configures them in the console (**Webhooks &
+  Replication**). The server tracks each webhook's position and POSTs batches
+  to it.
 
-Each subscription keeps its own position, can filter by key prefix, key suffix
-and operation, and can optionally start with a **snapshot** of the objects
-already in the bucket before switching to live changes.
+Both can filter by key prefix, key suffix and operation.
 
 ### Batch format
 
-Webhooks receive this as the POST body. Pull responses add an `ack` field.
+Webhooks receive this as the POST body. Reads return the same `events` (see
+below).
 
 ```json
 {
@@ -551,30 +553,63 @@ Delivery and failure handling:
 - Webhook URLs must be `https://` and must not resolve to internal addresses.
   Both rules can be relaxed in the config. Redirects are not followed.
 
-### Pulling with a replication token
+### Reading the changelog
 
-All requests go to the S3 port with `Authorization: Bearer rs3cl_…`. The token
-only works for these two endpoints. Use path-style addressing: a bucket name
-can't start with `_`, so `/_rs3/` never clashes with a bucket. On a
-virtual-hosted request (`<bucket>.<public_hostname>/_rs3/changelog`), the path
-is an ordinary object key and goes to S3.
+Reads are **stateless**: the server stores nothing per reader. A reader asks
+for the changes after the `seq` it has applied and saves the returned `next`
+itself. Saving it next to the data it applied is best, so that if that data is
+rolled back, the position rolls back with it. Re-reading is always safe.
+
+With SigV4 credentials that have `s3:GetBucketChangelog` (read-only; the admin
+group's `s3:*` includes it):
 
 ```text
-GET  /_rs3/changelog[?wait=<secs>]          next batch (long-polls up to 60s when idle)
-POST /_rs3/changelog/ack  {"ack": "<ack>"}  acknowledge it once applied
+GET /{bucket}?x-rs3-changelog&after=<seq>[&limit=N][&wait=secs][&prefix=][&suffix=][&ops=put,delete][&log_id=]
+GET /{bucket}?x-rs3-changelog-snapshot[&after=<key>][&limit=N][&prefix=][&suffix=]
 ```
+
+- **Changes:** returns `{bucket, log_id, head, trimmed_through, next, more,
+  events}`. `next` moves past filtered-out changes too. Use `wait` (up to 60s)
+  to long-poll.
+- **Snapshot listing:** pages through the current objects as `op: "exists"`
+  entries. Save the **first** page's `head`, page through to the end
+  (`next_after` is null), then read changes with `after=<that head>`. That
+  replays anything that changed during the listing.
+- **Errors:**
+  - `410 Gone`: `after` is older than what retention kept. The response names
+    the oldest available position. Re-snapshot, or accept the loss and
+    continue from there.
+  - `409 Conflict`: the position doesn't belong to this log, either because it
+    is beyond the head, or because `log_id` doesn't match after a rebuild
+    replaced the log.
+
+**Replication tokens** (created by an admin in the console) give the same reads
+without S3 credentials. They are scoped to one bucket and the token's filter:
+
+```text
+GET /_rs3/changelog?after=<seq>[&limit=N][&wait=secs][&log_id=]
+GET /_rs3/changelog/snapshot[?after=<key>][&limit=N]
+```
+
+Send `Authorization: Bearer rs3cl_…` on the S3 port, using path-style
+addressing. A bucket name can't start with `_`, so `/_rs3/` never clashes with
+a bucket. On a virtual-hosted request (`<bucket>.<public_hostname>/_rs3/…`) the
+path is an ordinary object key and goes to S3. Pausing a token in the console
+disables it (`403`).
 
 ### Falling behind retention
 
-If a subscription's position falls behind what retention has kept, the events
-it missed are gone, so it **pauses** instead of skipping them silently:
+A reader that falls behind retention gets `410 Gone` and decides for itself
+what to do.
+
+If a webhook's position falls behind what retention has kept, the events it
+missed are gone, so it **pauses** instead of skipping them silently:
 
 - **Resume** is refused with an explanation.
-- A paused replication token answers `410 Gone`.
 - The admin chooses one of: **resume from oldest retained**, **re-snapshot**,
   **skip to head**, or **set offset**.
 
-The console warns when a subscription's oldest pending change is close to
+The console warns when a webhook's oldest pending change is close to
 expiring. A bucket cannot be deleted while it has subscriptions. An index
 rebuild carries the changelog over, so positions stay valid.
 

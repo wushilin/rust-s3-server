@@ -26,6 +26,7 @@ pub mod delivery;
 pub mod engine;
 pub mod model;
 pub mod pull;
+pub mod read;
 #[cfg(test)]
 mod tests;
 
@@ -34,7 +35,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use self::db::NotifyDb;
 use self::engine::{Limits, Next};
 use self::model::{
-    Batch, Filter, Pause, PauseReason, Phase, Position, SnapshotState, SubState, Subscription,
+    Batch, Filter, Pause, PauseReason, Phase, SnapshotState, SubState, Subscription,
     SubscriptionKind,
 };
 use super::config::{ChangelogConfig, WebhookConfig};
@@ -68,8 +68,10 @@ pub enum NotifyError {
     /// The action conflicts with the subscription's state (e.g. resuming a
     /// subscription whose events expired).
     Conflict(String),
-    /// Pull only: the subscription is paused.
+    /// Webhook position no longer retained.
     Gone(String),
+    /// A paused replication token.
+    Forbidden(String),
     Unauthorized,
     Internal(String),
 }
@@ -81,6 +83,7 @@ impl std::fmt::Display for NotifyError {
             | NotifyError::BadRequest(m)
             | NotifyError::Conflict(m)
             | NotifyError::Gone(m)
+            | NotifyError::Forbidden(m)
             | NotifyError::Internal(m) => f.write_str(m),
             NotifyError::Unauthorized => f.write_str("invalid replication token"),
         }
@@ -200,16 +203,6 @@ pub struct Created {
     pub secret: Option<String>,
 }
 
-/// A pull response: a batch plus the value to acknowledge it with.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PullBatch {
-    #[serde(flatten)]
-    pub batch: Batch,
-    /// Pass back to the ack endpoint once the batch is applied; `None` when
-    /// the batch is empty and there is nothing to acknowledge.
-    pub ack: Option<String>,
-}
-
 struct Runtime {
     sub: RwLock<Subscription>,
     state: Mutex<SubState>,
@@ -255,14 +248,6 @@ pub fn hash_token(token: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-pub fn encode_ack(position: &Position) -> String {
-    URL_SAFE_NO_PAD.encode(serde_json::to_vec(position).expect("position serializes"))
-}
-
-pub fn decode_ack(ack: &str) -> Option<Position> {
-    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(ack.trim()).ok()?).ok()
 }
 
 impl NotifyService {
@@ -673,7 +658,9 @@ impl NotifyService {
             v: model::RECORD_VERSION,
             log_id: index.changelog_id().to_string(),
             offset: head,
-            snapshot: request.initial_snapshot.then_some(SnapshotState {
+            // Readers of a pull token run their own snapshot (they own the
+            // position), so only a webhook starts with one server-side.
+            snapshot: (request.initial_snapshot && request.kind == SubscriptionKind::Webhook).then_some(SnapshotState {
                 through: head,
                 cursor: None,
                 begun: false,
@@ -856,6 +843,13 @@ impl NotifyService {
     pub async fn act(&self, id: &str, action: Action) -> NResult<Created> {
         let rt = self.runtime(id)?;
         let sub = rt.sub();
+        if sub.kind == SubscriptionKind::Pull
+            && !matches!(action, Action::Pause | Action::Resume | Action::RotateToken)
+        {
+            return Err(NotifyError::BadRequest(
+                "replication tokens have no server-side position: readers choose it themselves (after=)".into(),
+            ));
+        }
         let mut shown_secret = None;
         let mut shown_token = None;
         {
@@ -871,6 +865,9 @@ impl NotifyService {
                             at_ms: now_ms(),
                         });
                     }
+                }
+                Action::Resume if sub.kind == SubscriptionKind::Pull => {
+                    next.paused = None;
                 }
                 Action::Resume => {
                     // Resume continues exactly where it stopped — or fails,
@@ -987,100 +984,35 @@ impl NotifyService {
             .ok_or(NotifyError::Unauthorized)
     }
 
-    /// The next batch for a pull consumer. Does not move its position — the
-    /// consumer acks once applied. With `wait`, an up-to-date consumer is
-    /// held until a change arrives or the wait elapses (long poll).
-    pub async fn pull(&self, token: &str, wait: Duration) -> NResult<PullBatch> {
-        let rt = self.runtime_for_token(token)?;
-        let deadline = tokio::time::Instant::now() + wait;
-        loop {
-            // Register for wake-ups before reading, so a commit that lands
-            // between the read and the wait is not missed.
-            let woken = rt.wake.notified();
-            tokio::pin!(woken);
-            woken.as_mut().enable();
-            let sub = rt.sub();
-            let mut state = rt.state.lock().await;
-            if let Some(pause) = &state.paused {
-                return Err(NotifyError::Gone(pause.message.clone()));
-            }
-            let index = self.inner.store.index(&sub.bucket).await?;
-            match engine::next(&index, &sub, &state, self.limits(&sub)).await? {
-                Next::Pause(pause) => {
-                    let message = pause.message.clone();
-                    state.paused = Some(pause);
-                    self.inner.db.put_state(&sub.id, &state, true).await?;
-                    return Err(NotifyError::Gone(message));
-                }
-                Next::Deliver { batch, after } => {
-                    state.last_attempt_ms = now_ms();
-                    return Ok(PullBatch {
-                        batch,
-                        ack: Some(encode_ack(&after)),
-                    });
-                }
-                Next::UpToDate { position } => {
-                    if position != state.position() {
-                        state.set_position(position);
-                        self.inner.db.put_state(&sub.id, &state, false).await?;
-                    }
-                    drop(state);
-                    drop(index);
-                    let now = tokio::time::Instant::now();
-                    if now >= deadline || rt.cancel.is_cancelled() {
-                        let state = rt.state.lock().await;
-                        return Ok(PullBatch {
-                            batch: Batch {
-                                subscription: sub.id.clone(),
-                                bucket: sub.bucket.clone(),
-                                phase: Phase::Live,
-                                from_seq: state.offset + 1,
-                                to_seq: state.offset,
-                                snapshot_begin: false,
-                                snapshot_end: false,
-                                snapshot_through: None,
-                                events: Vec::new(),
-                            },
-                            ack: None,
-                        });
-                    }
-                    tokio::select! {
-                        _ = &mut woken => {}
-                        _ = tokio::time::sleep_until(deadline) => {}
-                        _ = rt.cancel.cancelled() => {}
-                    }
-                }
-            }
-        }
-    }
-
-    /// Acknowledges a pulled batch: moves the consumer's position to `ack`.
-    pub async fn ack(&self, token: &str, ack: &str) -> NResult<SubView> {
+    /// Resolves a replication token to what it may read: its bucket and
+    /// filter. Tokens carry no position — readers keep their own and pass it
+    /// as `after=`.
+    pub async fn token_scope(&self, token: &str) -> NResult<(String, Filter)> {
         let rt = self.runtime_for_token(token)?;
         let sub = rt.sub();
-        let position = decode_ack(ack).ok_or_else(|| NotifyError::BadRequest("malformed ack".into()))?;
-        {
-            let mut state = rt.state.lock().await;
-            if let Some(pause) = &state.paused {
-                return Err(NotifyError::Gone(pause.message.clone()));
-            }
-            let index = self.inner.store.index(&sub.bucket).await?;
-            if position == state.position() {
-                // A repeated ack: already applied.
-            } else if !engine::ack_is_valid(&state.position(), &position, index.changelog_head()) {
-                return Err(NotifyError::Conflict(
-                    "ack does not continue from the current position (stale or forged)".into(),
-                ));
-            } else {
-                let moved = position.offset.saturating_sub(state.offset);
-                state.set_position(position);
-                state.last_success_ms = now_ms();
-                state.delivered_batches += 1;
-                state.delivered_events += moved;
-                self.inner.db.put_state(&sub.id, &state, false).await?;
-            }
+        let state = rt.state.lock().await;
+        if state.paused.is_some() {
+            return Err(NotifyError::Forbidden(format!(
+                "replication token \"{}\" is paused by an administrator",
+                sub.name
+            )));
         }
-        self.view(&sub.id).await
+        Ok((sub.bucket, sub.filter))
+    }
+
+    /// Records a served read for the console ("last read", "served through").
+    /// Informational only: it never decides what a reader gets next.
+    pub async fn record_read(&self, token: &str, served_through: u64) {
+        let Ok(rt) = self.runtime_for_token(token) else { return };
+        let id = rt.sub.read().unwrap().id.clone();
+        let mut state = rt.state.lock().await;
+        state.offset = served_through;
+        state.last_attempt_ms = now_ms();
+        state.last_success_ms = state.last_attempt_ms;
+        state.delivered_batches += 1;
+        if let Err(err) = self.inner.db.put_state(&id, &state, false).await {
+            log::debug!("could not record read for {id}: {err}");
+        }
     }
 }
 

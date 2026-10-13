@@ -7,6 +7,7 @@ const SUB_MASK='********';
 const subStatusBadge=s=>s.status==='active'?'<span class="badge green">Active</span>':s.status==='snapshot'?'<span class="badge green">Snapshot</span>':s.status==='muted'?`<span class="badge amber" title="Until ${esc(fmtTime(s.muted_until_ms))}">Muted ${fmtDur(s.muted_until_ms-Date.now())}</span>`:`<span class="badge" style="color:var(--danger,#c33)" title="${esc(s.paused?.message||'')}">Paused · ${esc((s.paused?.reason||'').replace('_',' '))}</span>`;
 function subFilterText(f){const parts=[];if(f.prefix)parts.push(`prefix <code>${esc(f.prefix)}</code>`);if(f.suffix)parts.push(`suffix <code>${esc(f.suffix)}</code>`);if(f.ops&&f.ops.length===1)parts.push(f.ops[0]+'s only');return parts.join(' · ')||'<span class="muted">all changes</span>';}
 function subPosition(s){
+  if(s.kind==='pull')return s.last_success_ms?`served through seq ${s.offset.toLocaleString()}<div class="muted" style="font-size:11px">readers keep their own position</div>`:'<span class="muted">not read yet</span>';
   if(s.phase==='snapshot')return `Snapshot${s.snapshot_cursor?` at <code>${esc(s.snapshot_cursor)}</code>`:''}`;
   const lag=s.lag??0;let text=`seq ${s.offset.toLocaleString()} / ${(s.head??0).toLocaleString()}`;
   if(lag)text+=`<div class="muted" style="font-size:11px">${lag.toLocaleString()} behind</div>`;
@@ -65,7 +66,7 @@ async function saveSub(event){
 }
 function showSubSecret(result){
   const s=result.subscription;
-  if(result.token){$('ss_title').textContent=`Replication token for ${s.name}`;$('ss_hint').textContent='Replicators send it as “Authorization: Bearer <token>” to GET /_rs3/changelog and POST /_rs3/changelog/ack on the S3 port.';$('ss_text').textContent=result.token;}
+  if(result.token){$('ss_title').textContent=`Replication token for ${s.name}`;$('ss_hint').textContent='Replicators send it as “Authorization: Bearer <token>” to GET /_rs3/changelog?after=<seq> and GET /_rs3/changelog/snapshot on the S3 port, and keep their own position.';$('ss_text').textContent=result.token;}
   else{$('ss_title').textContent=`Signing secret for ${s.name}`;$('ss_hint').textContent='Every delivery carries X-RS3-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>. Verify it, and reject stale timestamps.';$('ss_text').textContent=result.secret;}
   $('subSecretDlg').showModal();
 }
@@ -79,6 +80,8 @@ function renderSubActions(){
   const pause=$('sa_pause');pause.classList.toggle('hidden',!s.paused);pause.textContent=s.paused?.message||'';
   $('sa_detail').textContent=[`phase: ${s.phase}`,`offset: ${s.offset}`,`head: ${s.head??'?'}`,`oldest retained: after seq ${s.trimmed_through??'?'}`,`delivered: ${s.delivered_events} events in ${s.delivered_batches} batches`,s.last_error?`last error: ${s.last_error}`:null,s.muted_until_ms>Date.now()?`muted until: ${fmtTime(s.muted_until_ms)}`:null].filter(Boolean).join('\n');
   $('sa_rotate').textContent=s.kind==='webhook'?'Rotate secret':'Rotate token';
+  document.querySelectorAll('#subActionDlg .sa-webhook').forEach(el=>el.classList.toggle('hidden',s.kind!=='webhook'));
+  if(s.kind==='pull')$('sa_detail').textContent=[`last read: ${s.last_success_ms?fmtTime(s.last_success_ms):'never'}`,`served through: seq ${s.offset}`,`head: ${s.head??'?'}`,'Readers keep their own position (after=). Pause disables the token.'].join('\n');
 }
 async function subAction(action){
   setInlineError('saError');const body={action};

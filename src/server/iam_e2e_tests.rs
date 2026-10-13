@@ -1054,3 +1054,41 @@ async fn list_buckets_shows_each_caller_the_buckets_they_may_have_access_to() {
     h.join("bob", &["admin", "no-vault", "no-listing"]).await;
     assert_eq!(listed(bob).await, (OK, all.map(String::from).to_vec()));
 }
+
+#[tokio::test]
+async fn changelog_reads_need_their_own_action() {
+    // The changelog reveals every key, size and ETag, including deleted ones,
+    // so ordinary read rights do not grant it: s3:GetBucketChangelog does.
+    let h = Harness::new().await;
+    h.seed("logs", &["a.txt"]).await;
+    let reader = h.user("reader").await;
+    h.iam
+        .set_policy("reader", Some(&allow(&["s3:GetObject", "s3:ListBucket"], "logs")))
+        .await
+        .unwrap();
+    let (status, _) = h.s3_full(&reader, "GET", "/logs", "x-rs3-changelog=", &[], b"").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "list/read rights do not include the changelog");
+    let (status, _) = h.s3_full(&reader, "GET", "/logs", "x-rs3-changelog-snapshot=", &[], b"").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let replicator = h.user("replicator").await;
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:GetBucketChangelog"], "logs")))
+        .await
+        .unwrap();
+    let (status, body) = h.s3_full(&replicator, "GET", "/logs", "after=0&x-rs3-changelog=", &[], b"").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page["events"][0]["key"], "a.txt");
+    assert_eq!(page["next"], 1);
+    let (status, body) = h.s3_full(&replicator, "GET", "/logs", "x-rs3-changelog-snapshot=", &[], b"").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The action is read-only: no verb other than GET does anything.
+    let (status, _) = h.s3_full(&replicator, "DELETE", "/logs", "x-rs3-changelog=", &[], b"").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(h.store.bucket_exists("logs").await, "a DELETE with the subresource never deletes the bucket");
+    // And it grants nothing else.
+    assert_eq!(h.get(&replicator, "/logs/a.txt").await, StatusCode::FORBIDDEN);
+    // The admin group's s3:* covers it.
+    assert_eq!(h.s3_full(&root_cred(), "GET", "/logs", "x-rs3-changelog=", &[], b"").await.0, StatusCode::OK);
+}

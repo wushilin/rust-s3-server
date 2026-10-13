@@ -1524,6 +1524,23 @@ async fn bucket_route(
     );
     match method {
         Method::HEAD => handlers::head_bucket::handle(store, ctx, body).await,
+        // rusts3 extension: the bucket's changelog (stateless reads; the
+        // caller keeps its own position). Authorized as s3:GetBucketChangelog.
+        // Read-only: any other verb is refused rather than falling through to
+        // CreateBucket / DeleteBucket.
+        _ if ctx.query.contains_key(notify::read::QUERY_CHANGELOG)
+            || ctx.query.contains_key(notify::read::QUERY_SNAPSHOT) =>
+        {
+            if method != Method::GET {
+                return s3_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "The changelog is read-only",
+                    &ctx.bucket,
+                );
+            }
+            changelog_s3(store, ctx).await
+        }
         Method::GET if ctx.query.contains_key("cors") => get_bucket_cors_s3(store, ctx).await,
         Method::PUT if ctx.query.contains_key("cors") => put_bucket_cors_s3(store, ctx, body).await,
         Method::DELETE if ctx.query.contains_key("cors") => delete_bucket_cors_s3(store, ctx).await,
@@ -1656,6 +1673,28 @@ async fn put_bucket_cors_s3(
     match store.set_bucket_cors(&ctx.bucket, rules).await {
         Ok(()) => empty_response(StatusCode::OK),
         Err(err) => storage_error_response(err, &ctx.resource()),
+    }
+}
+
+async fn changelog_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    use axum::response::IntoResponse;
+    if ctx.query.contains_key(notify::read::QUERY_SNAPSHOT) {
+        let result = match notify::read::snapshot_params(&ctx.query) {
+            Ok(params) => notify::read::snapshot(&store, &ctx.bucket, &params).await,
+            Err(err) => Err(err),
+        };
+        return match result {
+            Ok(page) => axum::Json(page).into_response(),
+            Err(err) => err.into_response(),
+        };
+    }
+    let result = match notify::read::read_params(&ctx.query) {
+        Ok(params) => notify::read::read(&store, &ctx.bucket, &params).await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(page) => axum::Json(page).into_response(),
+        Err(err) => err.into_response(),
     }
 }
 

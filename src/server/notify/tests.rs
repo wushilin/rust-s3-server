@@ -897,12 +897,146 @@ async fn call(app: &Router, method: &str, uri: &str, token: Option<&str>, body: 
     (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
 }
 
+/// The S3 router with auth disabled, plus the token front door.
+fn s3_app(h: &Harness) -> Router {
+    crate::server::router_with_notify(
+        h.store.clone(),
+        crate::server::auth::AuthState {
+            config: Arc::new(crate::server::config::AppConfig::default()),
+            iam: None,
+            usage: None,
+        },
+        Arc::new(crate::server::TrafficMetrics::default()),
+        crate::server::registry::TaskRegistry::new(),
+        Some(h.service.clone()),
+    )
+}
+
+fn keys_of(page: &serde_json::Value, field: &str) -> Vec<String> {
+    page[field]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["key"].as_str().unwrap().to_string())
+        .collect()
+}
+
 #[tokio::test]
-async fn pull_token_snapshot_live_ack_and_expiry() {
+async fn changelog_reads_are_stateless_and_reader_positioned() {
     let h = Harness::new().await;
     h.store.create_bucket("bkt").await.unwrap();
-    h.put("bkt", "x1", b"x").await;
-    h.put("bkt", "x2", b"x").await;
+    for key in ["a", "b", "c"] {
+        h.put("bkt", key, b"x").await;
+    }
+    let app = s3_app(&h);
+
+    let (status, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=2", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys_of(&page, "events"), ["a", "b"]);
+    assert_eq!((page["next"].as_u64(), page["more"].as_bool(), page["head"].as_u64()), (Some(2), Some(true), Some(3)));
+    let log_id = page["log_id"].as_str().unwrap().to_string();
+    // Nothing is stored server-side: the same request returns the same page,
+    // and any position the reader chooses works — forward, or replay.
+    let (_, again) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=2", None, None).await;
+    assert_eq!(again, page);
+    let (_, rest) = call(&app, "GET", "/bkt?x-rs3-changelog&after=2", None, None).await;
+    assert_eq!((keys_of(&rest, "events"), rest["next"].as_u64(), rest["more"].as_bool()), (vec!["c".to_string()], Some(3), Some(false)));
+    let (_, replay) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1", None, None).await;
+    assert_eq!(keys_of(&replay, "events"), ["b", "c"]);
+    // Caught up: empty, and next stays put.
+    let (_, idle) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3", None, None).await;
+    assert_eq!((idle["events"].as_array().unwrap().len(), idle["next"].as_u64()), (0, Some(3)));
+
+    // Filters move `next` past what they reject.
+    h.put("bkt", "logs/1", b"x").await;
+    h.put("bkt", "img/1", b"x").await;
+    let (_, filtered) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&prefix=img/", None, None).await;
+    assert_eq!((keys_of(&filtered, "events"), filtered["next"].as_u64()), (vec!["img/1".to_string()], Some(5)));
+    let (_, none) = call(&app, "GET", "/bkt?x-rs3-changelog&after=3&prefix=zzz/", None, None).await;
+    assert_eq!((none["events"].as_array().unwrap().len(), none["next"].as_u64()), (0, Some(5)), "skips filtered changes");
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&ops=rename", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Positions that do not belong to this log are refused.
+    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=999", None, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&log_id=other", None, None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("Re-snapshot"));
+    let (status, _) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&after=0&log_id={log_id}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Behind retention: 410 naming the oldest available position.
+    h.service.trim_all(now_ms() + 1_000).await;
+    let (status, body) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1", None, None).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["trimmed_through"], 5);
+    assert!(body["error"].as_str().unwrap().contains("after=5"));
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&after=5", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Read-only, and other verbs never fall through to bucket create/delete.
+    let (status, _) = call(&app, "DELETE", "/bkt?x-rs3-changelog", None, None).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(h.store.bucket_exists("bkt").await);
+}
+
+#[tokio::test]
+async fn changelog_long_poll_wakes_on_commit() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let app = s3_app(&h);
+    let writer = {
+        let store = h.store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            store.put_object("bkt", "late", b"x", None, None, false).await.unwrap();
+        })
+    };
+    let started = Instant::now();
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&wait=10", None, None).await;
+    writer.await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5), "woke on the commit, not the timeout");
+    assert_eq!(keys_of(&page, "events"), ["late"]);
+    // An idle long poll returns empty after its wait.
+    let started = Instant::now();
+    let (_, idle) = call(&app, "GET", "/bkt?x-rs3-changelog&after=1&wait=1", None, None).await;
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert!(idle["events"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn snapshot_listing_pages_with_the_head_to_continue_from() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    for key in ["d/1", "d/2", "d/3", "e/1"] {
+        h.put("bkt", key, b"x").await;
+    }
+    let app = s3_app(&h);
+    let (status, first) = call(&app, "GET", "/bkt?x-rs3-changelog-snapshot&prefix=d/&limit=2", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys_of(&first, "entries"), ["d/1", "d/2"]);
+    assert_eq!(first["head"], 4);
+    assert!(first["entries"].as_array().unwrap().iter().all(|e| e["op"] == "exists" && e["version"].as_str().is_some_and(|v| !v.is_empty())));
+    let after = first["next_after"].as_str().unwrap().to_string();
+    // A change during the walk: replaying live from the first page's head
+    // picks it up.
+    h.put("bkt", "d/0", b"x").await;
+    let (_, second) = call(&app, "GET", &format!("/bkt?x-rs3-changelog-snapshot&prefix=d/&limit=2&after={after}"), None, None).await;
+    assert_eq!(keys_of(&second, "entries"), ["d/3"]);
+    assert!(second["next_after"].is_null(), "listing complete");
+    let (_, live) = call(&app, "GET", "/bkt?x-rs3-changelog&after=4&prefix=d/", None, None).await;
+    assert_eq!(keys_of(&live, "events"), ["d/0"]);
+}
+
+#[tokio::test]
+async fn replication_token_reads_its_bucket_and_filter_only() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    h.store.create_bucket("other").await.unwrap();
+    h.put("bkt", "in/a", b"x").await;
+    h.put("bkt", "out/b", b"x").await;
+    h.put("other", "in/c", b"x").await;
     let created = h
         .service
         .create(
@@ -912,7 +1046,7 @@ async fn pull_token_snapshot_live_ack_and_expiry() {
                 kind: SubscriptionKind::Pull,
                 url: String::new(),
                 headers: BTreeMap::new(),
-                filter: Filter::default(),
+                filter: prefix("in/"),
                 initial_snapshot: true,
                 secret: None,
                 batch_max_events: None,
@@ -926,71 +1060,44 @@ async fn pull_token_snapshot_live_ack_and_expiry() {
     let token = created.token.expect("token shown once");
     let app = pull::router(h.service.clone());
 
-    let (status, _) = call(&app, "GET", "/_rs3/changelog", None, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _) = call(&app, "GET", "/_rs3/changelog", Some("rs3cl_wrong"), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    // Snapshot.
-    let (status, batch) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
+    for bad in [None, Some("rs3cl_wrong"), Some("not-a-token")] {
+        let (status, _) = call(&app, "GET", "/_rs3/changelog", bad, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // The token's filter is the scope; a query cannot widen it.
+    let (status, page) = call(&app, "GET", "/_rs3/changelog?after=0&prefix=", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(batch["phase"], "snapshot");
-    assert_eq!(batch["snapshot_begin"], true);
-    assert_eq!(batch["snapshot_end"], true);
-    assert_eq!(batch["events"].as_array().unwrap().len(), 2);
-    // Not acked yet: pulling again returns the same batch.
-    let (_, again) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
-    assert_eq!(again, batch);
-    let ack = batch["ack"].as_str().unwrap().to_string();
-    let (status, _) = call(&app, "POST", "/_rs3/changelog/ack", Some(&token), Some(serde_json::json!({ "ack": ack }))).await;
-    assert_eq!(status, StatusCode::OK);
-    // Re-acking the same batch is harmless.
-    let (status, _) = call(&app, "POST", "/_rs3/changelog/ack", Some(&token), Some(serde_json::json!({ "ack": ack }))).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["bucket"], "bkt");
+    assert_eq!(keys_of(&page, "events"), ["in/a"]);
+    let (_, snap) = call(&app, "GET", "/_rs3/changelog/snapshot", Some(&token), None).await;
+    assert_eq!(keys_of(&snap, "entries"), ["in/a"]);
+    // The console sees the last read; it does not steer the next one.
+    let view = h.view(&created.subscription.id).await;
+    assert_eq!(view.offset, 2);
+    assert!(view.last_success_ms > 0);
+    let (_, replay) = call(&app, "GET", "/_rs3/changelog?after=0", Some(&token), None).await;
+    assert_eq!(keys_of(&replay, "events"), ["in/a"], "a reader may always re-read");
 
-    // Up to date: empty batch, nothing to ack.
-    let (_, empty) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
-    assert!(empty["events"].as_array().unwrap().is_empty());
-    assert!(empty["ack"].is_null());
-
-    // Long poll: a change during the wait is returned at once.
-    let writer = {
-        let store = h.store.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            store.put_object("bkt", "x3", b"x", None, None, false).await.unwrap();
-        })
-    };
-    let started = Instant::now();
-    let (_, live) = call(&app, "GET", "/_rs3/changelog?wait=10", Some(&token), None).await;
-    writer.await.unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5), "long poll woke on the commit");
-    assert_eq!(live["phase"], "live");
-    assert_eq!(live["events"][0]["key"], "x3");
-    let live_ack = live["ack"].as_str().unwrap().to_string();
-
-    // A forged ack (beyond head) is refused.
-    let mut forged = decode_ack(&live_ack).unwrap();
-    forged.offset += 1000;
-    let (status, _) = call(&app, "POST", "/_rs3/changelog/ack", Some(&token), Some(serde_json::json!({ "ack": encode_ack(&forged) }))).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    let (status, _) = call(&app, "POST", "/_rs3/changelog/ack", Some(&token), Some(serde_json::json!({ "ack": live_ack }))).await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Falling behind retention: 410 with the explanation.
-    h.put("bkt", "x4", b"x").await;
-    h.service.trim_all(now_ms() + 1_000).await;
+    // No server-side position: those actions do not apply to tokens.
+    for action in [Action::SkipToHead, Action::Resnapshot, Action::SetOffset { offset: 0 }, Action::ResumeFromOldest] {
+        assert!(matches!(h.service.act(&created.subscription.id, action).await, Err(NotifyError::BadRequest(_))));
+    }
+    // Pause disables the token; resume re-enables it.
+    h.service.act(&created.subscription.id, Action::Pause).await.unwrap();
     let (status, body) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
-    assert_eq!(status, StatusCode::GONE);
-    assert!(body["error"].as_str().unwrap().contains("Cannot resume replication token \"replica\""));
-
-    // Rotating the token invalidates the old one.
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    h.service.act(&created.subscription.id, Action::Resume).await.unwrap();
+    let (status, _) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    // Rotation invalidates the old token.
     let rotated = h.service.act(&created.subscription.id, Action::RotateToken).await.unwrap();
     let (status, _) = call(&app, "GET", "/_rs3/changelog", Some(&token), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    h.service.act(&created.subscription.id, Action::SkipToHead).await.unwrap();
     let (status, _) = call(&app, "GET", "/_rs3/changelog", Some(rotated.token.as_deref().unwrap()), None).await;
     assert_eq!(status, StatusCode::OK);
+    // The ack endpoint is gone.
+    let (status, _) = call(&app, "POST", "/_rs3/changelog/ack", Some(rotated.token.as_deref().unwrap()), Some(serde_json::json!({"ack": "x"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
