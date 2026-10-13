@@ -32,7 +32,23 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
 
     let object = match store.read_object(&bucket, &key).await {
         Ok(object) => object,
-        Err(err) => return srv::storage_error_response(err, &format!("/{bucket}/{key}")),
+        Err(err) => {
+            let not_found = matches!(err, crate::storage::errors::StorageError::ObjectNotFound { .. });
+            let mut response = srv::storage_error_response(err, &format!("/{bucket}/{key}"));
+            // A deleted key still has a state for replication: its
+            // tombstone's stamp.
+            if not_found {
+                if let Ok(Some((stamp, true))) = store.key_stamp(&bucket, &key).await {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&stamp.to_header()) {
+                        response.headers_mut().insert("x-rs3-stamp", value);
+                        response
+                            .headers_mut()
+                            .insert("x-rs3-deleted", axum::http::HeaderValue::from_static("true"));
+                    }
+                }
+            }
+            return response;
+        }
     };
 
     // Conditional request checks. Per RFC 7232 the precedence is:

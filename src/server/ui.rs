@@ -681,6 +681,7 @@ fn storage_error(err: StorageError) -> Response {
         }
         StorageError::BucketRebuilding(_) => StatusCode::SERVICE_UNAVAILABLE,
         StorageError::InvalidMultipartUpload(_) | StorageError::BucketInUse(_) => StatusCode::CONFLICT,
+        StorageError::StaleStamp { .. } => StatusCode::PRECONDITION_FAILED,
         StorageError::InvalidBucketName(_) | StorageError::InvalidObjectKey(_) => {
             StatusCode::BAD_REQUEST
         }

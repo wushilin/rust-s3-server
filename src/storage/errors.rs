@@ -28,6 +28,10 @@ pub enum StorageError {
     /// The bucket cannot be deleted while something still depends on it
     /// (changelog subscriptions). Maps to HTTP 409.
     BucketInUse(String),
+    /// A replicated write or delete (carrying a version stamp) that is not
+    /// newer than the key's current state — the object or its tombstone.
+    /// Nothing was changed. Maps to HTTP 412.
+    StaleStamp { bucket: String, key: String, current: String },
 }
 
 impl fmt::Display for StorageError {
@@ -66,6 +70,10 @@ impl fmt::Display for StorageError {
                 write!(f, "precondition failed for {bucket}/{key}")
             }
             StorageError::BucketInUse(v) => write!(f, "{v}"),
+            StorageError::StaleStamp { bucket, key, current } => write!(
+                f,
+                "{bucket}/{key} already has a state at least as new (stamp {current}); nothing changed"
+            ),
         }
     }
 }

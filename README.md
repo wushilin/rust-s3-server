@@ -318,7 +318,8 @@ batch/grace settings.
 | Field | Default | Description |
 |---|---:|---|
 | `changelog.retention_days` | `14` | Changelog entries older than this are trimmed, whether or not every subscription has read them. |
-| `changelog.trim_interval_secs` | `600` | How often the trim runs. |
+| `changelog.trim_interval_secs` | `600` | How often the trim and the tombstone purge run. |
+| `changelog.tombstone_days` | `14` | How long a delete's tombstone (its stamp) is kept, so an older replicated write cannot bring the object back. |
 | `webhooks.check_interval_secs` | `5` | Checker tick: muted webhooks whose mute has passed resume on the next tick. |
 | `webhooks.mute_secs` | `30` | Mute after any unsuccessful delivery (per-webhook override). A longer `Retry-After` wins. |
 | `webhooks.max_mute_secs` | `900` | Cap on a receiver's `Retry-After`. |
@@ -618,13 +619,29 @@ keeps the part layout and the ETag, including a multipart `-N` ETag. If the
 filesystem can't hardlink, it falls back to a byte copy. A copy to a different
 key is still a full copy, stored as a single part.
 
-**Replicated writes.** A PUT, CompleteMultipartUpload or CopyObject that sends
-`x-rs3-stamp: <ms>.<c>.<site>` keeps that stamp instead of getting a new local
-one, and its `Last-Modified` becomes the stamp's time. This is how a replica
-keeps the origin's stamp. Setting a stamp decides last-writer-wins conflicts,
-so it requires the custom IAM action `s3:ReplicateWrite` on the object, in
-addition to the write permission. Stamps more than 10 minutes in the future are
-refused.
+**Replicated writes.** A PUT, CompleteMultipartUpload, CopyObject or DELETE
+that sends `x-rs3-stamp: <ms>.<c>.<site>` keeps that stamp instead of getting a
+new local one. For a write, `Last-Modified` becomes the stamp's time. This is
+how a replica keeps the origin's stamp.
+
+- **Last-writer-wins.** A stamped change applies only if its stamp is higher
+  than the key's current state. Otherwise the server answers `412` with the
+  current stamp in `x-rs3-stamp-current`, and nothing is written or logged.
+  Replays and echoes are therefore no-ops, and every site ends up with the
+  highest-stamped state whatever order changes arrive in.
+- **Tombstones.** A delete leaves a tombstone holding its stamp, kept for
+  `changelog.tombstone_days` (14). It stops an older write from bringing the
+  object back. A stamped delete of a key that doesn't exist still records one.
+  - HEAD or GET of a deleted key answers `404` with `x-rs3-stamp` and
+    `x-rs3-deleted: true`.
+  - `?x-rs3-changelog-snapshot&deleted=1` lists the tombstones.
+  - A site offline for longer than the tombstone retention must re-snapshot
+    rather than resume.
+- **Permission.** Setting a stamp decides conflicts, so it requires the custom
+  IAM action `s3:ReplicateWrite` on the object, in addition to the write or
+  delete permission. Stamps more than 10 minutes in the future are refused.
+- Local (unstamped) writes and deletes are never conditional, and always
+  outrank every state the site has seen.
 
 **Replication tokens** (created by an admin in the console) give the same reads
 without S3 credentials. They are scoped to one bucket and the token's filter:

@@ -14,7 +14,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     if force_delete_enabled(&ctx) {
         return force_delete_prefix(store, ctx).await;
     }
-    match store.delete_object_with_size(&ctx.bucket, &ctx.key).await {
+    // A replicated delete carries the origin's stamp (s3:ReplicateWrite).
+    let stamp = match srv::replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &resource) {
+        Ok(stamp) => stamp,
+        Err(response) => return response,
+    };
+    match store.delete_object_stamped(&ctx.bucket, &ctx.key, stamp).await {
         Ok(size) => srv::with_measure(
             srv::empty_response(StatusCode::NO_CONTENT),
             srv::OperationMeasure::Bytes(size.unwrap_or(0)),

@@ -2390,6 +2390,18 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             response
         }
+        StorageError::StaleStamp { ref current, .. } => {
+            let mut response = s3_error(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                err.to_string(),
+                resource,
+            );
+            if let Ok(value) = HeaderValue::from_str(&current) {
+                response.headers_mut().insert("x-rs3-stamp-current", value);
+            }
+            response
+        }
         StorageError::BucketInUse(message) => s3_error(
             StatusCode::CONFLICT,
             "OperationAborted",

@@ -58,6 +58,9 @@ pub struct SnapshotParams {
     pub after: Option<String>,
     pub limit: usize,
     pub filter: Filter,
+    /// List the tombstones (deleted keys still remembered) instead of the
+    /// objects: `op: "deleted"` entries with the delete's stamp.
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +205,9 @@ pub fn snapshot_params(query: &HashMap<String, String>) -> Result<SnapshotParams
         after: query.get("after").cloned().filter(|v| !v.is_empty()),
         limit: parse_limit(query)?,
         filter: parse_filter(query)?,
+        deleted: query
+            .get("deleted")
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
     })
 }
 
@@ -324,6 +330,37 @@ pub async fn snapshot(
     params: &SnapshotParams,
 ) -> Result<SnapshotResponse, ReadError> {
     let index = store.index(bucket).await?;
+    if params.deleted {
+        let head = index.changelog_head();
+        let (tombstones, more) = index
+            .list_tombstones(&params.filter.prefix, params.after.as_deref(), params.limit)
+            .await?;
+        let next_after = if more { tombstones.last().map(|t| t.object_key.clone()) } else { None };
+        return Ok(SnapshotResponse {
+            bucket: bucket.to_string(),
+            site_id: store.site_id(),
+            log_id: index.changelog_id().to_string(),
+            head,
+            entries: tombstones
+                .into_iter()
+                .filter(|t| params.filter.matches_key(&t.object_key))
+                .map(|t| WireEvent {
+                    seq: None,
+                    op: "deleted".to_string(),
+                    key: t.object_key,
+                    etag: t.etag,
+                    size: t.size,
+                    last_modified_ms: t.deleted_at_ms,
+                    version: t.version,
+                    origin: None,
+                    ts_ms: None,
+                    parts: None,
+                    stamp: Some(t.stamp),
+                })
+                .collect(),
+            next_after,
+        });
+    }
     if !params.filter.wants_puts() {
         // A deletes-only reader has nothing to list.
         return Ok(SnapshotResponse {

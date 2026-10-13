@@ -31,6 +31,12 @@
 //! | `counters`  | `objects`              | i64 LE, summed via merge    |
 //! | `meta`      | `schema_version`       | i64 LE                      |
 //! | `changelog` | seq (8-byte big-endian)| changelog entry JSON        |
+//! | `tombstones`| object key (raw UTF-8) | [`Tombstone`] JSON          |
+//!
+//! A tombstone remembers a delete's version stamp, so that a replicated
+//! write older than the delete cannot bring the object back. It is written
+//! in the delete's batch, removed in the batch of the key's next publish,
+//! and purged after the tombstone retention.
 //!
 //! The `changelog` family (and its `meta` keys) is described in
 //! [`super::changelog`]. It is additive — opening an older index creates it
@@ -82,6 +88,7 @@ const CF_OBJECTS: &str = "objects";
 const CF_INTENTS: &str = "intents";
 const CF_COUNTERS: &str = "counters";
 const CF_META: &str = "meta";
+const CF_TOMBSTONES: &str = "tombstones";
 
 const KEY_OBJECT_COUNT: &[u8] = b"objects";
 const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
@@ -99,6 +106,33 @@ pub struct ObjectRecord {
     pub parts: Option<PartLayout>,
     /// Version stamp; `None` on rows indexed before stamps existed.
     pub stamp: Option<Stamp>,
+}
+
+/// A deleted key's last state: the delete's stamp, and what it removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    #[serde(skip)]
+    pub object_key: String,
+    pub stamp: Stamp,
+    pub deleted_at_ms: i64,
+    /// The removed version (empty when a replicated delete arrived for a key
+    /// this site never had).
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub etag: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+fn encode_tombstone(t: &Tombstone) -> Vec<u8> {
+    serde_json::to_vec(t).expect("Tombstone serializes")
+}
+
+fn decode_tombstone(key: &[u8], value: &[u8]) -> Result<Tombstone> {
+    let mut t: Tombstone = serde_json::from_slice(value)?;
+    t.object_key = String::from_utf8_lossy(key).into_owned();
+    Ok(t)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +361,7 @@ fn column_families() -> Vec<ColumnFamilyDescriptor> {
         ColumnFamilyDescriptor::new(CF_COUNTERS, counter_opts),
         ColumnFamilyDescriptor::new(CF_META, Options::default()),
         ColumnFamilyDescriptor::new(CF_CHANGELOG, Options::default()),
+        ColumnFamilyDescriptor::new(CF_TOMBSTONES, Options::default()),
     ]
 }
 
@@ -555,7 +590,7 @@ impl ObjectIndex {
         let db = self.db.clone();
         let _ = run_blocking(move || {
             let _ = db.flush();
-            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META, CF_CHANGELOG] {
+            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META, CF_CHANGELOG, CF_TOMBSTONES] {
                 if let Ok(handle) = cf(&db, name) {
                     let _ = db.flush_cf(&handle);
                 }
@@ -806,10 +841,12 @@ impl ObjectIndex {
             let intents = cf(&db, CF_INTENTS)?;
             let counters = cf(&db, CF_COUNTERS)?;
             let log = cf(&db, CF_CHANGELOG)?;
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
             let existed = db.get_cf(&objects, record.object_key.as_bytes())?.is_some();
 
             let mut batch = WriteBatch::default();
             batch.put_cf(&objects, record.object_key.as_bytes(), encode_object(&record));
+            batch.delete_cf(&tombstones, record.object_key.as_bytes());
             batch.delete_cf(&intents, id_key(publish_intent_id));
             if let (Some(old_dir), Some(id)) = (&displaced, retire_id) {
                 let value = encode_intent(INTENT_RETIRE, &record.object_key, old_dir, now_ms, 0);
@@ -873,6 +910,17 @@ impl ObjectIndex {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, (-1i64).to_le_bytes());
                 let g = changes.begin(now_ms);
                 let mut change = change_for(&g, ChangeOp::Delete, existing, origin);
+                if let Some(stamp) = &stamp {
+                    let tombstone = Tombstone {
+                        object_key: key.clone(),
+                        stamp: stamp.clone(),
+                        deleted_at_ms: now_ms,
+                        version: changelog::version_of(&existing.blob_dir),
+                        etag: existing.etag.clone(),
+                        size: existing.size,
+                    };
+                    batch.put_cf(&cf(&db, CF_TOMBSTONES)?, key.as_bytes(), encode_tombstone(&tombstone));
+                }
                 change.stamp = stamp;
                 batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
                 guard = Some(g);
@@ -891,6 +939,113 @@ impl ObjectIndex {
             }
             Err(err) => Err(err),
         }
+    }
+
+    // ── tombstones ──────────────────────────────────────────────────────────
+
+    pub async fn get_tombstone(&self, key: &str) -> Result<Option<Tombstone>> {
+        let db = self.db.clone();
+        let key = key.to_string();
+        run_blocking(move || {
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            match db.get_cf(&tombstones, key.as_bytes())? {
+                Some(value) => Ok(Some(decode_tombstone(key.as_bytes(), &value)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Records a delete of a key that has no object here (a replicated
+    /// delete arriving first), unless a newer tombstone exists. Returns
+    /// whether it was recorded. No changelog entry: nothing visible changed.
+    /// Called under the key lock.
+    pub async fn record_tombstone(&self, key: &str, stamp: &Stamp, now_ms: i64) -> Result<bool> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let key = key.to_string();
+        let stamp = stamp.clone();
+        run_blocking(move || {
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            if let Some(existing) = db.get_cf(&tombstones, key.as_bytes())? {
+                if decode_tombstone(key.as_bytes(), &existing)?.stamp >= stamp {
+                    return Ok(false);
+                }
+            }
+            let tombstone = Tombstone {
+                object_key: key.clone(),
+                stamp,
+                deleted_at_ms: now_ms,
+                version: String::new(),
+                etag: String::new(),
+                size: 0,
+            };
+            db.put_cf_opt(&tombstones, key.as_bytes(), encode_tombstone(&tombstone), &write_opts(durability))?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Removes tombstones of deletes made before `cutoff_ms`, at most
+    /// `max_entries` per call. Returns how many were removed.
+    pub async fn purge_tombstones(&self, cutoff_ms: i64, max_entries: usize) -> Result<usize> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        run_blocking(move || {
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let mut batch = WriteBatch::default();
+            let mut removed = 0usize;
+            for item in db.iterator_cf(&tombstones, IteratorMode::Start) {
+                let (key, value) = item?;
+                let expired = decode_tombstone(&key, &value)
+                    .map(|t| t.deleted_at_ms < cutoff_ms)
+                    .unwrap_or(true);
+                if expired {
+                    batch.delete_cf(&tombstones, &key);
+                    removed += 1;
+                    if removed >= max_entries {
+                        break;
+                    }
+                }
+            }
+            if removed > 0 {
+                db.write_opt(batch, &write_opts(durability))?;
+            }
+            Ok(removed)
+        })
+        .await
+    }
+
+    /// Tombstones under `prefix`, in key order, after `after`.
+    pub async fn list_tombstones(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<(Vec<Tombstone>, bool)> {
+        let db = self.db.clone();
+        let prefix = prefix.to_string();
+        let after = after.map(str::to_string);
+        run_blocking(move || {
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let start = match &after {
+                Some(after) if after.as_str() > prefix.as_str() => after.clone(),
+                _ => prefix.clone(),
+            };
+            let mut out = Vec::new();
+            let mut more = false;
+            for item in db.iterator_cf(&tombstones, IteratorMode::From(start.as_bytes(), Direction::Forward)) {
+                let (key, value) = item?;
+                if after.as_deref().is_some_and(|a| a.as_bytes() == key.as_ref()) {
+                    continue;
+                }
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                if out.len() >= limit {
+                    more = true;
+                    break;
+                }
+                out.push(decode_tombstone(&key, &value)?);
+            }
+            Ok((out, more))
+        })
+        .await
     }
 
     pub async fn delete_intent(&self, id: i64) -> Result<()> {
@@ -1285,6 +1440,16 @@ impl ObjectIndex {
                 let (key, value) = item?;
                 batch.put_cf(&dst_log, key, value);
                 copied += 1;
+                if batch.len() >= 10_000 {
+                    dst_db.write(std::mem::take(&mut batch))?;
+                }
+            }
+            // Tombstones too: they are what keeps a delete from being undone.
+            let src_tomb = cf(&src, CF_TOMBSTONES)?;
+            let dst_tomb = cf(&dst_db, CF_TOMBSTONES)?;
+            for item in src.iterator_cf(&src_tomb, IteratorMode::Start) {
+                let (key, value) = item?;
+                batch.put_cf(&dst_tomb, key, value);
                 if batch.len() >= 10_000 {
                     dst_db.write(std::mem::take(&mut batch))?;
                 }

@@ -563,6 +563,9 @@ impl NotifyService {
                         let cutoff = now_ms()
                             - (service.inner.changelog.retention_days as i64) * 86_400_000;
                         service.trim_all(cutoff).await;
+                        let tombstone_cutoff = now_ms()
+                            - (service.inner.changelog.tombstone_days as i64) * 86_400_000;
+                        service.purge_tombstones(tombstone_cutoff).await;
                     }
                 }
             }
@@ -597,6 +600,33 @@ impl NotifyService {
         }
         if total > 0 {
             log::info!("changelog trim removed {total} entries");
+        }
+        total
+    }
+
+    /// Purges tombstones of deletes made before `cutoff_ms` in every bucket.
+    pub async fn purge_tombstones(&self, cutoff_ms: i64) -> usize {
+        let Ok(buckets) = self.inner.store.list_buckets().await else {
+            return 0;
+        };
+        let mut total = 0;
+        for (bucket, _) in buckets {
+            let Ok(index) = self.inner.store.index(&bucket).await else {
+                continue;
+            };
+            loop {
+                match index.purge_tombstones(cutoff_ms, TRIM_BATCH).await {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(err) => {
+                        log::warn!("tombstone purge failed bucket={bucket} error={err}");
+                        break;
+                    }
+                }
+            }
+        }
+        if total > 0 {
+            log::info!("purged {total} expired tombstones");
         }
         total
     }

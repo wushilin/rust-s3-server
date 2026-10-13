@@ -1127,6 +1127,7 @@ impl LocalObjectStore {
         options: PublishOptions,
     ) -> Result<PutResult> {
         let PublishOptions { precondition, stamp: replicated } = options;
+        let replicated_for_check = replicated.clone();
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if self.durability == Durability::Full {
             fsync_publish_dir(publish_dir, &object_meta).await?;
@@ -1158,11 +1159,27 @@ impl LocalObjectStore {
             }
         }
 
+        // The key's current state: the object's stamp, or its tombstone's.
+        let current = self.current_stamp(&index, key, old.as_ref()).await?;
+        // A replicated state applies only over an older one, so the higher
+        // stamp wins on every site, whatever order the changes arrive in.
+        if let Some(incoming) = &replicated_for_check {
+            if let Some(current) = current.as_ref().filter(|current| incoming <= *current) {
+                let _ = index.delete_intent(intent_id).await;
+                let _ = tokio::fs::remove_dir_all(publish_dir).await;
+                return Err(StorageError::StaleStamp {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    current: current.to_header(),
+                });
+            }
+        }
+
         // The new state's version stamp. Seeing the current one first means
-        // a local write always outranks what it replaces, even if that came
-        // from a site whose clock runs ahead.
-        if let Some(old_stamp) = old.as_ref().and_then(|o| o.stamp.as_ref()) {
-            self.clock().observe(old_stamp);
+        // a local write always outranks what it replaces (object or
+        // tombstone), even if that came from a site whose clock runs ahead.
+        if let Some(current) = &current {
+            self.clock().observe(current);
         }
         let (stamp, last_modified_ms) = match replicated {
             // A replicated state keeps its origin's stamp and shows its
@@ -1407,6 +1424,60 @@ impl LocalObjectStore {
         )))
     }
 
+    /// The stamp of `key`'s current state: the live object's (its fallback
+    /// if it predates stamps), else its tombstone's, else `None` (never seen
+    /// or tombstone expired).
+    async fn current_stamp(&self, index: &ObjectIndex, key: &str, row: Option<&ObjectRecord>) -> Result<Option<Stamp>> {
+        let tombstone = index.get_tombstone(key).await?.map(|t| t.stamp);
+        let live = row.map(|row| self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms));
+        Ok(match (live, tombstone) {
+            (Some(live), Some(tomb)) => Some(live.max(tomb)),
+            (live, tomb) => live.or(tomb),
+        })
+    }
+
+    /// The current state's stamp of `key` (see [`Self::current_stamp`]),
+    /// and whether it is a tombstone. For HEAD of a deleted key and for
+    /// replicators comparing states.
+    pub async fn key_stamp(&self, bucket: &str, key: &str) -> Result<Option<(Stamp, bool)>> {
+        let index = self.index(bucket).await?;
+        if let Some(row) = index.get(key).await? {
+            return Ok(Some((self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms), false)));
+        }
+        Ok(index.get_tombstone(key).await?.map(|t| (t.stamp, true)))
+    }
+
+    /// Deletes `key`. With a replicated stamp, only if it is newer than the
+    /// key's current state ([`StorageError::StaleStamp`] otherwise), and a
+    /// key that is already absent still records the tombstone, so an older
+    /// write arriving later cannot bring it back. Returns the deleted size.
+    pub async fn delete_object_stamped(&self, bucket: &str, key: &str, stamp: Option<Stamp>) -> Result<Option<u64>> {
+        let Some(incoming) = stamp else {
+            return self.delete_object_with_size(bucket, key).await;
+        };
+        self.ensure_bucket_and_key(bucket, key).await?;
+        let index = self.index(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+        let row = index.get(key).await?;
+        if let Some(current) = self.current_stamp(&index, key, row.as_ref()).await? {
+            if incoming <= current {
+                return Err(StorageError::StaleStamp {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    current: current.to_header(),
+                });
+            }
+        }
+        self.clock().observe(&incoming);
+        match row {
+            Some(row) => self.delete_locked(bucket, key, &index, row, incoming).await,
+            None => {
+                index.record_tombstone(key, &incoming, now_ms()).await?;
+                Ok(None)
+            }
+        }
+    }
+
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.delete_object_with_size(bucket, key).await.map(|_| ())
     }
@@ -1420,8 +1491,21 @@ impl LocalObjectStore {
         let Some(row) = index.get(key).await? else {
             return Ok(None); // Idempotent: deleting an absent key succeeds.
         };
-        let deleted_size = row.size;
         let stamp = self.clock().next();
+        self.delete_locked(bucket, key, &index, row, stamp).await
+    }
+
+    /// Commits the delete of `row` with `stamp` and retires its blob dir.
+    /// The caller holds the key lock.
+    async fn delete_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        index: &ObjectIndex,
+        row: ObjectRecord,
+        stamp: Stamp,
+    ) -> Result<Option<u64>> {
+        let deleted_size = row.size;
         let retire_id = index
             .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Client, Some(stamp))
             .await?;
@@ -2034,6 +2118,20 @@ impl LocalObjectStore {
         requested_parts: &[CompletePartRequest],
         options: PublishOptions,
     ) -> Result<PutResult> {
+        // A replicated upload older than what is here is refused before
+        // anything is assembled, leaving the upload intact (to abort). The
+        // publish re-checks under the key lock.
+        if let Some(incoming) = &options.stamp {
+            if let Some((current, _)) = self.key_stamp(bucket, key).await? {
+                if incoming <= &current {
+                    return Err(StorageError::StaleStamp {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        current: current.to_header(),
+                    });
+                }
+            }
+        }
         self.validate_upload(bucket, key, upload_id).await?;
         if requested_parts.is_empty() {
             return Err(StorageError::InvalidMultipartUpload(

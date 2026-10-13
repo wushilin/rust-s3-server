@@ -1624,3 +1624,202 @@ async fn self_copy_over_http_and_stamp_only_updates() {
     assert_eq!(row.etag, etag);
     assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"only part");
 }
+
+// ── tombstones and conditional (last-writer-wins) apply ─────────────────────
+
+use crate::storage::store::PublishOptions;
+
+async fn put_stamped(store: &LocalObjectStore, bucket: &str, key: &str, body: &[u8], stamp: Option<Stamp>) -> crate::storage::errors::Result<crate::storage::store::PutResult> {
+    let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(body))));
+    store
+        .put_object_stream_with_metadata(
+            bucket,
+            key,
+            stream,
+            None,
+            None,
+            None,
+            None,
+            &BTreeMap::new(),
+            false,
+            None,
+            None,
+            PublishOptions { precondition: None, stamp },
+        )
+        .await
+}
+
+fn st(ms: i64, site: &str) -> Stamp {
+    Stamp { ms, c: 0, site: site.into() }
+}
+
+#[tokio::test]
+async fn replicated_changes_apply_only_over_older_states() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let base = now_ms();
+    put_stamped(&h.store, "bkt", "k", b"v5", Some(st(base + 5, "a"))).await.unwrap();
+
+    // Older or equal: refused, nothing changes, nothing is logged.
+    let head_before = h.store.index("bkt").await.unwrap().changelog_head();
+    for stale in [st(base + 4, "z"), st(base + 5, "a")] {
+        let err = put_stamped(&h.store, "bkt", "k", b"old", Some(stale)).await.unwrap_err();
+        assert!(matches!(err, crate::storage::errors::StorageError::StaleStamp { .. }), "{err:?}");
+    }
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"v5");
+    assert_eq!(h.store.index("bkt").await.unwrap().changelog_head(), head_before, "no event for a refused change");
+    // The same (ms, c) from a higher site id wins the tie.
+    put_stamped(&h.store, "bkt", "k", b"tie", Some(st(base + 5, "b"))).await.unwrap();
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"tie");
+
+    // Over HTTP: 412 naming the current stamp.
+    let app = s3_app(&h);
+    let response = send_put(&app, "/bkt/k", "older", &[("x-rs3-stamp", &st(base, "a").to_header())]).await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers()["x-rs3-stamp-current"], st(base + 5, "b").to_header().as_str());
+
+    // Local writes are never conditional, and outrank everything seen.
+    h.put("bkt", "k", b"local").await;
+    let local = h.store.key_stamp("bkt", "k").await.unwrap().unwrap().0;
+    assert!(local > st(base + 5, "b"));
+}
+
+#[tokio::test]
+async fn a_delete_leaves_a_tombstone_that_older_writes_cannot_undo() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let app = s3_app(&h);
+    let base = now_ms();
+    put_stamped(&h.store, "bkt", "k", b"v1", Some(st(base + 1, "a"))).await.unwrap();
+    // Replicated delete, newer: applied, tombstone kept.
+    h.store.delete_object_stamped("bkt", "k", Some(st(base + 3, "a"))).await.unwrap();
+    let head = app
+        .clone()
+        .oneshot(Request::builder().method("HEAD").uri("/bkt/k").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::NOT_FOUND);
+    assert_eq!(head.headers()["x-rs3-stamp"], st(base + 3, "a").to_header().as_str());
+    assert_eq!(head.headers()["x-rs3-deleted"], "true");
+
+    // A write that happened before the delete arrives late: refused.
+    let err = put_stamped(&h.store, "bkt", "k", b"v2", Some(st(base + 2, "b"))).await.unwrap_err();
+    assert!(matches!(err, crate::storage::errors::StorageError::StaleStamp { .. }));
+    assert!(h.store.read_object("bkt", "k").await.is_err(), "not resurrected");
+    // An older delete is refused as well; a newer write applies and clears
+    // the tombstone.
+    assert!(h.store.delete_object_stamped("bkt", "k", Some(st(base + 2, "b"))).await.is_err());
+    put_stamped(&h.store, "bkt", "k", b"v4", Some(st(base + 4, "b"))).await.unwrap();
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"v4");
+    assert!(h.store.index("bkt").await.unwrap().get_tombstone("k").await.unwrap().is_none());
+
+    // A replicated delete for a key never seen here still records the
+    // tombstone, so the older write arriving after it is refused.
+    h.store.delete_object_stamped("bkt", "ghost", Some(st(base + 10, "a"))).await.unwrap();
+    assert!(put_stamped(&h.store, "bkt", "ghost", b"late", Some(st(base + 9, "b"))).await.is_err());
+    // Local deletes leave tombstones too.
+    h.put("bkt", "local", b"x").await;
+    h.store.delete_object("bkt", "local").await.unwrap();
+    assert!(h.store.index("bkt").await.unwrap().get_tombstone("local").await.unwrap().is_some());
+
+    // Snapshot listing of tombstones.
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog-snapshot&deleted=1", None, None).await;
+    let keys = keys_of(&page, "entries");
+    assert_eq!(keys, ["ghost", "local"]);
+    assert!(page["entries"].as_array().unwrap().iter().all(|e| e["op"] == "deleted" && e["stamp"].is_object()));
+
+    // Tombstones survive a rebuild and expire after their retention.
+    h.store.rebuild_index("bkt").await.unwrap();
+    assert!(put_stamped(&h.store, "bkt", "ghost", b"late", Some(st(base + 9, "b"))).await.is_err());
+    assert_eq!(h.service.purge_tombstones(now_ms() + 1_000).await, 2);
+    put_stamped(&h.store, "bkt", "ghost", b"late", Some(st(base + 9, "b"))).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stale_replicated_multipart_upload_is_refused_before_assembly() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    h.put("bkt", "k", b"newer").await;
+    let upload_id = h.store.initiate_multipart("bkt", "k", None, None).await.unwrap();
+    let part = h.store.put_multipart_part("bkt", "k", &upload_id, 1, b"older", false).await.unwrap();
+    let err = h
+        .store
+        .complete_multipart_with(
+            "bkt",
+            "k",
+            &upload_id,
+            &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
+            PublishOptions { precondition: None, stamp: Some(st(1, "a")) },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::storage::errors::StorageError::StaleStamp { .. }));
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"newer");
+    h.store.abort_multipart("bkt", "k", &upload_id).await.unwrap();
+}
+
+/// Two sites receive the same set of changes in different orders and must
+/// end in the same state.
+#[tokio::test]
+async fn two_sites_converge_whatever_the_delivery_order() {
+    #[derive(Clone)]
+    enum Change {
+        Put(&'static str, &'static [u8], Stamp),
+        Delete(&'static str, Stamp),
+    }
+    async fn apply(store: &LocalObjectStore, change: &Change) {
+        // Stale changes are refused; that is the point.
+        let _ = match change {
+            Change::Put(key, body, stamp) => put_stamped(store, "bkt", key, body, Some(stamp.clone())).await.map(|_| ()),
+            Change::Delete(key, stamp) => store.delete_object_stamped("bkt", key, Some(stamp.clone())).await.map(|_| ()),
+        };
+    }
+    async fn state(store: &LocalObjectStore) -> Vec<(String, Option<Vec<u8>>, Stamp)> {
+        let mut out = Vec::new();
+        for key in ["k1", "k2", "k3"] {
+            let Some((stamp, deleted)) = store.key_stamp("bkt", key).await.unwrap() else { continue };
+            let body = if deleted { None } else { Some(object_bytes(store, "bkt", key).await) };
+            out.push((key.to_string(), body, stamp));
+        }
+        out
+    }
+    let base = now_ms();
+    let changes = vec![
+        Change::Put("k1", b"a1", st(base + 1, "site-a")),
+        Change::Put("k1", b"b1", st(base + 2, "site-b")),
+        Change::Delete("k1", st(base + 3, "site-a")),
+        Change::Put("k2", b"a2", st(base + 5, "site-a")),
+        Change::Put("k2", b"b2", st(base + 5, "site-b")), // tie on ms: site decides
+        Change::Put("k3", b"a3", st(base + 7, "site-a")),
+        Change::Delete("k3", st(base + 6, "site-b")), // an older delete loses
+    ];
+    let mut orders: Vec<Vec<Change>> = vec![changes.clone(), changes.iter().rev().cloned().collect()];
+    // A few interleavings.
+    for rot in 1..changes.len() {
+        let mut order = changes.clone();
+        order.rotate_left(rot);
+        orders.push(order);
+    }
+    let mut results = Vec::new();
+    for order in orders {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bkt").await.unwrap();
+        for change in &order {
+            apply(&store, change).await;
+        }
+        // Re-delivering everything (replays, echoes) changes nothing.
+        for change in &order {
+            apply(&store, change).await;
+        }
+        results.push(state(&store).await);
+    }
+    let expected = vec![
+        ("k1".to_string(), None, st(base + 3, "site-a")),
+        ("k2".to_string(), Some(b"b2".to_vec()), st(base + 5, "site-b")),
+        ("k3".to_string(), Some(b"a3".to_vec()), st(base + 7, "site-a")),
+    ];
+    for result in results {
+        assert_eq!(result, expected);
+    }
+}

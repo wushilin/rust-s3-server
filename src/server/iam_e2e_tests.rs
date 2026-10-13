@@ -1101,7 +1101,10 @@ async fn setting_a_version_stamp_needs_replicate_write() {
     h.seed("data", &[]).await;
     let writer = h.user("writer").await;
     h.iam.set_policy("writer", Some(&allow(&["s3:PutObject"], "data"))).await.unwrap();
-    let stamp = [("x-rs3-stamp", "1700000000000.0.site-a")];
+    // Ahead of the ordinary write below, so last-writer-wins accepts it.
+    let future = crate::storage::time::now_ms() + 60_000;
+    let stamp_value = format!("{future}.0.site-a");
+    let stamp = [("x-rs3-stamp", stamp_value.as_str())];
     let (status, _) = h.s3_full(&writer, "PUT", "/data/k", "", &stamp, b"x").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "PutObject alone cannot set a stamp");
     let (status, _) = h.s3_full(&writer, "PUT", "/data/k", "", &[], b"x").await;
@@ -1115,5 +1118,18 @@ async fn setting_a_version_stamp_needs_replicate_write() {
     let (status, body) = h.s3_full(&replicator, "PUT", "/data/k", "", &stamp, b"x").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let row = h.store.index("data").await.unwrap().get("k").await.unwrap().unwrap();
-    assert_eq!(row.stamp.unwrap().to_header(), "1700000000000.0.site-a");
+    assert_eq!(row.stamp.unwrap().to_header(), stamp_value);
+
+    // Stamped deletes need it too.
+    h.iam.set_policy("writer", Some(&allow(&["s3:PutObject", "s3:DeleteObject"], "data"))).await.unwrap();
+    let newer_value = format!("{}.0.site-a", future + 1);
+    let newer = [("x-rs3-stamp", newer_value.as_str())];
+    let (status, _) = h.s3_full(&writer, "DELETE", "/data/k", "", &newer, b"").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:DeleteObject", "s3:ReplicateWrite"], "data")))
+        .await
+        .unwrap();
+    let (status, _) = h.s3_full(&replicator, "DELETE", "/data/k", "", &newer, b"").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }

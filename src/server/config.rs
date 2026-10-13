@@ -319,6 +319,11 @@ pub struct ChangelogConfig {
     /// How often the trim pass runs.
     #[serde(default = "default_changelog_trim_interval_secs")]
     pub trim_interval_secs: u64,
+    /// How long a delete's tombstone (its version stamp) is kept. Replicated
+    /// changes older than this can no longer be told apart from new ones, so
+    /// a site offline for longer must re-snapshot instead of resuming.
+    #[serde(default = "default_tombstone_days")]
+    pub tombstone_days: u64,
 }
 
 impl Default for ChangelogConfig {
@@ -326,6 +331,7 @@ impl Default for ChangelogConfig {
         Self {
             retention_days: default_changelog_retention_days(),
             trim_interval_secs: default_changelog_trim_interval_secs(),
+            tombstone_days: default_tombstone_days(),
         }
     }
 }
@@ -335,6 +341,9 @@ fn default_changelog_retention_days() -> u64 {
 }
 fn default_changelog_trim_interval_secs() -> u64 {
     600
+}
+fn default_tombstone_days() -> u64 {
+    14
 }
 
 /// Webhook delivery. Each webhook can override the batch limits and
