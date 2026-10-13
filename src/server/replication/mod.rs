@@ -102,6 +102,10 @@ pub struct LinkRequest {
     pub prefix: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Mirror links need a read-only target: with this, a read-write target
+    /// is made read-only as part of creating the link (otherwise refused).
+    #[serde(default)]
+    pub make_read_only: bool,
 }
 
 fn yes() -> bool {
@@ -162,6 +166,9 @@ struct Inner {
     timing: Timing,
     shutdown: CancellationToken,
     links: RwLock<HashMap<String, Arc<Mutex<Runtime>>>>,
+    /// Serialises link creation, so the per-bucket rules (a mirror is the
+    /// bucket's only link) cannot be raced.
+    create_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -174,6 +181,19 @@ fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Names of the mirror links writing into `bucket`.
+fn mirror_links_into(inner: &Inner, bucket: &str) -> Vec<String> {
+    inner
+        .links
+        .read()
+        .unwrap()
+        .values()
+        .map(|rt| rt.lock().unwrap().link.clone())
+        .filter(|l| l.local_bucket == bucket && l.mode == Mode::Mirror)
+        .map(|l| format!("{} ({})", l.name, l.id))
+        .collect()
 }
 
 fn peer_config(link: &Link) -> PeerConfig {
@@ -200,6 +220,7 @@ impl ReplicationService {
                 timing,
                 shutdown,
                 links: RwLock::new(HashMap::new()),
+                create_lock: tokio::sync::Mutex::new(()),
             }),
         };
         for link in service.inner.db.load_all().await? {
@@ -233,6 +254,18 @@ impl ReplicationService {
                     Some(inner) => ReplicationService { inner }.restore(request).await,
                     None => Err("replication is shutting down".to_string()),
                 }
+            })
+        })));
+        // A mirror's target stays read-only while the mirror exists.
+        let weak = Arc::downgrade(&service.inner);
+        service.inner.store.add_read_write_guard(DeleteGuard(Arc::new(move |bucket| {
+            let inner = weak.upgrade()?;
+            let mirrors = mirror_links_into(&inner, bucket);
+            (!mirrors.is_empty()).then(|| {
+                format!(
+                    "bucket {bucket} is a mirror replica and must stay read-only; delete its mirror link first: {}",
+                    mirrors.join(", ")
+                )
             })
         })));
         service.spawn_supervisor();
@@ -372,6 +405,47 @@ impl ReplicationService {
         if !self.inner.store.bucket_exists(&request.local_bucket).await {
             return Err(LinkError::NotFound(format!("bucket {} not found", request.local_bucket)));
         }
+        let _creating = self.inner.create_lock.lock().await;
+        let bucket = request.local_bucket.clone();
+        // A mirror owns its bucket: no other link may write into it.
+        let existing: Vec<(String, Mode)> = self
+            .inner
+            .links
+            .read()
+            .unwrap()
+            .values()
+            .map(|rt| rt.lock().unwrap().link.clone())
+            .filter(|l| l.local_bucket == bucket)
+            .map(|l| (format!("{} ({})", l.name, l.id), l.mode))
+            .collect();
+        if let Some((name, _)) = existing.iter().find(|(_, mode)| *mode == Mode::Mirror) {
+            return Err(LinkError::BadRequest(format!(
+                "bucket {bucket} is already a mirror of {name}; a mirror is the bucket's only link"
+            )));
+        }
+        if request.mode == Mode::Mirror && !existing.is_empty() {
+            let names: Vec<&str> = existing.iter().map(|(n, _)| n.as_str()).collect();
+            return Err(LinkError::BadRequest(format!(
+                "bucket {bucket} already has replication links ({}); a mirror must be the bucket's only link",
+                names.join(", ")
+            )));
+        }
+        if request.mode == Mode::Mirror && !request.prefix.is_empty() {
+            // The whole bucket must be read-only for a mirror, so mirroring
+            // part of it would freeze the rest: nobody could write it.
+            return Err(LinkError::BadRequest(
+                "a mirror replicates the whole bucket; a prefix is only supported for merge links".into(),
+            ));
+        }
+        if request.mode == Mode::Mirror {
+            let read_only = self.inner.store.bucket_meta(&bucket).await?.read_only;
+            if !read_only && !request.make_read_only {
+                return Err(LinkError::BadRequest(format!(
+                    "a mirror needs a read-only target: make bucket {bucket} read-only first (or create the link \
+                     with make_read_only)"
+                )));
+            }
+        }
         let link = Link {
             v: RECORD_VERSION,
             id: format!("rl_{}", random_hex(8)),
@@ -389,6 +463,9 @@ impl ReplicationService {
             created_by: created_by.to_string(),
         };
         self.validate(&link)?;
+        if link.mode == Mode::Mirror {
+            self.inner.store.set_bucket_read_only(&link.local_bucket, true).await?;
+        }
         self.inner.db.put(&link).await?;
         let id = link.id.clone();
         self.install(link);

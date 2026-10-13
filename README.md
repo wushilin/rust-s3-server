@@ -691,7 +691,18 @@ Replication links**) on the **receiving** site, and that site's server runs it.
   dialog does this by default) so only replication writes it; that's what
   keeps "remote wins" true.
 - **Merge** (two-way: merge both sides, newer wins): configure a merge link on
-  each site, each pulling from the other. Both buckets end up as the union of their objects, with every key
+  each site, each pulling from the other.
+- **Rules the server enforces:**
+  - A mirror link needs a read-only target. The console makes the bucket
+    read-only when it creates the link.
+  - A mirror replicates the whole bucket; it can't have a prefix. Otherwise
+    the rest of the read-only bucket would be frozen, writable by no one.
+  - A mirror is its bucket's only link.
+  - A mirrored bucket can't be switched back to read-write while its mirror
+    link exists, even if the link is paused. Deleting the link leaves the bucket
+    read-only; making it writable again is a separate, explicit step.
+  - Merge links may filter by prefix: only keys under it are exchanged, and the
+    rest of each bucket stays local and writable. Both buckets end up as the union of their objects, with every key
   at its highest-stamped state. Deletes win or lose by stamp as well, via
   tombstones.
 

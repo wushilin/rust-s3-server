@@ -452,9 +452,8 @@
       <div class="field"><label for="ln_peer_bucket">Peer bucket</label><input class="input" id="ln_peer_bucket" autocomplete="off"></div>
       <div class="field"><label for="ln_ak">Peer access key</label><input class="input" id="ln_ak" autocomplete="off"></div>
       <div class="field"><label for="ln_sk">Peer secret key</label><input class="input" id="ln_sk" type="password" autocomplete="new-password"></div>
-      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode" onchange="$('ln_ro').checked=this.value==='mirror'"><option value="mirror">Mirror — replicate remote to local (remote wins)</option><option value="merge">Merge — merge both sides, newer wins</option></select></div>
-      <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="ln_ro" checked> Make the local bucket read-only (only replication writes it — what keeps "remote wins" true)</label>
-      <div class="field"><label for="ln_prefix">Key prefix (optional)</label><input class="input" id="ln_prefix" placeholder="(all keys)" autocomplete="off"></div>
+      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode" onchange="$('ln_mode_note').textContent=this.value==='mirror'?MIRROR_NOTE:MERGE_NOTE;$('ln_prefix_field').classList.toggle('hidden',this.value==='mirror')"><option value="mirror">Mirror — replicate remote to local (remote wins)</option><option value="merge">Merge — merge both sides, newer wins</option></select><span class="muted" style="font-size:11.5px" id="ln_mode_note"></span></div>
+      <div class="field" id="ln_prefix_field"><label for="ln_prefix">Key prefix (optional, merge only)</label><input class="input" id="ln_prefix" placeholder="(all keys)" autocomplete="off"></div>
       <div id="linkError" class="inline-error"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="linkDlg.close()">Cancel</button><button class="btn primary" type="submit">Create link</button></div>

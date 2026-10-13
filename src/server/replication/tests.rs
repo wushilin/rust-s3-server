@@ -149,6 +149,7 @@ impl Site {
                     mode,
                     prefix: String::new(),
                     enabled: true,
+                    make_read_only: mode == Mode::Mirror,
                 },
                 "tester",
             )
@@ -372,7 +373,28 @@ async fn least_privilege_credentials_are_enough_to_pull() {
     eventually(30, "mirror with a read-only key", || same(&a, &b, "data")).await;
 
     // A wrong secret: the link reports the error and keeps retrying.
-    let bad = b.pull_with(&a, "data", Mode::Mirror, &key.access_key, "wrong").await;
+    b.store.create_bucket("data2").await.unwrap();
+    let bad = b
+        .replication
+        .create(
+            LinkRequest {
+                name: "bad-secret".into(),
+                local_bucket: "data2".into(),
+                peer_endpoint: a.endpoint.clone(),
+                peer_bucket: "data".into(),
+                access_key: key.access_key.clone(),
+                secret_key: "wrong".into(),
+                region: None,
+                mode: Mode::Mirror,
+                prefix: String::new(),
+                enabled: true,
+                make_read_only: true,
+            },
+            "tester",
+        )
+        .await
+        .unwrap()
+        .id;
     eventually(10, "the error is visible", || {
         let view = b.link(&bad);
         async move { view.status.last_error.is_some_and(|e| e.contains("403")) }
@@ -416,12 +438,14 @@ async fn a_crashed_or_hung_worker_is_replaced_by_the_supervisor() {
             }
         }
     });
+    b.store.create_bucket("hung").await.unwrap();
     let hung = b
         .replication
         .create(
             LinkRequest {
                 name: "hung".into(),
-                local_bucket: "data".into(),
+                // Its own bucket: "data" is a mirror, which allows no other link.
+                local_bucket: "hung".into(),
                 peer_endpoint: hole,
                 peer_bucket: "data".into(),
                 access_key: AK.into(),
@@ -430,6 +454,7 @@ async fn a_crashed_or_hung_worker_is_replaced_by_the_supervisor() {
                 mode: Mode::Merge,
                 prefix: String::new(),
                 enabled: true,
+                make_read_only: false,
             },
             "tester",
         )
@@ -1040,4 +1065,103 @@ async fn a_mirror_into_a_read_only_bucket() {
     a.put("data", "two", b"2").await;
     a.store.delete_object("data", "one").await.unwrap();
     eventually(30, "following", || same(&a, &b, "data")).await;
+}
+
+// ── link integrity rules ───────────────────────────────────────────────────
+
+fn request(bucket: &str, peer: &Site, mode: Mode, prefix: &str, make_read_only: bool) -> LinkRequest {
+    LinkRequest {
+        name: format!("{bucket}-{mode:?}"),
+        local_bucket: bucket.into(),
+        peer_endpoint: peer.endpoint.clone(),
+        peer_bucket: "data".into(),
+        access_key: AK.into(),
+        secret_key: SK.into(),
+        region: None,
+        mode,
+        prefix: prefix.into(),
+        enabled: true,
+        make_read_only,
+    }
+}
+
+#[tokio::test]
+async fn mirror_targets_are_read_only_exclusive_and_whole_bucket() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    a.store.create_bucket("data").await.unwrap();
+    for bucket in ["mirror-one", "mirror-two", "shared"] {
+        b.store.create_bucket(bucket).await.unwrap();
+    }
+    let err = |r: Result<LinkView, LinkError>| r.err().map(|e| e.to_string()).unwrap_or_default();
+
+    // A mirror needs a read-only target...
+    let refused = err(b.replication.create(request("mirror-one", &a, Mode::Mirror, "", false), "t").await);
+    assert!(refused.contains("read-only target"), "{refused}");
+    assert!(!b.store.bucket_meta("mirror-one").await.unwrap().read_only);
+    // ...which creating it can arrange.
+    let mirror = b.replication.create(request("mirror-one", &a, Mode::Mirror, "", true), "t").await.unwrap().id;
+    assert!(b.store.bucket_meta("mirror-one").await.unwrap().read_only);
+    // A mirror replicates the whole bucket.
+    let refused = err(b.replication.create(request("mirror-two", &a, Mode::Mirror, "photos/", true), "t").await);
+    assert!(refused.contains("whole bucket"), "{refused}");
+    // A mirror is its bucket's only link, either way round.
+    let refused = err(b.replication.create(request("mirror-one", &a, Mode::Merge, "", false), "t").await);
+    assert!(refused.contains("only link"), "{refused}");
+    b.replication.create(request("shared", &a, Mode::Merge, "", false), "t").await.unwrap();
+    let refused = err(b.replication.create(request("shared", &a, Mode::Mirror, "", true), "t").await);
+    assert!(refused.contains("only link"), "{refused}");
+    assert!(!b.store.bucket_meta("shared").await.unwrap().read_only, "a refused mirror changes nothing");
+
+    // The replica cannot be made writable while mirrored — paused or not.
+    b.replication.act(&mirror, LinkAction::Pause).await.unwrap();
+    let refused = b.store.set_bucket_read_only("mirror-one", false).await.unwrap_err().to_string();
+    assert!(refused.contains("mirror replica"), "{refused}");
+    // Deleting the link leaves it read-only; making it writable is then an
+    // explicit step.
+    b.replication.delete(&mirror).await.unwrap();
+    assert!(b.store.bucket_meta("mirror-one").await.unwrap().read_only);
+    b.store.set_bucket_read_only("mirror-one", false).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_prefix_filtered_two_way_merge_exchanges_only_that_prefix() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "shared/from-a", b"a").await;
+    a.put("data", "private/a-only", b"a").await;
+    b.put("data", "shared/from-b", b"b").await;
+    b.put("data", "private/b-only", b"b").await;
+    for (site, peer) in [(&b, &a), (&a, &b)] {
+        site.replication
+            .create(
+                LinkRequest { prefix: "shared/".into(), ..request("data", peer, Mode::Merge, "shared/", false) },
+                "t",
+            )
+            .await
+            .unwrap();
+    }
+    let shared = |site: &Site| {
+        let store = site.store.clone();
+        async move {
+            let page = store.list_objects("data", "", None, None, 1000).await.unwrap();
+            page.entries.into_iter().map(|e| e.object_key).collect::<Vec<_>>()
+        }
+    };
+    eventually(30, "the shared prefix converges", || async {
+        let (ka, kb) = (shared(&a).await, shared(&b).await);
+        ka.contains(&"shared/from-b".to_string()) && kb.contains(&"shared/from-a".to_string())
+    })
+    .await;
+    // Outside the prefix nothing moves, and both buckets stay writable.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(shared(&a).await, ["private/a-only", "shared/from-a", "shared/from-b"]);
+    assert_eq!(shared(&b).await, ["private/b-only", "shared/from-a", "shared/from-b"]);
+    b.put("data", "private/another", b"local").await;
+    a.store.delete_object("data", "shared/from-b").await.unwrap();
+    eventually(30, "the delete crossed over", || async { !shared(&b).await.contains(&"shared/from-b".to_string()) }).await;
+    assert!(!shared(&a).await.contains(&"private/another".to_string()));
 }

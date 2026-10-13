@@ -146,6 +146,9 @@ pub struct LocalObjectStore {
     /// Vetoes bucket deletion (returns the reason) — the changelog
     /// subscriptions refuse while any subscription targets the bucket.
     delete_guard: Arc<std::sync::RwLock<Vec<DeleteGuard>>>,
+    /// Vetoes making a bucket read-write (a mirror replica must stay
+    /// read-only).
+    read_write_guard: Arc<std::sync::RwLock<Vec<DeleteGuard>>>,
     /// Restores lost objects from replication peers (health-scan repair).
     peer_restorer: Arc<std::sync::RwLock<Option<PeerRestorer>>>,
     /// Per-bucket "the changelog moved" signal, for long-polling readers.
@@ -348,6 +351,7 @@ impl LocalObjectStore {
             shutdown: CancellationToken::new(),
             change_listener: Arc::new(std::sync::RwLock::new(None)),
             delete_guard: Arc::new(std::sync::RwLock::new(Vec::new())),
+            read_write_guard: Arc::new(std::sync::RwLock::new(Vec::new())),
             change_signals: Arc::new(Mutex::new(HashMap::new())),
             peer_restorer: Arc::new(std::sync::RwLock::new(None)),
             clock: Arc::new(std::sync::OnceLock::new()),
@@ -375,6 +379,11 @@ impl LocalObjectStore {
             Some(restorer) => restorer.0(request).await,
             None => Err("replication is not available on this server".to_string()),
         }
+    }
+
+    /// Adds a veto on making a bucket read-write. Any one refusing blocks it.
+    pub fn add_read_write_guard(&self, guard: DeleteGuard) {
+        self.read_write_guard.write().unwrap().push(guard);
     }
 
     /// Adds a bucket-deletion veto. Any one refusing blocks the delete.
@@ -579,6 +588,12 @@ impl LocalObjectStore {
     /// read-write.
     pub async fn set_bucket_read_only(&self, bucket: &str, read_only: bool) -> Result<()> {
         validate_bucket_name(bucket)?;
+        if !read_only {
+            let veto = self.read_write_guard.read().unwrap().iter().find_map(|g| g.0(bucket));
+            if let Some(reason) = veto {
+                return Err(StorageError::BucketInUse(reason));
+            }
+        }
         let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
         let path = self.layout.bucket_meta_path(bucket)?;
         if !path.exists() {

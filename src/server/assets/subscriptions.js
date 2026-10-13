@@ -98,6 +98,8 @@ function confirmDeleteSub(i){const s=subs[i];showConfirm('Delete subscription?',
 
 // ── replication links ─────────────────────────────────────────────────────
 let links=[];
+const MIRROR_NOTE='The local bucket becomes a read-only replica: only this link writes it, objects the remote lacks are removed, and it stays read-only until the link is deleted. It must be the bucket\'s only link.';
+const MERGE_NOTE='Both sides keep their objects; the newer state of each key wins. Configure a merge link on each site for two-way replication.';
 const linkBadge=s=>({live:'<span class="badge green">Live</span>',snapshot:'<span class="badge green">Snapshot</span>',idle:'<span class="badge">Starting</span>',paused:'<span class="badge">Paused</span>',error:'<span class="badge amber">Retrying</span>',stopped:'<span class="badge" style="color:var(--danger,#c33)">Stopped</span>'}[s]||`<span class="badge">${esc(s||'—')}</span>`);
 async function loadLinks(){
   try{
@@ -111,16 +113,15 @@ async function loadLinks(){
 async function openLinkDialog(){
   setInlineError('linkError');
   try{const data=await api('GET','/api/buckets');$('ln_bucket').innerHTML=(data.buckets||[]).map(b=>`<option>${esc(b.name)}</option>`).join('');}catch{}
-  ['ln_name','ln_endpoint','ln_peer_bucket','ln_ak','ln_sk','ln_prefix'].forEach(id=>$(id).value='');$('ln_mode').value='mirror';$('ln_ro').checked=true;
+  ['ln_name','ln_endpoint','ln_peer_bucket','ln_ak','ln_sk','ln_prefix'].forEach(id=>$(id).value='');$('ln_mode').value='mirror';$('ln_mode_note').textContent=MIRROR_NOTE;$('ln_prefix_field').classList.add('hidden');
   $('ln_bucket').onchange=()=>{if(!$('ln_peer_bucket').value)$('ln_peer_bucket').value=$('ln_bucket').value;};
   $('linkDlg').showModal();setTimeout(()=>$('ln_name').focus(),50);
 }
 async function saveLink(event){
   event.preventDefault();setInlineError('linkError');
   try{
-    await api('POST','/api/replication',{name:$('ln_name').value,local_bucket:$('ln_bucket').value,peer_endpoint:$('ln_endpoint').value,peer_bucket:$('ln_peer_bucket').value||$('ln_bucket').value,access_key:$('ln_ak').value,secret_key:$('ln_sk').value,mode:$('ln_mode').value,prefix:$('ln_prefix').value});
-    if($('ln_ro').checked)await api('PUT','/api/buckets/'+encodeURIComponent($('ln_bucket').value)+'/read-only',{read_only:true});
-    $('linkDlg').close();toast('Replication link created',$('ln_name').value+($('ln_ro').checked?' · bucket is now read-only':''));await loadLinks();
+    await api('POST','/api/replication',{name:$('ln_name').value,local_bucket:$('ln_bucket').value,peer_endpoint:$('ln_endpoint').value,peer_bucket:$('ln_peer_bucket').value||$('ln_bucket').value,access_key:$('ln_ak').value,secret_key:$('ln_sk').value,mode:$('ln_mode').value,prefix:$('ln_mode').value==='mirror'?'':$('ln_prefix').value,make_read_only:$('ln_mode').value==='mirror'});
+    $('linkDlg').close();toast('Replication link created',$('ln_name').value+($('ln_mode').value==='mirror'?' · the bucket is now a read-only replica':''));await loadLinks();if(typeof loadBuckets==='function')loadBuckets(true);
   }catch(e){setInlineError('linkError',e.message);}
 }
 async function linkAction(i,action){
