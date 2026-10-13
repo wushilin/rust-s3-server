@@ -1095,6 +1095,44 @@ async fn changelog_reads_need_their_own_action() {
 }
 
 #[tokio::test]
+async fn x_rs3_headers_must_be_signed() {
+    // A stamp decides which version of an object wins, so like every
+    // x-amz-* header it is only honoured when the signature covers it.
+    let h = Harness::new().await;
+    h.seed("data", &[]).await;
+    let replicator = h.user("replicator").await;
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:PutObject", "s3:ReplicateWrite"], "data")))
+        .await
+        .unwrap();
+    let stamp_value = format!("{}.0.site-a", crate::storage::time::now_ms() + 60_000);
+    let stamp = [("x-rs3-stamp", stamp_value.as_str())];
+    let (status, _) = h.s3_full(&replicator, "PUT", "/data/k", "", &stamp, b"x").await;
+    assert_eq!(status, StatusCode::OK, "signed: accepted");
+
+    // The same request with the stamp added after signing.
+    let datetime = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let auth = super::auth::compute_auth_header_with_headers(
+        "PUT", "/data/k2", "", HOST, &replicator.ak, &replicator.sk, REGION, &datetime, &[],
+    );
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/data/k2")
+        .header("host", HOST)
+        .header("x-amz-date", &datetime)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .header("authorization", auth)
+        .header("x-rs3-stamp", stamp_value.as_str())
+        .body(Body::from(&b"x"[..]))
+        .unwrap();
+    let response = h.s3.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = String::from_utf8_lossy(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).into_owned();
+    assert!(body.contains("not signed"), "{body}");
+    assert_eq!(h.get(&root_cred(), "/data/k2").await, StatusCode::NOT_FOUND, "nothing written");
+}
+
+#[tokio::test]
 async fn setting_a_version_stamp_needs_replicate_write() {
     // A stamp decides last-writer-wins conflicts, so carrying one is a
     // privilege of replication credentials, on top of the write itself.

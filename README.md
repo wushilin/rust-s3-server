@@ -320,7 +320,7 @@ batch/grace settings.
 | `changelog.retention_days` | `14` | Changelog entries older than this are trimmed, whether or not every subscription has read them. |
 | `changelog.trim_interval_secs` | `600` | How often the trim and the tombstone purge run. |
 | `replication.check_interval_secs` | `5` | Supervisor tick: an enabled replication link without a live worker gets one within this. |
-| `replication.worker_stale_secs` | `300` | A link worker silent for this long is replaced. |
+| `replication.worker_stale_secs` | `600` | A link worker silent for this long is replaced. A worker renews its lease while it makes progress (every chunk of a transfer counts, renewed at most every 5s), so a slow transfer of a large object is never mistaken for a hang. |
 | `replication.parallelism` | `8` | Changes a link applies concurrently within one batch. |
 | `changelog.tombstone_days` | `14` | How long a delete's tombstone (its stamp) is kept, so an older replicated write cannot bring the object back. |
 | `webhooks.check_interval_secs` | `5` | Checker tick: muted webhooks whose mute has passed resume on the next tick. |
@@ -660,6 +660,9 @@ how a replica keeps the origin's stamp.
 - **Permission.** Setting a stamp decides conflicts, so it requires the custom
   IAM action `s3:ReplicateWrite` on the object, in addition to the write or
   delete permission. Stamps more than 10 minutes in the future are refused.
+  Like every `x-amz-*` header, an `x-rs3-*` header must be covered by the
+  request's signature (`403` otherwise): a stamp decides which version wins,
+  so it is never taken from an unsigned header.
 - Local (unstamped) writes and deletes are never conditional, and always
   outrank every state the site has seen.
 
@@ -802,12 +805,17 @@ Operation:
   it describes, and is carried across index rebuilds.
 - **Re-snapshot triggers:** a link re-snapshots on its own when the peer's
   changelog no longer has its position (`410`), when the peer's log was
-  replaced, or when its checkpoint is older than the tombstone retention.
+  replaced, or when its checkpoint is older than the tombstone retention
+  while it is behind (a caught-up link refreshes its checkpoint as it idles,
+  so a quiet bucket is never re-walked for nothing).
 - **Supervision:** a supervisor checks every `replication.check_interval_secs`
   (5s) and starts a worker for every enabled link that lacks one, for example
   after a crash or a restart. It replaces a worker that has been silent for
-  `replication.worker_stale_secs` (300s), and never runs two workers for one
-  link.
+  `replication.worker_stale_secs` (600s), and never runs two workers for one
+  link. A worker renews its lease while it makes progress (every chunk of a
+  transfer) and while a request to the peer is pending (such a wait is
+  bounded by the client's timeouts), so only a worker stuck where no timeout
+  applies is ever replaced.
 - **Safety:**
   - A link whose peer reports this server's own site id (a copied data
     directory) stops with an error.

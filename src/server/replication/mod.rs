@@ -112,6 +112,8 @@ pub struct Timing {
     pub long_poll: Duration,
     /// Changes a link applies concurrently within a batch.
     pub parallelism: usize,
+    /// A transfer in progress renews the worker's lease this often.
+    pub lease_renew: Duration,
 }
 
 impl Default for Timing {
@@ -122,6 +124,7 @@ impl Default for Timing {
             max_checkpoint_age: Duration::from_secs(14 * 86_400),
             long_poll: Duration::from_secs(20),
             parallelism: 8,
+            lease_renew: Duration::from_secs(5),
         }
     }
 }
@@ -475,10 +478,12 @@ impl ReplicationService {
             links.values().find_map(|rt| {
                 let rt = rt.lock().unwrap();
                 let link = &rt.link;
+                // The persisted peer id, so a restart answers right away; a
+                // link created unchecked knows its peer from its first step.
                 let paired = link.mode == Mode::Merge
                     && link.local_bucket == bucket
                     && link.peer_bucket == peer_bucket
-                    && rt.status.lock().unwrap().peer_site.as_deref() == Some(site.as_str());
+                    && (link.peer_site_id == site || rt.status.lock().unwrap().peer_site.as_deref() == Some(site.as_str()));
                 paired.then(|| peer::MergeBack { link: link.id.clone(), name: link.name.clone() }.to_header())
             })
         })));
@@ -565,6 +570,7 @@ impl ReplicationService {
                     parallelism: self.inner.timing.parallelism,
                     local_check: self.local_check(&rt.link),
                     bind_peer: self.bind_peer(&rt.link.id),
+                    lease_renew: self.inner.timing.lease_renew,
                 };
                 rt.worker = Some((cancel, tokio::spawn(worker.run())));
             }
@@ -592,6 +598,7 @@ impl ReplicationService {
                     long_poll: self.inner.timing.long_poll,
                     parallelism: self.inner.timing.parallelism,
                     local_check: self.local_check(&rt.link),
+                    lease_renew: self.inner.timing.lease_renew,
                 };
                 rt.pusher = Some((cancel, tokio::spawn(pusher.run())));
             }
@@ -613,6 +620,10 @@ impl ReplicationService {
                     return;
                 }
                 rt.link.peer_site_id = site.clone();
+                // The running workers hold the unbound copy: stop them, the
+                // supervisor restarts them with the bound link (the step in
+                // flight has nothing checkpointed yet).
+                rt.stop();
                 rt.link.clone()
             };
             let db = inner.db.clone();
@@ -1054,6 +1065,7 @@ impl ReplicationService {
                 parallelism: 1,
                 local_check: self.local_check(&link),
                 bind_peer: Arc::new(|_| {}),
+                lease_renew: self.inner.timing.lease_renew,
             };
             if let Err(err) = check_local(&self.inner.local_auth, &link) {
                 notes.push(format!("{}: {err}", link.name));

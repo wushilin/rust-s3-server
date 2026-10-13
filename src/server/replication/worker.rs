@@ -48,6 +48,45 @@ pub(super) struct Worker {
     /// Records the peer's site id on a link that has none yet (created
     /// without the check): its first contact binds it.
     pub bind_peer: BindPeer,
+    /// How often a transfer in progress renews the lease (the heartbeat):
+    /// every chunk counts as progress, the renewal is throttled to this.
+    pub lease_renew: Duration,
+}
+
+/// Renews `heartbeat` (the worker's lease) if `renew` has passed since it
+/// was last renewed. Called per chunk of a transfer, so a worker busy
+/// moving one large object is never mistaken for a hung one, while a
+/// worker that stalls (no chunk for `stale_after`) still is.
+pub(super) fn renew_lease(heartbeat: &AtomicI64, renew: Duration) {
+    let now = now_ms();
+    if now - heartbeat.load(Ordering::Relaxed) >= renew.as_millis() as i64 {
+        heartbeat.store(now, Ordering::SeqCst);
+    }
+}
+
+/// Awaits a request to the peer, renewing `heartbeat` every `renew` while it
+/// is pending. Such a wait is bounded by the client's timeouts (connect,
+/// read), so it is not a hang — and there may be nothing else to observe:
+/// a pushed body can sit in socket buffers, consumed from our side in an
+/// instant, while the peer takes a while to receive and answer it. The
+/// stale guard is for a worker stuck where no timeout applies.
+pub(super) async fn alive<T>(heartbeat: &AtomicI64, renew: Duration, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::pin!(fut);
+    let mut tick = tokio::time::interval(renew.max(Duration::from_millis(50)));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = tick.tick() => heartbeat.store(now_ms(), Ordering::SeqCst),
+        }
+    }
+}
+
+/// A caught-up link refreshes its checkpoint this often, so an idle link
+/// does not age past the tombstone retention and re-snapshot for nothing
+/// (the age guard is for a reader that is behind).
+pub(super) fn refresh_after_ms(max_checkpoint_age_ms: i64) -> i64 {
+    (max_checkpoint_age_ms / 4).min(3_600_000).max(1)
 }
 
 pub(super) type LocalCheck = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
@@ -119,6 +158,11 @@ impl Worker {
 
     fn update(&self, f: impl FnOnce(&mut LinkStatus)) {
         f(&mut self.status.lock().unwrap());
+    }
+
+    /// A request to the peer, the lease renewed while it is pending.
+    async fn alive<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
+        alive(&self.heartbeat, self.lease_renew, fut).await
     }
 
     /// Runs until cancelled or a fatal error.
@@ -353,7 +397,8 @@ impl Worker {
                     s.peer_head = Some(page.head);
                     s.last_progress_ms = now_ms();
                 });
-                if page.next != after {
+                let idle_too_long = now_ms() - checkpoint.saved_at_ms > refresh_after_ms(self.max_checkpoint_age_ms);
+                if page.next != after || idle_too_long {
                     self.save(Some(&checkpoint)).await?;
                 }
                 Ok(())
@@ -539,7 +584,7 @@ impl Worker {
             // Same bytes here already: adopt the peer's metadata and stamp
             // without moving data.
             let _ = local;
-            let headers = self.peer.head(key, &event.version).await.map_err(PutError::Peer)?;
+            let headers = self.alive(self.peer.head(key, &event.version)).await.map_err(PutError::Peer)?;
             self.store
                 .copy_object_with_metadata(
                     bucket,
@@ -569,7 +614,9 @@ impl Worker {
         match event.parts.as_ref().filter(|layout| layout.multipart) {
             Some(layout) => self.copy_multipart(event, layout, options).await,
             None => {
-                let (headers, stream) = self.peer.body(key, &event.version, None).await.map_err(PutError::Peer)?;
+                use futures::StreamExt;
+                let (headers, stream) = self.alive(self.peer.body(key, &event.version, None)).await.map_err(PutError::Peer)?;
+                let stream = stream.inspect(|_| renew_lease(&self.heartbeat, self.lease_renew));
                 self.store
                     .put_object_stream_with_metadata(
                         bucket,
@@ -606,7 +653,7 @@ impl Worker {
     ) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
         let key = &event.key;
-        let headers = self.peer.head(key, &event.version).await.map_err(PutError::Peer)?;
+        let headers = self.alive(self.peer.head(key, &event.version)).await.map_err(PutError::Peer)?;
         let upload_id = self
             .store
             .initiate_multipart_replicated(
@@ -627,7 +674,9 @@ impl Worker {
                 self.beat();
                 let number = (i + 1) as u16;
                 let range = if size == 0 { None } else { Some((offset, offset + size - 1)) };
-                let (_, stream) = self.peer.body(key, &event.version, range).await.map_err(PutError::Peer)?;
+                use futures::StreamExt;
+                let (_, stream) = self.alive(self.peer.body(key, &event.version, range)).await.map_err(PutError::Peer)?;
+                let stream = stream.inspect(|_| renew_lease(&self.heartbeat, self.lease_renew));
                 let put = self
                     .store
                     .put_multipart_part_stream(bucket, key, &upload_id, number, stream, false, None, None)

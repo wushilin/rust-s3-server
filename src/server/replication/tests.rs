@@ -37,6 +37,7 @@ fn fast_timing() -> Timing {
         max_checkpoint_age: Duration::from_secs(14 * 86_400),
         long_poll: Duration::from_secs(1),
         parallelism: 8,
+        lease_renew: Duration::from_millis(200),
     }
 }
 
@@ -132,6 +133,11 @@ impl Site {
 
     /// Stops this site and starts it again on the same data.
     async fn restart(self) -> Self {
+        self.stop().await.start().await
+    }
+
+    /// Stops this site (its data and address are kept for [`Stopped::start`]).
+    async fn stop(self) -> Stopped {
         self.shutdown.cancel();
         // As the real server does: the store's token is the process one, and
         // it ends long polls so the shutdown is not held up.
@@ -140,8 +146,7 @@ impl Site {
         let Site { tmp, name, store, iam, notify, replication, endpoint, .. } = self;
         drop((store, iam, notify, replication));
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let bind = endpoint.trim_start_matches("http://").to_string();
-        Self::open(tmp, &name, fast_timing(), &bind).await
+        Stopped { tmp, name, endpoint }
     }
 
     /// A link on this site pulling `bucket` from `peer`.
@@ -266,6 +271,54 @@ impl Site {
     }
 }
 
+
+/// A stopped site: start it again on the same data and address.
+struct Stopped {
+    tmp: tempfile::TempDir,
+    name: String,
+    endpoint: String,
+}
+
+impl Stopped {
+    async fn start(self) -> Site {
+        let bind = self.endpoint.trim_start_matches("http://").to_string();
+        Site::open(self.tmp, &self.name, fast_timing(), &bind).await
+    }
+}
+
+/// A TCP proxy to `target` (`host:port`) that limits both directions to
+/// about `bytes_per_sec`: a slow network between two sites.
+async fn throttled_proxy(target: String, bytes_per_sec: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn pump(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, bytes_per_sec: usize) {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match from.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if to.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis((n as u64 * 1000 / bytes_per_sec as u64).max(1))).await;
+        }
+        let _ = to.shutdown().await;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let target = target.clone();
+            tokio::spawn(async move {
+                let Ok(upstream) = tokio::net::TcpStream::connect(&target).await else { return };
+                let (cr, cw) = client.into_split();
+                let (ur, uw) = upstream.into_split();
+                let _ = tokio::join!(tokio::spawn(pump(cr, uw, bytes_per_sec)), tokio::spawn(pump(ur, cw, bytes_per_sec)));
+            });
+        }
+    });
+    endpoint
+}
 
 async fn eventually<F, Fut>(secs: u64, what: &str, mut check: F)
 where
@@ -577,9 +630,100 @@ async fn an_unchecked_link_binds_the_peer_site_id_on_first_contact() {
         async move { view.peer_site_id == "site-a" }
     })
     .await;
+    // The running link holds the bound id (not the unbound copy it started
+    // with): another site answering at the endpoint stops it.
+    let a = a.replace_with_fresh("site-c").await;
+    a.store.create_bucket("data").await.unwrap();
+    eventually(30, "stopped on another site", || {
+        let view = b.link(&id);
+        async move { view.status.site_changed.as_deref().is_some_and(|c| c.contains("from site-a to site-c")) }
+    })
+    .await;
     // Persisted: still bound after a restart.
     let b = b.restart().await;
     assert_eq!(b.link(&id).peer_site_id, "site-a");
+}
+
+#[tokio::test]
+async fn a_slow_transfer_of_a_large_object_is_not_mistaken_for_a_hung_worker() {
+    // A 2 MB/s link, an 8 MB object each way (4 s per transfer), and a lease
+    // of 2 s: the worker renews it while the bytes move, so it is never
+    // replaced mid-copy (which would restart the copy forever).
+    let a = Site::start("site-a").await;
+    let b = Site::start_with("site-b", Timing { stale_after: Duration::from_secs(2), ..fast_timing() }).await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let slow = throttled_proxy(a.endpoint.trim_start_matches("http://").to_string(), 2 * 1024 * 1024).await;
+    let id = b
+        .replication
+        .create(LinkRequest { peer_endpoint: slow, ..request("data", &a, Mode::Merge, "", false) }, "t")
+        .await
+        .unwrap()
+        .id;
+    let big = vec![7u8; 8 * 1024 * 1024];
+    a.put("data", "big-from-a", &big).await;
+    b.put("data", "big-from-b", &big).await;
+    // Also a multipart one: the renewal must cover every part.
+    a.multipart("data", "parts-from-a", &[vec![1u8; MIB], vec![2u8; MIB]]).await;
+    eventually(90, "both large objects crossed the slow link", || same(&a, &b, "data")).await;
+    let view = b.link(&id);
+    assert_eq!(view.status.restarts, 0, "never replaced while transferring: {:?}", view.status);
+    assert!(view.status.last_error.is_none(), "{:?}", view.status);
+}
+
+#[tokio::test]
+async fn an_idle_link_refreshes_its_checkpoint_instead_of_re_snapshotting() {
+    let a = Site::start("site-a").await;
+    let b = Site::start_with("site-b", Timing { max_checkpoint_age: Duration::from_secs(3), ..fast_timing() }).await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "k", b"v").await;
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "live both ways", || {
+        let view = b.link(&id);
+        async move { view.status.state == "live" && view.status.push.as_ref().is_some_and(|p| p.state == "live") }
+    })
+    .await;
+    let before = b.link(&id).status;
+    let saved = checkpoint_of(&b, "data", &id).await.unwrap().saved_at_ms;
+    // Quiet for longer than the retention: nothing to re-walk.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let after = b.link(&id).status;
+    assert_eq!((after.skipped, after.push.as_ref().unwrap().skipped), (before.skipped, before.push.as_ref().unwrap().skipped), "no re-snapshot: {after:?}");
+    assert_eq!((after.state.as_str(), after.last_error.as_deref()), ("live", None), "{after:?}");
+    assert!(checkpoint_of(&b, "data", &id).await.unwrap().saved_at_ms > saved, "the checkpoint was refreshed");
+}
+
+#[tokio::test]
+async fn a_push_error_clears_once_the_peer_is_back_even_on_a_quiet_bucket() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "live", || {
+        let view = b.link(&id);
+        async move { view.status.push.as_ref().is_some_and(|p| p.state == "live") }
+    })
+    .await;
+    let stopped = a.stop().await;
+    b.put("data", "during-the-outage", b"x").await;
+    eventually(30, "the push reports the outage", || {
+        let view = b.link(&id);
+        async move { view.status.push.as_ref().is_some_and(|p| p.last_error.is_some()) }
+    })
+    .await;
+    let a = stopped.start().await;
+    // No further local writes: the error must still clear.
+    eventually(30, "cleared", || {
+        let view = b.link(&id);
+        async move { view.status.push.as_ref().is_some_and(|p| p.last_error.is_none()) }
+    })
+    .await;
+    eventually(30, "delivered", || same(&a, &b, "data")).await;
 }
 
 #[tokio::test]
@@ -1431,6 +1575,7 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
         parallelism: 4,
         local_check: Arc::new(|| Ok(())),
         bind_peer: Arc::new(|_| {}),
+        lease_renew: Duration::from_secs(5),
     };
     let w = worker(&b);
     // Applying the stale v1 event: the peer answers 412 to the pinned reads,

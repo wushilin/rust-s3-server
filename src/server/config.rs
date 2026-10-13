@@ -380,7 +380,10 @@ fn default_replication_check_interval_secs() -> u64 {
     5
 }
 fn default_replication_stale_secs() -> u64 {
-    300
+    // A worker renews its lease on every chunk it moves (throttled to 5s),
+    // so only a real hang goes this long without one; generous so a slow
+    // peer never looks hung.
+    600
 }
 fn default_replication_parallelism() -> usize {
     8

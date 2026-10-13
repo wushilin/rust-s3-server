@@ -326,10 +326,11 @@ impl PeerClient {
 
     async fn json<T: serde::de::DeserializeOwned>(&self, query: &str, timeout: Duration) -> Result<T, PeerError> {
         let path = format!("/{}", encode_segment(&self.config.bucket));
-        let mut request = self.signed(Method::GET, &path, query, &[]).timeout(timeout);
-        if let Some(replicator) = &self.config.replicator {
-            request = request.header(HEADER_REPLICATOR, (replicator.0)());
-        }
+        // Signed with the request (the peer requires every x-rs3-* header to
+        // be).
+        let replicator = self.config.replicator.as_ref().map(|r| (r.0)());
+        let extra: Vec<(&str, &str)> = replicator.iter().map(|r| (HEADER_REPLICATOR, r.as_str())).collect();
+        let request = self.signed(Method::GET, &path, query, &extra).timeout(timeout);
         let response = request
             .send()
             .await
@@ -522,7 +523,24 @@ impl PeerClient {
         headers
     }
 
+    /// The raw user-metadata values. [`meta_headers`] folds whitespace for
+    /// the signature (the canonical form); the headers sent carry the
+    /// values as stored, so the peer stores exactly them.
+    fn raw_meta(meta: &ObjectHeaders) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in &meta.user_meta {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                map.insert(name, value);
+            }
+        }
+        map
+    }
+
     fn with_content_headers(mut builder: reqwest::RequestBuilder, meta: &ObjectHeaders) -> reqwest::RequestBuilder {
+        builder = builder.headers(Self::raw_meta(meta));
         if let Some(v) = &meta.content_type {
             builder = builder.header("content-type", v);
         }

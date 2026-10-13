@@ -1207,6 +1207,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             max_checkpoint_age: std::time::Duration::from_secs(config.app_config.changelog.tombstone_days.max(1) * 86_400),
             long_poll: std::time::Duration::from_secs(20),
             parallelism: config.app_config.replication.parallelism.clamp(1, 256),
+            lease_renew: std::time::Duration::from_secs(5),
         },
         shutdown.clone(),
     )

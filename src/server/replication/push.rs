@@ -43,6 +43,7 @@ pub(super) struct Pusher {
     pub long_poll: Duration,
     pub parallelism: usize,
     pub local_check: super::worker::LocalCheck,
+    pub lease_renew: Duration,
 }
 
 impl From<ReadError> for StepError {
@@ -63,6 +64,11 @@ impl Pusher {
 
     fn update(&self, f: impl FnOnce(&mut PushStatus)) {
         f(self.status.lock().unwrap().push.get_or_insert_with(PushStatus::default));
+    }
+
+    /// A request to the peer, the lease renewed while it is pending.
+    async fn alive<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
+        super::worker::alive(&self.heartbeat, self.lease_renew, fut).await
     }
 
     fn record_error(&self, reason: &str) {
@@ -160,6 +166,7 @@ impl Pusher {
 
     async fn step(&self) -> Result<(), StepError> {
         if let Some(changed) = super::worker::local_site_changed(&self.link, &self.store.site_id()) {
+            self.status.lock().unwrap().site_changed = Some(changed.clone());
             return Err(StepError::Fatal(changed));
         }
         (self.local_check)().map_err(StepError::Retry)?;
@@ -181,7 +188,7 @@ impl Pusher {
         };
         let Some(mut checkpoint) = checkpoint else {
             // Start: learn who the peer is, then list from the local head.
-            let probe = self.peer.snapshot(None, 1, "", false).await?;
+            let probe = self.alive(self.peer.snapshot(None, 1, "", false)).await?;
             self.peer_answered();
             if let Some(changed) = super::worker::peer_site_changed(&self.link, &probe.site_id) {
                 return Err(StepError::Fatal(changed));
@@ -234,6 +241,14 @@ impl Pusher {
                     s.position = Some(after);
                     s.snapshot_cursor = None;
                 });
+                // After an error, confirm the peer is back before the long
+                // poll on local changes: a quiet bucket would otherwise show
+                // the error until its next write.
+                let recovering = self.status.lock().unwrap().push.as_ref().is_some_and(|p| p.last_error.is_some());
+                if recovering {
+                    self.peer.access().await?;
+                    self.peer_answered();
+                }
                 let params = ReadParams {
                     after,
                     limit: CHANGES_PAGE,
@@ -260,7 +275,9 @@ impl Pusher {
                     s.local_head = Some(page.head);
                     s.last_progress_ms = now_ms();
                 });
-                if page.next != after {
+                let idle_too_long =
+                    now_ms() - checkpoint.saved_at_ms > super::worker::refresh_after_ms(self.max_checkpoint_age_ms);
+                if page.next != after || idle_too_long {
                     self.save(Some(&checkpoint)).await?;
                 }
                 Ok(())
@@ -305,7 +322,7 @@ impl Pusher {
         }
         let removed = event.removed_stamp.clone().unwrap_or_else(|| stamp.clone());
         let incoming = if is_delete { Rank::deleted(removed.clone()) } else { Rank::live(stamp.clone()) };
-        let remote = self.peer.state(&event.key).await.map_err(StepError::from)?;
+        let remote = self.alive(self.peer.state(&event.key)).await.map_err(StepError::from)?;
         // Still the site the link was made with? Checked before every write.
         if let Some(changed) = self.peer.last_site().and_then(|site| super::worker::peer_site_changed(&self.link, &site)) {
             self.status.lock().unwrap().site_changed = Some(changed.clone());
@@ -316,8 +333,7 @@ impl Pusher {
             return Ok(());
         }
         let result = if is_delete {
-            self.peer
-                .delete(&event.key, &stamp, &removed)
+            self.alive(self.peer.delete(&event.key, &stamp, &removed))
                 .await
                 .map(|()| self.update(|s| s.deleted += 1))
         } else {
@@ -367,14 +383,17 @@ impl Pusher {
             size: object.meta.size,
         };
         if remote.is_some_and(|r| r.etag == object.meta.etag && r.size == object.meta.size) {
-            self.peer.copy_metadata(key, &meta, stamp).await.map_err(PushError::Peer)?;
+            self.alive(self.peer.copy_metadata(key, &meta, stamp)).await.map_err(PushError::Peer)?;
             self.update(|s| s.metadata_only += 1);
             return Ok(());
         }
         let size = object.meta.size;
         let body = |start: u64, len: u64| {
             let object = &object;
+            let heartbeat = self.heartbeat.clone();
+            let renew = self.lease_renew;
             async move {
+                use futures::StreamExt;
                 let body = crate::server::handlers::get_object::stream_object_range(
                     &object.meta,
                     &object.part_offsets,
@@ -384,31 +403,30 @@ impl Pusher {
                 )
                 .await
                 .map_err(PushError::Local)?;
-                Ok::<_, PushError>(reqwest::Body::wrap_stream(body.into_data_stream()))
+                let stream = body.into_data_stream().inspect(move |_| super::worker::renew_lease(&heartbeat, renew));
+                Ok::<_, PushError>(reqwest::Body::wrap_stream(stream))
             }
         };
         match event.parts.as_ref().filter(|layout| layout.multipart) {
             None => {
-                self.peer.put(key, &meta, stamp, size, body(0, size).await?).await.map_err(PushError::Peer)?;
+                self.alive(self.peer.put(key, &meta, stamp, size, body(0, size).await?)).await.map_err(PushError::Peer)?;
             }
             Some(layout) => {
-                let upload_id = self.peer.create_multipart(key, &meta).await.map_err(PushError::Peer)?;
+                let upload_id = self.alive(self.peer.create_multipart(key, &meta)).await.map_err(PushError::Peer)?;
                 let result: Result<(), PushError> = async {
                     let mut etags = Vec::new();
                     let mut offset = 0u64;
                     for (i, len) in layout.part_sizes(size).into_iter().enumerate() {
                         self.beat();
                         let etag = self
-                            .peer
-                            .upload_part(key, &upload_id, (i + 1) as u16, len, body(offset, len).await?)
+                            .alive(self.peer.upload_part(key, &upload_id, (i + 1) as u16, len, body(offset, len).await?))
                             .await
                             .map_err(PushError::Peer)?;
                         etags.push(etag);
                         offset += len;
                     }
                     let etag = self
-                        .peer
-                        .complete_multipart(key, &upload_id, &etags, stamp)
+                        .alive(self.peer.complete_multipart(key, &upload_id, &etags, stamp))
                         .await
                         .map_err(PushError::Peer)?;
                     if etag != object.meta.etag {
@@ -422,7 +440,7 @@ impl Pusher {
                 }
                 .await;
                 if result.is_err() {
-                    self.peer.abort_multipart(key, &upload_id).await;
+                    self.alive(self.peer.abort_multipart(key, &upload_id)).await;
                 }
                 result?;
             }
