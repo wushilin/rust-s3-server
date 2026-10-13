@@ -187,13 +187,13 @@
           <div id="subEmpty" class="empty hidden"></div>
         </div>
         <div class="panel" style="margin-top:18px">
-          <div class="panel-title"><div><h3>Replication links</h3><p>Replicate a whole bucket with another rusts3 site. <b>Mirror</b> copies the remote bucket into a read-only local one (remote wins); <b>merge</b> syncs both ways, newer wins — one link, on either site, serves the pair. This site's id: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
-          <div class="table-wrap"><table><thead><tr><th>Link</th><th>Local ↔ peer</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
+          <div class="panel-title"><div><h3>Replication links</h3><p>Replicate a whole bucket with another rusts3 site. <b>Mirror</b> (this ⟵ peer) copies the peer's bucket into a read-only one here, remote wins. <b>Merge</b> (this ⟷ peer) syncs both ways, newer wins; one link, on either site, serves the pair. This site's id: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Link</th><th>Direction</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
           <div id="linkEmpty" class="empty hidden"></div>
           <div id="incomingWrap" class="hidden" style="margin-top:14px">
             <h4 style="margin:0 0 6px">Managed on other sites</h4>
             <p class="muted" style="font-size:12px;margin:0 0 8px">Links configured on a peer that replicate this site's buckets (seen in the last 5 minutes). Change them on that site.</p>
-            <div class="table-wrap"><table><thead><tr><th>Bucket here</th><th>Peer site / bucket</th><th>Link</th><th>Mode</th><th>Last seen</th></tr></thead><tbody id="incomingRows"></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th>Link</th><th>Direction</th><th>Last seen</th></tr></thead><tbody id="incomingRows"></tbody></table></div>
           </div>
         </div>
       </section>
@@ -449,18 +449,25 @@
 
 <dialog id="linkDlg">
   <form onsubmit="saveLink(event)">
-    <div class="dialog-head"><div><h3>New replication link</h3><p>Runs on this site. The peer key needs s3:GetObject and s3:GetBucketChangelog on the peer bucket; a merge link also writes it: s3:PutObject, s3:DeleteObject and s3:ReplicateWrite.</p></div><button type="button" class="dialog-close" onclick="linkDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-head"><div><h3>New replication link</h3><p>This site runs the link; nothing is configured on the peer. It acts as two keys: a key on this site for what it does here, and a key on the peer for what it does there.</p></div><button type="button" class="dialog-close" onclick="linkDlg.close()"><span data-icon="x"></span></button></div>
     <div class="dialog-body">
-      <div class="field"><label for="ln_name">Name</label><input class="input" id="ln_name" placeholder="e.g. sg-to-jp" autocomplete="off"></div>
-      <div class="field"><label for="ln_bucket">Local bucket</label><select class="input" id="ln_bucket"></select></div>
+      <div class="field"><label>Mode</label>
+        <div class="mode-cards">
+          <label class="mode-card"><input type="radio" name="ln_mode" value="mirror" onchange="linkModeChanged()"><strong>Mirror</strong><div class="rflow"><div class="rend here"><small>this site</small><code>bucket</code></div><div class="rarrow">⟵</div><div class="rend"><small>peer</small><code>bucket</code></div></div><span>One way. This bucket becomes a read-only copy of the peer's (remote wins).</span></label>
+          <label class="mode-card"><input type="radio" name="ln_mode" value="merge" onchange="linkModeChanged()"><strong>Merge</strong><div class="rflow"><div class="rend here"><small>this site</small><code>bucket</code></div><div class="rarrow">⟷</div><div class="rend"><small>peer</small><code>bucket</code></div></div><span>Both ways, newer wins. This site pulls the peer's changes and pushes its own.</span></label>
+        </div>
+      </div>
+      <div class="field"><label for="ln_name">Name</label><input class="input" id="ln_name" placeholder="e.g. sg-jp-photos" autocomplete="off"></div>
+      <div class="field"><label for="ln_bucket">This site's bucket</label><select class="input" id="ln_bucket"></select></div>
+      <div class="field"><label for="ln_local_key">This site's key</label><select class="input" id="ln_local_key"></select><span class="muted" style="font-size:11.5px">The link acts as this key here: its policy decides what the link may do to the bucket. No secret is needed.</span></div>
       <div class="field"><label for="ln_endpoint">Peer S3 endpoint</label><input class="input" id="ln_endpoint" placeholder="https://s3.other-site.example.com" autocomplete="off"></div>
       <div class="field"><label for="ln_peer_bucket">Peer bucket</label><input class="input" id="ln_peer_bucket" autocomplete="off"></div>
       <div class="field"><label for="ln_ak">Peer access key</label><input class="input" id="ln_ak" autocomplete="off"></div>
       <div class="field"><label for="ln_sk">Peer secret key</label><input class="input" id="ln_sk" type="password" autocomplete="new-password"></div>
-      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode" onchange="$('ln_mode_note').textContent=this.value==='mirror'?MIRROR_NOTE:MERGE_NOTE"><option value="mirror">Mirror — replicate remote to local (remote wins)</option><option value="merge">Merge — sync both ways, newer wins</option></select><span class="muted" style="font-size:11.5px" id="ln_mode_note"></span></div>
+      <div class="perm-box" id="ln_perms"></div>
       <div id="linkError" class="inline-error"></div>
     </div>
-    <div class="dialog-actions"><button type="button" class="btn" onclick="linkDlg.close()">Cancel</button><button class="btn primary" type="submit">Create link</button></div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="linkDlg.close()">Cancel</button><button class="btn primary" type="submit" id="ln_submit">Check and create</button></div>
   </form>
 </dialog>
 

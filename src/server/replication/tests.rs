@@ -66,15 +66,20 @@ impl Site {
         )
         .await
         .unwrap();
-        let replication = ReplicationService::start(store.clone(), db::LinkDb::new(iam.admin_db()), timing, shutdown.clone())
-            .await
-            .unwrap();
         let mut config = AppConfig::default();
         config.auth.enabled = true;
         config.auth.credentials.push(Credential {
             access_key: AK.to_string(),
             secret_key: SK.to_string(),
         });
+        let local_auth = {
+            let auth = crate::server::auth::AuthState { config: Arc::new(config.clone()), iam: Some(iam.clone()), usage: None };
+            LocalAuth(Arc::new(move |key| auth.identity_of_key(key)))
+        };
+        let replication =
+            ReplicationService::start(store.clone(), db::LinkDb::new(iam.admin_db()), local_auth, timing, shutdown.clone())
+                .await
+                .unwrap();
         let app = crate::server::router_with_notify(
             store.clone(),
             crate::server::auth::AuthState {
@@ -139,6 +144,12 @@ impl Site {
     }
 
     async fn pull_with(&self, peer: &Site, bucket: &str, mode: Mode, ak: &str, sk: &str) -> String {
+        self.link_with(peer, bucket, mode, ak, sk, true).await.unwrap()
+    }
+
+    /// A link here with `bucket` on `peer`, with the peer key `ak`/`sk`;
+    /// `verify: false` skips the creation-time permission check.
+    async fn link_with(&self, peer: &Site, bucket: &str, mode: Mode, ak: &str, sk: &str, verify: bool) -> Result<String, LinkError> {
         self.replication
             .create(
                 LinkRequest {
@@ -148,17 +159,18 @@ impl Site {
                     peer_bucket: bucket.to_string(),
                     access_key: ak.to_string(),
                     secret_key: sk.to_string(),
+                    local_access_key: AK.to_string(),
                     region: None,
                     mode,
                     prefix: None,
                     enabled: true,
                     make_read_only: mode == Mode::Mirror,
+                    verify,
                 },
                 "tester",
             )
             .await
-            .unwrap()
-            .id
+            .map(|view| view.id)
     }
 
     async fn put(&self, bucket: &str, key: &str, body: &[u8]) {
@@ -396,9 +408,13 @@ async fn a_merge_link_needs_write_and_replicate_write_on_the_peer() {
     }
     a.put("data", "from-a", b"a").await;
     b.put("data", "from-b", b"b").await;
-    // Without s3:ReplicateWrite the pull works and the push reports why not.
+    // Without s3:ReplicateWrite the link is refused up front, saying so...
     let (ak, sk) = key_with(&a, "no-stamps", &["s3:GetObject", "s3:GetBucketChangelog", "s3:PutObject", "s3:DeleteObject"]).await;
-    let id = b.pull_with(&a, "data", Mode::Merge, &ak, &sk).await;
+    let refused = b.link_with(&a, "data", Mode::Merge, &ak, &sk, true).await.unwrap_err().to_string();
+    assert!(refused.contains("lacks s3:ReplicateWrite"), "{refused}");
+    // ...and if permissions shrink later, the pull works and the push
+    // reports why not.
+    let id = b.link_with(&a, "data", Mode::Merge, &ak, &sk, false).await.unwrap();
     eventually(30, "the push error shows", || {
         let view = b.link(&id);
         async move { view.status.push.and_then(|p| p.last_error).is_some_and(|e| e.contains("ReplicateWrite")) }
@@ -459,7 +475,16 @@ async fn merge_links_on_both_sites_one_stands_down() {
         site.store.create_bucket("data").await.unwrap();
     }
     let on_a = a.pull_from(&b, "data", Mode::Merge).await;
-    let on_b = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "a's link is live", || {
+        let view = a.link(&on_a);
+        async move { view.status.state == "live" }
+    })
+    .await;
+    // Creating the second one is refused: a's link already serves the pair.
+    let refused = b.link_with(&a, "data", Mode::Merge, AK, SK, true).await.unwrap_err().to_string();
+    assert!(refused.contains("already merges") && refused.contains(&on_a), "{refused}");
+    // One configured anyway (say, while a was down) stands down at runtime.
+    let on_b = b.link_with(&a, "data", Mode::Merge, AK, SK, false).await.unwrap();
     // b has the higher site id: its link stands down, a's keeps both ways.
     eventually(30, "b's link stands down", || {
         let view = b.link(&on_b);
@@ -486,6 +511,81 @@ async fn merge_links_on_both_sites_one_stands_down() {
     a.put("data", "z", b"after restart").await;
     eventually(30, "converged", || same(&a, &b, "data")).await;
     assert_eq!(a.link(&on_a).status.peer_site.as_deref(), Some("site-b"));
+}
+
+#[tokio::test]
+async fn a_link_is_checked_against_the_peer_before_it_is_created() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    a.store.create_bucket("data").await.unwrap();
+    b.store.create_bucket("data").await.unwrap();
+    let refused = |r: Result<String, LinkError>| r.unwrap_err().to_string();
+    // A wrong secret.
+    let msg = refused(b.link_with(&a, "data", Mode::Merge, AK, "wrong", true).await);
+    assert!(msg.contains("SignatureDoesNotMatch"), "{msg}");
+    // No such bucket on the peer.
+    let msg = refused(
+        b.replication
+            .create(LinkRequest { peer_bucket: "nope".into(), ..request("data", &a, Mode::Merge, "", false) }, "t")
+            .await
+            .map(|v| v.id),
+    );
+    assert!(msg.contains("nope"), "{msg}");
+    // Nobody there.
+    let msg = refused(
+        b.replication
+            .create(LinkRequest { peer_endpoint: "http://127.0.0.1:9".into(), ..request("data", &a, Mode::Merge, "", false) }, "t")
+            .await
+            .map(|v| v.id),
+    );
+    assert!(msg.contains("unreachable"), "{msg}");
+    // A mirror only needs to read.
+    let (ak, sk) = key_with(&a, "reader", &["s3:GetObject", "s3:GetBucketChangelog"]).await;
+    b.store.create_bucket("copy").await.unwrap();
+    let mirror = LinkRequest { access_key: ak.clone(), secret_key: sk.clone(), ..request("copy", &a, Mode::Mirror, "", true) };
+    b.replication.create(mirror, "t").await.unwrap();
+    // A merge also writes: refused with what is missing.
+    let msg = refused(b.link_with(&a, "data", Mode::Merge, &ak, &sk, true).await);
+    assert!(msg.contains("lacks s3:PutObject, s3:DeleteObject, s3:ReplicateWrite"), "{msg}");
+    // The peer being this very server.
+    let msg = refused(b.link_with(&b, "data", Mode::Merge, AK, SK, true).await);
+    assert!(msg.contains("own site id"), "{msg}");
+}
+
+#[tokio::test]
+async fn the_local_side_acts_as_the_links_local_key() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "k", b"v").await;
+    let with_local = |key: &str| LinkRequest { local_access_key: key.to_string(), ..request("data", &a, Mode::Merge, "", false) };
+    // The local key must exist...
+    let msg = b.replication.create(with_local("no-such-key"), "t").await.unwrap_err().to_string();
+    assert!(msg.contains("does not exist"), "{msg}");
+    // ...and may do here what the link does: write (and for a merge, read).
+    let (writer, _) = key_with(&b, "writer", &["s3:PutObject", "s3:DeleteObject", "s3:ReplicateWrite"]).await;
+    let msg = b.replication.create(with_local(&writer), "t").await.unwrap_err().to_string();
+    assert!(msg.contains("lacks s3:GetObject, s3:GetBucketChangelog") && msg.contains("this site"), "{msg}");
+    let (ak, _) = key_with(
+        &b,
+        "local-replicator",
+        &["s3:GetObject", "s3:GetBucketChangelog", "s3:PutObject", "s3:DeleteObject", "s3:ReplicateWrite"],
+    )
+    .await;
+    let id = b.replication.create(with_local(&ak), "t").await.unwrap().id;
+    eventually(30, "replicating as the local key", || same(&a, &b, "data")).await;
+    // Revoking the key's permission stops the link, with the reason.
+    b.iam.set_policy("local-replicator", None).await.unwrap();
+    eventually(10, "stopped by the local policy", || {
+        let view = b.link(&id);
+        async move { view.status.last_error.is_some_and(|e| e.contains("local access key") && e.contains("lacks")) }
+    })
+    .await;
+    a.put("data", "k2", b"v").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!b.contents("data").await.contains_key("k2"));
 }
 
 #[tokio::test]
@@ -520,11 +620,14 @@ async fn least_privilege_credentials_are_enough_to_pull() {
                 peer_bucket: "data".into(),
                 access_key: key.access_key.clone(),
                 secret_key: "wrong".into(),
+                local_access_key: AK.into(),
                 region: None,
                 mode: Mode::Mirror,
                 prefix: None,
                 enabled: true,
                 make_read_only: true,
+                // A runtime error is the point here.
+                verify: false,
             },
             "tester",
         )
@@ -586,11 +689,14 @@ async fn a_crashed_or_hung_worker_is_replaced_by_the_supervisor() {
                 peer_bucket: "data".into(),
                 access_key: AK.into(),
                 secret_key: SK.into(),
+                local_access_key: AK.into(),
                 region: None,
                 mode: Mode::Merge,
                 prefix: None,
                 enabled: true,
                 make_read_only: false,
+                // The peer never answers.
+                verify: false,
             },
             "tester",
         )
@@ -675,7 +781,11 @@ async fn a_cloned_site_is_refused() {
     for site in [&a, &b] {
         site.store.create_bucket("data").await.unwrap();
     }
-    let id = b.pull_from(&a, "data", Mode::Mirror).await;
+    // Refused up front...
+    let msg = b.link_with(&a, "data", Mode::Mirror, AK, SK, true).await.unwrap_err().to_string();
+    assert!(msg.contains("own site id"), "{msg}");
+    // ...and at runtime (the copy happened after the link was made).
+    let id = b.link_with(&a, "data", Mode::Mirror, AK, SK, false).await.unwrap();
     eventually(10, "refused", || {
         let view = b.link(&id);
         async move { view.status.last_error.is_some_and(|e| e.contains("own site id")) }
@@ -834,7 +944,7 @@ async fn restoring_never_rolls_back_silently() {
     put_aged(&a, "data", "k", b"v1", 60_000).await;
     // A key that may read a but not write it: b's changes never reach a.
     let (ak, sk) = key_with(&a, "reader", &["s3:GetObject", "s3:GetBucketChangelog"]).await;
-    b.pull_with(&a, "data", Mode::Merge, &ak, &sk).await;
+    b.link_with(&a, "data", Mode::Merge, &ak, &sk, false).await.unwrap();
     eventually(30, "merged", || same(&a, &b, "data")).await;
     // b writes a newer version that a never gets.
     put_aged(&b, "data", "k", b"v2 only on b", 30_000).await;
@@ -1180,6 +1290,7 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
             peer_bucket: "data".into(),
             access_key: AK.into(),
             secret_key: SK.into(),
+            local_access_key: AK.into(),
             region: "us-east-1".into(),
             mode: Mode::Mirror,
             enabled: true,
@@ -1201,6 +1312,7 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
         max_checkpoint_age_ms: i64::MAX,
         long_poll: Duration::from_secs(1),
         parallelism: 4,
+        local_check: Arc::new(|| Ok(())),
     };
     let w = worker(&b);
     // Applying the stale v1 event: the peer answers 412 to the pinned reads,
@@ -1259,11 +1371,13 @@ fn request(bucket: &str, peer: &Site, mode: Mode, prefix: &str, make_read_only: 
         peer_bucket: "data".into(),
         access_key: AK.into(),
         secret_key: SK.into(),
+        local_access_key: AK.into(),
         region: None,
         mode,
         prefix: (!prefix.is_empty()).then(|| prefix.to_string()),
         enabled: true,
         make_read_only,
+        verify: true,
     }
 }
 
@@ -1329,7 +1443,7 @@ async fn the_last_error_clears_once_the_link_works_again() {
     a.put("data", "k", b"v").await;
     let id = b
         .replication
-        .create(LinkRequest { secret_key: "wrong".into(), ..request("data", &a, Mode::Merge, "", false) }, "t")
+        .create(LinkRequest { secret_key: "wrong".into(), verify: false, ..request("data", &a, Mode::Merge, "", false) }, "t")
         .await
         .unwrap()
         .id;

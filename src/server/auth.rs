@@ -71,6 +71,19 @@ impl AuthState {
         None
     }
 
+    /// The identity an access key acts as, without a request: a config
+    /// credential is root, an IAM key its user (hidden web keys are not
+    /// eligible). For server-side actors that act *as* a key — a
+    /// replication link's local writes.
+    pub fn identity_of_key(&self, access_key: &str) -> Option<super::identity::Identity> {
+        if self.config.find_secret(access_key).is_some() {
+            return Some(super::identity::Identity::root(None, Some(access_key.to_string())));
+        }
+        let iam = self.iam.as_ref()?;
+        let (_, username) = iam.find_key(access_key)?;
+        Some(iam.identity_for(&username))
+    }
+
     /// Stamps `access_key` as used just now. Call only once its signature has
     /// verified, so a request merely *naming* a key never counts as a use.
     /// Hidden `RSWEB_…` console signing keys are never listed, so not tracked.

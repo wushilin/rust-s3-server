@@ -42,7 +42,12 @@ pub(super) struct Worker {
     pub long_poll: Duration,
     /// Changes applied concurrently within a batch.
     pub parallelism: usize,
+    /// The link's local key still exists and may do what the link does
+    /// here (checked every step: revoking it stops the link).
+    pub local_check: LocalCheck,
 }
+
+pub(super) type LocalCheck = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 /// Why a step stopped.
 #[derive(Debug)]
@@ -209,6 +214,7 @@ impl Worker {
     /// One unit of progress: a snapshot page or a changelog batch, applied
     /// and checkpointed.
     async fn step(&self) -> Result<(), StepError> {
+        (self.local_check)().map_err(StepError::Retry)?;
         let checkpoint = match self.load().await? {
             Some(checkpoint) if now_ms() - checkpoint.saved_at_ms > self.max_checkpoint_age_ms => {
                 return Err(StepError::Resnapshot(

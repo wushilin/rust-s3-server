@@ -20,6 +20,30 @@ use crate::storage::stamp::{Rank, Stamp};
 /// Request header naming the replication link that reads a changelog:
 /// `<site>;<mode>;<link id>;<url-encoded link name>`.
 pub const HEADER_REPLICATOR: &str = "x-rs3-replicator";
+/// Query selecting the access report (`GET /{bucket}?x-rs3-access`): what
+/// the caller's key may do on the bucket, as [`AccessReport`].
+pub const QUERY_ACCESS: &str = "x-rs3-access";
+
+/// The actions a link needs on the peer bucket: reading it (both modes),
+/// and for a merge link also writing it with the changes' own stamps.
+pub const READ_ACTIONS: [&str; 2] = ["s3:GetObject", "s3:GetBucketChangelog"];
+pub const WRITE_ACTIONS: [&str; 3] = ["s3:PutObject", "s3:DeleteObject", "s3:ReplicateWrite"];
+
+/// The answer to [`QUERY_ACCESS`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AccessReport {
+    pub site_id: String,
+    pub bucket: String,
+    pub read_only: bool,
+    /// Each of [`READ_ACTIONS`] and [`WRITE_ACTIONS`]: allowed on the bucket
+    /// (and on every key in it)?
+    pub actions: BTreeMap<String, bool>,
+    /// A merge link on the answering site already pairs this bucket with the
+    /// caller's (`<link id>;<url-encoded name>`).
+    #[serde(default)]
+    pub merge_back: Option<String>,
+}
+
 /// Response header: the answering site already has a merge link pairing
 /// this bucket with the reader's site (`<link id>;<url-encoded name>`).
 pub const HEADER_MERGE_BACK: &str = "x-rs3-merge-back";
@@ -202,6 +226,11 @@ impl PeerClient {
             StatusCode::CONFLICT => Err(PeerError::LogMismatch(message())),
             other => Err(PeerError::Other(format!("peer answered {other}: {}", message()))),
         }
+    }
+
+    /// What the link's key may do on the peer bucket.
+    pub async fn access(&self) -> Result<AccessReport, PeerError> {
+        self.json(&format!("{QUERY_ACCESS}="), Duration::from_secs(15)).await
     }
 
     /// Changes after `after` (long-polls up to `wait`).

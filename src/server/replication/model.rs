@@ -33,9 +33,16 @@ pub struct Link {
     pub local_bucket: String,
     pub peer_endpoint: String,
     pub peer_bucket: String,
+    /// The peer key: what the link may do on the peer is that key's policy
+    /// there.
     pub access_key: String,
     /// Secret: never returned by the API.
     pub secret_key: String,
+    /// An access key on this site: what the link may do here (write the
+    /// local bucket, and for a merge link read it and its changelog) is that
+    /// key's policy. Only named — the server acts as it, so no secret.
+    #[serde(default)]
+    pub local_access_key: String,
     #[serde(default = "default_region")]
     pub region: String,
     #[serde(default)]

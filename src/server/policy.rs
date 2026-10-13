@@ -725,6 +725,12 @@ pub fn requirements_for_request(
         // s3:* includes it). The router refuses any verb but GET.
         return Some(vec![Requirement::bucket("s3:GetBucketChangelog", bucket)]);
     }
+    if key.is_none() && has(super::replication::peer::QUERY_ACCESS) {
+        // rusts3 extension: "what may I do on this bucket?" — any
+        // authenticated caller may ask about its own permissions (a
+        // replication link checks its key before it is created).
+        return Some(Vec::new());
+    }
 
     let decoded_key = key.map(|k| {
         urlencoding::decode(k)

@@ -104,11 +104,11 @@ impl std::fmt::Debug for PeerRestorer {
 }
 
 /// Told about each replication link reading a bucket's changelog:
-/// `(bucket, the reader's x-rs3-replicator header)`. Returns the
+/// `(bucket, the reader's x-rs3-replicator header, record it?)`. Returns the
 /// `x-rs3-merge-back` answer (a merge link here already pairs the bucket
 /// with that reader's site), if any. Installed by the replication service.
 #[derive(Clone)]
-pub struct ReplicaReader(pub Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>);
+pub struct ReplicaReader(pub Arc<dyn Fn(&str, &str, bool) -> Option<String> + Send + Sync>);
 
 impl std::fmt::Debug for ReplicaReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -394,10 +394,11 @@ impl LocalObjectStore {
     }
 
     /// A replication link (header `x-rs3-replicator`) read `bucket`'s
-    /// changelog; returns the `x-rs3-merge-back` answer, if any.
-    pub(crate) fn replica_read(&self, bucket: &str, replicator: &str) -> Option<String> {
+    /// changelog (`record`), or a link being created asks; returns the
+    /// `x-rs3-merge-back` answer, if any.
+    pub(crate) fn replica_read(&self, bucket: &str, replicator: &str, record: bool) -> Option<String> {
         let reader = self.replica_reader.read().unwrap().clone();
-        reader.and_then(|reader| reader.0(bucket, replicator))
+        reader.and_then(|reader| reader.0(bucket, replicator, record))
     }
 
     /// Fetches a lost object back from a replication peer.

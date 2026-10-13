@@ -42,6 +42,7 @@ pub(super) struct Pusher {
     pub max_checkpoint_age_ms: i64,
     pub long_poll: Duration,
     pub parallelism: usize,
+    pub local_check: super::worker::LocalCheck,
 }
 
 impl From<ReadError> for StepError {
@@ -151,6 +152,7 @@ impl Pusher {
     }
 
     async fn step(&self) -> Result<(), StepError> {
+        (self.local_check)().map_err(StepError::Retry)?;
         let bucket = self.link.local_bucket.clone();
         // Held only to read the log's identity, never across a long poll or
         // the peer's writes: an index rebuild waits for in-flight handles.

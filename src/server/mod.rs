@@ -850,6 +850,9 @@ fn operation_and_target(
             if query.contains_key(notify::read::QUERY_CHANGELOG) {
                 return ("CHANGELOG", format!("/{bucket}/ changelog"));
             }
+            if query.contains_key(replication::peer::QUERY_ACCESS) {
+                return ("ACCESS_CHECK", format!("/{bucket}"));
+            }
             return ("LIST", target);
         }
         if *method == Method::HEAD {
@@ -1193,6 +1196,11 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let replication = replication::ReplicationService::start(
         store.clone(),
         replication::db::LinkDb::new(iam.admin_db()),
+        {
+            // A link acts here as its local access key.
+            let auth = AuthState { config: config.app_config.clone(), iam: Some(iam.clone()), usage: None };
+            replication::LocalAuth(Arc::new(move |access_key| auth.identity_of_key(access_key)))
+        },
         replication::Timing {
             check_interval: std::time::Duration::from_secs(config.app_config.replication.check_interval_secs.max(1)),
             stale_after: std::time::Duration::from_secs(config.app_config.replication.worker_stale_secs.max(30)),
@@ -1568,6 +1576,7 @@ async fn bucket_route(
             }
             changelog_s3(store, ctx).await
         }
+        Method::GET if ctx.query.contains_key(replication::peer::QUERY_ACCESS) => access_s3(store, ctx).await,
         Method::GET if ctx.query.contains_key("cors") => get_bucket_cors_s3(store, ctx).await,
         Method::PUT if ctx.query.contains_key("cors") => put_bucket_cors_s3(store, ctx, body).await,
         Method::DELETE if ctx.query.contains_key("cors") => delete_bucket_cors_s3(store, ctx).await,
@@ -1712,7 +1721,7 @@ async fn changelog_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Resp
         .headers
         .get(replication::peer::HEADER_REPLICATOR)
         .and_then(|v| v.to_str().ok())
-        .and_then(|replicator| store.replica_read(&ctx.bucket, replicator));
+        .and_then(|replicator| store.replica_read(&ctx.bucket, replicator, true));
     let mut response = if ctx.query.contains_key(notify::read::QUERY_SNAPSHOT) {
         let result = match notify::read::snapshot_params(&ctx.query) {
             Ok(params) => notify::read::snapshot(&store, &ctx.bucket, &params).await,
@@ -1736,6 +1745,40 @@ async fn changelog_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Resp
         response.headers_mut().insert(replication::peer::HEADER_MERGE_BACK, value);
     }
     response
+}
+
+/// rusts3 extension: what the caller may do on this bucket — the check a
+/// replication link runs against its peer before it is created.
+async fn access_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    use axum::response::IntoResponse;
+    use replication::peer::{AccessReport, READ_ACTIONS, WRITE_ACTIONS};
+    let meta = match store.bucket_meta(&ctx.bucket).await {
+        Ok(meta) => meta,
+        Err(err) => return storage_error_response(err, &ctx.resource()),
+    };
+    let allowed = |action: &'static str| match &ctx.identity {
+        // Auth disabled: everything is allowed.
+        None => true,
+        Some(identity) => replication::allowed_on_bucket(identity, action, &ctx.bucket),
+    };
+    let actions = READ_ACTIONS
+        .iter()
+        .chain(WRITE_ACTIONS.iter())
+        .map(|action| (action.to_string(), allowed(action)))
+        .collect();
+    let merge_back = ctx
+        .headers
+        .get(replication::peer::HEADER_REPLICATOR)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|replicator| store.replica_read(&ctx.bucket, replicator, false));
+    axum::Json(AccessReport {
+        site_id: store.site_id(),
+        bucket: ctx.bucket.clone(),
+        read_only: meta.read_only,
+        actions,
+        merge_back,
+    })
+    .into_response()
 }
 
 async fn delete_bucket_cors_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {

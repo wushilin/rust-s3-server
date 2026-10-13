@@ -681,22 +681,42 @@ disables it (`403`).
 
 A replication link replicates a whole bucket with a bucket on another rusts3
 site (the peer). It is configured in the console (**Webhooks & Replication →
-Replication links**) on one site, and that site's server runs it. There are no
-prefix filters on links (webhooks can filter by prefix).
+Replication links**) on one site, and that site's server runs it: it is the
+actor for both directions. There are no prefix filters on links (webhooks can
+filter by prefix).
 
-- **Mirror** (one-way: replicate remote to local, remote wins): the local
-  bucket becomes an exact copy of the peer's. Its initial snapshot also deletes
-  local objects the peer doesn't have. The bucket is made **read-only** so only
-  replication writes it; that's what keeps "remote wins" true. The peer key
-  needs only `s3:GetObject` and `s3:GetBucketChangelog` on the peer bucket.
-- **Merge** (two-way: sync both ways, newer wins): one link, created on either
-  site, pulls the peer's changes in and pushes the local bucket's changes out.
-  Both buckets end up as the union of their objects, every key at its
-  highest-stamped state; deletes win or lose by stamp too, via tombstones. The
-  peer key also needs `s3:PutObject`, `s3:DeleteObject` and
-  `s3:ReplicateWrite` on the peer bucket. Nothing is configured on the peer:
+- **Mirror** (this ⟵ peer: one way, remote wins): the local bucket becomes an
+  exact copy of the peer's. Its initial snapshot also deletes local objects the
+  peer doesn't have. The bucket is made **read-only** so only replication
+  writes it; that's what keeps "remote wins" true.
+- **Merge** (this ⟷ peer: both ways, newer wins): the link pulls the peer's
+  changes in and pushes the local bucket's changes out. Both buckets end up as
+  the union of their objects, every key at its highest-stamped state; deletes
+  win or lose by stamp too, via tombstones. Nothing is configured on the peer:
   its console lists the link under **Managed on other sites** (links seen
   reading its changelogs in the last 5 minutes).
+
+**Two keys, both explicit.** A link carries everything it is allowed to do:
+
+| | Key | Mirror needs | Merge needs |
+|---|---|---|---|
+| On this site | **local access key**: an access key of this site, named only (no secret: the server acts *as* it) | `s3:PutObject`, `s3:DeleteObject`, `s3:ReplicateWrite` | the same, plus `s3:GetObject`, `s3:GetBucketChangelog` |
+| On the peer | **peer access key and secret** (SigV4) | `s3:GetObject`, `s3:GetBucketChangelog` | the same, plus `s3:PutObject`, `s3:DeleteObject`, `s3:ReplicateWrite` |
+
+Each action is needed on the whole bucket (every key). `s3:ReplicateWrite` is
+the permission to write with a change's original stamp: replicated writes keep
+the stamp of the site that made them, which is what decides conflicts, so
+setting it is a privilege of its own. Admin keys (`s3:*`) have everything.
+
+- **Checked when the link is created** (and when its peer or keys change): the
+  peer must answer, not be this server, have the bucket, and its key must have
+  every permission above (the peer reports them for the calling key:
+  `GET /{bucket}?x-rs3-access`); the local key must exist and have its
+  permissions too. A merge into a read-only peer bucket is refused. So is a
+  merge link for a pair the peer already serves with its own merge link.
+- **Checked while it runs:** the local key's permissions every step (delete
+  the key or narrow its policy and the link stops with an error saying what
+  is missing); the peer enforces its key on every request.
 - **Rules the server enforces:**
   - A mirror link needs a read-only target. The console makes the bucket
     read-only when it creates the link.
@@ -704,17 +724,18 @@ prefix filters on links (webhooks can filter by prefix).
   - A mirrored bucket can't be switched back to read-write while its mirror
     link exists, even if the link is paused. Deleting the link leaves the bucket
     read-only; making it writable again is a separate, explicit step.
-  - One link per bucket pair on a site. If both sites create a merge link for
-    the same pair, the one on the site with the higher site id stops with an
-    error saying so (the peer reports its own link on changelog reads), and
-    the other keeps syncing both ways. Delete one of them.
+  - One link per bucket pair on a site. If both sites end up with a merge link
+    for the same pair anyway (one was created while the other site was down),
+    the one on the site with the higher site id stops with an error saying so,
+    and the other keeps syncing both ways. Delete one of them.
 
 How it works:
 
 - The link first walks the peer's snapshot, then follows its changelog. A
   merge link's push does the same with the local bucket: it walks the local
-  objects and tombstones, then follows the local changelog, writing to the
-  peer with stamped S3 requests.
+  objects and tombstones, then follows the local changelog (read in-process,
+  the same code that serves the changelog API), writing to the peer with
+  stamped S3 requests.
 - Every change is applied with its original stamp, under last-writer-wins.
   - A change whose stamp is not newer than the receiving side's state is
     skipped without fetching or sending anything (the push asks the peer with

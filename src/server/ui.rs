@@ -3652,11 +3652,36 @@ async fn list_links(State(state): State<UiState>, headers: HeaderMap) -> Respons
     if let Err(resp) = require_root(&state, &headers) {
         return resp;
     }
+    // The keys a link can act as here (its local access key).
+    let mut local_keys: Vec<serde_json::Value> = state
+        .config
+        .auth
+        .credentials
+        .iter()
+        .map(|c| json!({ "access_key": c.access_key, "owner": "root (config)", "admin": true }))
+        .collect();
+    for user in &state.config.auth.users {
+        for key in &user.api_keys {
+            local_keys.push(json!({ "access_key": key.ak, "owner": user.user, "admin": true }));
+        }
+    }
+    if let Ok(users) = state.iam.list_users().await {
+        for user in users {
+            for key in state.iam.list_access_keys(&user.username).await.unwrap_or_default() {
+                local_keys.push(json!({
+                    "access_key": key.access_key,
+                    "owner": user.username,
+                    "admin": state.iam.is_admin(&user.username),
+                }));
+            }
+        }
+    }
     match replication_service(&state) {
         Ok(service) => Json(json!({
             "links": service.list(),
             "incoming": service.incoming(),
             "site_id": state.store.site_id(),
+            "local_keys": local_keys,
         })).into_response(),
         Err(resp) => resp,
     }

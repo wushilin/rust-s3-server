@@ -41,6 +41,63 @@ use self::peer::{PeerClient, PeerConfig};
 use crate::storage::store::{DeleteGuard, LocalObjectStore};
 use crate::storage::time::now_ms;
 
+/// Resolves an access key on this site to the identity it acts as (`None`:
+/// no such key). A link's local writes are authorized as its local key.
+#[derive(Clone)]
+pub struct LocalAuth(pub Arc<dyn Fn(&str) -> Option<crate::server::identity::Identity> + Send + Sync>);
+
+/// Actions a link needs on its local bucket: writing it with stamps (both
+/// modes); a merge link's push also reads it and its changelog.
+pub const LOCAL_WRITE_ACTIONS: [&str; 3] = ["s3:PutObject", "s3:DeleteObject", "s3:ReplicateWrite"];
+
+/// Whether `identity` may do `action` on bucket `bucket` — on the bucket
+/// itself for the changelog, otherwise on every key (links replicate the
+/// whole bucket).
+pub fn allowed_on_bucket(identity: &crate::server::identity::Identity, action: &'static str, bucket: &str) -> bool {
+    let requirement = if action == "s3:GetBucketChangelog" {
+        crate::server::policy::Requirement::bucket(action, bucket)
+    } else {
+        crate::server::policy::Requirement::object(action, bucket, "*")
+    };
+    identity.authorize(&[requirement])
+}
+
+/// The actions `link` needs on its local bucket.
+fn local_actions(mode: Mode) -> Vec<&'static str> {
+    let mut needed = LOCAL_WRITE_ACTIONS.to_vec();
+    if mode == Mode::Merge {
+        needed.extend(peer::READ_ACTIONS);
+    }
+    needed
+}
+
+/// Checks `link`'s local key: it exists and may do everything the mode
+/// needs on the local bucket. `Err` says what is missing.
+fn check_local(auth: &LocalAuth, link: &Link) -> Result<(), String> {
+    if link.local_access_key.is_empty() {
+        return Err("the link has no local access key: edit it and choose the key whose permissions it uses here".into());
+    }
+    let Some(identity) = auth.0(&link.local_access_key) else {
+        return Err(format!(
+            "local access key {} does not exist on this site (deleted?)",
+            link.local_access_key
+        ));
+    };
+    let missing: Vec<&str> = local_actions(link.mode)
+        .into_iter()
+        .filter(|action| !allowed_on_bucket(&identity, action, &link.local_bucket))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "local access key {} lacks {} on bucket {} of this site",
+        link.local_access_key,
+        missing.join(", "),
+        link.local_bucket
+    ))
+}
+
 /// Families this module keeps in `admin.rocksdb`.
 pub const ADMIN_DB_FAMILIES: [&str; 1] = [db::CF_LINKS];
 
@@ -101,6 +158,9 @@ pub struct LinkRequest {
     pub peer_bucket: String,
     pub access_key: String,
     pub secret_key: String,
+    /// An access key on this site whose policy governs the link here.
+    #[serde(default)]
+    pub local_access_key: String,
     #[serde(default)]
     pub region: Option<String>,
     #[serde(default)]
@@ -114,6 +174,11 @@ pub struct LinkRequest {
     /// is made read-only as part of creating the link (otherwise refused).
     #[serde(default)]
     pub make_read_only: bool,
+    /// Check the peer first: reachable, the bucket exists, and the key has
+    /// every permission the mode needs (default). Off only to configure a
+    /// link to a peer that is down right now.
+    #[serde(default = "yes")]
+    pub verify: bool,
 }
 
 fn yes() -> bool {
@@ -127,8 +192,11 @@ pub struct LinkUpdate {
     pub access_key: Option<String>,
     /// Omitted or empty: keep the stored secret.
     pub secret_key: Option<String>,
+    pub local_access_key: Option<String>,
     pub region: Option<String>,
     pub enabled: Option<bool>,
+    /// Check new peer settings first (default true).
+    pub verify: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +218,7 @@ pub struct LinkView {
     pub peer_endpoint: String,
     pub peer_bucket: String,
     pub access_key: String,
+    pub local_access_key: String,
     pub region: String,
     pub mode: Mode,
     pub enabled: bool,
@@ -206,6 +275,7 @@ const INCOMING_TTL_MS: i64 = 5 * 60 * 1000;
 struct Inner {
     store: LocalObjectStore,
     db: LinkDb,
+    local_auth: LocalAuth,
     timing: Timing,
     shutdown: CancellationToken,
     links: RwLock<HashMap<String, Arc<Mutex<Runtime>>>>,
@@ -298,6 +368,7 @@ impl ReplicationService {
     pub async fn start(
         store: LocalObjectStore,
         db: LinkDb,
+        local_auth: LocalAuth,
         timing: Timing,
         shutdown: CancellationToken,
     ) -> Result<Self, LinkError> {
@@ -305,6 +376,7 @@ impl ReplicationService {
             inner: Arc::new(Inner {
                 store,
                 db,
+                local_auth,
                 timing,
                 shutdown,
                 links: RwLock::new(HashMap::new()),
@@ -360,11 +432,11 @@ impl ReplicationService {
         // Links on other sites reading our buckets: remember them, and tell a
         // merge reader when a merge link here already pairs the buckets.
         let weak = Arc::downgrade(&service.inner);
-        service.inner.store.set_replica_reader(crate::storage::store::ReplicaReader(Arc::new(move |bucket, header| {
+        service.inner.store.set_replica_reader(crate::storage::store::ReplicaReader(Arc::new(move |bucket, header, record| {
             let inner = weak.upgrade()?;
             let (site, mode, peer_bucket, link_id, link_name) = parse_replicator(header)?;
             let now = now_ms();
-            {
+            if record {
                 let mut incoming = inner.incoming.lock().unwrap();
                 incoming.retain(|_, seen| now - seen.last_seen_ms < INCOMING_TTL_MS);
                 incoming.insert(
@@ -475,6 +547,7 @@ impl ReplicationService {
                     max_checkpoint_age_ms: self.inner.timing.max_checkpoint_age.as_millis() as i64,
                     long_poll: self.inner.timing.long_poll,
                     parallelism: self.inner.timing.parallelism,
+                    local_check: self.local_check(&rt.link),
                 };
                 rt.worker = Some((cancel, tokio::spawn(worker.run())));
             }
@@ -501,10 +574,17 @@ impl ReplicationService {
                     max_checkpoint_age_ms: self.inner.timing.max_checkpoint_age.as_millis() as i64,
                     long_poll: self.inner.timing.long_poll,
                     parallelism: self.inner.timing.parallelism,
+                    local_check: self.local_check(&rt.link),
                 };
                 rt.pusher = Some((cancel, tokio::spawn(pusher.run())));
             }
         }
+    }
+
+    fn local_check(&self, link: &Link) -> worker::LocalCheck {
+        let auth = self.inner.local_auth.clone();
+        let link = link.clone();
+        Arc::new(move || check_local(&auth, &link))
     }
 
     fn peer_client(&self, rt: &Runtime, now: i64) -> Option<PeerClient> {
@@ -557,6 +637,69 @@ impl ReplicationService {
         crate::storage::encoding::validate_bucket_name(&link.peer_bucket)
             .map_err(|_| LinkError::BadRequest(format!("invalid peer bucket {:?}", link.peer_bucket)))?;
         PeerClient::new(peer_config(link, &self.inner.store.site_id())).map_err(LinkError::BadRequest)?;
+        Ok(())
+    }
+
+    /// Checks a link against its peer before it is saved: the peer answers,
+    /// is not this site, has the bucket, and the key may do everything the
+    /// mode needs — reading it, and for a merge link also writing it with
+    /// the changes' own stamps. A merge link the peer already runs for this
+    /// pair makes a second one pointless: refused.
+    async fn verify(&self, link: &Link) -> Result<(), LinkError> {
+        let peer = PeerClient::new(peer_config(link, &self.inner.store.site_id())).map_err(LinkError::BadRequest)?;
+        let at = format!("bucket {} at {}", link.peer_bucket, link.peer_endpoint);
+        let report = match peer.access().await {
+            Ok(report) => report,
+            Err(peer::PeerError::Other(message)) if message.starts_with("bad peer response") => {
+                return Err(LinkError::BadRequest(format!(
+                    "{at} did not answer the access check: is it a rusts3 site of this version? ({message})"
+                )))
+            }
+            Err(err) => return Err(LinkError::BadRequest(format!("checking {at}: {err}"))),
+        };
+        let local = self.inner.store.site_id();
+        if report.site_id == local {
+            return Err(LinkError::BadRequest(format!(
+                "the peer reports this server's own site id ({local}): it is this server, or a copy of its data \
+                 directory (give the copy its own server.site_id)"
+            )));
+        }
+        let mut needed: Vec<&str> = peer::READ_ACTIONS.to_vec();
+        if link.mode == Mode::Merge {
+            needed.extend(peer::WRITE_ACTIONS);
+        }
+        let missing: Vec<&str> = needed
+            .into_iter()
+            .filter(|action| !report.actions.get(*action).copied().unwrap_or(false))
+            .collect();
+        if !missing.is_empty() {
+            let why = match link.mode {
+                Mode::Mirror => "a mirror link reads the peer bucket and its changelog",
+                Mode::Merge => {
+                    "a merge link reads the peer bucket and its changelog, and writes this bucket's changes into \
+                     it with their original stamps"
+                }
+            };
+            return Err(LinkError::BadRequest(format!(
+                "access key {} lacks {} on {at} ({why})",
+                link.access_key,
+                missing.join(", ")
+            )));
+        }
+        if link.mode == Mode::Merge && report.read_only {
+            return Err(LinkError::BadRequest(format!(
+                "{at} is read-only (a mirror replica?): a merge link would write into it"
+            )));
+        }
+        if let (Mode::Merge, Some(back)) = (link.mode, &report.merge_back) {
+            let (id, name) = back.split_once(';').unwrap_or((back.as_str(), ""));
+            let name = urlencoding::decode(name).map(|n| n.into_owned()).unwrap_or_default();
+            return Err(LinkError::BadRequest(format!(
+                "site {} already merges {} with this bucket through its link \"{name}\" ({id}), which syncs both \
+                 ways: no link is needed here",
+                report.site_id, link.peer_bucket
+            )));
+        }
         Ok(())
     }
 
@@ -625,6 +768,7 @@ impl ReplicationService {
             peer_bucket: request.peer_bucket,
             access_key: request.access_key,
             secret_key: request.secret_key,
+            local_access_key: request.local_access_key.trim().to_string(),
             region: request.region.filter(|r| !r.is_empty()).unwrap_or_else(|| "us-east-1".to_string()),
             mode: request.mode,
             enabled: request.enabled,
@@ -632,6 +776,10 @@ impl ReplicationService {
             created_by: created_by.to_string(),
         };
         self.validate(&link)?;
+        check_local(&self.inner.local_auth, &link).map_err(LinkError::BadRequest)?;
+        if request.verify {
+            self.verify(&link).await?;
+        }
         if link.mode == Mode::Mirror {
             self.inner.store.set_bucket_read_only(&link.local_bucket, true).await?;
         }
@@ -646,6 +794,7 @@ impl ReplicationService {
     pub async fn update(&self, id: &str, update: LinkUpdate) -> Result<LinkView, LinkError> {
         let rt = self.runtime(id)?;
         let mut link = rt.lock().unwrap().link.clone();
+        let before = (link.peer_endpoint.clone(), link.access_key.clone(), link.secret_key.clone(), link.region.clone());
         if let Some(name) = update.name {
             link.name = name.trim().to_string();
         }
@@ -664,7 +813,16 @@ impl ReplicationService {
         if let Some(enabled) = update.enabled {
             link.enabled = enabled;
         }
+        if let Some(local) = update.local_access_key {
+            link.local_access_key = local.trim().to_string();
+            check_local(&self.inner.local_auth, &link).map_err(LinkError::BadRequest)?;
+        }
         self.validate(&link)?;
+        // New peer or credentials: check them as on create.
+        let after = (link.peer_endpoint.clone(), link.access_key.clone(), link.secret_key.clone(), link.region.clone());
+        if after != before && update.verify.unwrap_or(true) {
+            self.verify(&link).await?;
+        }
         self.inner.db.put(&link).await?;
         {
             let mut rt = rt.lock().unwrap();
@@ -729,6 +887,7 @@ impl ReplicationService {
             peer_endpoint: link.peer_endpoint.clone(),
             peer_bucket: link.peer_bucket.clone(),
             access_key: link.access_key.clone(),
+            local_access_key: link.local_access_key.clone(),
             region: link.region.clone(),
             mode: link.mode,
             enabled: link.enabled,
@@ -813,7 +972,12 @@ impl ReplicationService {
                 max_checkpoint_age_ms: i64::MAX,
                 long_poll: self.inner.timing.long_poll,
                 parallelism: 1,
+                local_check: self.local_check(&link),
             };
+            if let Err(err) = check_local(&self.inner.local_auth, &link) {
+                notes.push(format!("{}: {err}", link.name));
+                continue;
+            }
             let options = crate::storage::store::PublishOptions {
                 precondition: Some(crate::storage::store::Precondition::IfMatch(request.lost_etag.clone())),
                 stamp: Some(stamp.clone()),
