@@ -2415,6 +2415,12 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             response
         }
+        StorageError::BucketReadOnly(_) => s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            format!("{err} (marked read-only; replication writes only)"),
+            resource,
+        ),
         StorageError::StaleStamp { ref current, .. } => {
             let mut response = s3_error(
                 StatusCode::PRECONDITION_FAILED,

@@ -2018,3 +2018,108 @@ async fn console_shows_an_expired_webhook_and_recovers_it_by_re_snapshot() {
     let (status, _) = console(&app, &alice, "GET", "/api/subscriptions", None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+// ── read-only buckets ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_read_only_bucket_accepts_only_replicated_writes() {
+    use crate::storage::errors::StorageError;
+    let h = Harness::new().await;
+    h.store.create_bucket("replica").await.unwrap();
+    h.put("replica", "existing", b"x").await;
+    h.store.set_bucket_read_only("replica", true).await.unwrap();
+    assert!(h.store.bucket_meta("replica").await.unwrap().read_only);
+    let ro = |r: crate::storage::errors::Result<()>| matches!(r, Err(StorageError::BucketReadOnly(_)));
+
+    // Every client write path is refused.
+    assert!(ro(h.store.put_object("replica", "k", b"x", None, None, false).await.map(|_| ())));
+    assert!(ro(put_stamped(&h.store, "replica", "k", b"x", None).await.map(|_| ())));
+    assert!(ro(h.store.copy_object("replica", "existing", "replica", "copy").await.map(|_| ())));
+    assert!(ro(h
+        .store
+        .copy_object_with_metadata("replica", "existing", "replica", "existing", None, Some(&BTreeMap::new()), Some("text/x"), None, Default::default())
+        .await
+        .map(|_| ())));
+    assert!(ro(h.store.initiate_multipart("replica", "big", None, None).await.map(|_| ())));
+    assert!(ro(h.store.delete_object("replica", "existing").await));
+    assert_eq!(object_bytes(&h.store, "replica", "existing").await, b"x", "nothing changed");
+    let head = h.store.index("replica").await.unwrap().changelog_head();
+
+    // Replicated (stamped) writes go through: put, metadata update,
+    // multipart, delete.
+    let base = now_ms() + 1_000;
+    put_stamped(&h.store, "replica", "k", b"replicated", Some(st(base, "peer"))).await.unwrap();
+    h.store
+        .copy_object_with_metadata(
+            "replica",
+            "k",
+            "replica",
+            "k",
+            None,
+            Some(&BTreeMap::from([("m".to_string(), "1".to_string())])),
+            None,
+            None,
+            PublishOptions { stamp: Some(st(base + 1, "peer")), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let upload = h.store.initiate_multipart_replicated("replica", "big", None, None, None, None, &BTreeMap::new()).await.unwrap();
+    let part = h.store.put_multipart_part("replica", "big", &upload, 1, b"part", false).await.unwrap();
+    h.store
+        .complete_multipart_with(
+            "replica",
+            "big",
+            &upload,
+            &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
+            PublishOptions { stamp: Some(st(base + 2, "peer")), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    h.store.delete_object_stamped("replica", "existing", Some(st(base + 3, "peer")), None).await.unwrap();
+    assert!(h.store.index("replica").await.unwrap().changelog_head() > head);
+
+    // Read-write again: client writes work.
+    h.store.set_bucket_read_only("replica", false).await.unwrap();
+    h.put("replica", "client", b"x").await;
+}
+
+#[tokio::test]
+async fn read_only_over_http_and_the_console() {
+    let h = Harness::new().await;
+    h.store.create_bucket("replica").await.unwrap();
+    h.put("replica", "doc", b"x").await;
+    let (console_app, session) = console_app(&h).await;
+    let (status, _) = console(&console_app, &session, "PUT", "/api/buckets/replica/read-only", Some(serde_json::json!({"read_only": true}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, settings) = console(&console_app, &session, "GET", "/api/buckets/replica/cors", None).await;
+    assert_eq!(settings["read_only"], true);
+    let (_, buckets) = console(&console_app, &session, "GET", "/api/buckets", None).await;
+    assert_eq!(buckets["buckets"][0]["read_only"], true);
+    // Only admins may change it.
+    h.iam.create_user("bob", "password123").await.unwrap();
+    let bob = h.iam.create_session("bob", false);
+    let (status, _) = console(&console_app, &bob, "PUT", "/api/buckets/replica/read-only", Some(serde_json::json!({"read_only": false}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A console delete is refused like any client write.
+    let (status, body) = console(&console_app, &session, "DELETE", "/api/object?bucket=replica&key=doc", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let app = s3_app(&h);
+    // A client PUT is refused up front, with a clear reason.
+    let response = send_put(&app, "/replica/new", "data", &[]).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("read-only"), "{}", String::from_utf8_lossy(&body));
+    let response = send_put(&app, "/replica/copy", "", &[("x-amz-copy-source", "/replica/doc")]).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let delete = app
+        .clone()
+        .oneshot(Request::builder().method("DELETE").uri("/replica/doc").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::FORBIDDEN);
+    // A replicated (stamped) PUT is accepted.
+    let stamp = st(now_ms() + 1_000, "peer").to_header();
+    let response = send_put(&app, "/replica/new", "data", &[("x-rs3-stamp", &stamp)]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}

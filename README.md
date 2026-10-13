@@ -685,10 +685,13 @@ Replication links**) on the **receiving** site, and that site's server runs it.
 
 - The peer only needs to grant a key `s3:GetObject` and `s3:GetBucketChangelog`
   on its bucket. Nothing is configured on the peer.
-- **Mirror** (one-way): the local bucket becomes an exact copy of the peer's.
-  Its initial snapshot also deletes local objects the peer doesn't have.
-- **Merge** (two-way): configure a merge link on each site, each pulling from
-  the other. Both buckets end up as the union of their objects, with every key
+- **Mirror** (one-way: replicate remote to local, remote wins): the local
+  bucket becomes an exact copy of the peer's. Its initial snapshot also deletes
+  local objects the peer doesn't have. Mark the bucket **read-only** (the link
+  dialog does this by default) so only replication writes it; that's what
+  keeps "remote wins" true.
+- **Merge** (two-way: merge both sides, newer wins): configure a merge link on
+  each site, each pulling from the other. Both buckets end up as the union of their objects, with every key
   at its highest-stamped state. Deletes win or lose by stamp as well, via
   tombstones.
 
@@ -738,6 +741,19 @@ Operation:
     directory) stops with an error.
   - A bucket that is the target of a link can't be deleted until the link is
     removed.
+
+### Read-only buckets
+
+An admin can mark a bucket **read-only** (console: bucket settings, or `PUT
+/api/buckets/{name}/read-only {"read_only": true}`). A read-only bucket accepts
+only replicated writes: writes carrying a version stamp, which come from
+replication links (including the mirror sweep and restore from peer) or from
+`s3:ReplicateWrite` clients sending `x-rs3-stamp`.
+
+Every other write is refused with `403`: PUT, copy (including metadata
+updates), multipart upload, DELETE, multi-delete, browser POST, and console
+uploads and deletes. Uploads are refused before any bytes are sent. Reads are
+unaffected. This is meant for replica buckets.
 
 ### Falling behind retention
 

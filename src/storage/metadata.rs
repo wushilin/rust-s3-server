@@ -97,6 +97,11 @@ pub struct BucketMeta {
     /// an implicit server rule and is deliberately not persisted here.
     #[serde(default)]
     pub cors: Vec<CorsRule>,
+    /// A read-only bucket accepts only replicated writes (carrying a version
+    /// stamp — replication links, or `s3:ReplicateWrite` clients); every
+    /// other write is refused. For replica buckets.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

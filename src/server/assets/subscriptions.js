@@ -103,7 +103,7 @@ async function loadLinks(){
   try{
     const data=await api('GET','/api/replication');links=data.links||[];$('siteId').textContent=data.site_id||'';
     $('linkRows').innerHTML=links.map((l,i)=>{const s=l.status||{};const progress=s.state==='snapshot'?`snapshot${s.snapshot_cursor?` at <code>${esc(s.snapshot_cursor)}</code>`:''}`:s.position!=null?`seq ${s.position.toLocaleString()} / ${(s.peer_head??0).toLocaleString()}`:'—';
-      return `<tr><td><div class="identity"><span class="identity-icon">${icons.layers}</span><div><strong>${esc(l.name)}</strong><small>${esc(l.mode)}${l.prefix?` · prefix <code>${esc(l.prefix)}</code>`:''}</small></div></div></td><td><code>${esc(l.local_bucket)}</code> ← <code>${esc(l.peer_bucket)}</code><div class="muted" style="font-size:11px">${esc(l.peer_endpoint)}${s.peer_site?` · site ${esc(s.peer_site)}`:''}</div></td><td>${l.enabled?linkBadge(s.state):'<span class="badge">Paused</span>'}</td><td>${progress}<div class="muted" style="font-size:11px">${(s.copied||0).toLocaleString()} copied · ${(s.metadata_only||0).toLocaleString()} metadata-only · ${(s.deleted||0).toLocaleString()} deleted · ${(s.skipped||0).toLocaleString()} skipped</div></td><td>${s.last_error?`<span style="font-size:11.5px">${esc(s.last_error)}</span><div class="muted" style="font-size:11px">${fmtTime(s.last_error_ms)}</div>`:'<span class="muted">—</span>'}</td><td class="actions"><button class="row-action" title="${l.enabled?'Pause':'Resume'}" onclick="linkAction(${i},'${l.enabled?'pause':'resume'}')">${icons[l.enabled?'x':'check']}</button><button class="row-action" title="Re-snapshot" onclick="linkAction(${i},'resnapshot')">${icons.refresh}</button><button class="row-action danger" title="Delete" onclick="confirmDeleteLink(${i})">${icons.trash}</button></td></tr>`;}).join('');
+      return `<tr><td><div class="identity"><span class="identity-icon">${icons.layers}</span><div><strong>${esc(l.name)}</strong><small>${l.mode==='mirror'?'Mirror — remote wins':'Merge — newer wins'}${l.prefix?` · prefix <code>${esc(l.prefix)}</code>`:''}</small></div></div></td><td><code>${esc(l.local_bucket)}</code> ← <code>${esc(l.peer_bucket)}</code><div class="muted" style="font-size:11px">${esc(l.peer_endpoint)}${s.peer_site?` · site ${esc(s.peer_site)}`:''}</div></td><td>${l.enabled?linkBadge(s.state):'<span class="badge">Paused</span>'}</td><td>${progress}<div class="muted" style="font-size:11px">${(s.copied||0).toLocaleString()} copied · ${(s.metadata_only||0).toLocaleString()} metadata-only · ${(s.deleted||0).toLocaleString()} deleted · ${(s.skipped||0).toLocaleString()} skipped</div></td><td>${s.last_error?`<span style="font-size:11.5px">${esc(s.last_error)}</span><div class="muted" style="font-size:11px">${fmtTime(s.last_error_ms)}</div>`:'<span class="muted">—</span>'}</td><td class="actions" style="white-space:nowrap"><button class="btn small" title="${l.enabled?'Stop pulling for now (keeps the link and its position)':'Continue pulling from where it stopped'}" onclick="linkAction(${i},'${l.enabled?'pause':'resume'}')">${l.enabled?'Pause':'Resume'}</button><button class="row-action" title="Re-snapshot" onclick="linkAction(${i},'resnapshot')">${icons.refresh}</button><button class="row-action danger" title="Delete link" onclick="confirmDeleteLink(${i})">${icons.trash}</button></td></tr>`;}).join('');
     const empty=!links.length;$('linkRows').closest('table').classList.toggle('hidden',empty);$('linkEmpty').classList.toggle('hidden',!empty);
     if(empty)$('linkEmpty').innerHTML=`<div class="empty-icon">${icons.layers}</div><h3>No replication links</h3><p>Pull a bucket from another rusts3 site.</p>`;
   }catch(e){toast('Could not load replication links',e.message,false);}
@@ -111,7 +111,7 @@ async function loadLinks(){
 async function openLinkDialog(){
   setInlineError('linkError');
   try{const data=await api('GET','/api/buckets');$('ln_bucket').innerHTML=(data.buckets||[]).map(b=>`<option>${esc(b.name)}</option>`).join('');}catch{}
-  ['ln_name','ln_endpoint','ln_peer_bucket','ln_ak','ln_sk','ln_prefix'].forEach(id=>$(id).value='');$('ln_mode').value='mirror';
+  ['ln_name','ln_endpoint','ln_peer_bucket','ln_ak','ln_sk','ln_prefix'].forEach(id=>$(id).value='');$('ln_mode').value='mirror';$('ln_ro').checked=true;
   $('ln_bucket').onchange=()=>{if(!$('ln_peer_bucket').value)$('ln_peer_bucket').value=$('ln_bucket').value;};
   $('linkDlg').showModal();setTimeout(()=>$('ln_name').focus(),50);
 }
@@ -119,7 +119,8 @@ async function saveLink(event){
   event.preventDefault();setInlineError('linkError');
   try{
     await api('POST','/api/replication',{name:$('ln_name').value,local_bucket:$('ln_bucket').value,peer_endpoint:$('ln_endpoint').value,peer_bucket:$('ln_peer_bucket').value||$('ln_bucket').value,access_key:$('ln_ak').value,secret_key:$('ln_sk').value,mode:$('ln_mode').value,prefix:$('ln_prefix').value});
-    $('linkDlg').close();toast('Replication link created',$('ln_name').value);await loadLinks();
+    if($('ln_ro').checked)await api('PUT','/api/buckets/'+encodeURIComponent($('ln_bucket').value)+'/read-only',{read_only:true});
+    $('linkDlg').close();toast('Replication link created',$('ln_name').value+($('ln_ro').checked?' · bucket is now read-only':''));await loadLinks();
   }catch(e){setInlineError('linkError',e.message);}
 }
 async function linkAction(i,action){

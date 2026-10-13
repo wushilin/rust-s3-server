@@ -32,6 +32,9 @@ pub enum StorageError {
     /// newer than the key's current state — the object or its tombstone.
     /// Nothing was changed. Maps to HTTP 412.
     StaleStamp { bucket: String, key: String, current: String },
+    /// A client write to a read-only bucket (only replicated writes are
+    /// accepted). Maps to HTTP 403.
+    BucketReadOnly(String),
 }
 
 impl fmt::Display for StorageError {
@@ -70,6 +73,10 @@ impl fmt::Display for StorageError {
                 write!(f, "precondition failed for {bucket}/{key}")
             }
             StorageError::BucketInUse(v) => write!(f, "{v}"),
+            StorageError::BucketReadOnly(bucket) => write!(
+                f,
+                "bucket {bucket} is read-only: it accepts only replicated writes"
+            ),
             StorageError::StaleStamp { bucket, key, current } => write!(
                 f,
                 "{bucket}/{key} already has a state at least as new (stamp {current}); nothing changed"

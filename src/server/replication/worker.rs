@@ -299,8 +299,21 @@ impl Worker {
                     return Ok(());
                 }
                 if !present.contains(entry.object_key.as_str()) {
-                    self.store.delete_object(bucket, &entry.object_key).await?;
-                    self.update(|s| s.deleted += 1);
+                    // A replication write (stamped), so a read-only replica
+                    // accepts it; it removes exactly the version seen here.
+                    let removed = self
+                        .store
+                        .effective_stamp(entry.stamp.as_ref(), entry.last_modified_ms);
+                    match self
+                        .store
+                        .delete_object_stamped(bucket, &entry.object_key, Some(self.store.next_stamp()), Some(removed))
+                        .await
+                    {
+                        Ok(_) => self.update(|s| s.deleted += 1),
+                        // Changed under us: the next snapshot or event decides.
+                        Err(StorageError::StaleStamp { .. }) => {}
+                        Err(err) => return Err(err.into()),
+                    }
                 }
             }
             if !page.is_truncated {
@@ -493,7 +506,7 @@ impl Worker {
         let headers = self.peer.head(key, &event.version).await.map_err(PutError::Peer)?;
         let upload_id = self
             .store
-            .initiate_multipart_with_metadata(
+            .initiate_multipart_replicated(
                 bucket,
                 key,
                 headers.content_type.as_deref(),

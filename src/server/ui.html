@@ -187,7 +187,7 @@
           <div id="subEmpty" class="empty hidden"></div>
         </div>
         <div class="panel" style="margin-top:18px">
-          <div class="panel-title"><div><h3>Replication links</h3><p>Pull a bucket from another rusts3 site into a local bucket. <b>Mirror</b> makes the local bucket a copy of the peer's; <b>merge</b> keeps both sides' objects — configure a merge link on each site for two-way replication. This site's id: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
+          <div class="panel-title"><div><h3>Replication links</h3><p>Pull a bucket from another rusts3 site into a local bucket. <b>Mirror</b> replicates remote to local (remote wins — make the bucket read-only); <b>merge</b> merges both sides, newer wins (configure a merge link on each site). This site's id: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
           <div class="table-wrap"><table><thead><tr><th>Link</th><th>Local ← peer</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
           <div id="linkEmpty" class="empty hidden"></div>
         </div>
@@ -304,6 +304,7 @@
 <dialog id="bucketSettingsDlg">
   <div class="dialog-head"><div><h3>Bucket settings — <span id="bucketSettingsName"></span></h3><p>Configure browser origins allowed to access this bucket.</p></div><button type="button" class="dialog-close" onclick="bucketSettingsDlg.close()"><span data-icon="x"></span></button></div>
   <div class="dialog-body">
+    <label class="field" data-admin-only style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="bucketReadOnly"> <span><b>Read-only</b> — accept only replicated writes (replication links, or s3:ReplicateWrite clients). Uploads, copies and deletes from clients and this console are refused.</span></label>
     <div class="field"><label>Console origin (implicitly allowed)</label><input class="input" id="bucketConsoleOrigin" readonly></div>
     <div class="field"><label for="bucketCorsJson">CORS rules (JSON) <button type="button" class="btn small" onclick="openCorsSample()">View sample</button></label><textarea class="input code-area" id="bucketCorsJson" rows="15" spellcheck="false"></textarea><span class="muted" style="font-size:11.5px">Each rule uses allowed_origins, allowed_methods, allowed_headers, expose_headers, and optional max_age_seconds. The faded example is not saved unless you paste or type it. The console rule is applied automatically.</span></div>
     <div id="bucketSettingsError" class="inline-error"></div>
@@ -451,7 +452,8 @@
       <div class="field"><label for="ln_peer_bucket">Peer bucket</label><input class="input" id="ln_peer_bucket" autocomplete="off"></div>
       <div class="field"><label for="ln_ak">Peer access key</label><input class="input" id="ln_ak" autocomplete="off"></div>
       <div class="field"><label for="ln_sk">Peer secret key</label><input class="input" id="ln_sk" type="password" autocomplete="new-password"></div>
-      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode"><option value="mirror">Mirror (one-way: local becomes a copy)</option><option value="merge">Merge (two-way member: keep both sides)</option></select></div>
+      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode" onchange="$('ln_ro').checked=this.value==='mirror'"><option value="mirror">Mirror — replicate remote to local (remote wins)</option><option value="merge">Merge — merge both sides, newer wins</option></select></div>
+      <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="ln_ro" checked> Make the local bucket read-only (only replication writes it — what keeps "remote wins" true)</label>
       <div class="field"><label for="ln_prefix">Key prefix (optional)</label><input class="input" id="ln_prefix" placeholder="(all keys)" autocomplete="off"></div>
       <div id="linkError" class="inline-error"></div>
     </div>

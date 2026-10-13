@@ -96,6 +96,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/{name}/stats", get(bucket_stats))
         .route("/api/buckets/{name}/rebuild", post(rebuild_bucket))
         .route("/api/buckets/{name}/cors", get(get_bucket_cors).put(set_bucket_cors))
+        .route("/api/buckets/{name}/read-only", put(set_bucket_read_only))
         // Changelog subscriptions: webhooks and replication tokens (admin only).
         .route("/api/subscriptions", get(list_subscriptions).post(create_subscription))
         .route(
@@ -688,6 +689,7 @@ fn storage_error(err: StorageError) -> Response {
         StorageError::BucketRebuilding(_) => StatusCode::SERVICE_UNAVAILABLE,
         StorageError::InvalidMultipartUpload(_) | StorageError::BucketInUse(_) => StatusCode::CONFLICT,
         StorageError::StaleStamp { .. } => StatusCode::PRECONDITION_FAILED,
+        StorageError::BucketReadOnly(_) => StatusCode::FORBIDDEN,
         StorageError::InvalidBucketName(_) | StorageError::InvalidObjectKey(_) => {
             StatusCode::BAD_REQUEST
         }
@@ -1553,6 +1555,7 @@ async fn list_buckets(
                 let multipart_uploads = state.store.count_multipart_uploads(&name).await;
                 visible.push(json!({
                     "name": name,
+                    "read_only": meta.read_only,
                     "created_at_ms": meta.created_at_ms,
                     "multipart_uploads": multipart_uploads,
                 }));
@@ -1681,7 +1684,7 @@ async fn get_bucket_cors(
             let console_origin = state.config.ui.public_hostname.as_deref().map(|host| {
                 format!("{}://{host}", state.config.ui.public_scheme.as_str())
             });
-            Json(json!({ "rules": meta.cors, "console_origin": console_origin })).into_response()
+            Json(json!({ "rules": meta.cors, "console_origin": console_origin, "read_only": meta.read_only })).into_response()
         }
         Err(err) => storage_error(err),
     }
@@ -3761,5 +3764,39 @@ async fn link_action(
             Json(view).into_response()
         }
         Err(err) => link_error(err),
+    }
+}
+
+// ── bucket read-only flag (admin only) ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ReadOnlyRequest {
+    read_only: bool,
+}
+
+/// Marks a bucket read-only (only replicated writes accepted) or read-write.
+async fn set_bucket_read_only(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+    Json(request): Json<ReadOnlyRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.set_bucket_read_only(&name, request.read_only).await {
+        Ok(()) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                if request.read_only { "set_bucket_read_only" } else { "set_bucket_read_write" },
+                format!("/{name}"),
+            );
+            Json(json!({ "ok": true, "read_only": request.read_only })).into_response()
+        }
+        Err(err) => storage_error(err),
     }
 }

@@ -67,6 +67,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         Ok(stamp) => stamp,
         Err(response) => return response,
     };
+    // A read-only bucket: refuse before the body is uploaded.
+    if stamp.is_none() {
+        if let Err(err) = store.ensure_writable(&ctx.bucket).await {
+            return srv::storage_error_response(err, &resource);
+        }
+    }
     match store
         .put_object_stream_with_metadata(
             &ctx.bucket,

@@ -1018,3 +1018,26 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
     assert!(same(&a, &b, "data").await);
     assert_eq!(b.contents("data").await["k"].3, "text/v2");
 }
+
+#[tokio::test]
+async fn a_mirror_into_a_read_only_bucket() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "one", b"1").await;
+    b.put("data", "stray", b"only on b").await;
+    b.store.set_bucket_read_only("data", true).await.unwrap();
+    b.pull_from(&a, "data", Mode::Mirror).await;
+    // Replication writes, including the sweep of b's stray object.
+    eventually(30, "mirrored", || same(&a, &b, "data")).await;
+    assert!(!b.contents("data").await.contains_key("stray"));
+    // Clients cannot write the replica...
+    assert!(b.store.put_object("data", "local", b"x", None, None, false).await.is_err());
+    assert!(b.store.delete_object("data", "one").await.is_err());
+    // ...so it stays exactly the remote: remote wins.
+    a.put("data", "two", b"2").await;
+    a.store.delete_object("data", "one").await.unwrap();
+    eventually(30, "following", || same(&a, &b, "data")).await;
+}

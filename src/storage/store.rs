@@ -518,6 +518,7 @@ impl LocalObjectStore {
                 created_at_ms: now_ms(),
                 storage_version: "v2".to_string(),
                 cors: Vec::new(),
+                read_only: false,
             };
             write_json_atomic(&bucket_meta_path, &meta).await?;
             self.bucket_meta_cache.insert(bucket.to_string(), meta);
@@ -571,6 +572,35 @@ impl LocalObjectStore {
             fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
         }
         self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        Ok(())
+    }
+
+    /// Marks a bucket read-only (only replicated writes accepted) or
+    /// read-write.
+    pub async fn set_bucket_read_only(&self, bucket: &str, read_only: bool) -> Result<()> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        meta.read_only = read_only;
+        write_json_atomic(&path, &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&path).await?;
+            fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
+        }
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        log::info!("bucket {bucket} is now {}", if read_only { "read-only" } else { "read-write" });
+        Ok(())
+    }
+
+    /// Refuses a client (unstamped) write to a read-only bucket.
+    pub async fn ensure_writable(&self, bucket: &str) -> Result<()> {
+        if self.bucket_meta(bucket).await.map(|m| m.read_only).unwrap_or(false) {
+            return Err(StorageError::BucketReadOnly(bucket.to_string()));
+        }
         Ok(())
     }
 
@@ -1173,6 +1203,13 @@ impl LocalObjectStore {
         options: PublishOptions,
     ) -> Result<PutResult> {
         let PublishOptions { precondition, stamp: replicated, restore } = options;
+        // A read-only bucket takes only replicated (stamped) states.
+        if replicated.is_none() && !restore {
+            if let Err(err) = self.ensure_writable(bucket).await {
+                let _ = tokio::fs::remove_dir_all(publish_dir).await;
+                return Err(err);
+            }
+        }
         let replicated_for_check = replicated.clone();
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if self.durability == Durability::Full {
@@ -1564,6 +1601,7 @@ impl LocalObjectStore {
     /// avoids an extra metadata read for operation audit logging.
     pub async fn delete_object_with_size(&self, bucket: &str, key: &str) -> Result<Option<u64>> {
         self.ensure_bucket_and_key(bucket, key).await?;
+        self.ensure_writable(bucket).await?;
         let index = self.index(bucket).await?;
         let _guard = self.locks.lock(bucket, key).await;
         let Some(row) = index.get(key).await? else {
@@ -1872,6 +1910,25 @@ impl LocalObjectStore {
     }
 
     pub async fn initiate_multipart_with_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        // Refused up front on a read-only bucket, before any part is sent.
+        self.ensure_writable(bucket).await?;
+        self.initiate_multipart_replicated(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta)
+            .await
+    }
+
+    /// [`Self::initiate_multipart_with_metadata`] for a replicated upload,
+    /// which a read-only bucket accepts (its completion carries the stamp).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn initiate_multipart_replicated(
         &self,
         bucket: &str,
         key: &str,
