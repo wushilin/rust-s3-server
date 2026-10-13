@@ -158,7 +158,7 @@ async function saveLink(event){
 async function linkAction(i,action){
   const l=links[i];
   const run=async()=>{await api('POST','/api/replication/'+encodeURIComponent(l.id)+'/action',{action});toast('Done',`${action} ${l.name}`);await loadLinks();};
-  if(action==='resnapshot')showConfirm('Re-snapshot link?',l.name,'The link discards its positions and walks the bucket${l.mode==='merge'?'s':''} again. Unchanged objects are skipped without copying.',run,{confirmLabel:'Re-snapshot',danger:false,busyLabel:'Restarting…'});
+  if(action==='resnapshot')showConfirm('Re-snapshot link?',l.name,`The link discards its positions and walks the bucket${l.mode==='merge'?'s':''} again. Unchanged objects are skipped without copying.`,run,{confirmLabel:'Re-snapshot',danger:false,busyLabel:'Restarting…'});
   else try{await run();}catch(e){toast('Action failed',e.message,false);}
 }
 function confirmDeleteLink(i){const l=links[i];showConfirm('Delete replication link?',l.name,'Replication stops and the link\'s position is discarded. Local objects are kept.',async()=>{await api('DELETE','/api/replication/'+encodeURIComponent(l.id));toast('Link deleted',l.name);await loadLinks();});}
