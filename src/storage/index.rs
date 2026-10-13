@@ -56,9 +56,10 @@ use serde::{Deserialize, Serialize};
 
 use super::changelog::{
     self, ChangeEvent, ChangeOp, ChangeOrigin, ChangelogPage, ChangelogStatus, PartLayout, SeqTracker,
-    CF_CHANGELOG, KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH,
+    CF_CHANGELOG, KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH, KEY_TRIMMED_TS,
 };
 use super::errors::{Result, StorageError};
+use super::stamp::Stamp;
 
 /// Multi-threaded RocksDB handle: `cf_handle` yields an `Arc<BoundColumnFamily>`
 /// that outlives a borrow of the DB, which suits the `Arc<DB>` +
@@ -96,6 +97,8 @@ pub struct ObjectRecord {
     pub last_modified_ms: i64,
     /// Upload layout; `None` on rows indexed before layouts were recorded.
     pub parts: Option<PartLayout>,
+    /// Version stamp; `None` on rows indexed before stamps existed.
+    pub stamp: Option<Stamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +160,8 @@ struct ObjectValueV1 {
     last_modified_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parts: Option<PartLayout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stamp: Option<Stamp>,
 }
 
 /// The `intents` family value. The id is the RocksDB key.
@@ -195,6 +200,7 @@ fn encode_object(record: &ObjectRecord) -> Vec<u8> {
         etag: record.etag.clone(),
         last_modified_ms: record.last_modified_ms,
         parts: record.parts.clone(),
+        stamp: record.stamp.clone(),
     })
     .expect("ObjectValueV1 serializes")
 }
@@ -209,6 +215,7 @@ fn decode_object(key: &[u8], value: &[u8]) -> Result<ObjectRecord> {
         etag: v.etag,
         last_modified_ms: v.last_modified_ms,
         parts: v.parts,
+        stamp: v.stamp,
     })
 }
 
@@ -361,6 +368,29 @@ fn last_change_seq(db: &Db) -> Result<u64> {
     Ok(newest.max(trimmed_through(db)?))
 }
 
+/// Commit time of the newest entry (0 when the log is empty): seeds the
+/// non-decreasing commit clock on open.
+fn last_change_ts(db: &Db) -> Result<i64> {
+    let log = cf(db, CF_CHANGELOG)?;
+    let mut it = db.raw_iterator_cf(&log);
+    it.seek_to_last();
+    it.status()?;
+    Ok(match (it.key(), it.value()) {
+        (Some(k), Some(v)) => changelog::decode_change(changelog::seq_from_key(k), v)
+            .map(|c| c.ts_ms)
+            .unwrap_or(0),
+        _ => 0,
+    })
+}
+
+fn trimmed_ts(db: &Db) -> Result<i64> {
+    let meta = cf(db, CF_META)?;
+    Ok(db
+        .get_cf(&meta, KEY_TRIMMED_TS)?
+        .map(|b| changelog::decode_u64(&b) as i64)
+        .unwrap_or(i64::MIN))
+}
+
 fn trimmed_through(db: &Db) -> Result<u64> {
     let meta = cf(db, CF_META)?;
     Ok(db
@@ -460,19 +490,20 @@ impl ObjectIndex {
     /// call [`create_schema`](Self::create_schema) for that.
     pub async fn open_at(db_path: &Path, durability: Durability) -> Result<Self> {
         let path = db_path.to_path_buf();
-        let (db, seed, last_change, log_id) = run_blocking(move || {
+        let (db, seed, last_change, last_ts, log_id) = run_blocking(move || {
             let db = open_db(&path)?;
             let seed = max_intent_id(&db)?;
             let last_change = last_change_seq(&db)?;
+            let last_ts = last_change_ts(&db)?;
             let log_id = ensure_log_id(&db)?;
-            Ok((db, seed, last_change, log_id))
+            Ok((db, seed, last_change, last_ts, log_id))
         })
         .await?;
         Ok(Self {
             db: Arc::new(db),
             durability,
             intent_seq: Arc::new(AtomicI64::new(seed)),
-            changes: Arc::new(SeqTracker::new(last_change)),
+            changes: Arc::new(SeqTracker::new(last_change, last_ts)),
             log_id: Arc::new(log_id),
             commit_hook: None,
         })
@@ -612,6 +643,7 @@ impl ObjectIndex {
         etag: &str,
         last_modified_ms: i64,
         parts: Option<PartLayout>,
+        stamp: Option<Stamp>,
     ) -> Result<bool> {
         let db = self.db.clone();
         let durability = self.durability;
@@ -632,14 +664,15 @@ impl ObjectIndex {
             record.etag = etag;
             record.last_modified_ms = last_modified_ms;
             record.parts = parts;
+            record.stamp = stamp;
             let log = cf(&db, CF_CHANGELOG)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&objects, key.as_bytes(), encode_object(&record));
-            let guard = changes.begin();
+            let guard = changes.begin(super::time::now_ms());
             batch.put_cf(
                 &log,
                 changelog::seq_key(guard.seq),
-                changelog::encode_change(&change_for(guard.seq, ChangeOp::Put, &record, ChangeOrigin::Repair)),
+                changelog::encode_change(&change_for(&guard, ChangeOp::Put, &record, ChangeOrigin::Repair)),
             );
             db.write_opt(batch, &write_opts(durability))?;
             Ok(true)
@@ -785,9 +818,8 @@ impl ObjectIndex {
             if !existed {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, 1i64.to_le_bytes());
             }
-            let guard = changes.begin();
-            let mut change = change_for(guard.seq, ChangeOp::Put, &record, origin);
-            change.ts_ms = now_ms;
+            let guard = changes.begin(now_ms);
+            let change = change_for(&guard, ChangeOp::Put, &record, origin);
             batch.put_cf(&log, changelog::seq_key(guard.seq), changelog::encode_change(&change));
             db.write_opt(batch, &write_opts(durability))?;
             Ok(retire_id)
@@ -802,17 +834,19 @@ impl ObjectIndex {
     /// The atomic commit point of a DELETE: removes the object and records a
     /// `retire` intent for its blob dir in one write batch.
     pub async fn commit_delete(&self, key: &str, blob_dir: &str, now_ms: i64) -> Result<i64> {
-        self.commit_delete_from(key, blob_dir, now_ms, ChangeOrigin::Client).await
+        self.commit_delete_from(key, blob_dir, now_ms, ChangeOrigin::Client, None).await
     }
 
-    /// [`Self::commit_delete`] recording who caused the change. A changelog
-    /// entry is appended only when a row was actually removed.
+    /// [`Self::commit_delete`] recording who caused the change and the
+    /// delete's own version stamp. A changelog entry is appended only when a
+    /// row was actually removed.
     pub async fn commit_delete_from(
         &self,
         key: &str,
         blob_dir: &str,
         now_ms: i64,
         origin: ChangeOrigin,
+        stamp: Option<Stamp>,
     ) -> Result<i64> {
         let db = self.db.clone();
         let durability = self.durability;
@@ -837,9 +871,9 @@ impl ObjectIndex {
             let mut guard = None;
             if let Some(existing) = &existing {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, (-1i64).to_le_bytes());
-                let g = changes.begin();
-                let mut change = change_for(g.seq, ChangeOp::Delete, existing, origin);
-                change.ts_ms = now_ms;
+                let g = changes.begin(now_ms);
+                let mut change = change_for(&g, ChangeOp::Delete, existing, origin);
+                change.stamp = stamp;
                 batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
                 guard = Some(g);
             }
@@ -1123,6 +1157,63 @@ impl ObjectIndex {
         .await
     }
 
+    /// The position to read from to get every change committed at or after
+    /// `since_ms`: the seq just before the first such change, or the head
+    /// when there is none. Commit times never decrease in seq order, so this
+    /// is a binary search. `None` when changes from that time may already
+    /// have been trimmed (`since_ms` is at or before the newest trimmed
+    /// change's commit time).
+    pub async fn position_at_time(&self, since_ms: i64) -> Result<Option<u64>> {
+        let db = self.db.clone();
+        let head = self.changes.watermark();
+        run_blocking(move || {
+            let log = cf(&db, CF_CHANGELOG)?;
+            let trimmed = trimmed_through(&db)?;
+            if trimmed > 0 && since_ms <= trimmed_ts(&db)? {
+                // Changes from that time were (or may have been) trimmed.
+                return Ok(None);
+            }
+            // First retained entry at or after `seq` (seqs have holes).
+            let entry_from = |seq: u64| -> Result<Option<(u64, i64)>> {
+                let mut it = db.raw_iterator_cf(&log);
+                it.seek(changelog::seq_key(seq));
+                match (it.key(), it.value()) {
+                    (Some(k), Some(v)) => {
+                        let s = changelog::seq_from_key(k);
+                        if s > head {
+                            return Ok(None);
+                        }
+                        Ok(Some((s, changelog::decode_change(s, v)?.ts_ms)))
+                    }
+                    _ => {
+                        it.status()?;
+                        Ok(None)
+                    }
+                }
+            };
+            let Some((first_seq, first_ts)) = entry_from(trimmed + 1)? else {
+                return Ok(Some(head));
+            };
+            if first_ts >= since_ms {
+                // Everything retained qualifies (and nothing trimmed did).
+                return Ok(Some(first_seq - 1));
+            }
+            // Invariant: the entry at `lo` is before since_ms; find the first
+            // entry at or after it in (lo, head].
+            let (mut lo, mut hi) = (first_seq, head + 1);
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                match entry_from(mid)? {
+                    Some((seq, ts)) if ts < since_ms => lo = seq,
+                    Some(_) | None => hi = mid,
+                }
+            }
+            // `lo` is the last entry before since_ms: read after it.
+            Ok(Some(lo))
+        })
+        .await
+    }
+
     /// Removes entries committed before `cutoff_ms`, at most `max_entries`
     /// per call, never past the watermark. Raises `trimmed_through` in the
     /// same batch. Returns how many entries were removed.
@@ -1137,6 +1228,7 @@ impl ObjectIndex {
             it.seek_to_first();
             let mut first = None;
             let mut last = None;
+            let mut last_ts = i64::MIN;
             let mut removed = 0usize;
             while removed < max_entries {
                 let (Some(key), Some(value)) = (it.key(), it.value()) else {
@@ -1148,12 +1240,14 @@ impl ObjectIndex {
                     break;
                 }
                 // Undecodable rows are trimmed by position, not age.
-                let expired = changelog::decode_change(seq, value)
-                    .map(|change| change.ts_ms < cutoff_ms)
-                    .unwrap_or(true);
+                let ts = changelog::decode_change(seq, value).map(|change| change.ts_ms);
+                let expired = ts.as_ref().map(|ts| *ts < cutoff_ms).unwrap_or(true);
                 if !expired {
                     break;
                 }
+                // Undecodable rows are trimmed by position; the cutoff bounds
+                // their time.
+                last_ts = last_ts.max(ts.unwrap_or(cutoff_ms - 1));
                 first.get_or_insert(seq);
                 last = Some(seq);
                 removed += 1;
@@ -1166,6 +1260,8 @@ impl ObjectIndex {
             batch.delete_range_cf(&log, changelog::seq_key(first), changelog::seq_key(last + 1));
             let floor = trimmed_through(&db)?.max(last);
             batch.put_cf(&meta, KEY_TRIMMED_THROUGH, floor.to_le_bytes());
+            let floor_ts = trimmed_ts(&db)?.max(last_ts);
+            batch.put_cf(&meta, KEY_TRIMMED_TS, (floor_ts as u64).to_le_bytes());
             db.write_opt(batch, &write_opts(durability))?;
             Ok(removed)
         })
@@ -1193,7 +1289,7 @@ impl ObjectIndex {
                     dst_db.write(std::mem::take(&mut batch))?;
                 }
             }
-            for key in [KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH] {
+            for key in [KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH, KEY_TRIMMED_TS] {
                 if let Some(value) = src.get_cf(&src_meta, key)? {
                     batch.put_cf(&dst_meta, key, value);
                 }
@@ -1407,10 +1503,11 @@ pub(crate) fn same_blob_dir(a: &str, b: &str) -> bool {
             .all(|(x, y)| x == y || (matches!(x, b'/' | b'\\') && matches!(y, b'/' | b'\\')))
 }
 
-/// The changelog entry for a commit of `record` (`ts_ms` defaults to now).
-fn change_for(seq: u64, op: ChangeOp, record: &ObjectRecord, origin: ChangeOrigin) -> ChangeEvent {
+/// The changelog entry for a commit of `record`, at the guard's seq and
+/// commit time.
+fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectRecord, origin: ChangeOrigin) -> ChangeEvent {
     ChangeEvent {
-        seq,
+        seq: guard.seq,
         op,
         key: record.object_key.clone(),
         etag: record.etag.clone(),
@@ -1418,8 +1515,9 @@ fn change_for(seq: u64, op: ChangeOp, record: &ObjectRecord, origin: ChangeOrigi
         last_modified_ms: record.last_modified_ms,
         version: changelog::version_of(&record.blob_dir),
         origin,
-        ts_ms: super::time::now_ms(),
+        ts_ms: guard.ts,
         parts: record.parts.clone(),
+        stamp: record.stamp.clone(),
     }
 }
 
@@ -1445,8 +1543,16 @@ fn is_legacy_layout(blob_dir: &str) -> bool {
 /// Newer-wins adjudication: highest `last_modified_ms`, blob path as a
 /// deterministic tie-break.
 fn newer_wins(candidate: &ObjectRecord, incumbent: &ObjectRecord) -> bool {
-    (candidate.last_modified_ms, candidate.blob_dir.as_str())
-        > (incumbent.last_modified_ms, incumbent.blob_dir.as_str())
+    // Version stamps order states exactly (a replicated state's
+    // Last-Modified is its origin's time, which a local clamp may not
+    // exceed); Last-Modified decides only when a side has no stamp.
+    match (&candidate.stamp, &incumbent.stamp) {
+        (Some(a), Some(b)) if a != b => a > b,
+        _ => {
+            (candidate.last_modified_ms, candidate.blob_dir.as_str())
+                > (incumbent.last_modified_ms, incumbent.blob_dir.as_str())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1455,6 +1561,7 @@ mod tests {
 
     fn record(key: &str, blob_dir: &str, lm: i64) -> ObjectRecord {
         ObjectRecord {
+            stamp: None,
             object_key: key.to_string(),
             blob_dir: blob_dir.to_string(),
             size: 1,
@@ -1562,6 +1669,21 @@ mod tests {
         assert_eq!(reopened.changelog_id(), index.changelog_id());
         let status = reopened.changelog_status().await.unwrap();
         assert_eq!((status.head, status.trimmed_through), (2, 1));
+    }
+
+    #[test]
+    fn rebuild_prefers_the_higher_stamp_over_last_modified() {
+        use crate::storage::stamp::Stamp;
+        let stamped = |lm: i64, ms: i64, site: &str| ObjectRecord {
+            stamp: Some(Stamp { ms, c: 0, site: site.into() }),
+            ..record("k", &format!("objects/x/V1{ms}{site}"), lm)
+        };
+        // A replicated state shows its origin's (older) time but carries the
+        // newer stamp; the stamp decides.
+        assert!(newer_wins(&stamped(100, 500, "b"), &stamped(200, 400, "a")));
+        assert!(!newer_wins(&stamped(200, 400, "a"), &stamped(100, 500, "b")));
+        // Without a stamp on one side, Last-Modified decides as before.
+        assert!(newer_wins(&record("k", "objects/x/V1z", 300), &stamped(200, 900, "a")));
     }
 
     #[tokio::test]

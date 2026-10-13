@@ -22,6 +22,10 @@ pub struct ServerConfig {
     /// PROXY protocol handling on both listeners (S3 API and console).
     #[serde(default)]
     pub proxy_protocol: ProxyProtocolMode,
+    /// This site's id for replication (1-64 of `[A-Za-z0-9_-]`). Unset: an
+    /// id generated on first start and kept in `<base_dir>/site.json`.
+    #[serde(default)]
+    pub site_id: Option<String>,
 }
 
 /// Whether the listeners read a PROXY protocol header (v1 or v2) ahead of HTTP.
@@ -584,6 +588,10 @@ impl AppConfig {
                 );
             }
         }
+        // An empty value means "not configured" (container templating).
+        if let Some(site) = self.server.site_id.as_deref().filter(|v| !v.is_empty()) {
+            crate::storage::stamp::validate_site_id(site).map_err(|err| format!("server.site_id: {err}"))?;
+        }
         if self.sweeper.trash_expiry_secs < MIN_TRASH_RETENTION_SECS {
             return Err(format!(
                 "sweeper.trash_expiry_secs must be at least {MIN_TRASH_RETENTION_SECS} seconds (3 hours)"
@@ -677,6 +685,7 @@ impl Default for ServerConfig {
             bind_port: default_bind_port(),
             base_dir: default_base_dir(),
             proxy_protocol: ProxyProtocolMode::default(),
+            site_id: None,
         }
     }
 }

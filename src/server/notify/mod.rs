@@ -397,7 +397,8 @@ impl NotifyService {
                     return;
                 }
             };
-            let next = engine::next(&index, &sub, &state, self.limits(&sub)).await;
+            let site = self.inner.store.site_id();
+            let next = engine::next(&index, &sub, &state, self.limits(&sub), &site).await;
             drop(index);
             match next {
                 Err(err) => {

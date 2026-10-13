@@ -32,8 +32,14 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             return srv::s3_error(StatusCode::BAD_REQUEST, "MalformedXML", message, &resource)
         }
     };
+    // A replicated upload takes its stamp at completion.
+    let stamp = match srv::replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &resource) {
+        Ok(stamp) => stamp,
+        Err(response) => return response,
+    };
+    let options = crate::storage::store::PublishOptions { precondition: None, stamp };
     match store
-        .complete_multipart(&ctx.bucket, &ctx.key, &upload_id, &parts)
+        .complete_multipart_with(&ctx.bucket, &ctx.key, &upload_id, &parts, options)
         .await
     {
         Ok(result) => {

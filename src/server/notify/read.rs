@@ -40,6 +40,9 @@ const MAX_SCAN_PAGES: usize = 20;
 pub struct ReadParams {
     /// Return changes with `seq > after`.
     pub after: u64,
+    /// Instead of `after`: start at the first change committed at or after
+    /// this time (epoch ms). The response's `next` is a seq as usual.
+    pub since_ms: Option<i64>,
     pub limit: usize,
     /// Long-poll: hold an up-to-date reader until a change arrives.
     pub wait: Duration,
@@ -60,6 +63,9 @@ pub struct SnapshotParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadResponse {
     pub bucket: String,
+    /// This server's site id: a replicator refuses to copy between two
+    /// servers reporting the same one (a cloned data directory).
+    pub site_id: String,
     pub log_id: String,
     /// The newest readable seq right now.
     pub head: u64,
@@ -76,6 +82,8 @@ pub struct ReadResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotResponse {
     pub bucket: String,
+    /// This server's site id (see `storage::stamp`).
+    pub site_id: String,
     pub log_id: String,
     /// The changelog head when this page was read. Save the *first* page's
     /// value and continue live (`after=`) from it once the listing is done:
@@ -175,6 +183,12 @@ fn parse_limit(query: &HashMap<String, String>) -> Result<usize, ReadError> {
 pub fn read_params(query: &HashMap<String, String>) -> Result<ReadParams, ReadError> {
     Ok(ReadParams {
         after: parse_u64(query, "after")?.unwrap_or(0),
+        since_ms: match parse_u64(query, "since")? {
+            Some(_) if query.get("after").is_some_and(|v| !v.is_empty()) => {
+                return Err(ReadError::BadRequest("pass after or since, not both".into()))
+            }
+            since => since.map(|v| v as i64),
+        },
         limit: parse_limit(query)?,
         wait: Duration::from_secs(parse_u64(query, "wait")?.unwrap_or(0).min(MAX_WAIT_SECS)),
         filter: parse_filter(query)?,
@@ -230,6 +244,24 @@ async fn read_once(store: &LocalObjectStore, bucket: &str, params: &ReadParams) 
             });
         }
     }
+    let mut params = params.clone();
+    if let Some(since) = params.since_ms {
+        match index.position_at_time(since).await? {
+            Some(after) => params.after = after,
+            None => {
+                return Err(ReadError::Gone {
+                    message: format!(
+                        "changes of bucket {bucket} from {since} may have been removed by retention; the oldest \
+                         available position is after={}. Re-snapshot, or accept the loss and continue from there.",
+                        status.trimmed_through
+                    ),
+                    trimmed_through: status.trimmed_through,
+                    head: status.head,
+                })
+            }
+        }
+    }
+    let params = &params;
     if params.after < status.trimmed_through {
         return Err(ReadError::Gone {
             message: format!(
@@ -274,6 +306,7 @@ async fn read_once(store: &LocalObjectStore, bucket: &str, params: &ReadParams) 
     }
     Ok(ReadResponse {
         bucket: bucket.to_string(),
+        site_id: store.site_id(),
         log_id: status.log_id,
         head: status.head,
         trimmed_through: status.trimmed_through,
@@ -295,6 +328,7 @@ pub async fn snapshot(
         // A deletes-only reader has nothing to list.
         return Ok(SnapshotResponse {
             bucket: bucket.to_string(),
+            site_id: store.site_id(),
             log_id: index.changelog_id().to_string(),
             head: index.changelog_head(),
             entries: Vec::new(),
@@ -304,6 +338,7 @@ pub async fn snapshot(
     // Head first: everything committed after it is replayed live.
     let head = index.changelog_head();
     let log_id = index.changelog_id().to_string();
+    let site = store.site_id();
     let page = index
         .list(&params.filter.prefix, None, params.after.as_deref(), params.limit)
         .await?;
@@ -311,21 +346,11 @@ pub async fn snapshot(
             .entries
             .iter()
             .filter(|record| params.filter.matches_key(&record.object_key))
-            .map(|record| WireEvent {
-                seq: None,
-                op: "exists".to_string(),
-                key: record.object_key.clone(),
-                etag: record.etag.clone(),
-                size: record.size,
-                last_modified_ms: record.last_modified_ms,
-                version: crate::storage::changelog::version_of(&record.blob_dir),
-                origin: None,
-                ts_ms: None,
-                parts: record.parts.clone(),
-            })
+            .map(|record| WireEvent::exists(record, &site))
             .collect();
     Ok(SnapshotResponse {
         bucket: bucket.to_string(),
+        site_id: site,
         log_id,
         head,
         entries,

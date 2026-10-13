@@ -33,6 +33,9 @@ use super::errors::{Result, StorageError};
 pub const CF_CHANGELOG: &str = "changelog";
 pub const KEY_CHANGELOG_ID: &[u8] = b"changelog_id";
 pub const KEY_TRIMMED_THROUGH: &[u8] = b"changelog_trimmed_through";
+/// Commit time of the newest trimmed entry: changes at or before it may be
+/// gone, changes after it are all retained.
+pub const KEY_TRIMMED_TS: &[u8] = b"changelog_trimmed_ts";
 
 /// Highest changelog value version this build can read.
 const CHANGE_VERSION: u32 = 1;
@@ -164,6 +167,9 @@ pub struct ChangeEvent {
     /// The object's upload layout (for `delete`, the removed version's).
     /// `None` for objects indexed before layouts were recorded.
     pub parts: Option<PartLayout>,
+    /// The change's version stamp: the new state's for `put`, the delete's
+    /// own for `delete`. `None` only for changes logged before stamps.
+    pub stamp: Option<super::stamp::Stamp>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -187,6 +193,8 @@ struct ChangeValueV1 {
     ts_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parts: Option<PartLayout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stamp: Option<super::stamp::Stamp>,
 }
 
 fn default_version() -> u32 {
@@ -215,6 +223,7 @@ pub fn encode_change(event: &ChangeEvent) -> Vec<u8> {
         origin: event.origin,
         ts_ms: event.ts_ms,
         parts: event.parts.clone(),
+        stamp: event.stamp.clone(),
     })
     .expect("ChangeValueV1 serializes")
 }
@@ -238,6 +247,7 @@ pub fn decode_change(seq: u64, value: &[u8]) -> Result<ChangeEvent> {
         origin: v.origin,
         ts_ms: v.ts_ms,
         parts: v.parts,
+        stamp: v.stamp,
     })
 }
 
@@ -271,14 +281,17 @@ pub struct SeqTracker {
 struct SeqState {
     /// Last allocated seq.
     last: u64,
+    /// Commit time given to the last allocated seq.
+    last_ts: i64,
     in_flight: BTreeSet<u64>,
 }
 
 impl SeqTracker {
-    pub fn new(last: u64) -> Self {
+    pub fn new(last: u64, last_ts: i64) -> Self {
         Self {
             state: Mutex::new(SeqState {
                 last,
+                last_ts,
                 in_flight: BTreeSet::new(),
             }),
         }
@@ -286,12 +299,17 @@ impl SeqTracker {
 
     /// Allocates the next seq and marks it in flight until the returned guard
     /// drops (after the write batch carrying it returned, success or not).
-    pub fn begin(&self) -> SeqGuard<'_> {
+    /// Its commit time is `now_ms`, clamped so commit times never decrease
+    /// in seq order — which makes "the first change at or after time T" a
+    /// binary search over seqs.
+    pub fn begin(&self, now_ms: i64) -> SeqGuard<'_> {
         let mut state = self.state.lock().unwrap();
         state.last += 1;
+        state.last_ts = state.last_ts.max(now_ms);
         let seq = state.last;
+        let ts = state.last_ts;
         state.in_flight.insert(seq);
-        SeqGuard { tracker: self, seq }
+        SeqGuard { tracker: self, seq, ts }
     }
 
     /// Every seq `<=` this has finished committing (or failed and will never
@@ -308,6 +326,8 @@ impl SeqTracker {
 pub struct SeqGuard<'a> {
     tracker: &'a SeqTracker,
     pub seq: u64,
+    /// The change's commit time (non-decreasing in seq order).
+    pub ts: i64,
 }
 
 impl Drop for SeqGuard<'_> {
@@ -346,10 +366,11 @@ mod tests {
 
     #[test]
     fn watermark_waits_for_out_of_order_commits() {
-        let tracker = SeqTracker::new(10);
-        let a = tracker.begin();
-        let b = tracker.begin();
+        let tracker = SeqTracker::new(10, 0);
+        let a = tracker.begin(5);
+        let b = tracker.begin(3);
         assert_eq!((a.seq, b.seq), (11, 12));
+        assert_eq!((a.ts, b.ts), (5, 5), "commit times never decrease in seq order");
         assert_eq!(tracker.watermark(), 10);
         drop(b); // 12 committed first
         assert_eq!(tracker.watermark(), 10, "11 still in flight");
@@ -396,6 +417,7 @@ mod tests {
             origin: ChangeOrigin::Repair,
             ts_ms: 9,
             parts: Some(PartLayout::multipart(&[5, 5, 2])),
+            stamp: Some(super::super::stamp::Stamp { ms: 9, c: 1, site: "s".into() }),
         };
         assert_eq!(decode_change(7, &encode_change(&event)).unwrap(), event);
     }

@@ -1092,3 +1092,28 @@ async fn changelog_reads_need_their_own_action() {
     // The admin group's s3:* covers it.
     assert_eq!(h.s3_full(&root_cred(), "GET", "/logs", "x-rs3-changelog=", &[], b"").await.0, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn setting_a_version_stamp_needs_replicate_write() {
+    // A stamp decides last-writer-wins conflicts, so carrying one is a
+    // privilege of replication credentials, on top of the write itself.
+    let h = Harness::new().await;
+    h.seed("data", &[]).await;
+    let writer = h.user("writer").await;
+    h.iam.set_policy("writer", Some(&allow(&["s3:PutObject"], "data"))).await.unwrap();
+    let stamp = [("x-rs3-stamp", "1700000000000.0.site-a")];
+    let (status, _) = h.s3_full(&writer, "PUT", "/data/k", "", &stamp, b"x").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "PutObject alone cannot set a stamp");
+    let (status, _) = h.s3_full(&writer, "PUT", "/data/k", "", &[], b"x").await;
+    assert_eq!(status, StatusCode::OK, "an ordinary write is unaffected");
+
+    let replicator = h.user("replicator").await;
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:PutObject", "s3:ReplicateWrite"], "data")))
+        .await
+        .unwrap();
+    let (status, body) = h.s3_full(&replicator, "PUT", "/data/k", "", &stamp, b"x").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = h.store.index("data").await.unwrap().get("k").await.unwrap().unwrap();
+    assert_eq!(row.stamp.unwrap().to_header(), "1700000000000.0.site-a");
+}

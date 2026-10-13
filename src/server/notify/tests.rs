@@ -777,7 +777,7 @@ async fn repair_changes_are_marked_as_such() {
     let index = h.store.index("bkt").await.unwrap();
     let row = index.get("k").await.unwrap().unwrap();
     index
-        .commit_delete_from("k", &row.blob_dir, now_ms(), ChangeOrigin::Repair)
+        .commit_delete_from("k", &row.blob_dir, now_ms(), ChangeOrigin::Repair, None)
         .await
         .unwrap();
     wait_until(10, "two events", || rx.live_keys().len() == 2).await;
@@ -1309,4 +1309,201 @@ async fn rows_without_a_layout_omit_it() {
     assert!(snap["entries"][0].get("parts").is_none());
     let (_, first) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&limit=1", None, None).await;
     assert_eq!(first["events"][0]["parts"], serde_json::json!({"count": 1}));
+}
+
+// ── version stamps ──────────────────────────────────────────────────────────
+
+use crate::storage::stamp::Stamp;
+
+fn stamp_of(value: &serde_json::Value) -> Stamp {
+    serde_json::from_value(value.clone()).expect("a stamp")
+}
+
+async fn send_put(app: &Router, uri: &str, body: &'static str, headers: &[(&str, &str)]) -> axum::response::Response {
+    let mut request = Request::builder().method("PUT").uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    app.clone().oneshot(request.body(Body::from(body)).unwrap()).await.unwrap()
+}
+
+async fn head_stamp(app: &Router, uri: &str) -> (Stamp, String) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().method("HEAD").uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let stamp = Stamp::parse_header(response.headers()["x-rs3-stamp"].to_str().unwrap()).unwrap();
+    let last_modified = response.headers()["last-modified"].to_str().unwrap().to_string();
+    (stamp, last_modified)
+}
+
+#[tokio::test]
+async fn every_state_gets_an_increasing_stamp_from_this_site() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let app = s3_app(&h);
+    let site = h.store.site_id();
+    assert_eq!(site.len(), 16, "generated on first start");
+
+    h.put("bkt", "k", b"one").await;
+    h.put("bkt", "k", b"two").await;
+    h.store.delete_object("bkt", "k").await.unwrap();
+    h.put("bkt", "k", b"three").await;
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0", None, None).await;
+    assert_eq!(page["site_id"], site.as_str());
+    let stamps: Vec<Stamp> = page["events"].as_array().unwrap().iter().map(|e| stamp_of(&e["stamp"])).collect();
+    assert_eq!(stamps.len(), 4);
+    assert!(stamps.windows(2).all(|w| w[0] < w[1]), "puts and deletes stamped in order: {stamps:?}");
+    assert!(stamps.iter().all(|s| s.site == site));
+
+    // GET/HEAD report the current state's stamp; Last-Modified matches it.
+    let (stamp, _) = head_stamp(&app, "/bkt/k").await;
+    assert_eq!(&stamp, stamps.last().unwrap());
+    // It lives in meta.json, so an index rebuild keeps it.
+    h.store.rebuild_index("bkt").await.unwrap();
+    let (_, snap) = call(&app, "GET", "/bkt?x-rs3-changelog-snapshot", None, None).await;
+    assert_eq!(stamp_of(&snap["entries"][0]["stamp"]), stamp);
+    assert_eq!(snap["site_id"], site.as_str());
+}
+
+#[tokio::test]
+async fn a_replicated_write_keeps_its_origin_stamp() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let app = s3_app(&h);
+    // Written on site "site-a" a while ago.
+    let origin = Stamp { ms: 1_700_000_000_000, c: 3, site: "site-a".into() };
+    let response = send_put(&app, "/bkt/k", "replicated", &[("x-rs3-stamp", &origin.to_header())]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (stamp, last_modified) = head_stamp(&app, "/bkt/k").await;
+    assert_eq!(stamp, origin, "kept, not re-stamped");
+    assert_eq!(last_modified, crate::storage::time::http_date_ms(origin.ms), "shows the origin's time");
+    let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0", None, None).await;
+    assert_eq!(stamp_of(&page["events"][0]["stamp"]), origin);
+
+    // A site whose clock runs ahead: the next local write still outranks it.
+    let ahead = Stamp { ms: now_ms() + 120_000, c: 0, site: "site-b".into() };
+    send_put(&app, "/bkt/k", "from b", &[("x-rs3-stamp", &ahead.to_header())]).await;
+    h.put("bkt", "k", b"local").await;
+    let (local, _) = head_stamp(&app, "/bkt/k").await;
+    assert!(local > ahead, "{local:?} must outrank {ahead:?}");
+    assert_eq!(local.site, h.store.site_id());
+
+    // Validation.
+    for bad in ["nonsense", "1.2", "1.x.site", "1.0.bad.site"] {
+        assert_eq!(send_put(&app, "/bkt/x", "b", &[("x-rs3-stamp", bad)]).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let far = Stamp { ms: now_ms() + 3_600_000, c: 0, site: "site-c".into() };
+    let response = send_put(&app, "/bkt/x", "b", &[("x-rs3-stamp", &far.to_header())]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "a peer clock an hour ahead is refused");
+}
+
+#[tokio::test]
+async fn a_replicated_multipart_upload_is_stamped_at_completion() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let upload_id = h.store.initiate_multipart("bkt", "big", None, None).await.unwrap();
+    let part = h.store.put_multipart_part("bkt", "big", &upload_id, 1, b"tail", false).await.unwrap();
+    let origin = Stamp { ms: 1_700_000_000_000, c: 0, site: "site-a".into() };
+    let result = h
+        .store
+        .complete_multipart_with(
+            "bkt",
+            "big",
+            &upload_id,
+            &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
+            crate::storage::store::PublishOptions { precondition: None, stamp: Some(origin.clone()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.stamp, Some(origin.clone()));
+    assert_eq!(result.last_modified_ms, origin.ms);
+    let app = s3_app(&h);
+    assert_eq!(head_stamp(&app, "/bkt/big").await.0, origin);
+}
+
+#[tokio::test]
+async fn objects_from_before_stamps_report_a_fallback_stamp() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    h.put("bkt", "old", b"x").await;
+    // Strip the stamp from both the row and meta.json, as an object written
+    // by an older server would be.
+    let index = h.store.index("bkt").await.unwrap();
+    let row = index.get("old").await.unwrap().unwrap();
+    let meta_path = h.tmp.path().join("buckets").join("bkt").join(&row.blob_dir).join("meta.json");
+    let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta.as_object_mut().unwrap().remove("stamp");
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let intent = index.insert_publish_intent("old", &row.blob_dir, now_ms()).await.unwrap();
+    index
+        .commit_publish(&crate::storage::index::ObjectRecord { stamp: None, ..row.clone() }, intent, None, now_ms())
+        .await
+        .unwrap();
+    h.store.forget_cached_meta("bkt", "old");
+
+    let expected = Stamp::fallback(row.last_modified_ms, &h.store.site_id());
+    let app = s3_app(&h);
+    assert_eq!(head_stamp(&app, "/bkt/old").await.0, expected);
+    let (_, snap) = call(&app, "GET", "/bkt?x-rs3-changelog-snapshot", None, None).await;
+    assert_eq!(stamp_of(&snap["entries"][0]["stamp"]), expected);
+    // Its next write is stamped normally and outranks the fallback.
+    h.put("bkt", "old", b"y").await;
+    assert!(head_stamp(&app, "/bkt/old").await.0 > expected);
+}
+
+#[tokio::test]
+async fn the_site_id_and_clock_survive_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path());
+    store.init_site(None).unwrap();
+    store.create_bucket("bkt").await.unwrap();
+    store.put_object("bkt", "k", b"x", None, None, false).await.unwrap();
+    let site = store.site_id();
+    let before = store.index("bkt").await.unwrap().get("k").await.unwrap().unwrap().stamp.unwrap();
+    drop(store);
+    let reopened = LocalObjectStore::new(tmp.path());
+    reopened.init_site(None).unwrap();
+    assert_eq!(reopened.site_id(), site);
+    assert!(reopened.next_stamp() > before);
+    // A configured id overrides the generated one.
+    let named = LocalObjectStore::new(tmp.path());
+    named.init_site(Some("sg-1")).unwrap();
+    assert_eq!(named.site_id(), "sg-1");
+}
+
+#[tokio::test]
+async fn reading_from_a_point_in_time() {
+    let h = Harness::new().await;
+    h.store.create_bucket("bkt").await.unwrap();
+    let app = s3_app(&h);
+    for key in ["a", "b"] {
+        h.put("bkt", key, b"x").await;
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let t = now_ms();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    for key in ["c", "d", "e"] {
+        h.put("bkt", key, b"x").await;
+    }
+    let (status, page) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={t}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys_of(&page, "events"), ["c", "d", "e"]);
+    let (_, all) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0", None, None).await;
+    assert_eq!(keys_of(&all, "events"), ["a", "b", "c", "d", "e"]);
+    let (_, none) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={}", now_ms() + 60_000), None, None).await;
+    assert_eq!((none["events"].as_array().unwrap().len(), none["next"].as_u64()), (0, Some(5)));
+    // Commit times never decrease in seq order.
+    let ts: Vec<i64> = all["events"].as_array().unwrap().iter().map(|e| e["ts_ms"].as_i64().unwrap()).collect();
+    assert!(ts.windows(2).all(|w| w[0] <= w[1]));
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0&after=1", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Once retention removed changes from that time, the answer is 410.
+    h.service.trim_all(t).await;
+    let (status, _) = call(&app, "GET", "/bkt?x-rs3-changelog&since=0", None, None).await;
+    assert_eq!(status, StatusCode::GONE);
+    let (status, page) = call(&app, "GET", &format!("/bkt?x-rs3-changelog&since={t}"), None, None).await;
+    assert_eq!(status, StatusCode::OK, "everything from t is still retained");
+    assert_eq!(keys_of(&page, "events"), ["c", "d", "e"]);
 }

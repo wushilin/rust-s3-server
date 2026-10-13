@@ -1138,6 +1138,7 @@ impl LocalObjectStore {
                         meta.etag.trim_matches('"'),
                         meta.last_modified_ms,
                         Some(crate::storage::changelog::PartLayout::of(&meta)),
+                        meta.stamp.clone(),
                     )
                     .await?;
                 self.forget_cached_meta(bucket, &object_key);
@@ -1194,7 +1195,7 @@ impl LocalObjectStore {
     async fn delete_row(&self, bucket: &str, key: &str, row: &ObjectRecord) -> Result<()> {
         let index = self.index(bucket).await?;
         let retire_id = index
-            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Repair)
+            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Repair, Some(self.next_stamp()))
             .await?;
         self.forget_cached_meta(bucket, key);
         let _ = index.delete_intent(retire_id).await;

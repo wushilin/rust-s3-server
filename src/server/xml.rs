@@ -604,6 +604,7 @@ mod tests {
             100,
             &ListPage {
                 entries: vec![ObjectRecord {
+                    stamp: None,
                     object_key: "a/file".to_string(),
                     blob_dir: "objects/aa/bb/cc/dd/V1ABCDEF_0001".to_string(),
                     size: 3,
@@ -636,6 +637,7 @@ mod tests {
             100,
             &ListPage {
                 entries: vec![ObjectRecord {
+                    stamp: None,
                     object_key: "a+b c".to_string(),
                     blob_dir: "objects/aa/bb/cc/dd/V1ABCDEF_0002".to_string(),
                     size: 3,
@@ -663,6 +665,7 @@ mod tests {
     #[test]
     fn list_object_versions_reports_null_version_id() {
         let meta = ObjectMeta {
+            stamp: None,
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "my-prefix/datafile".to_string(),

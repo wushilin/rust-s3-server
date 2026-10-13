@@ -209,6 +209,34 @@ pub struct WireEvent {
     /// indexed before layouts were recorded (ask GetObjectAttributes).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parts: Option<crate::storage::changelog::PartLayout>,
+    /// Version stamp: the state's (put / exists) or the delete's own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stamp: Option<crate::storage::stamp::Stamp>,
+}
+
+impl WireEvent {
+    /// A snapshot entry for a stored object. Objects written before stamps
+    /// existed get the fallback stamp `(last_modified_ms, 0, site)`.
+    pub fn exists(record: &crate::storage::index::ObjectRecord, site: &str) -> Self {
+        Self {
+            seq: None,
+            op: "exists".to_string(),
+            key: record.object_key.clone(),
+            etag: record.etag.clone(),
+            size: record.size,
+            last_modified_ms: record.last_modified_ms,
+            version: crate::storage::changelog::version_of(&record.blob_dir),
+            origin: None,
+            ts_ms: None,
+            parts: record.parts.clone(),
+            stamp: Some(
+                record
+                    .stamp
+                    .clone()
+                    .unwrap_or_else(|| crate::storage::stamp::Stamp::fallback(record.last_modified_ms, site)),
+            ),
+        }
+    }
 }
 
 impl From<&ChangeEvent> for WireEvent {
@@ -230,6 +258,7 @@ impl From<&ChangeEvent> for WireEvent {
             ),
             ts_ms: Some(event.ts_ms),
             parts: event.parts.clone(),
+            stamp: event.stamp.clone(),
         }
     }
 }

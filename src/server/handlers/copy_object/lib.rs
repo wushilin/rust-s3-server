@@ -82,6 +82,10 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         );
     }
     drop(src_object);
+    let stamp = match srv::replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &ctx.resource()) {
+        Ok(stamp) => stamp,
+        Err(response) => return response,
+    };
     match store
         .copy_object_with_metadata(
             &src_bucket,
@@ -92,6 +96,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             user_meta.as_ref(),
             replacement_content_type,
             replacement_content_language,
+            crate::storage::store::PublishOptions { precondition: None, stamp },
         )
         .await
     {

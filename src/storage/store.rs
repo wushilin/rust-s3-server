@@ -40,6 +40,8 @@ use super::encoding::{
     validate_object_key,
 };
 use super::errors::{Result, StorageError};
+use super::changelog::ChangeOrigin;
+use super::stamp::{SiteClock, Stamp};
 use super::index::{
     self, Durability, IntentRecord, ListPage, ObjectRecord, ObjectIndex, INTENT_RETIRE,
 };
@@ -121,6 +123,9 @@ pub struct LocalObjectStore {
     delete_guard: Arc<std::sync::RwLock<Option<DeleteGuard>>>,
     /// Per-bucket "the changelog moved" signal, for long-polling readers.
     change_signals: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// This site's identity and version-stamp clock. Opened by
+    /// [`Self::init_site`] at startup; tests get an ephemeral one lazily.
+    clock: Arc<std::sync::OnceLock<Arc<SiteClock>>>,
     #[cfg(test)]
     crash_points: Arc<Mutex<HashSet<String>>>,
 }
@@ -141,12 +146,31 @@ pub struct ObjectVersionPage {
     pub next_key_marker: Option<String>,
 }
 
+/// How a publish (PUT, copy, multipart complete) is performed.
+#[derive(Debug, Clone, Default)]
+pub struct PublishOptions {
+    pub precondition: Option<Precondition>,
+    /// A replicated write: keep this stamp (the writing site's) instead of
+    /// minting a local one. Last-Modified becomes `stamp.ms`.
+    pub stamp: Option<Stamp>,
+}
+
+impl PublishOptions {
+    pub fn precondition(precondition: Option<Precondition>) -> Self {
+        Self {
+            precondition,
+            stamp: None,
+        }
+    }
+}
+
 /// Returned by a successful PUT or multipart complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutResult {
     pub etag: String,
     pub size: u64,
     pub last_modified_ms: i64,
+    pub stamp: Option<Stamp>,
 }
 
 /// A conditional-write precondition, evaluated against the object currently at
@@ -294,6 +318,7 @@ impl LocalObjectStore {
             change_listener: Arc::new(std::sync::RwLock::new(None)),
             delete_guard: Arc::new(std::sync::RwLock::new(None)),
             change_signals: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -309,6 +334,45 @@ impl LocalObjectStore {
     /// Installs the bucket-deletion veto (replacing any previous one).
     pub fn set_delete_guard(&self, guard: DeleteGuard) {
         *self.delete_guard.write().unwrap() = Some(guard);
+    }
+
+    /// Opens this site's identity and clock (`<root>/site.json`), with an
+    /// optional configured site id. Call once at startup, before any write.
+    pub fn init_site(&self, configured_site_id: Option<&str>) -> Result<()> {
+        let clock = SiteClock::open(self.layout.root(), configured_site_id)?;
+        log::info!("site id {}", clock.site_id());
+        self.clock
+            .set(Arc::new(clock))
+            .map_err(|_| StorageError::Io("site clock already initialised".to_string()))
+    }
+
+    fn clock(&self) -> &Arc<SiteClock> {
+        self.clock.get_or_init(|| {
+            // Tests and tools that never call init_site: persisted when the
+            // data root is writable, so stamps still survive a reopen.
+            Arc::new(
+                SiteClock::open(self.layout.root(), None)
+                    .unwrap_or_else(|_| SiteClock::ephemeral("local")),
+            )
+        })
+    }
+
+    /// This site's id (see `storage::stamp`).
+    pub fn site_id(&self) -> String {
+        self.clock().site_id().to_string()
+    }
+
+    /// The next local version stamp.
+    pub fn next_stamp(&self) -> Stamp {
+        self.clock().next()
+    }
+
+    /// The effective stamp of a stored state: its own, or for objects
+    /// written before stamps existed, `(last_modified_ms, 0, this site)`.
+    pub fn effective_stamp(&self, stamp: Option<&Stamp>, last_modified_ms: i64) -> Stamp {
+        stamp
+            .cloned()
+            .unwrap_or_else(|| Stamp::fallback(last_modified_ms, self.clock().site_id()))
     }
 
     /// The bucket's changelog signal: woken (`notify_waiters`) after every
@@ -693,7 +757,7 @@ impl LocalObjectStore {
             aws_chunked,
             expected_sha256,
             None,
-            None,
+            PublishOptions::default(),
         )
         .await
     }
@@ -711,7 +775,7 @@ impl LocalObjectStore {
         aws_chunked: bool,
         expected_sha256: Option<&str>,
         expected_decoded_len: Option<u64>,
-        precondition: Option<Precondition>,
+        options: PublishOptions,
     ) -> Result<PutResult>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -744,7 +808,7 @@ impl LocalObjectStore {
             )
             .await?
         };
-        self.commit_staged_put(bucket, key, &staging_id, precondition)
+        self.commit_staged_put_with(bucket, key, &staging_id, options)
             .await
     }
 
@@ -982,6 +1046,19 @@ impl LocalObjectStore {
         staging_id: &str,
         precondition: Option<Precondition>,
     ) -> Result<PutResult> {
+        self.commit_staged_put_with(bucket, key, staging_id, PublishOptions::precondition(precondition))
+            .await
+    }
+
+    /// [`Self::commit_staged_put`] with full [`PublishOptions`] (a replicated
+    /// stamp).
+    pub async fn commit_staged_put_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        staging_id: &str,
+        options: PublishOptions,
+    ) -> Result<PutResult> {
         validate_staging_id(staging_id)?;
         let staging_dir = self.layout.put_staging_dir(bucket, staging_id)?;
         let put_meta: PutMeta = read_json(&staging_dir.join("put.json")).await?;
@@ -1004,6 +1081,7 @@ impl LocalObjectStore {
 
         let object_meta = ObjectMeta {
             format_version: 1,
+            stamp: None,
             bucket: bucket.to_string(),
             object_key: key.to_string(),
             storage: ObjectStorageKind::Single,
@@ -1029,7 +1107,7 @@ impl LocalObjectStore {
         // Remove staging on every path — a rejected precondition must not leak
         // the staged blob.
         let result = self
-            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, precondition)
+            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, options)
             .await;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         cleanup.disarm();
@@ -1046,8 +1124,9 @@ impl LocalObjectStore {
         key: &str,
         publish_dir: &Path,
         mut object_meta: ObjectMeta,
-        precondition: Option<Precondition>,
+        options: PublishOptions,
     ) -> Result<PutResult> {
+        let PublishOptions { precondition, stamp: replicated } = options;
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if self.durability == Durability::Full {
             fsync_publish_dir(publish_dir, &object_meta).await?;
@@ -1079,15 +1158,36 @@ impl LocalObjectStore {
             }
         }
 
-        // Monotonic per-key clamp: newer-wins adjudication (rebuild, DR)
-        // requires timestamps to order versions even across clock steps.
-        let last_modified_ms = old
-            .as_ref()
-            .map(|o| o.last_modified_ms.saturating_add(1))
-            .unwrap_or(i64::MIN)
-            .max(now_ms());
-        if last_modified_ms != object_meta.last_modified_ms {
+        // The new state's version stamp. Seeing the current one first means
+        // a local write always outranks what it replaces, even if that came
+        // from a site whose clock runs ahead.
+        if let Some(old_stamp) = old.as_ref().and_then(|o| o.stamp.as_ref()) {
+            self.clock().observe(old_stamp);
+        }
+        let (stamp, last_modified_ms) = match replicated {
+            // A replicated state keeps its origin's stamp and shows its
+            // origin's time.
+            Some(stamp) => {
+                self.clock().observe(&stamp);
+                let ms = stamp.ms;
+                (stamp, ms)
+            }
+            None => {
+                let stamp = self.clock().next();
+                // Monotonic per-key clamp: newer-wins adjudication (rebuild,
+                // DR) requires timestamps to order versions even across
+                // clock steps.
+                let ms = old
+                    .as_ref()
+                    .map(|o| o.last_modified_ms.saturating_add(1))
+                    .unwrap_or(i64::MIN)
+                    .max(stamp.ms);
+                (stamp, ms)
+            }
+        };
+        if last_modified_ms != object_meta.last_modified_ms || object_meta.stamp.as_ref() != Some(&stamp) {
             object_meta.last_modified_ms = last_modified_ms;
+            object_meta.stamp = Some(stamp.clone());
             write_json_atomic(&publish_dir.join("meta.json"), &object_meta).await?;
             if self.durability == Durability::Full {
                 fsync_file(&publish_dir.join("meta.json")).await?;
@@ -1190,6 +1290,7 @@ impl LocalObjectStore {
             etag: object_meta.etag.clone(),
             last_modified_ms,
             parts: Some(crate::storage::changelog::PartLayout::of(&object_meta)),
+            stamp: Some(stamp.clone()),
         };
         let retire_id = index
             .commit_publish(
@@ -1215,6 +1316,7 @@ impl LocalObjectStore {
                         etag: object_meta.etag,
                         size: object_meta.size,
                         last_modified_ms,
+                        stamp: Some(stamp),
                     });
                 }
             }
@@ -1237,6 +1339,7 @@ impl LocalObjectStore {
             etag: object_meta.etag,
             size: object_meta.size,
             last_modified_ms,
+            stamp: Some(stamp),
         })
     }
 
@@ -1318,7 +1421,10 @@ impl LocalObjectStore {
             return Ok(None); // Idempotent: deleting an absent key succeeds.
         };
         let deleted_size = row.size;
-        let retire_id = index.commit_delete(key, &row.blob_dir, now_ms()).await?;
+        let stamp = self.clock().next();
+        let retire_id = index
+            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Client, Some(stamp))
+            .await?;
         self.crash_point("delete_after_commit");
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
         if self.durability == Durability::Relaxed {
@@ -1769,6 +1875,7 @@ impl LocalObjectStore {
             etag,
             size,
             last_modified_ms: now_ms(),
+            stamp: None,
         })
     }
 
@@ -1849,6 +1956,7 @@ impl LocalObjectStore {
             etag: written.md5,
             size: written.size,
             last_modified_ms: now_ms(),
+            stamp: None,
         })
     }
 
@@ -1901,6 +2009,7 @@ impl LocalObjectStore {
             etag: written.md5,
             size: written.size,
             last_modified_ms: now_ms(),
+            stamp: None,
         })
     }
 
@@ -1910,6 +2019,20 @@ impl LocalObjectStore {
         key: &str,
         upload_id: &str,
         requested_parts: &[CompletePartRequest],
+    ) -> Result<PutResult> {
+        self.complete_multipart_with(bucket, key, upload_id, requested_parts, PublishOptions::default())
+            .await
+    }
+
+    /// [`Self::complete_multipart`] with [`PublishOptions`] — a replicated
+    /// upload takes its stamp here, at completion, not at create.
+    pub async fn complete_multipart_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        requested_parts: &[CompletePartRequest],
+        options: PublishOptions,
     ) -> Result<PutResult> {
         self.validate_upload(bucket, key, upload_id).await?;
         if requested_parts.is_empty() {
@@ -2003,6 +2126,7 @@ impl LocalObjectStore {
             .collect();
         let object_meta = ObjectMeta {
             format_version: 1,
+            stamp: None,
             bucket: bucket.to_string(),
             object_key: key.to_string(),
             storage: ObjectStorageKind::Multipart,
@@ -2022,7 +2146,7 @@ impl LocalObjectStore {
         // Multipart completion is unconditional (object_store never sends a
         // precondition with it).
         let result = self
-            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, None)
+            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, options)
             .await?;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(result)
@@ -2036,7 +2160,15 @@ impl LocalObjectStore {
         dst_key: &str,
     ) -> Result<PutResult> {
         self.copy_object_with_metadata(
-            src_bucket, src_key, dst_bucket, dst_key, None, None, None, None,
+            src_bucket,
+            src_key,
+            dst_bucket,
+            dst_key,
+            None,
+            None,
+            None,
+            None,
+            PublishOptions::default(),
         )
         .await
     }
@@ -2051,6 +2183,7 @@ impl LocalObjectStore {
         replacement_user_meta: Option<&BTreeMap<String, String>>,
         replacement_content_type: Option<&str>,
         replacement_content_language: Option<&str>,
+        options: PublishOptions,
     ) -> Result<PutResult> {
         self.ensure_bucket_and_key(dst_bucket, dst_key).await?;
         let _source_guard = self.locks.lock(src_bucket, src_key).await;
@@ -2090,7 +2223,7 @@ impl LocalObjectStore {
         drop(_source_guard);
         // commit_staged_put owns the staging dir from here (and removes it).
         cleanup.disarm();
-        self.commit_staged_put(dst_bucket, dst_key, &staging_id, None)
+        self.commit_staged_put_with(dst_bucket, dst_key, &staging_id, options)
             .await
     }
 
@@ -2846,6 +2979,7 @@ async fn rebuild_classify_dir(dir: &Path, bucket_dir: &Path) -> Result<RebuildDi
                 etag: meta.etag.clone(),
                 last_modified_ms: meta.last_modified_ms,
                 parts: Some(crate::storage::changelog::PartLayout::of(&meta)),
+                stamp: meta.stamp.clone(),
             },
             dir.to_path_buf(),
         )));
@@ -3570,6 +3704,7 @@ mod tests {
                                 .unwrap_or_default();
                             let _ = tx
                                 .send(ObjectRecord {
+                                    stamp: None,
                                     object_key: meta.object_key.clone(),
                                     blob_dir: rel,
                                     size: meta.size,

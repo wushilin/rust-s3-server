@@ -45,6 +45,8 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     let server_etag = object.meta.etag.trim_matches('"');
     // The exact object state, as named by changelog events (`version`).
     let version = crate::storage::changelog::version_of(&object.object_dir.to_string_lossy());
+    // Its version stamp (the fallback for objects written before stamps).
+    let stamp = store.effective_stamp(object.meta.stamp.as_ref(), object.meta.last_modified_ms);
 
     // 0. x-rs3-if-version: a replicator pins the exact state a changelog
     // event named. Anything else (overwritten since, even with the same
@@ -302,6 +304,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::LAST_MODIFIED, last_modified)
         .header("x-rs3-version", version)
+        .header("x-rs3-stamp", stamp.to_header())
         .header("x-amz-request-id", "rust-s3-server");
     // AWS sends this header only for a non-default class; a STANDARD object
     // carries no `x-amz-storage-class` at all.
@@ -698,6 +701,7 @@ mod tests {
 
     fn multipart_meta(sizes: &[u64]) -> ObjectMeta {
         ObjectMeta {
+            stamp: None,
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

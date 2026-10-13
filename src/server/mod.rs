@@ -1035,6 +1035,8 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let _process_lock = acquire_process_lock(FsPath::new(&config.root))?;
 
     let store = LocalObjectStore::from_storage_config(&config.root, &config.app_config.storage);
+    // Site identity and version-stamp clock, before anything can write.
+    store.init_site(config.app_config.server.site_id.as_deref())?;
     let shutdown = store.shutdown_token();
     let metrics = Arc::new(TrafficMetrics::default());
     // One registry of in-flight work, shared by the HTTP handlers and the
@@ -2407,6 +2409,48 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
             resource,
         ),
     }
+}
+
+/// The `x-rs3-stamp` request header of a replicated write: the version
+/// stamp the object keeps instead of a fresh local one. Setting it means
+/// backdating (or forward-dating) the object, which decides last-writer-wins
+/// conflicts, so it needs `s3:ReplicateWrite` on the object as well as the
+/// write permission itself. `Ok(None)` when absent.
+pub(crate) fn replicated_stamp(
+    identity: Option<&Identity>,
+    headers: &HeaderMap,
+    bucket: &str,
+    key: &str,
+    resource: &str,
+) -> Result<Option<crate::storage::stamp::Stamp>, Response> {
+    let Some(value) = headers.get("x-rs3-stamp") else {
+        return Ok(None);
+    };
+    let stamp = value
+        .to_str()
+        .map_err(|_| "x-rs3-stamp is not valid text".to_string())
+        .and_then(crate::storage::stamp::Stamp::parse_header)
+        .map_err(|message| s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, resource))?;
+    if stamp.ms > crate::storage::time::now_ms() + crate::storage::stamp::MAX_FUTURE_MS {
+        return Err(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-rs3-stamp is too far in the future (check the source site's clock)",
+            resource,
+        ));
+    }
+    if let Some(identity) = identity {
+        let needed = [self::policy::Requirement::object("s3:ReplicateWrite", bucket, key)];
+        if !identity.authorize(&needed) {
+            return Err(s3_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "x-rs3-stamp requires s3:ReplicateWrite",
+                resource,
+            ));
+        }
+    }
+    Ok(Some(stamp))
 }
 
 fn s3_error(

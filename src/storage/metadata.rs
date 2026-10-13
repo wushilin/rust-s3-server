@@ -45,6 +45,10 @@ pub struct ObjectMeta {
     #[serde(default)]
     pub user_meta: BTreeMap<String, String>,
     pub parts: Vec<PartMeta>,
+    /// Version stamp (see `storage::stamp`); `None` on objects written
+    /// before stamps existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<super::stamp::Stamp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,6 +230,7 @@ mod tests {
     #[test]
     fn object_meta_serializes_storage_as_lowercase() {
         let meta = ObjectMeta {
+            stamp: None,
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

@@ -245,6 +245,7 @@ HMAC key.
 | `server.bind_address` | `0.0.0.0` | S3 API listen address. |
 | `server.bind_port` | `8002` | S3 API listen port. |
 | `server.base_dir` | `./rusts3-data` | Object, index, and IAM data root. |
+| `server.site_id` | generated | This site's id for replication: 1–64 letters, digits, `-` or `_`. If unset, an id is generated on first start and kept in `<base_dir>/site.json`. Give each site its own id; a copied data directory keeps the original's id, so set one on the copy. |
 | `server.proxy_protocol` | `auto` | PROXY protocol v1/v2 on both listeners. `auto` detects it per connection — a header from a loopback/private peer names the real client, a connection without one is plain HTTP; a header from a public peer is dropped. `off` never looks for one. |
 | `ui.enabled` | `true` | Enable the management console. |
 | `ui.bind_address` | S3 bind address | Optional separate console listen address. |
@@ -515,6 +516,17 @@ below).
   - Sending `x-rs3-if-version: <version>` on a GET makes it fail with `412` if
     the object has changed since. A replicator can therefore fetch exactly the
     state an event names.
+- `stamp` is the version stamp `{"ms", "c", "site"}`: when the state was
+  written (epoch ms), a counter for writes within the same millisecond
+  (almost always 0), and the id of the site that wrote it.
+  - For a delete, it is the delete's own stamp.
+  - Stamps compare by `ms`, then `c`, then `site`, identically on every site,
+    so two sites holding different states of a key agree which one is newer.
+  - A site's stamps only ever increase, including across restarts and backwards
+    clock steps, and a local write always outranks any stamp the site has seen.
+  - GET and HEAD return it as `x-rs3-stamp: <ms>.<c>.<site>`.
+  - Objects written before stamps existed report `<last-modified>.0.<this
+    site>`.
 - `parts` is how the object was uploaded. Upload the same bytes the same way
   and the other side computes the identical ETag:
   - `{"count": 1}`: a single PUT (ETag = MD5 of the content).
@@ -592,6 +604,20 @@ GET /{bucket}?x-rs3-changelog-snapshot[&after=<key>][&limit=N][&prefix=][&suffix
   - `409 Conflict`: the position doesn't belong to this log, either because it
     is beyond the head, or because `log_id` doesn't match after a rebuild
     replaced the log.
+
+Instead of `after`, pass `since=<epoch ms>` to start at the first change
+committed at or after that time; `next` is a seq as usual. Commit times never
+decrease in seq order, so the server finds the position with a binary search.
+If changes from that time may already have been removed by retention, the
+response is `410`. Responses also carry the server's `site_id`.
+
+**Replicated writes.** A PUT, CompleteMultipartUpload or CopyObject that sends
+`x-rs3-stamp: <ms>.<c>.<site>` keeps that stamp instead of getting a new local
+one, and its `Last-Modified` becomes the stamp's time. This is how a replica
+keeps the origin's stamp. Setting a stamp decides last-writer-wins conflicts,
+so it requires the custom IAM action `s3:ReplicateWrite` on the object, in
+addition to the write permission. Stamps more than 10 minutes in the future are
+refused.
 
 **Replication tokens** (created by an admin in the console) give the same reads
 without S3 credentials. They are scoped to one bucket and the token's filter:
