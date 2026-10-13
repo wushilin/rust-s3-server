@@ -45,9 +45,37 @@ pub(super) struct Worker {
     /// The link's local key still exists and may do what the link does
     /// here (checked every step: revoking it stops the link).
     pub local_check: LocalCheck,
+    /// Records the peer's site id on a link that has none yet (created
+    /// without the check): its first contact binds it.
+    pub bind_peer: BindPeer,
 }
 
 pub(super) type LocalCheck = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+pub(super) type BindPeer = Arc<dyn Fn(String) + Send + Sync>;
+
+/// The link's own site id no longer being this site's: `Err` describing
+/// the change (a site id only changes by `rusts3 change-site-id`, which
+/// starts every changelog over).
+pub(super) fn local_site_changed(link: &Link, current: &str) -> Option<String> {
+    (!link.local_site_id.is_empty() && link.local_site_id != current).then(|| {
+        format!(
+            "this site's id changed from {} to {current} since the link was made; it stays stopped until the new \
+             site ids are accepted",
+            link.local_site_id
+        )
+    })
+}
+
+/// The peer reporting another site id than the link was made with.
+pub(super) fn peer_site_changed(link: &Link, reported: &str) -> Option<String> {
+    (!link.peer_site_id.is_empty() && link.peer_site_id != reported).then(|| {
+        format!(
+            "the peer's site id changed from {} to {reported} since the link was made (renamed, or the endpoint \
+             now reaches another site); it stays stopped until the new site ids are accepted",
+            link.peer_site_id
+        )
+    })
+}
 
 /// Why a step stopped.
 #[derive(Debug)]
@@ -187,8 +215,19 @@ impl Worker {
         Ok(())
     }
 
+    fn site_changed(&self, what: String) -> StepError {
+        self.update(|s| s.site_changed = Some(what.clone()));
+        StepError::Fatal(what)
+    }
+
     fn check_site(&self, peer_site: &str) -> Result<(), StepError> {
         let local = self.store.site_id();
+        if let Some(changed) = peer_site_changed(&self.link, peer_site) {
+            return Err(self.site_changed(changed));
+        }
+        if self.link.peer_site_id.is_empty() && peer_site != local {
+            (self.bind_peer)(peer_site.to_string());
+        }
         if peer_site == local {
             return Err(StepError::Fatal(format!(
                 "the peer reports this server's own site id ({local}): a copied data directory? Give one of \
@@ -214,6 +253,9 @@ impl Worker {
     /// One unit of progress: a snapshot page or a changelog batch, applied
     /// and checkpointed.
     async fn step(&self) -> Result<(), StepError> {
+        if let Some(changed) = local_site_changed(&self.link, &self.store.site_id()) {
+            return Err(self.site_changed(changed));
+        }
         (self.local_check)().map_err(StepError::Retry)?;
         let checkpoint = match self.load().await? {
             Some(checkpoint) if now_ms() - checkpoint.saved_at_ms > self.max_checkpoint_age_ms => {

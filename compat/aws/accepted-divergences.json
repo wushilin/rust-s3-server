@@ -90,6 +90,10 @@
     {
       "op": "*", "kind": "header", "contains": "x-rs3-stamp",
       "why": "rusts3 extension: the object's version stamp (ms.counter.site), which replication compares for last-writer-wins. S3 clients ignore unknown headers."
+    },
+    {
+      "op": "*", "kind": "header", "contains": "x-rs3-site",
+      "why": "rusts3 extension: the answering server's site id on object reads, so a replication link confirms it is still writing to the site it was made with. S3 clients ignore unknown headers."
     }
   ]
 }

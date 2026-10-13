@@ -245,7 +245,7 @@ HMAC key.
 | `server.bind_address` | `0.0.0.0` | S3 API listen address. |
 | `server.bind_port` | `8002` | S3 API listen port. |
 | `server.base_dir` | `./rusts3-data` | Object, index, and IAM data root. |
-| `server.site_id` | generated | This site's id for replication: 1–64 letters, digits, `-` or `_`. If unset, an id is generated on first start and kept in `<base_dir>/site.json`. Give each site its own id; a copied data directory keeps the original's id, so set one on the copy. |
+| `server.site_id` | generated | This site's id for replication: 1–64 letters, digits, `-` or `_`. It is fixed at the first start (this value, or a generated id when unset) and recorded in `<base_dir>/site.json`, and it never changes after: it is in every version stamp the site writes and is how replication peers know it. Setting a different value later makes the server refuse to start. Give each site its own id. A copied data directory keeps the original's id: give the copy a new one with `rusts3 change-site-id` before its first start (see Replication links). The console shows the id in the sidebar. |
 | `server.proxy_protocol` | `auto` | PROXY protocol v1/v2 on both listeners. `auto` detects it per connection — a header from a loopback/private peer names the real client, a connection without one is plain HTTP; a header from a public peer is dropped. `off` never looks for one. |
 | `ui.enabled` | `true` | Enable the management console. |
 | `ui.bind_address` | S3 bind address | Optional separate console listen address. |
@@ -696,6 +696,21 @@ filter by prefix).
   its console lists the link under **Managed on other sites** (links seen
   reading its changelogs in the last 5 minutes).
 
+**Changing a site id.** A site id is how a site's changes are known: every
+version stamp carries the id of the site that wrote it, and peers remember
+which site a changelog belongs to. So it is fixed at first start, a
+different `server.site_id` later makes the server refuse to start, and the
+only way to change it is, with the server stopped:
+
+```
+rusts3 change-site-id -c config.yaml <new-id> --yes
+```
+
+It starts every bucket's changelog over (a new log id, old entries dropped),
+then records the new id. Changelog readers re-snapshot on their own;
+webhooks that were behind pause; replication links on both sides stop until
+their new site ids are accepted. Objects are untouched and keep their stamps.
+
 **Two keys, both explicit.** A link carries everything it is allowed to do:
 
 | | Key | Mirror needs | Merge needs |
@@ -720,6 +735,14 @@ pushed multipart copy can clean up.
   `GET /{bucket}?x-rs3-access`); the local key must exist and have its
   permissions too. A merge into a read-only peer bucket is refused. So is a
   merge link for a pair the peer already serves with its own merge link.
+- **Bound to two site ids.** A link records this site's id and the peer's
+  when it is created (the peer's from the check; a link created without the
+  check records it on first contact). If either side later reports another
+  id, the link stops with an error naming the change, and nothing moves in
+  either direction: the push also confirms the peer's id (`x-rs3-site`, on
+  object reads) before every write. **Accept site ids** (console, or action
+  `accept_site_ids`) re-checks the peer, records the ids both sides report
+  now, and starts again from a fresh snapshot.
 - **Checked while it runs:** the local key's permissions every step (delete
   the key or narrow its policy and the link stops with an error saying what
   is missing); the peer enforces its key on every request.

@@ -79,6 +79,13 @@ impl Pusher {
         });
     }
 
+    /// The link is stopped (by the pull side, or a site id change): push
+    /// nothing.
+    fn held(&self) -> bool {
+        let status = self.status.lock().unwrap();
+        status.state == "stopped" || status.site_changed.is_some()
+    }
+
     pub async fn run(self) {
         self.update(|s| s.state = "idle".to_string());
         let mut backoff = Duration::from_secs(1);
@@ -89,7 +96,7 @@ impl Pusher {
             self.beat();
             // The pull side found this pair served by a link on the peer:
             // stand down with it.
-            if self.status.lock().unwrap().state == "stopped" {
+            if self.held() {
                 self.update(|s| s.state = "stopped".to_string());
                 tokio::select! {
                     _ = self.cancel.cancelled() => return,
@@ -152,6 +159,9 @@ impl Pusher {
     }
 
     async fn step(&self) -> Result<(), StepError> {
+        if let Some(changed) = super::worker::local_site_changed(&self.link, &self.store.site_id()) {
+            return Err(StepError::Fatal(changed));
+        }
         (self.local_check)().map_err(StepError::Retry)?;
         let bucket = self.link.local_bucket.clone();
         // Held only to read the log's identity, never across a long poll or
@@ -173,6 +183,9 @@ impl Pusher {
             // Start: learn who the peer is, then list from the local head.
             let probe = self.peer.snapshot(None, 1, "", false).await?;
             self.peer_answered();
+            if let Some(changed) = super::worker::peer_site_changed(&self.link, &probe.site_id) {
+                return Err(StepError::Fatal(changed));
+            }
             if probe.site_id == self.store.site_id() {
                 return Err(StepError::Retry(format!(
                     "the peer reports this server's own site id ({}): a copied data directory?",
@@ -233,6 +246,10 @@ impl Pusher {
                     _ = self.cancel.cancelled() => return Ok(()),
                     page = read::read(&self.store, &bucket, &params) => page?,
                 };
+                // Stopped while this waited for changes: keep them for later.
+                if self.held() {
+                    return Ok(());
+                }
                 self.apply_all(&page.events, &checkpoint.peer_site, true).await?;
                 if !page.events.is_empty() {
                     self.peer_answered();
@@ -289,6 +306,11 @@ impl Pusher {
         let removed = event.removed_stamp.clone().unwrap_or_else(|| stamp.clone());
         let incoming = if is_delete { Rank::deleted(removed.clone()) } else { Rank::live(stamp.clone()) };
         let remote = self.peer.state(&event.key).await.map_err(StepError::from)?;
+        // Still the site the link was made with? Checked before every write.
+        if let Some(changed) = self.peer.last_site().and_then(|site| super::worker::peer_site_changed(&self.link, &site)) {
+            self.status.lock().unwrap().site_changed = Some(changed.clone());
+            return Err(StepError::Fatal(changed));
+        }
         if remote.as_ref().is_some_and(|(rank, _)| *rank >= incoming) {
             self.update(|s| s.skipped += 1);
             return Ok(());

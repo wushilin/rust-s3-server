@@ -430,6 +430,28 @@ impl LocalObjectStore {
             .map_err(|_| StorageError::Io("site clock already initialised".to_string()))
     }
 
+    /// Gives this data directory a new site id (offline, server stopped).
+    /// The site id only matters through the changelogs — peers remember
+    /// which site a log belongs to, and stamps name the site that wrote
+    /// them — so every bucket's changelog starts over first (a new log id:
+    /// every reader re-snapshots and learns the new id), and only then is
+    /// the id recorded. Safe to re-run after an interruption. Objects keep
+    /// their stamps (with the old id): they are only values, and still
+    /// order correctly. Returns `(old id, [(bucket, changes dropped)])`.
+    pub async fn change_site_id(&self, new_site: &str) -> Result<(Option<String>, Vec<(String, usize)>)> {
+        super::stamp::validate_site_id(new_site).map_err(StorageError::Io)?;
+        let root = self.layout.root().to_path_buf();
+        let old = SiteClock::recorded_site_id(&root)?;
+        let mut buckets = Vec::new();
+        for (bucket, _) in self.list_buckets().await? {
+            let index = self.index(&bucket).await?;
+            let (_, removed) = index.reset_changelog().await?;
+            buckets.push((bucket, removed));
+        }
+        SiteClock::record_site_id(&root, new_site)?;
+        Ok((old, buckets))
+    }
+
     fn clock(&self) -> &Arc<SiteClock> {
         self.clock.get_or_init(|| {
             // Tests and tools that never call init_site: persisted when the

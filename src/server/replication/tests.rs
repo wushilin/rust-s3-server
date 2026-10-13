@@ -147,6 +147,22 @@ impl Site {
         self.link_with(peer, bucket, mode, ak, sk, true).await.unwrap()
     }
 
+    /// Stops this site, gives it a new site id as `rusts3 change-site-id`
+    /// does (every changelog starts over), and starts it as `name`.
+    async fn restart_as(self, name: &str) -> Self {
+        self.shutdown.cancel();
+        self.store.shutdown_token().cancel();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let Site { tmp, store, iam, notify, replication, endpoint, .. } = self;
+        drop((store, iam, notify, replication));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let offline = LocalObjectStore::new(tmp.path());
+        offline.change_site_id(name).await.unwrap();
+        drop(offline);
+        let bind = endpoint.trim_start_matches("http://").to_string();
+        Self::open(tmp, name, fast_timing(), &bind).await
+    }
+
     /// A link here with `bucket` on `peer`, with the peer key `ak`/`sk`;
     /// `verify: false` skips the creation-time permission check.
     async fn link_with(&self, peer: &Site, bucket: &str, mode: Mode, ak: &str, sk: &str, verify: bool) -> Result<String, LinkError> {
@@ -465,6 +481,85 @@ async fn a_delete_of_a_key_absent_here_still_reaches_the_peer() {
     // it must not stay on a while b refuses it forever.
     eventually(30, "deleted on both", || async { !a.contents("data").await.contains_key("k") }).await;
     assert!(!b.contents("data").await.contains_key("k"));
+}
+
+#[tokio::test]
+async fn a_link_is_bound_to_both_site_ids_and_stops_when_either_changes() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "from-a", b"a").await;
+    b.put("data", "from-b", b"b").await;
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    let view = b.link(&id);
+    assert_eq!((view.local_site_id.as_str(), view.peer_site_id.as_str()), ("site-b", "site-a"), "bound at creation");
+    eventually(30, "merged", || same(&a, &b, "data")).await;
+
+    // The peer changes its id: the link stops and says so; nothing moves.
+    let a = a.restart_as("site-a2").await;
+    eventually(30, "stopped on the peer's new id", || {
+        let view = b.link(&id);
+        async move {
+            view.status.state == "stopped"
+                && view.status.site_changed.as_deref().is_some_and(|c| c.contains("from site-a to site-a2"))
+        }
+    })
+    .await;
+    a.put("data", "after-a-renamed", b"a2").await;
+    b.put("data", "while-a-renamed", b"b2").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!b.contents("data").await.contains_key("after-a-renamed"), "held");
+    assert!(!a.contents("data").await.contains_key("while-a-renamed"), "held both ways");
+    // Accepted: bound to the new id, replicating again.
+    let view = b.replication.act(&id, LinkAction::AcceptSiteIds).await.unwrap();
+    assert_eq!(view.peer_site_id, "site-a2");
+    eventually(30, "converged after accepting", || same(&a, &b, "data")).await;
+    eventually(10, "no error", || {
+        let view = b.link(&id);
+        async move { view.status.site_changed.is_none() && view.status.last_error.is_none() }
+    })
+    .await;
+
+    // The site running the link changes its id: stopped too, until accepted.
+    let b = b.restart_as("site-b2").await;
+    eventually(30, "stopped on this site's new id", || {
+        let view = b.link(&id);
+        async move { view.status.site_changed.as_deref().is_some_and(|c| c.contains("this site's id changed")) }
+    })
+    .await;
+    b.store.delete_object("data", "from-a").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(a.contents("data").await.contains_key("from-a"), "held");
+    b.replication.act(&id, LinkAction::AcceptSiteIds).await.unwrap();
+    assert_eq!(b.link(&id).local_site_id, "site-b2");
+    eventually(30, "converged after accepting", || same(&a, &b, "data")).await;
+    assert!(!a.contents("data").await.contains_key("from-a"));
+    // Stamps written before keep the old ids and still order correctly.
+    assert!(a.contents("data").await["from-b"].2.ends_with(".site-b"));
+    // And a configured id that differs from the recorded one is refused.
+    let err = crate::storage::stamp::SiteClock::open(a.tmp.path(), Some("site-a")).unwrap_err().to_string();
+    assert!(err.contains("change-site-id"), "{err}");
+}
+
+#[tokio::test]
+async fn an_unchecked_link_binds_the_peer_site_id_on_first_contact() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let id = b.link_with(&a, "data", Mode::Merge, AK, SK, false).await.unwrap();
+    assert_eq!(b.link(&id).peer_site_id, "");
+    eventually(30, "bound", || {
+        let view = b.link(&id);
+        async move { view.peer_site_id == "site-a" }
+    })
+    .await;
+    // Persisted: still bound after a restart.
+    let b = b.restart().await;
+    assert_eq!(b.link(&id).peer_site_id, "site-a");
 }
 
 #[tokio::test]
@@ -1291,6 +1386,8 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
             access_key: AK.into(),
             secret_key: SK.into(),
             local_access_key: AK.into(),
+            local_site_id: String::new(),
+            peer_site_id: String::new(),
             region: "us-east-1".into(),
             mode: Mode::Mirror,
             enabled: true,
@@ -1313,6 +1410,7 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
         long_poll: Duration::from_secs(1),
         parallelism: 4,
         local_check: Arc::new(|| Ok(())),
+        bind_peer: Arc::new(|_| {}),
     };
     let w = worker(&b);
     // Applying the stale v1 event: the peer answers 412 to the pinned reads,

@@ -35,6 +35,9 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         Err(err) => {
             let not_found = matches!(err, crate::storage::errors::StorageError::ObjectNotFound { .. });
             let mut response = srv::storage_error_response(err, &format!("/{bucket}/{key}"));
+            if let Ok(value) = axum::http::HeaderValue::from_str(&store.site_id()) {
+                response.headers_mut().insert("x-rs3-site", value);
+            }
             // A deleted key still has a state for replication: its
             // tombstone's stamp.
             if not_found {
@@ -329,6 +332,9 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         .header(header::LAST_MODIFIED, last_modified)
         .header("x-rs3-version", version)
         .header("x-rs3-stamp", stamp.to_header())
+        // Which site answers: a replication link confirms it is still the one
+        // it was made with before writing to it.
+        .header("x-rs3-site", store.site_id())
         .header("x-amz-request-id", "rust-s3-server");
     // AWS sends this header only for a non-default class; a STANDARD object
     // carries no `x-amz-storage-class` at all.

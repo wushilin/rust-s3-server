@@ -206,6 +206,9 @@ pub enum LinkAction {
     Resume,
     /// Discard the checkpoint and start again from a fresh snapshot.
     Resnapshot,
+    /// A site id changed (the link stopped): re-check the peer, record the
+    /// current ids of both sides, and start again from a fresh snapshot.
+    AcceptSiteIds,
 }
 
 /// What the console shows: the configuration (without the secret) and the
@@ -219,6 +222,8 @@ pub struct LinkView {
     pub peer_bucket: String,
     pub access_key: String,
     pub local_access_key: String,
+    pub local_site_id: String,
+    pub peer_site_id: String,
     pub region: String,
     pub mode: Mode,
     pub enabled: bool,
@@ -373,7 +378,24 @@ impl ReplicationService {
                 incoming: Mutex::new(HashMap::new()),
             }),
         };
-        for link in service.inner.db.load_all().await? {
+        for mut link in service.inner.db.load_all().await? {
+            // Links made before site ids were recorded: bind to what they
+            // already replicate with.
+            if link.local_site_id.is_empty() || link.peer_site_id.is_empty() {
+                if link.local_site_id.is_empty() {
+                    link.local_site_id = service.inner.store.site_id();
+                }
+                if link.peer_site_id.is_empty() {
+                    if let Ok(index) = service.inner.store.index(&link.local_bucket).await {
+                        if let Ok(Some(bytes)) = index.get_checkpoint(&link.id).await {
+                            if let Ok(checkpoint) = serde_json::from_slice::<model::Checkpoint>(&bytes) {
+                                link.peer_site_id = checkpoint.peer_site;
+                            }
+                        }
+                    }
+                }
+                service.inner.db.put(&link).await?;
+            }
             service.install(link);
         }
         let weak = Arc::downgrade(&service.inner);
@@ -538,6 +560,7 @@ impl ReplicationService {
                     long_poll: self.inner.timing.long_poll,
                     parallelism: self.inner.timing.parallelism,
                     local_check: self.local_check(&rt.link),
+                    bind_peer: self.bind_peer(&rt.link.id),
                 };
                 rt.worker = Some((cancel, tokio::spawn(worker.run())));
             }
@@ -569,6 +592,33 @@ impl ReplicationService {
                 rt.pusher = Some((cancel, tokio::spawn(pusher.run())));
             }
         }
+    }
+
+    /// Binds a link created unchecked to the peer site id its first contact
+    /// reports (persisted; the running worker keeps its own copy).
+    fn bind_peer(&self, id: &str) -> worker::BindPeer {
+        let weak = Arc::downgrade(&self.inner);
+        let id = id.to_string();
+        Arc::new(move |site: String| {
+            let Some(inner) = weak.upgrade() else { return };
+            let link = {
+                let links = inner.links.read().unwrap();
+                let Some(rt) = links.get(&id) else { return };
+                let mut rt = rt.lock().unwrap();
+                if !rt.link.peer_site_id.is_empty() {
+                    return;
+                }
+                rt.link.peer_site_id = site.clone();
+                rt.link.clone()
+            };
+            let db = inner.db.clone();
+            tokio::spawn(async move {
+                match db.put(&link).await {
+                    Ok(()) => log::info!("replication link {} bound to peer site {site}", link.id),
+                    Err(err) => log::warn!("replication link {}: could not record peer site {site}: {err}", link.id),
+                }
+            });
+        })
     }
 
     fn local_check(&self, link: &Link) -> worker::LocalCheck {
@@ -635,7 +685,7 @@ impl ReplicationService {
     /// mode needs — reading it, and for a merge link also writing it with
     /// the changes' own stamps. A merge link the peer already runs for this
     /// pair makes a second one pointless: refused.
-    async fn verify(&self, link: &Link) -> Result<(), LinkError> {
+    async fn verify(&self, link: &Link) -> Result<peer::AccessReport, LinkError> {
         let peer = PeerClient::new(peer_config(link, &self.inner.store.site_id())).map_err(LinkError::BadRequest)?;
         let at = format!("bucket {} at {}", link.peer_bucket, link.peer_endpoint);
         let report = match peer.access().await {
@@ -690,7 +740,7 @@ impl ReplicationService {
                 report.site_id, link.peer_bucket
             )));
         }
-        Ok(())
+        Ok(report)
     }
 
     pub async fn create(&self, request: LinkRequest, created_by: &str) -> Result<LinkView, LinkError> {
@@ -749,7 +799,7 @@ impl ReplicationService {
                 )));
             }
         }
-        let link = Link {
+        let mut link = Link {
             v: RECORD_VERSION,
             id: format!("rl_{}", random_hex(8)),
             name: request.name.trim().to_string(),
@@ -759,6 +809,9 @@ impl ReplicationService {
             access_key: request.access_key,
             secret_key: request.secret_key,
             local_access_key: request.local_access_key.trim().to_string(),
+            local_site_id: self.inner.store.site_id(),
+            // From the check below; unchecked, the first contact binds it.
+            peer_site_id: String::new(),
             region: request.region.filter(|r| !r.is_empty()).unwrap_or_else(|| "us-east-1".to_string()),
             mode: request.mode,
             enabled: request.enabled,
@@ -768,7 +821,7 @@ impl ReplicationService {
         self.validate(&link)?;
         check_local(&self.inner.local_auth, &link).map_err(LinkError::BadRequest)?;
         if request.verify {
-            self.verify(&link).await?;
+            link.peer_site_id = self.verify(&link).await?.site_id;
         }
         if link.mode == Mode::Mirror {
             self.inner.store.set_bucket_read_only(&link.local_bucket, true).await?;
@@ -811,7 +864,8 @@ impl ReplicationService {
         // New peer or credentials: check them as on create.
         let after = (link.peer_endpoint.clone(), link.access_key.clone(), link.secret_key.clone(), link.region.clone());
         if after != before && update.verify.unwrap_or(true) {
-            self.verify(&link).await?;
+            // A new endpoint may reach another site: bind to what answers.
+            link.peer_site_id = self.verify(&link).await?.site_id;
         }
         self.inner.db.put(&link).await?;
         {
@@ -849,6 +903,36 @@ impl ReplicationService {
             LinkAction::Resume => {
                 self.update(id, LinkUpdate { enabled: Some(true), ..LinkUpdate::default() }).await?;
             }
+            LinkAction::AcceptSiteIds => {
+                let rt = self.runtime(id)?;
+                let mut link = rt.lock().unwrap().link.clone();
+                // What answers now, checked as on create.
+                let report = self.verify(&link).await?;
+                link.peer_site_id = report.site_id;
+                link.local_site_id = self.inner.store.site_id();
+                self.inner.db.put(&link).await?;
+                let bucket = {
+                    let mut rt = rt.lock().unwrap();
+                    rt.stop();
+                    rt.link = link.clone();
+                    let mut status = rt.status.lock().unwrap();
+                    status.site_changed = None;
+                    status.last_error = None;
+                    status.last_error_ms = 0;
+                    status.peer_site = None;
+                    link.local_bucket.clone()
+                };
+                // Positions in logs of the old ids mean nothing now.
+                let index = self.inner.store.index(&bucket).await?;
+                index.put_checkpoint(id, None).await?;
+                index.put_checkpoint(&push::checkpoint_key(id), None).await?;
+                log::info!(
+                    "replication link {id}: site ids accepted (here {}, peer {})",
+                    link.local_site_id,
+                    link.peer_site_id
+                );
+                self.supervise();
+            }
             LinkAction::Resnapshot => {
                 let rt = self.runtime(id)?;
                 let bucket = {
@@ -878,6 +962,8 @@ impl ReplicationService {
             peer_bucket: link.peer_bucket.clone(),
             access_key: link.access_key.clone(),
             local_access_key: link.local_access_key.clone(),
+            local_site_id: link.local_site_id.clone(),
+            peer_site_id: link.peer_site_id.clone(),
             region: link.region.clone(),
             mode: link.mode,
             enabled: link.enabled,
@@ -963,6 +1049,7 @@ impl ReplicationService {
                 long_poll: self.inner.timing.long_poll,
                 parallelism: 1,
                 local_check: self.local_check(&link),
+                bind_peer: Arc::new(|_| {}),
             };
             if let Err(err) = check_local(&self.inner.local_auth, &link) {
                 notes.push(format!("{}: {err}", link.name));

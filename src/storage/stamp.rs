@@ -130,6 +130,13 @@ struct SiteFile {
     /// Generated once, on first start.
     #[serde(default)]
     generated_site_id: String,
+    /// The site id this data directory is: fixed at first start (the
+    /// configured one, else the generated one) and never changed after —
+    /// it is in every stamp the site wrote and is how peers know it.
+    /// (Empty in files written before it was recorded: pinned on the next
+    /// start.)
+    #[serde(default)]
+    site_id: String,
     /// No stamp at or below this was ever issued... or above it: every
     /// issued `ms` is `<=` this.
     #[serde(default)]
@@ -152,8 +159,10 @@ pub struct SiteClock {
 }
 
 impl SiteClock {
-    /// Opens (creating on first start) `<root>/site.json`. `configured`
-    /// overrides the generated site id.
+    /// Opens (creating on first start) `<root>/site.json`. The site id is
+    /// fixed at first start — `configured` if given, else a generated one —
+    /// and a later `configured` that differs is refused: a site id never
+    /// changes.
     pub fn open(root: &Path, configured: Option<&str>) -> Result<Self> {
         fs::create_dir_all(root)?;
         let path = root.join(SITE_FILE);
@@ -168,12 +177,28 @@ impl SiteClock {
             rand::rng().fill_bytes(&mut buf);
             file.generated_site_id = buf.iter().map(|b| format!("{b:02x}")).collect();
         }
-        let site = match configured.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(site) => {
-                validate_site_id(site).map_err(StorageError::Io)?;
-                site.to_string()
+        let configured = configured.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(site) = configured {
+            validate_site_id(site).map_err(StorageError::Io)?;
+        }
+        let site = match (file.site_id.as_str(), configured) {
+            // First start (or a file from before the id was recorded): pin
+            // what is in effect now.
+            ("", Some(site)) => site.to_string(),
+            ("", None) => file.generated_site_id.clone(),
+            (pinned, Some(site)) if site != pinned => {
+                return Err(StorageError::Io(format!(
+                    "this data directory is site {pinned:?}, but server.site_id is {site:?}. A site id does not \
+                     change by configuration: it is in every version stamp this site wrote and is how \
+                     replication peers know it, through the changelogs. Set server.site_id to {pinned:?} (or \
+                     remove it) — or, to really change it, stop the server and run `rusts3 change-site-id -c \
+                     <config> {site} --yes`, which starts every bucket's changelog over."
+                )))
             }
-            None => file.generated_site_id.clone(),
+            (pinned, _) => {
+                validate_site_id(pinned).map_err(StorageError::Io)?;
+                pinned.to_string()
+            }
         };
         let clock = Self {
             site,
@@ -194,6 +219,41 @@ impl SiteClock {
             clock.reserve(&mut state, until)?;
         }
         Ok(clock)
+    }
+
+    /// The site id `<root>/site.json` records (`None`: no site has run
+    /// here yet, or it predates recording it).
+    pub fn recorded_site_id(root: &Path) -> Result<Option<String>> {
+        match fs::read(root.join(SITE_FILE)) {
+            Ok(bytes) => {
+                let file: SiteFile = serde_json::from_slice(&bytes)?;
+                Ok(Some(file.site_id).filter(|s| !s.is_empty()))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Records `site` as this data directory's site id (offline; see
+    /// `LocalObjectStore::change_site_id`, which first starts every
+    /// changelog over). Keeps the clock's high-water mark.
+    pub fn record_site_id(root: &Path, site: &str) -> Result<()> {
+        validate_site_id(site).map_err(StorageError::Io)?;
+        let path = root.join(SITE_FILE);
+        let mut file: SiteFile = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => SiteFile::default(),
+            Err(err) => return Err(err.into()),
+        };
+        file.site_id = site.to_string();
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut out = fs::File::create(&tmp)?;
+            out.write_all(&serde_json::to_vec_pretty(&file)?)?;
+            out.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     /// An unpersisted clock (tests, tools): a fixed site id.
@@ -222,6 +282,7 @@ impl SiteClock {
         let high_water = until + RESERVE_MS;
         let body = serde_json::to_vec_pretty(&SiteFile {
             generated_site_id: self.generated.clone(),
+            site_id: self.site.clone(),
             high_water_ms: high_water,
         })?;
         let tmp = path.with_extension("json.tmp");
@@ -322,7 +383,8 @@ mod tests {
     }
 
     #[test]
-    fn site_id_persists_and_can_be_overridden() {
+    fn the_site_id_is_fixed_at_first_start() {
+        // Generated: kept across restarts.
         let tmp = tempfile::tempdir().unwrap();
         let first = SiteClock::open(tmp.path(), None).unwrap();
         let id = first.site_id().to_string();
@@ -332,10 +394,36 @@ mod tests {
         let again = SiteClock::open(tmp.path(), None).unwrap();
         assert_eq!(again.site_id(), id, "generated once");
         assert!(again.next() > stamp, "a restart never reissues older stamps");
-        let named = SiteClock::open(tmp.path(), Some("sg-1")).unwrap();
-        assert_eq!(named.site_id(), "sg-1");
+        drop(again);
+        // A configured id that differs is refused, saying what to do.
+        let err = SiteClock::open(tmp.path(), Some("sg-1")).unwrap_err().to_string();
+        assert!(err.contains(&id) && err.contains("change-site-id"), "{err}");
         assert!(SiteClock::open(tmp.path(), Some("bad.id")).is_err());
-        assert_eq!(SiteClock::open(tmp.path(), None).unwrap().site_id(), id, "override does not replace it");
+        // Configuring the same id is fine.
+        assert_eq!(SiteClock::open(tmp.path(), Some(&id)).unwrap().site_id(), id);
+
+        // Configured at first start: that is the id, with or without the
+        // setting afterwards.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(SiteClock::open(tmp.path(), Some("sg-1")).unwrap().site_id(), "sg-1");
+        assert_eq!(SiteClock::open(tmp.path(), None).unwrap().site_id(), "sg-1");
+        assert!(SiteClock::open(tmp.path(), Some("sg-2")).is_err());
+
+        // A file from before the id was recorded: what is in effect is pinned.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(SITE_FILE), r#"{"generated_site_id":"0011223344556677","high_water_ms":5}"#).unwrap();
+        assert_eq!(SiteClock::open(tmp.path(), Some("legacy")).unwrap().site_id(), "legacy");
+        assert_eq!(SiteClock::open(tmp.path(), None).unwrap().site_id(), "legacy");
+        assert!(SiteClock::open(tmp.path(), Some("other")).is_err());
+
+        // Recording a new id (what `change-site-id` does after starting the
+        // changelogs over) keeps the clock's high-water mark.
+        let before = SiteClock::open(tmp.path(), None).unwrap().next();
+        SiteClock::record_site_id(tmp.path(), "renamed").unwrap();
+        assert_eq!(SiteClock::recorded_site_id(tmp.path()).unwrap().as_deref(), Some("renamed"));
+        let after = SiteClock::open(tmp.path(), Some("renamed")).unwrap();
+        assert_eq!(after.site_id(), "renamed");
+        assert!(after.next().ms >= before.ms, "the clock never goes back");
     }
 
     #[test]
@@ -345,7 +433,7 @@ mod tests {
         // (relative to the wall clock now — as after a backwards step).
         fs::write(
             tmp.path().join(SITE_FILE),
-            serde_json::to_vec(&SiteFile { generated_site_id: "abc".into(), high_water_ms: now_ms() + 60_000 }).unwrap(),
+            serde_json::to_vec(&SiteFile { generated_site_id: "abc".into(), site_id: String::new(), high_water_ms: now_ms() + 60_000 }).unwrap(),
         )
         .unwrap();
         let clock = SiteClock::open(tmp.path(), None).unwrap();

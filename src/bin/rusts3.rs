@@ -71,6 +71,23 @@ enum Command {
     },
     /// Write a documented config.yaml in the current directory.
     Init,
+    /// Give this server a new site id (run with the server stopped).
+    ///
+    /// A site id is in every version stamp the site writes and is how
+    /// replication peers know it, through the changelogs. So every bucket's
+    /// changelog starts over: replication links and changelog readers
+    /// re-snapshot, and webhooks that were behind pause.
+    #[command(name = "change-site-id")]
+    ChangeSiteId {
+        /// Path to config.yaml.
+        #[arg(short = 'c', long, value_name = "FILE", default_value = "config.yaml")]
+        config: String,
+        /// The new site id: 1-64 letters, digits, '-' or '_'.
+        new_site_id: String,
+        /// Do it (without this, only explains what would happen).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Header prepended to the config `init` writes. The body below it is the
@@ -239,6 +256,21 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(Command::Init) => write_default_config(),
+        Some(Command::ChangeSiteId { config, new_site_id, yes }) => {
+            let cfg = AppConfig::from_file(&config)?;
+            if !yes {
+                println!(
+                    "This gives the server with data directory {} the site id {new_site_id:?}.\n\
+                     Every bucket's changelog starts over: replication links and changelog readers \
+                     re-snapshot, webhooks that are behind pause. Objects are not touched.\n\
+                     Stop the server first, then re-run with --yes.",
+                    cfg.server.base_dir
+                );
+                return Ok(());
+            }
+            print!("{}", rust_s3_server::server::change_site_id(&cfg, &new_site_id).await?);
+            Ok(())
+        }
         None if cli.init => write_default_config(),
         None => {
             let cfg = match cli.config {

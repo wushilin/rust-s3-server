@@ -1467,10 +1467,11 @@ async fn the_site_id_and_clock_survive_a_restart() {
     reopened.init_site(None).unwrap();
     assert_eq!(reopened.site_id(), site);
     assert!(reopened.next_stamp() > before);
-    // A configured id overrides the generated one.
+    // The id is fixed: configuring another one later is refused (only
+    // `rusts3 change-site-id` changes it).
     let named = LocalObjectStore::new(tmp.path());
-    named.init_site(Some("sg-1")).unwrap();
-    assert_eq!(named.site_id(), "sg-1");
+    let err = named.init_site(Some("sg-1")).unwrap_err().to_string();
+    assert!(err.contains("change-site-id"), "{err}");
 }
 
 #[tokio::test]

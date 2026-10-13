@@ -203,6 +203,8 @@ pub struct PeerClient {
     http: reqwest::Client,
     /// The last changelog read's [`HEADER_MERGE_BACK`] answer.
     merge_back: std::sync::Mutex<Option<String>>,
+    /// The site id the peer last answered an object HEAD with (`x-rs3-site`).
+    last_site: std::sync::Mutex<Option<String>>,
 }
 
 /// AWS URI encoding of one path segment. `.` / `..` segments are escaped
@@ -252,7 +254,13 @@ impl PeerClient {
             .user_agent(concat!("rusts3-replication/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|err| err.to_string())?;
-        Ok(Self { config, host, http, merge_back: std::sync::Mutex::new(None) })
+        Ok(Self {
+            config,
+            host,
+            http,
+            merge_back: std::sync::Mutex::new(None),
+            last_site: std::sync::Mutex::new(None),
+        })
     }
 
     fn signed(&self, method: Method, path: &str, query: &str, extra: &[(&str, &str)]) -> reqwest::RequestBuilder {
@@ -290,6 +298,11 @@ impl PeerClient {
     /// its own pairing this bucket with us: `<link id>;<name>`.
     pub fn merge_back(&self) -> Option<String> {
         self.merge_back.lock().unwrap().clone()
+    }
+
+    /// The site id the peer reported on the last [`Self::state`].
+    pub fn last_site(&self) -> Option<String> {
+        self.last_site.lock().unwrap().clone()
     }
 
     async fn json<T: serde::de::DeserializeOwned>(&self, query: &str, timeout: Duration) -> Result<T, PeerError> {
@@ -444,6 +457,9 @@ impl PeerClient {
             .send()
             .await
             .map_err(|err| PeerError::Other(format!("peer unreachable: {err}")))?;
+        if let Some(site) = response.headers().get("x-rs3-site").and_then(|v| v.to_str().ok()) {
+            *self.last_site.lock().unwrap() = Some(site.to_string());
+        }
         let header = |name: &str| {
             response
                 .headers()

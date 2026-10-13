@@ -43,6 +43,15 @@ pub struct Link {
     /// key's policy. Only named — the server acts as it, so no secret.
     #[serde(default)]
     pub local_access_key: String,
+    /// The two site ids this link was made between: this site's, and the
+    /// peer's (from the creation check, or its first contact when created
+    /// unchecked). A site id is how a site's changelog and stamps are
+    /// known, so if either side reports another one the link stops until an
+    /// admin accepts the new ids.
+    #[serde(default)]
+    pub local_site_id: String,
+    #[serde(default)]
+    pub peer_site_id: String,
     #[serde(default = "default_region")]
     pub region: String,
     #[serde(default)]
@@ -158,6 +167,10 @@ pub struct LinkStatus {
     /// same batch.
     pub collapsed: u64,
     pub restarts: u64,
+    /// A site id changed since the link was made (what changed): the link
+    /// is stopped until the new ids are accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_changed: Option<String>,
     /// Merge links: the push direction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push: Option<PushStatus>,
