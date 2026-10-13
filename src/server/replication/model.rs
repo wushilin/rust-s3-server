@@ -114,5 +114,8 @@ pub struct LinkStatus {
     pub skipped: u64,
     /// Changes refused because the local state was newer (last-writer-wins).
     pub superseded: u64,
+    /// Changes skipped because a later change to the same key was in the
+    /// same batch.
+    pub collapsed: u64,
     pub restarts: u64,
 }

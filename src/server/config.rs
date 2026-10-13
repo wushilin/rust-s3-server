@@ -355,6 +355,9 @@ pub struct ReplicationConfig {
     /// A worker silent (no heartbeat) for this long is replaced.
     #[serde(default = "default_replication_stale_secs")]
     pub worker_stale_secs: u64,
+    /// Changes a link applies concurrently (per batch, latest per key).
+    #[serde(default = "default_replication_parallelism")]
+    pub parallelism: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -362,6 +365,7 @@ impl Default for ReplicationConfig {
         Self {
             check_interval_secs: default_replication_check_interval_secs(),
             worker_stale_secs: default_replication_stale_secs(),
+            parallelism: default_replication_parallelism(),
         }
     }
 }
@@ -371,6 +375,9 @@ fn default_replication_check_interval_secs() -> u64 {
 }
 fn default_replication_stale_secs() -> u64 {
     300
+}
+fn default_replication_parallelism() -> usize {
+    8
 }
 
 /// Webhook delivery. Each webhook can override the batch limits and

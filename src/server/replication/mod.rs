@@ -46,6 +46,8 @@ pub struct Timing {
     /// Checkpoints older than this re-snapshot (the tombstone retention).
     pub max_checkpoint_age: Duration,
     pub long_poll: Duration,
+    /// Changes a link applies concurrently within a batch.
+    pub parallelism: usize,
 }
 
 impl Default for Timing {
@@ -55,6 +57,7 @@ impl Default for Timing {
             stale_after: Duration::from_secs(300),
             max_checkpoint_age: Duration::from_secs(14 * 86_400),
             long_poll: Duration::from_secs(20),
+            parallelism: 8,
         }
     }
 }
@@ -336,6 +339,7 @@ impl ReplicationService {
                 cancel: cancel.clone(),
                 max_checkpoint_age_ms: self.inner.timing.max_checkpoint_age.as_millis() as i64,
                 long_poll: self.inner.timing.long_poll,
+                parallelism: self.inner.timing.parallelism,
             };
             rt.worker = Some((cancel, tokio::spawn(worker.run())));
         }
@@ -569,6 +573,7 @@ impl ReplicationService {
                 cancel: CancellationToken::new(),
                 max_checkpoint_age_ms: i64::MAX,
                 long_poll: self.inner.timing.long_poll,
+                parallelism: 1,
             };
             let options = crate::storage::store::PublishOptions {
                 precondition: Some(crate::storage::store::Precondition::IfMatch(request.lost_etag.clone())),

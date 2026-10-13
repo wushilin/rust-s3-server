@@ -40,10 +40,13 @@ pub(super) struct Worker {
     pub max_checkpoint_age_ms: i64,
     /// Long-poll wait while following the changelog.
     pub long_poll: Duration,
+    /// Changes applied concurrently within a batch.
+    pub parallelism: usize,
 }
 
 /// Why a step stopped.
-enum StepError {
+#[derive(Debug)]
+pub(super) enum StepError {
     /// Start over with a fresh snapshot.
     Resnapshot(String),
     /// Will not work until reconfigured (e.g. both sides report one site id).
@@ -214,9 +217,7 @@ impl Worker {
                 // Merge mode: the peer's remembered deletes, so a key deleted
                 // there does not survive here.
                 let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, &prefix, true).await?;
-                for entry in &page.entries {
-                    self.apply(entry, &checkpoint.peer_site).await?;
-                }
+                self.apply_all(&page.entries, &checkpoint.peer_site).await?;
                 checkpoint.phase = match page.next_after {
                     Some(next) => Phase::Snapshot { through, cursor: Some(next), tombstones: true },
                     None => Phase::Live { after: through },
@@ -234,9 +235,7 @@ impl Worker {
                     page = self.peer.changes(after, CHANGES_PAGE, self.long_poll, &prefix, Some(&checkpoint.peer_log_id)) => page?,
                 };
                 self.check_site(&page.site_id)?;
-                for event in &page.events {
-                    self.apply(event, &checkpoint.peer_site).await?;
-                }
+                self.apply_all(&page.events, &checkpoint.peer_site).await?;
                 checkpoint.phase = Phase::Live { after: page.next };
                 self.update(|s| {
                     s.position = Some(page.next);
@@ -262,9 +261,7 @@ impl Worker {
         let Phase::Snapshot { through, .. } = checkpoint.phase else {
             return Ok(());
         };
-        for entry in &page.entries {
-            self.apply(entry, &checkpoint.peer_site).await?;
-        }
+        self.apply_all(&page.entries, &checkpoint.peer_site).await?;
         if self.link.mode == Mode::Mirror {
             let upto = page.next_after.clone();
             let present: std::collections::HashSet<&str> = page.entries.iter().map(|e| e.key.as_str()).collect();
@@ -310,6 +307,41 @@ impl Worker {
                 return Ok(());
             }
             after = page.next_after;
+        }
+    }
+
+    /// Applies a batch: only the latest change per key (the earlier ones are
+    /// superseded — applying them would fetch data only to discard it), up
+    /// to `parallelism` at a time. Safe in any order: the last-writer-wins
+    /// check and the commit are atomic under each key's lock, so concurrent
+    /// applies of one key still end at the highest stamp. Returns only once
+    /// every change is applied, so the caller's checkpoint never runs ahead.
+    pub(super) async fn apply_all(&self, events: &[WireEvent], peer_site: &str) -> Result<(), StepError> {
+        use futures::StreamExt;
+        let mut latest: std::collections::HashMap<&str, &WireEvent> = std::collections::HashMap::new();
+        for event in events {
+            // Later in the batch = later in the log (snapshot pages hold each
+            // key once).
+            latest.insert(event.key.as_str(), event);
+        }
+        let collapsed = events.len() - latest.len();
+        if collapsed > 0 {
+            self.update(|s| s.collapsed += collapsed as u64);
+        }
+        let mut batch: Vec<WireEvent> = latest.into_values().cloned().collect();
+        batch.sort_by_key(|e| e.seq.unwrap_or(0));
+        let mut results = futures::stream::iter(batch)
+            .map(|event: WireEvent| async move { self.apply(&event, peer_site).await })
+            .buffer_unordered(self.parallelism.max(1));
+        let mut first_error = None;
+        while let Some(result) = results.next().await {
+            if let Err(err) = result {
+                first_error.get_or_insert(err);
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 

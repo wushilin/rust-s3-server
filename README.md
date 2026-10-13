@@ -321,6 +321,7 @@ batch/grace settings.
 | `changelog.trim_interval_secs` | `600` | How often the trim and the tombstone purge run. |
 | `replication.check_interval_secs` | `5` | Supervisor tick: an enabled replication link without a live worker gets one within this. |
 | `replication.worker_stale_secs` | `300` | A link worker silent for this long is replaced. |
+| `replication.parallelism` | `8` | Changes a link applies concurrently within one batch. |
 | `changelog.tombstone_days` | `14` | How long a delete's tombstone (its stamp) is kept, so an older replicated write cannot bring the object back. |
 | `webhooks.check_interval_secs` | `5` | Checker tick: muted webhooks whose mute has passed resume on the next tick. |
 | `webhooks.mute_secs` | `30` | Mute after any unsuccessful delivery (per-webhook override). A longer `Retry-After` wins. |
@@ -691,6 +692,13 @@ How it works:
     so changes the peer has since superseded are skipped.
 - Multipart objects are re-uploaded with the peer's part layout, so ETags
   match.
+- **Parallelism:** each batch is collapsed to the latest change per key, then
+  applied up to `replication.parallelism` (8) at a time. Batches run one after
+  another, and the link checkpoints only after every change in a batch has
+  succeeded. One failure holds the checkpoint, and the batch is retried; the
+  changes that already succeeded are cheap no-ops on replay. Concurrent applies
+  are safe because the last-writer-wins check and the commit are atomic under
+  each key's lock.
 - Deletes caused by the peer's health-scan repair (`origin: repair`) are never
   replicated. The local copy is kept.
 - **Restore from peer.** When the storage scan finds an object whose bytes are

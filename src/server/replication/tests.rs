@@ -36,6 +36,7 @@ fn fast_timing() -> Timing {
         stale_after: Duration::from_secs(30),
         max_checkpoint_age: Duration::from_secs(14 * 86_400),
         long_poll: Duration::from_secs(1),
+        parallelism: 8,
     }
 }
 
@@ -290,9 +291,13 @@ async fn one_way_mirror_copies_everything_exactly_and_follows_changes() {
         .unwrap();
     a.store.delete_object("data", "meta.json").await.unwrap();
     eventually(30, "live changes", || same(&a, &b, "data")).await;
-    let view = b.link(&id);
-    assert_eq!(view.status.state, "live");
-    assert!(view.status.metadata_only >= 1, "the tier change moved no data: {:?}", view.status);
+    // Counters are bumped just after each commit; give the last one a beat.
+    eventually(5, "the tier change counted as metadata-only (no data moved)", || {
+        let view = b.link(&id);
+        async move { view.status.metadata_only >= 1 }
+    })
+    .await;
+    assert_eq!(b.link(&id).status.state, "live");
     assert_eq!(b.contents("data").await["big.bin"].0, etag);
 }
 
@@ -466,6 +471,11 @@ async fn the_position_lives_with_the_data_and_survives_a_restart() {
     let b = b.restart().await;
     a.put("data", "after-restart", b"v").await;
     eventually(30, "resumed", || same(&a, &b, "data")).await;
+    eventually(5, "the copy counted", || {
+        let view = b.link(&id);
+        async move { view.status.copied >= 1 }
+    })
+    .await;
     let status = b.link(&id).status;
     // A new snapshot would have walked (and skipped) all 20 objects again.
     assert_eq!((status.copied, status.skipped), (1, 0), "resumed from the checkpoint: {status:?}");
@@ -821,4 +831,185 @@ async fn two_way_chaos_converges_exactly() {
     assert_eq!((head(&a).await, head(&b).await), before, "no ping-pong");
     let status = b.link(&id_b).status;
     assert_eq!(status.state, "live", "{status:?}");
+}
+
+// ── parallel batches ───────────────────────────────────────────────────────
+
+async fn checkpoint_of(site: &Site, bucket: &str, id: &str) -> Option<model::Checkpoint> {
+    let bytes = site.store.index(bucket).await.unwrap().get_checkpoint(id).await.unwrap()?;
+    Some(serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn a_batch_applies_only_the_latest_change_per_key() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let id = b.pull_from(&a, "data", Mode::Mirror).await;
+    eventually(30, "live", || {
+        let view = b.link(&id);
+        async move { view.status.state == "live" }
+    })
+    .await;
+    b.replication.act(&id, LinkAction::Pause).await.unwrap();
+    for i in 0..5 {
+        a.put("data", "hot", format!("version {i}").as_bytes()).await;
+    }
+    for i in 0..30 {
+        a.put("data", &format!("cold-{i:02}"), b"x").await;
+    }
+    b.replication.act(&id, LinkAction::Resume).await.unwrap();
+    eventually(30, "caught up", || same(&a, &b, "data")).await;
+    eventually(5, "all copies counted", || {
+        let view = b.link(&id);
+        async move { view.status.copied >= 31 }
+    })
+    .await;
+    let status = b.link(&id).status;
+    assert_eq!(b.contents("data").await["hot"].5, b"version 4");
+    assert_eq!(status.copied, 31, "the hot key fetched once, not five times: {status:?}");
+    assert_eq!(status.collapsed, 4, "{status:?}");
+}
+
+#[tokio::test]
+async fn a_failed_change_holds_the_checkpoint_until_it_succeeds() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let id = b.pull_from(&a, "data", Mode::Mirror).await;
+    eventually(30, "live", || {
+        let view = b.link(&id);
+        async move { view.status.state == "live" }
+    })
+    .await;
+    let start = a.store.index("data").await.unwrap().changelog_head();
+    eventually(10, "checkpoint at the head", || {
+        let (b, id) = (&b, id.clone());
+        async move { checkpoint_of(b, "data", &id).await.map(|c| c.phase) == Some(model::Phase::Live { after: start }) }
+    })
+    .await;
+
+    // One batch: nine good objects and one whose bytes the peer has lost
+    // (its reads fail with 500 until it is rewritten).
+    b.replication.act(&id, LinkAction::Pause).await.unwrap();
+    for i in 0..9 {
+        a.put("data", &format!("good-{i}"), b"x").await;
+    }
+    a.put("data", "broken", b"x").await;
+    let row = a.store.index("data").await.unwrap().get("broken").await.unwrap().unwrap();
+    std::fs::remove_dir_all(a.tmp.path().join("buckets").join("data").join(&row.blob_dir)).unwrap();
+    a.store.forget_cached_meta("data", "broken");
+    b.replication.act(&id, LinkAction::Resume).await.unwrap();
+
+    eventually(30, "the good ones applied", || {
+        let b = &b;
+        async move { b.contents("data").await.len() == 9 }
+    })
+    .await;
+    // The batch failed as a whole: the checkpoint did not move.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let held = checkpoint_of(&b, "data", &id).await.unwrap();
+    assert_eq!(held.phase, model::Phase::Live { after: start }, "watermark held at the batch start");
+    assert!(b.link(&id).status.last_error.is_some());
+
+    // The peer repairs the object: the batch replays (the good ones are now
+    // no-ops) and the checkpoint advances past it.
+    a.put("data", "broken", b"fixed").await;
+    eventually(30, "converged", || same(&a, &b, "data")).await;
+    let head = a.store.index("data").await.unwrap().changelog_head();
+    eventually(10, "checkpoint advanced", || {
+        let (b, id) = (&b, id.clone());
+        async move { checkpoint_of(b, "data", &id).await.map(|c| c.phase) == Some(model::Phase::Live { after: head }) }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    // The event for v1 (a multipart object with metadata)...
+    let upload = a.store.initiate_multipart_with_metadata("data", "k", Some("text/v1"), None, None, None, &BTreeMap::new()).await.unwrap();
+    let mut parts = Vec::new();
+    for (i, part) in [vec![1u8; MIB], vec![2u8; 5]].iter().enumerate() {
+        let n = (i + 1) as u16;
+        parts.push(CompletePartRequest { number: n, etag: a.store.put_multipart_part("data", "k", &upload, n, part, false).await.unwrap().etag });
+    }
+    a.store.complete_multipart("data", "k", &upload, &parts).await.unwrap();
+    let v1 = crate::server::notify::read::read(
+        &a.store,
+        "data",
+        &crate::server::notify::read::ReadParams { limit: 10, ..Default::default() },
+    )
+    .await
+    .unwrap();
+    // ...then, before anyone fetches it, k changes: first its metadata only,
+    // then its bytes and layout entirely.
+    a.store
+        .copy_object_with_metadata("data", "k", "data", "k", None, None, Some("text/v2"), None, Default::default())
+        .await
+        .unwrap();
+
+    let worker = |b: &Site| worker::Worker {
+        store: b.store.clone(),
+        link: model::Link {
+            v: 1,
+            id: "manual".into(),
+            name: "manual".into(),
+            local_bucket: "data".into(),
+            peer_endpoint: a.endpoint.clone(),
+            peer_bucket: "data".into(),
+            access_key: AK.into(),
+            secret_key: SK.into(),
+            region: "us-east-1".into(),
+            mode: Mode::Mirror,
+            filter: Default::default(),
+            enabled: true,
+            created_at_ms: 0,
+            created_by: String::new(),
+        },
+        peer: peer::PeerClient::new(peer::PeerConfig {
+            endpoint: a.endpoint.clone(),
+            bucket: "data".into(),
+            access_key: AK.into(),
+            secret_key: SK.into(),
+            region: "us-east-1".into(),
+        })
+        .unwrap(),
+        status: Arc::new(std::sync::Mutex::new(model::LinkStatus::default())),
+        heartbeat: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cancel: CancellationToken::new(),
+        max_checkpoint_age_ms: i64::MAX,
+        long_poll: Duration::from_secs(1),
+        parallelism: 4,
+    };
+    let w = worker(&b);
+    // Applying the stale v1 event: the peer answers 412 to the pinned reads,
+    // so nothing at all is written — no v1 bytes with v2 metadata, no
+    // partial multipart.
+    assert!(w.apply_all(&v1.events, &v1.site_id).await.is_ok());
+    assert!(b.contents("data").await.is_empty(), "nothing applied from a superseded event");
+    assert_eq!(w.status.lock().unwrap().skipped, 1);
+    assert!(
+        b.store.list_multipart_uploads("data").await.unwrap().is_empty(),
+        "no half-copied multipart upload left behind"
+    );
+    // The later event carries the current state, applied whole.
+    let v2 = crate::server::notify::read::read(
+        &a.store,
+        "data",
+        &crate::server::notify::read::ReadParams { after: v1.next, limit: 10, ..Default::default() },
+    )
+    .await
+    .unwrap();
+    w.apply_all(&v2.events, &v2.site_id).await.unwrap();
+    assert!(same(&a, &b, "data").await);
+    assert_eq!(b.contents("data").await["k"].3, "text/v2");
 }
