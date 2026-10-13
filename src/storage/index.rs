@@ -1005,15 +1005,19 @@ impl ObjectIndex {
 
     /// Records a delete of a key that has no object here (a replicated
     /// delete arriving first), unless a newer tombstone exists. Returns
-    /// whether it was recorded. No changelog entry: nothing visible changed.
-    /// Called under the key lock.
+    /// whether it was recorded. Logged as a `delete` (no ETag, size 0) in the
+    /// same batch: nothing visible changed here, but the delete must still
+    /// reach every other site and reader — a site that has the removed
+    /// version (or an older one) would otherwise keep it while this one
+    /// refuses it forever. Called under the key lock.
     pub async fn record_tombstone(&self, key: &str, stamp: &Stamp, removed: &Stamp, now_ms: i64) -> Result<bool> {
         let db = self.db.clone();
         let durability = self.durability;
         let key = key.to_string();
         let stamp = stamp.clone();
         let removed = removed.clone();
-        run_blocking(move || {
+        let changes = self.changes.clone();
+        let recorded = run_blocking(move || {
             let tombstones = cf(&db, CF_TOMBSTONES)?;
             if let Some(existing) = db.get_cf(&tombstones, key.as_bytes())? {
                 if decode_tombstone(key.as_bytes(), &existing)?.rank() >= super::stamp::Rank::deleted(removed.clone()) {
@@ -1022,17 +1026,40 @@ impl ObjectIndex {
             }
             let tombstone = Tombstone {
                 object_key: key.clone(),
-                stamp,
-                removed: Some(removed),
+                stamp: stamp.clone(),
+                removed: Some(removed.clone()),
                 deleted_at_ms: now_ms,
                 version: String::new(),
                 etag: String::new(),
                 size: 0,
             };
-            db.put_cf_opt(&tombstones, key.as_bytes(), encode_tombstone(&tombstone), &write_opts(durability))?;
+            let mut batch = WriteBatch::default();
+            batch.put_cf(&tombstones, key.as_bytes(), encode_tombstone(&tombstone));
+            let guard = changes.begin(now_ms);
+            let change = ChangeEvent {
+                seq: guard.seq,
+                op: ChangeOp::Delete,
+                key: key.clone(),
+                etag: String::new(),
+                size: 0,
+                last_modified_ms: stamp.ms,
+                version: String::new(),
+                origin: ChangeOrigin::Client,
+                ts_ms: guard.ts,
+                parts: None,
+                stamp: Some(stamp),
+                removed_stamp: Some(removed),
+            };
+            batch.put_cf(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change));
+            db.write_opt(batch, &write_opts(durability))?;
+            drop(guard);
             Ok(true)
         })
-        .await
+        .await?;
+        if recorded {
+            self.notify_commit();
+        }
+        Ok(recorded)
     }
 
     /// Removes tombstones of deletes made before `cutoff_ms`, at most
