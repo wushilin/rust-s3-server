@@ -777,7 +777,7 @@ async fn repair_changes_are_marked_as_such() {
     let index = h.store.index("bkt").await.unwrap();
     let row = index.get("k").await.unwrap().unwrap();
     index
-        .commit_delete_from("k", &row.blob_dir, now_ms(), ChangeOrigin::Repair, None)
+        .commit_delete_from("k", &row.blob_dir, now_ms(), ChangeOrigin::Repair, None, None)
         .await
         .unwrap();
     wait_until(10, "two events", || rx.live_keys().len() == 2).await;
@@ -1685,14 +1685,15 @@ async fn replicated_changes_apply_only_over_older_states() {
 }
 
 #[tokio::test]
-async fn a_delete_leaves_a_tombstone_that_older_writes_cannot_undo() {
+async fn deletes_are_version_scoped() {
     let h = Harness::new().await;
     h.store.create_bucket("bkt").await.unwrap();
     let app = s3_app(&h);
     let base = now_ms();
-    put_stamped(&h.store, "bkt", "k", b"v1", Some(st(base + 1, "a"))).await.unwrap();
-    // Replicated delete, newer: applied, tombstone kept.
-    h.store.delete_object_stamped("bkt", "k", Some(st(base + 3, "a"))).await.unwrap();
+    let v1 = st(base + 1, "a");
+    put_stamped(&h.store, "bkt", "k", b"v1", Some(v1.clone())).await.unwrap();
+    // Site a deletes v1 (the version it sees).
+    h.store.delete_object_stamped("bkt", "k", Some(st(base + 3, "a")), Some(v1.clone())).await.unwrap();
     let head = app
         .clone()
         .oneshot(Request::builder().method("HEAD").uri("/bkt/k").body(Body::empty()).unwrap())
@@ -1702,25 +1703,44 @@ async fn a_delete_leaves_a_tombstone_that_older_writes_cannot_undo() {
     assert_eq!(head.headers()["x-rs3-stamp"], st(base + 3, "a").to_header().as_str());
     assert_eq!(head.headers()["x-rs3-deleted"], "true");
 
-    // A write that happened before the delete arrives late: refused.
-    let err = put_stamped(&h.store, "bkt", "k", b"v2", Some(st(base + 2, "b"))).await.unwrap_err();
-    assert!(matches!(err, crate::storage::errors::StorageError::StaleStamp { .. }));
-    assert!(h.store.read_object("bkt", "k").await.is_err(), "not resurrected");
-    // An older delete is refused as well; a newer write applies and clears
-    // the tombstone.
-    assert!(h.store.delete_object_stamped("bkt", "k", Some(st(base + 2, "b"))).await.is_err());
-    put_stamped(&h.store, "bkt", "k", b"v4", Some(st(base + 4, "b"))).await.unwrap();
-    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"v4");
+    // Meanwhile site b had written v2 — before the delete in time, but the
+    // deleter never saw it. It arrives late and survives: the delete only
+    // removed v1.
+    put_stamped(&h.store, "bkt", "k", b"v2", Some(st(base + 2, "b"))).await.unwrap();
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"v2");
+    // Replaying the delete of v1 does not touch v2.
+    assert!(h.store.delete_object_stamped("bkt", "k", Some(st(base + 3, "a")), Some(v1.clone())).await.is_err());
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"v2");
+    // A delete that saw v2 removes it; v1 (or v2) replayed later stays dead.
+    h.store.delete_object_stamped("bkt", "k", Some(st(base + 4, "b")), Some(st(base + 2, "b"))).await.unwrap();
+    assert!(h.store.read_object("bkt", "k").await.is_err());
+    for old in [v1.clone(), st(base + 2, "b")] {
+        let err = put_stamped(&h.store, "bkt", "k", b"old", Some(old)).await.unwrap_err();
+        assert!(matches!(err, crate::storage::errors::StorageError::StaleStamp { .. }), "{err:?}");
+    }
+    // Anything newer than the deleted version applies and clears the tombstone.
+    put_stamped(&h.store, "bkt", "k", b"v5", Some(st(base + 5, "a"))).await.unwrap();
+    assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"v5");
     assert!(h.store.index("bkt").await.unwrap().get_tombstone("k").await.unwrap().is_none());
 
     // A replicated delete for a key never seen here still records the
-    // tombstone, so the older write arriving after it is refused.
-    h.store.delete_object_stamped("bkt", "ghost", Some(st(base + 10, "a"))).await.unwrap();
-    assert!(put_stamped(&h.store, "bkt", "ghost", b"late", Some(st(base + 9, "b"))).await.is_err());
-    // Local deletes leave tombstones too.
+    // tombstone: the version it removed (or older) cannot arrive afterwards,
+    // a newer one can.
+    h.store.delete_object_stamped("bkt", "ghost", Some(st(base + 10, "a")), Some(st(base + 8, "a"))).await.unwrap();
+    assert!(put_stamped(&h.store, "bkt", "ghost", b"removed one", Some(st(base + 8, "a"))).await.is_err());
+    put_stamped(&h.store, "bkt", "ghost", b"newer", Some(st(base + 9, "b"))).await.unwrap();
+    h.store.delete_object_stamped("bkt", "ghost", Some(st(base + 11, "b")), Some(st(base + 9, "b"))).await.unwrap();
+    // Local deletes remove exactly the version they see.
     h.put("bkt", "local", b"x").await;
+    let seen = h.store.index("bkt").await.unwrap().get("local").await.unwrap().unwrap().stamp.unwrap();
     h.store.delete_object("bkt", "local").await.unwrap();
-    assert!(h.store.index("bkt").await.unwrap().get_tombstone("local").await.unwrap().is_some());
+    let tomb = h.store.index("bkt").await.unwrap().get_tombstone("local").await.unwrap().unwrap();
+    assert_eq!(tomb.removed, Some(seen));
+    // ...and say so in the changelog.
+    let (_, log) = call(&app, "GET", "/bkt?x-rs3-changelog&after=0&wait=0", None, None).await;
+    let last = log["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["op"], "delete");
+    assert_eq!(stamp_of(&last["removed_stamp"]), tomb.removed.clone().unwrap());
 
     // Snapshot listing of tombstones.
     let (_, page) = call(&app, "GET", "/bkt?x-rs3-changelog-snapshot&deleted=1", None, None).await;
@@ -1765,18 +1785,23 @@ async fn two_sites_converge_whatever_the_delivery_order() {
     #[derive(Clone)]
     enum Change {
         Put(&'static str, &'static [u8], Stamp),
-        Delete(&'static str, Stamp),
+        /// (key, the delete's stamp, the stamp of the version it removed)
+        Delete(&'static str, Stamp, Stamp),
     }
     async fn apply(store: &LocalObjectStore, change: &Change) {
-        // Stale changes are refused; that is the point.
+        // Changes that do not outrank the current state are refused; that
+        // is the point.
         let _ = match change {
             Change::Put(key, body, stamp) => put_stamped(store, "bkt", key, body, Some(stamp.clone())).await.map(|_| ()),
-            Change::Delete(key, stamp) => store.delete_object_stamped("bkt", key, Some(stamp.clone())).await.map(|_| ()),
+            Change::Delete(key, stamp, removed) => store
+                .delete_object_stamped("bkt", key, Some(stamp.clone()), Some(removed.clone()))
+                .await
+                .map(|_| ()),
         };
     }
     async fn state(store: &LocalObjectStore) -> Vec<(String, Option<Vec<u8>>, Stamp)> {
         let mut out = Vec::new();
-        for key in ["k1", "k2", "k3"] {
+        for key in ["k1", "k2", "k3", "k4"] {
             let Some((stamp, deleted)) = store.key_stamp("bkt", key).await.unwrap() else { continue };
             let body = if deleted { None } else { Some(object_bytes(store, "bkt", key).await) };
             out.push((key.to_string(), body, stamp));
@@ -1785,13 +1810,19 @@ async fn two_sites_converge_whatever_the_delivery_order() {
     }
     let base = now_ms();
     let changes = vec![
+        // k1: a deletes its a1 while b concurrently wrote b1 — b1 survives.
         Change::Put("k1", b"a1", st(base + 1, "site-a")),
         Change::Put("k1", b"b1", st(base + 2, "site-b")),
-        Change::Delete("k1", st(base + 3, "site-a")),
+        Change::Delete("k1", st(base + 3, "site-a"), st(base + 1, "site-a")),
+        // k2: same millisecond on both sites: the site id decides.
         Change::Put("k2", b"a2", st(base + 5, "site-a")),
-        Change::Put("k2", b"b2", st(base + 5, "site-b")), // tie on ms: site decides
+        Change::Put("k2", b"b2", st(base + 5, "site-b")),
+        // k3: a delete of an older version loses to the newer write.
         Change::Put("k3", b"a3", st(base + 7, "site-a")),
-        Change::Delete("k3", st(base + 6, "site-b")), // an older delete loses
+        Change::Delete("k3", st(base + 8, "site-b"), st(base + 6, "site-b")),
+        // k4: a delete of the latest version wins.
+        Change::Put("k4", b"a4", st(base + 1, "site-a")),
+        Change::Delete("k4", st(base + 4, "site-b"), st(base + 1, "site-a")),
     ];
     let mut orders: Vec<Vec<Change>> = vec![changes.clone(), changes.iter().rev().cloned().collect()];
     // A few interleavings.
@@ -1815,9 +1846,10 @@ async fn two_sites_converge_whatever_the_delivery_order() {
         results.push(state(&store).await);
     }
     let expected = vec![
-        ("k1".to_string(), None, st(base + 3, "site-a")),
+        ("k1".to_string(), Some(b"b1".to_vec()), st(base + 2, "site-b")),
         ("k2".to_string(), Some(b"b2".to_vec()), st(base + 5, "site-b")),
         ("k3".to_string(), Some(b"a3".to_vec()), st(base + 7, "site-a")),
+        ("k4".to_string(), None, st(base + 4, "site-b")),
     ];
     for result in results {
         assert_eq!(result, expected);

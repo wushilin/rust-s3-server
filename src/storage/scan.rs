@@ -1250,7 +1250,14 @@ impl LocalObjectStore {
     async fn delete_row(&self, bucket: &str, key: &str, row: &ObjectRecord) -> Result<()> {
         let index = self.index(bucket).await?;
         let retire_id = index
-            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Repair, Some(self.next_stamp()))
+            .commit_delete_from(
+                key,
+                &row.blob_dir,
+                now_ms(),
+                ChangeOrigin::Repair,
+                Some(self.next_stamp()),
+                Some(self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms)),
+            )
             .await?;
         self.forget_cached_meta(bucket, key);
         let _ = index.delete_intent(retire_id).await;

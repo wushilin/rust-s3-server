@@ -325,7 +325,10 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     let merged = a.contents("shared").await;
     assert!(merged.contains_key("only-a") && merged.contains_key("only-b"), "union");
     assert_eq!(merged["both"].5, b"from b, later", "the later write wins on both sides");
-    assert!(!merged.contains_key("gone"), "a's newer delete (its tombstone) wins over b's copy");
+    // a deleted its own copy of "gone"; b's copy was a different, newer
+    // version a never saw — deletes are version-scoped, so it survives.
+    assert_eq!(merged["gone"].5, b"x", "b's unseen version survives a's delete");
+    assert_eq!(merged["gone"].2, b.contents("shared").await["gone"].2);
 
     // Writes on both sides, including the same key.
     a.put("shared", "k1", b"a1").await;
@@ -724,7 +727,9 @@ async fn writer(store: LocalObjectStore, site: String, seed: u64, ops: usize, sk
                     .await;
             }
             5..=6 => {
-                let _ = store.delete_object_stamped("chaos", &key, stamp).await;
+                // A skewed writer's delete removes what it currently sees.
+                let removed = store.key_rank("chaos", &key).await.ok().flatten().filter(|r| !r.deleted).map(|r| r.stamp);
+                let _ = store.delete_object_stamped("chaos", &key, stamp, removed).await;
             }
             7..=8 => {
                 let meta = BTreeMap::from([("rev".to_string(), format!("{site}-{i}"))]);

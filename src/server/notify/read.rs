@@ -374,6 +374,7 @@ pub async fn snapshot(
                     origin: None,
                     ts_ms: None,
                     parts: None,
+                    removed_stamp: t.removed.clone(),
                     stamp: Some(t.stamp),
                 })
                 .collect(),

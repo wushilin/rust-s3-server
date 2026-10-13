@@ -350,10 +350,19 @@ impl Worker {
         self.beat();
         let bucket = &self.link.local_bucket;
         let stamp = event_stamp(event, peer_site);
-        // Not newer than what is here: nothing to fetch (an echo, a replay,
-        // or a change that lost to a newer one).
-        if let Some((current, _)) = self.store.key_stamp(bucket, &event.key).await? {
-            if current >= stamp {
+        let is_delete = matches!(event.op.as_str(), "delete" | "deleted");
+        // A delete ranks by the version it removed (falling back to its own
+        // stamp for changes logged before that was recorded).
+        let removed = event.removed_stamp.clone().unwrap_or_else(|| stamp.clone());
+        let incoming = if is_delete {
+            crate::storage::stamp::Rank::deleted(removed.clone())
+        } else {
+            crate::storage::stamp::Rank::live(stamp.clone())
+        };
+        // Not ranked above what is here: nothing to fetch (an echo, a replay,
+        // or a change that lost to another).
+        if let Some(current) = self.store.key_rank(bucket, &event.key).await? {
+            if current >= incoming {
                 self.update(|s| s.skipped += 1);
                 return Ok(());
             }
@@ -367,7 +376,7 @@ impl Worker {
                     return Ok(());
                 }
                 self.store
-                    .delete_object_stamped(bucket, &event.key, Some(stamp))
+                    .delete_object_stamped(bucket, &event.key, Some(stamp), Some(removed))
                     .await
                     .map(|_| self.update(|s| s.deleted += 1))
             }

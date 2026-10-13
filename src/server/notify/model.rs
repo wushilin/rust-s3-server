@@ -212,6 +212,10 @@ pub struct WireEvent {
     /// Version stamp: the state's (put / exists) or the delete's own.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub stamp: Option<crate::storage::stamp::Stamp>,
+    /// Deletes: the stamp of the version removed. A delete ranks by it, so
+    /// it never defeats a newer version than the one its author saw.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub removed_stamp: Option<crate::storage::stamp::Stamp>,
 }
 
 impl WireEvent {
@@ -235,6 +239,7 @@ impl WireEvent {
                     .clone()
                     .unwrap_or_else(|| crate::storage::stamp::Stamp::fallback(record.last_modified_ms, site)),
             ),
+            removed_stamp: None,
         }
     }
 }
@@ -259,6 +264,7 @@ impl From<&ChangeEvent> for WireEvent {
             ts_ms: Some(event.ts_ms),
             parts: event.parts.clone(),
             stamp: event.stamp.clone(),
+            removed_stamp: event.removed_stamp.clone(),
         }
     }
 }

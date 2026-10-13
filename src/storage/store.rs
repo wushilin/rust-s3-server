@@ -41,7 +41,7 @@ use super::encoding::{
 };
 use super::errors::{Result, StorageError};
 use super::changelog::ChangeOrigin;
-use super::stamp::{SiteClock, Stamp};
+use super::stamp::{Rank, SiteClock, Stamp};
 use super::index::{
     self, Durability, IntentRecord, ListPage, ObjectRecord, ObjectIndex, INTENT_RETIRE,
 };
@@ -1205,27 +1205,23 @@ impl LocalObjectStore {
             }
         }
 
-        // The key's current state: the object's stamp, or its tombstone's.
-        let current = self.current_stamp(&index, key, old.as_ref()).await?;
-        // A replicated state applies only over an older one, so the higher
-        // stamp wins on every site, whatever order the changes arrive in.
+        // The key's current state: the object, or its tombstone.
+        let current = self.current_rank(&index, key, old.as_ref()).await?;
+        // A replicated state applies only over a lower-ranked one, so the
+        // same state wins on every site, whatever order changes arrive in.
         if let Some(incoming) = replicated_for_check.as_ref().filter(|_| !restore) {
-            if let Some(current) = current.as_ref().filter(|current| incoming <= *current) {
+            if let Some((current, _)) = current.as_ref().filter(|(current, _)| Rank::live(incoming.clone()) <= *current) {
                 let _ = index.delete_intent(intent_id).await;
                 let _ = tokio::fs::remove_dir_all(publish_dir).await;
-                return Err(StorageError::StaleStamp {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    current: current.to_header(),
-                });
+                return Err(Self::stale(bucket, key, current));
             }
         }
 
         // The new state's version stamp. Seeing the current one first means
         // a local write always outranks what it replaces (object or
         // tombstone), even if that came from a site whose clock runs ahead.
-        if let Some(current) = &current {
-            self.clock().observe(current);
+        if let Some((_, newest)) = &current {
+            self.clock().observe(newest);
         }
         let (stamp, last_modified_ms) = match replicated {
             // A replicated state keeps its origin's stamp and shows its
@@ -1470,16 +1466,44 @@ impl LocalObjectStore {
         )))
     }
 
-    /// The stamp of `key`'s current state: the live object's (its fallback
-    /// if it predates stamps), else its tombstone's, else `None` (never seen
-    /// or tombstone expired).
-    async fn current_stamp(&self, index: &ObjectIndex, key: &str, row: Option<&ObjectRecord>) -> Result<Option<Stamp>> {
-        let tombstone = index.get_tombstone(key).await?.map(|t| t.stamp);
+    /// The rank of `key`'s current state (see [`Rank`]): the live object's,
+    /// or its tombstone's, whichever ranks higher; `None` when the key was
+    /// never seen (or its tombstone expired). Also returns the newest stamp
+    /// involved, for the clock to observe.
+    async fn current_rank(&self, index: &ObjectIndex, key: &str, row: Option<&ObjectRecord>) -> Result<Option<(Rank, Stamp)>> {
+        let tombstone = index.get_tombstone(key).await?;
         let live = row.map(|row| self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms));
-        Ok(match (live, tombstone) {
+        let newest = match (&live, &tombstone) {
+            (Some(live), Some(t)) => Some(live.clone().max(t.stamp.clone())),
+            (Some(live), None) => Some(live.clone()),
+            (None, Some(t)) => Some(t.stamp.clone()),
+            (None, None) => None,
+        };
+        let rank = match (live.map(Rank::live), tombstone.map(|t| t.rank())) {
             (Some(live), Some(tomb)) => Some(live.max(tomb)),
             (live, tomb) => live.or(tomb),
-        })
+        };
+        Ok(rank.zip(newest))
+    }
+
+    /// The rank of `key`'s current state, for replicators deciding whether a
+    /// change is newer than what is here.
+    pub async fn key_rank(&self, bucket: &str, key: &str) -> Result<Option<Rank>> {
+        let index = self.index(bucket).await?;
+        let row = index.get(key).await?;
+        Ok(self.current_rank(&index, key, row.as_ref()).await?.map(|(rank, _)| rank))
+    }
+
+    fn stale(bucket: &str, key: &str, current: &Rank) -> StorageError {
+        StorageError::StaleStamp {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            current: if current.deleted {
+                format!("{} (deleted)", current.stamp.to_header())
+            } else {
+                current.stamp.to_header()
+            },
+        }
     }
 
     /// The current state's stamp of `key` (see [`Self::current_stamp`]),
@@ -1493,32 +1517,40 @@ impl LocalObjectStore {
         Ok(index.get_tombstone(key).await?.map(|t| (t.stamp, true)))
     }
 
-    /// Deletes `key`. With a replicated stamp, only if it is newer than the
-    /// key's current state ([`StorageError::StaleStamp`] otherwise), and a
-    /// key that is already absent still records the tombstone, so an older
-    /// write arriving later cannot bring it back. Returns the deleted size.
-    pub async fn delete_object_stamped(&self, bucket: &str, key: &str, stamp: Option<Stamp>) -> Result<Option<u64>> {
-        let Some(incoming) = stamp else {
+    /// Deletes `key`. A replicated delete carries its own `stamp` and the
+    /// stamp of the version it `removed` (defaulting to `stamp` for a peer
+    /// that does not send it); it applies only if it ranks above the key's
+    /// current state ([`StorageError::StaleStamp`] otherwise) — i.e. it never
+    /// removes a version newer than the one its author deleted. A key that is
+    /// already absent still records the tombstone, so the removed version (or
+    /// an older one) arriving later cannot come back. Returns the deleted
+    /// size.
+    pub async fn delete_object_stamped(
+        &self,
+        bucket: &str,
+        key: &str,
+        stamp: Option<Stamp>,
+        removed: Option<Stamp>,
+    ) -> Result<Option<u64>> {
+        let Some(stamp) = stamp else {
             return self.delete_object_with_size(bucket, key).await;
         };
+        let removed = removed.unwrap_or_else(|| stamp.clone());
+        let incoming = Rank::deleted(removed.clone());
         self.ensure_bucket_and_key(bucket, key).await?;
         let index = self.index(bucket).await?;
         let _guard = self.locks.lock(bucket, key).await;
         let row = index.get(key).await?;
-        if let Some(current) = self.current_stamp(&index, key, row.as_ref()).await? {
+        if let Some((current, _)) = self.current_rank(&index, key, row.as_ref()).await? {
             if incoming <= current {
-                return Err(StorageError::StaleStamp {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    current: current.to_header(),
-                });
+                return Err(Self::stale(bucket, key, &current));
             }
         }
-        self.clock().observe(&incoming);
+        self.clock().observe(&stamp);
         match row {
-            Some(row) => self.delete_locked(bucket, key, &index, row, incoming).await,
+            Some(row) => self.delete_locked(bucket, key, &index, row, stamp, Some(removed)).await,
             None => {
-                index.record_tombstone(key, &incoming, now_ms()).await?;
+                index.record_tombstone(key, &stamp, &removed, now_ms()).await?;
                 Ok(None)
             }
         }
@@ -1538,7 +1570,9 @@ impl LocalObjectStore {
             return Ok(None); // Idempotent: deleting an absent key succeeds.
         };
         let stamp = self.clock().next();
-        self.delete_locked(bucket, key, &index, row, stamp).await
+        // A local delete removes exactly the version it sees.
+        let removed = self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms);
+        self.delete_locked(bucket, key, &index, row, stamp, Some(removed)).await
     }
 
     /// Commits the delete of `row` with `stamp` and retires its blob dir.
@@ -1550,10 +1584,11 @@ impl LocalObjectStore {
         index: &ObjectIndex,
         row: ObjectRecord,
         stamp: Stamp,
+        removed: Option<Stamp>,
     ) -> Result<Option<u64>> {
         let deleted_size = row.size;
         let retire_id = index
-            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Client, Some(stamp))
+            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Client, Some(stamp), removed)
             .await?;
         self.crash_point("delete_after_commit");
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
@@ -2168,13 +2203,9 @@ impl LocalObjectStore {
         // anything is assembled, leaving the upload intact (to abort). The
         // publish re-checks under the key lock.
         if let Some(incoming) = options.stamp.as_ref().filter(|_| !options.restore) {
-            if let Some((current, _)) = self.key_stamp(bucket, key).await? {
-                if incoming <= &current {
-                    return Err(StorageError::StaleStamp {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        current: current.to_header(),
-                    });
+            if let Some(current) = self.key_rank(bucket, key).await? {
+                if Rank::live(incoming.clone()) <= current {
+                    return Err(Self::stale(bucket, key, &current));
                 }
             }
         }

@@ -170,6 +170,9 @@ pub struct ChangeEvent {
     /// The change's version stamp: the new state's for `put`, the delete's
     /// own for `delete`. `None` only for changes logged before stamps.
     pub stamp: Option<super::stamp::Stamp>,
+    /// `delete` only: the stamp of the version it removed — what the delete
+    /// ranks by (see `stamp::Rank`).
+    pub removed_stamp: Option<super::stamp::Stamp>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,6 +198,8 @@ struct ChangeValueV1 {
     parts: Option<PartLayout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stamp: Option<super::stamp::Stamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removed_stamp: Option<super::stamp::Stamp>,
 }
 
 fn default_version() -> u32 {
@@ -224,6 +229,7 @@ pub fn encode_change(event: &ChangeEvent) -> Vec<u8> {
         ts_ms: event.ts_ms,
         parts: event.parts.clone(),
         stamp: event.stamp.clone(),
+        removed_stamp: event.removed_stamp.clone(),
     })
     .expect("ChangeValueV1 serializes")
 }
@@ -248,6 +254,7 @@ pub fn decode_change(seq: u64, value: &[u8]) -> Result<ChangeEvent> {
         ts_ms: v.ts_ms,
         parts: v.parts,
         stamp: v.stamp,
+        removed_stamp: v.removed_stamp,
     })
 }
 
@@ -418,6 +425,7 @@ mod tests {
             ts_ms: 9,
             parts: Some(PartLayout::multipart(&[5, 5, 2])),
             stamp: Some(super::super::stamp::Stamp { ms: 9, c: 1, site: "s".into() }),
+            removed_stamp: Some(super::super::stamp::Stamp { ms: 5, c: 0, site: "s".into() }),
         };
         assert_eq!(decode_change(7, &encode_change(&event)).unwrap(), event);
     }

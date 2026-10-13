@@ -19,7 +19,21 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         Ok(stamp) => stamp,
         Err(response) => return response,
     };
-    match store.delete_object_stamped(&ctx.bucket, &ctx.key, stamp).await {
+    // With it, the stamp of the version the delete removed (what it ranks
+    // by); without, the delete's own stamp is used.
+    let removed = match ctx.headers.get("x-rs3-removed-stamp").map(|v| v.to_str().map(crate::storage::stamp::Stamp::parse_header)) {
+        None => None,
+        Some(Ok(Ok(removed))) if stamp.is_some() => Some(removed),
+        Some(_) => {
+            return srv::s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "x-rs3-removed-stamp must be <ms>.<counter>.<site> and needs x-rs3-stamp",
+                &resource,
+            )
+        }
+    };
+    match store.delete_object_stamped(&ctx.bucket, &ctx.key, stamp, removed).await {
         Ok(size) => srv::with_measure(
             srv::empty_response(StatusCode::NO_CONTENT),
             srv::OperationMeasure::Bytes(size.unwrap_or(0)),

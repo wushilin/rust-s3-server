@@ -85,6 +85,32 @@ impl Stamp {
     }
 }
 
+/// Where a state of a key ranks in last-writer-wins. Every site computes it
+/// the same way, so every site keeps the same winner.
+///
+/// A live object ranks by its stamp. A delete ranks by the stamp of the
+/// version it **removed** — not by when it happened — just above that
+/// version. So a delete only defeats what its author saw: a write made
+/// concurrently on another site (a higher stamp than the removed version)
+/// survives it ("observed-remove" / add-wins), while the removed version
+/// itself, and anything older, stays deleted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Rank {
+    pub stamp: Stamp,
+    /// A tombstone; ranks above a live state with the same stamp.
+    pub deleted: bool,
+}
+
+impl Rank {
+    pub fn live(stamp: Stamp) -> Self {
+        Self { stamp, deleted: false }
+    }
+
+    pub fn deleted(removed: Stamp) -> Self {
+        Self { stamp: removed, deleted: true }
+    }
+}
+
 /// Site ids are 1–64 characters of `[A-Za-z0-9_-]` (no dots: they end the
 /// header form).
 pub fn validate_site_id(site: &str) -> std::result::Result<(), String> {
@@ -264,6 +290,17 @@ mod tests {
         assert!(Stamp::parse_header("5.2").is_err());
         assert!(Stamp::parse_header("5.x.a").is_err());
         assert!(Stamp::parse_header("5.1.bad.site").is_err(), "no dots in site ids");
+    }
+
+    #[test]
+    fn a_delete_ranks_just_above_the_version_it_removed() {
+        let s = |ms| Stamp { ms, c: 0, site: "a".into() };
+        let v1 = Rank::live(s(1));
+        let delete_v1 = Rank::deleted(s(1));
+        let v2 = Rank::live(s(2));
+        assert!(delete_v1 > v1, "the delete beats the version it removed");
+        assert!(v2 > delete_v1, "a newer write, seen or not, beats the delete of v1");
+        assert!(Rank::deleted(s(2)) > v2, "deleting v2 needs to have seen v2");
     }
 
     #[test]

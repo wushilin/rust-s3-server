@@ -520,6 +520,8 @@ below).
   - Sending `x-rs3-if-version: <version>` on a GET makes it fail with `412` if
     the object has changed since. A replicator can therefore fetch exactly the
     state an event names.
+- Delete events also carry `removed_stamp`, the stamp of the version they
+  removed.
 - `stamp` is the version stamp `{"ms", "c", "site"}`: when the state was
   written (epoch ms), a counter for writes within the same millisecond
   (almost always 0), and the id of the site that wrote it.
@@ -632,11 +634,21 @@ that sends `x-rs3-stamp: <ms>.<c>.<site>` keeps that stamp instead of getting a
 new local one. For a write, `Last-Modified` becomes the stamp's time. This is
 how a replica keeps the origin's stamp.
 
-- **Last-writer-wins.** A stamped change applies only if its stamp is higher
-  than the key's current state. Otherwise the server answers `412` with the
-  current stamp in `x-rs3-stamp-current`, and nothing is written or logged.
-  Replays and echoes are therefore no-ops, and every site ends up with the
-  highest-stamped state whatever order changes arrive in.
+- **Last-writer-wins, with version-scoped deletes.** Every state of a key has a
+  rank, computed identically on every site.
+  - A live object ranks by its stamp.
+  - A delete ranks by the stamp of the version it **removed**, just above that
+    version. It does not rank by when the delete happened.
+  - A stamped change applies only if it outranks the key's current state.
+    Otherwise the server answers `412` with the current stamp in
+    `x-rs3-stamp-current`, and nothing is written or logged. Replays and echoes
+    are therefore no-ops, and every site keeps the same winner whatever order
+    changes arrive in.
+  - So a delete only removes what its author saw. A version written
+    concurrently on another site, even slightly earlier in wall-clock time,
+    survives a delete of an older version.
+  - A replicated DELETE sends the removed version's stamp in
+    `x-rs3-removed-stamp`. Without it, the delete's own stamp is used.
 - **Tombstones.** A delete leaves a tombstone holding its stamp, kept for
   `changelog.tombstone_days` (14). It stops an older write from bringing the
   object back. A stamped delete of a key that doesn't exist still records one.

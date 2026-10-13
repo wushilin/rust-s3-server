@@ -116,7 +116,12 @@ pub struct ObjectRecord {
 pub struct Tombstone {
     #[serde(skip)]
     pub object_key: String,
+    /// The delete's own stamp (when it happened).
     pub stamp: Stamp,
+    /// The stamp of the version it removed: what the tombstone ranks by.
+    /// Absent on tombstones written before deletes were version-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<Stamp>,
     pub deleted_at_ms: i64,
     /// The removed version (empty when a replicated delete arrived for a key
     /// this site never had).
@@ -126,6 +131,13 @@ pub struct Tombstone {
     pub etag: String,
     #[serde(default)]
     pub size: u64,
+}
+
+impl Tombstone {
+    /// Where this delete ranks (see [`super::stamp::Rank`]).
+    pub fn rank(&self) -> super::stamp::Rank {
+        super::stamp::Rank::deleted(self.removed.clone().unwrap_or_else(|| self.stamp.clone()))
+    }
 }
 
 fn encode_tombstone(t: &Tombstone) -> Vec<u8> {
@@ -874,7 +886,7 @@ impl ObjectIndex {
     /// The atomic commit point of a DELETE: removes the object and records a
     /// `retire` intent for its blob dir in one write batch.
     pub async fn commit_delete(&self, key: &str, blob_dir: &str, now_ms: i64) -> Result<i64> {
-        self.commit_delete_from(key, blob_dir, now_ms, ChangeOrigin::Client, None).await
+        self.commit_delete_from(key, blob_dir, now_ms, ChangeOrigin::Client, None, None).await
     }
 
     /// [`Self::commit_delete`] recording who caused the change and the
@@ -887,6 +899,7 @@ impl ObjectIndex {
         now_ms: i64,
         origin: ChangeOrigin,
         stamp: Option<Stamp>,
+        removed: Option<Stamp>,
     ) -> Result<i64> {
         let db = self.db.clone();
         let durability = self.durability;
@@ -917,6 +930,7 @@ impl ObjectIndex {
                     let tombstone = Tombstone {
                         object_key: key.clone(),
                         stamp: stamp.clone(),
+                        removed: removed.clone(),
                         deleted_at_ms: now_ms,
                         version: changelog::version_of(&existing.blob_dir),
                         etag: existing.etag.clone(),
@@ -925,6 +939,7 @@ impl ObjectIndex {
                     batch.put_cf(&cf(&db, CF_TOMBSTONES)?, key.as_bytes(), encode_tombstone(&tombstone));
                 }
                 change.stamp = stamp;
+                change.removed_stamp = removed;
                 batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
                 guard = Some(g);
             }
@@ -992,21 +1007,23 @@ impl ObjectIndex {
     /// delete arriving first), unless a newer tombstone exists. Returns
     /// whether it was recorded. No changelog entry: nothing visible changed.
     /// Called under the key lock.
-    pub async fn record_tombstone(&self, key: &str, stamp: &Stamp, now_ms: i64) -> Result<bool> {
+    pub async fn record_tombstone(&self, key: &str, stamp: &Stamp, removed: &Stamp, now_ms: i64) -> Result<bool> {
         let db = self.db.clone();
         let durability = self.durability;
         let key = key.to_string();
         let stamp = stamp.clone();
+        let removed = removed.clone();
         run_blocking(move || {
             let tombstones = cf(&db, CF_TOMBSTONES)?;
             if let Some(existing) = db.get_cf(&tombstones, key.as_bytes())? {
-                if decode_tombstone(key.as_bytes(), &existing)?.stamp >= stamp {
+                if decode_tombstone(key.as_bytes(), &existing)?.rank() >= super::stamp::Rank::deleted(removed.clone()) {
                     return Ok(false);
                 }
             }
             let tombstone = Tombstone {
                 object_key: key.clone(),
                 stamp,
+                removed: Some(removed),
                 deleted_at_ms: now_ms,
                 version: String::new(),
                 etag: String::new(),
@@ -1725,6 +1742,7 @@ fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectReco
         ts_ms: guard.ts,
         parts: record.parts.clone(),
         stamp: record.stamp.clone(),
+        removed_stamp: None,
     }
 }
 
