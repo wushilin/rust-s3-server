@@ -190,9 +190,8 @@
           <div class="panel-title"><div><h3>Replication links</h3><p>Replicate a whole bucket with another rusts3 site. <b>Mirror</b> (this ⟵ peer) copies the peer's bucket into a read-only one here, remote wins. <b>Merge</b> (this ⟷ peer) syncs both ways, newer wins; one link, on either site, serves the pair. This site: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
           <div class="table-wrap"><table><thead><tr><th>Link</th><th>Direction</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
           <div id="linkEmpty" class="empty hidden"></div>
-          <div id="incomingWrap" class="hidden" style="margin-top:14px">
-            <h4 style="margin:0 0 6px">Managed on other sites</h4>
-            <p class="muted" style="font-size:12px;margin:0 0 8px">Links configured on a peer that replicate this site's buckets (seen in the last 5 minutes). Change them on that site.</p>
+          <div id="incomingWrap" class="hidden">
+            <div class="panel-title" style="border-top:1px solid var(--line)"><div><h3>Managed on other sites</h3><p>Links configured on a peer that replicate this site's buckets (seen in the last 5 minutes). Change them on that site.</p></div></div>
             <div class="table-wrap"><table><thead><tr><th>Link</th><th>Direction</th><th>Last seen</th></tr></thead><tbody id="incomingRows"></tbody></table></div>
           </div>
         </div>
