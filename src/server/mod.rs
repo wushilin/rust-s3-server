@@ -2418,7 +2418,7 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
         StorageError::BucketReadOnly(_) => s3_error(
             StatusCode::FORBIDDEN,
             "AccessDenied",
-            format!("{err} (marked read-only; replication writes only)"),
+            err.to_string(),
             resource,
         ),
         StorageError::StaleStamp { ref current, .. } => {
