@@ -187,9 +187,14 @@
           <div id="subEmpty" class="empty hidden"></div>
         </div>
         <div class="panel" style="margin-top:18px">
-          <div class="panel-title"><div><h3>Replication links</h3><p>Pull a bucket from another rusts3 site into a local bucket. <b>Mirror</b> replicates remote to local (remote wins — make the bucket read-only); <b>merge</b> merges both sides, newer wins (configure a merge link on each site). This site's id: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
-          <div class="table-wrap"><table><thead><tr><th>Link</th><th>Local ← peer</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
+          <div class="panel-title"><div><h3>Replication links</h3><p>Replicate a whole bucket with another rusts3 site. <b>Mirror</b> copies the remote bucket into a read-only local one (remote wins); <b>merge</b> syncs both ways, newer wins — one link, on either site, serves the pair. This site's id: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Link</th><th>Local ↔ peer</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
           <div id="linkEmpty" class="empty hidden"></div>
+          <div id="incomingWrap" class="hidden" style="margin-top:14px">
+            <h4 style="margin:0 0 6px">Managed on other sites</h4>
+            <p class="muted" style="font-size:12px;margin:0 0 8px">Links configured on a peer that replicate this site's buckets (seen in the last 5 minutes). Change them on that site.</p>
+            <div class="table-wrap"><table><thead><tr><th>Bucket here</th><th>Peer site / bucket</th><th>Link</th><th>Mode</th><th>Last seen</th></tr></thead><tbody id="incomingRows"></tbody></table></div>
+          </div>
         </div>
       </section>
 
@@ -444,7 +449,7 @@
 
 <dialog id="linkDlg">
   <form onsubmit="saveLink(event)">
-    <div class="dialog-head"><div><h3>New replication link</h3><p>Runs on this site and pulls from the peer. Use a peer key with s3:GetObject and s3:GetBucketChangelog on the peer bucket.</p></div><button type="button" class="dialog-close" onclick="linkDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-head"><div><h3>New replication link</h3><p>Runs on this site. The peer key needs s3:GetObject and s3:GetBucketChangelog on the peer bucket; a merge link also writes it: s3:PutObject, s3:DeleteObject and s3:ReplicateWrite.</p></div><button type="button" class="dialog-close" onclick="linkDlg.close()"><span data-icon="x"></span></button></div>
     <div class="dialog-body">
       <div class="field"><label for="ln_name">Name</label><input class="input" id="ln_name" placeholder="e.g. sg-to-jp" autocomplete="off"></div>
       <div class="field"><label for="ln_bucket">Local bucket</label><select class="input" id="ln_bucket"></select></div>
@@ -452,8 +457,7 @@
       <div class="field"><label for="ln_peer_bucket">Peer bucket</label><input class="input" id="ln_peer_bucket" autocomplete="off"></div>
       <div class="field"><label for="ln_ak">Peer access key</label><input class="input" id="ln_ak" autocomplete="off"></div>
       <div class="field"><label for="ln_sk">Peer secret key</label><input class="input" id="ln_sk" type="password" autocomplete="new-password"></div>
-      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode" onchange="$('ln_mode_note').textContent=this.value==='mirror'?MIRROR_NOTE:MERGE_NOTE;$('ln_prefix_field').classList.toggle('hidden',this.value==='mirror')"><option value="mirror">Mirror — replicate remote to local (remote wins)</option><option value="merge">Merge — merge both sides, newer wins</option></select><span class="muted" style="font-size:11.5px" id="ln_mode_note"></span></div>
-      <div class="field" id="ln_prefix_field"><label for="ln_prefix">Key prefix (optional, merge only)</label><input class="input" id="ln_prefix" placeholder="(all keys)" autocomplete="off"></div>
+      <div class="field"><label for="ln_mode">Mode</label><select class="input" id="ln_mode" onchange="$('ln_mode_note').textContent=this.value==='mirror'?MIRROR_NOTE:MERGE_NOTE"><option value="mirror">Mirror — replicate remote to local (remote wins)</option><option value="merge">Merge — sync both ways, newer wins</option></select><span class="muted" style="font-size:11.5px" id="ln_mode_note"></span></div>
       <div id="linkError" class="inline-error"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="linkDlg.close()">Cancel</button><button class="btn primary" type="submit">Create link</button></div>

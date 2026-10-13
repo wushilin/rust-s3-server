@@ -116,6 +116,12 @@ impl Worker {
                     log::error!("replication {} stopped: {reason}", self.link.id);
                     self.record_error(&reason);
                     self.update(|s| s.state = "stopped".to_string());
+                    // Stay stopped a while before the supervisor tries again
+                    // (the configuration may get fixed meanwhile).
+                    tokio::select! {
+                        _ = self.cancel.cancelled() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
                     return;
                 }
                 Err(StepError::Retry(reason)) => {
@@ -184,13 +190,25 @@ impl Worker {
                  them its own server.site_id."
             )));
         }
+        // Both sites configured a merge link for the same pair. One link
+        // syncs both ways, so one of them stands down — the one on the
+        // higher site id, so exactly one keeps running.
+        if self.link.mode == Mode::Merge && local.as_str() > peer_site {
+            if let Some(back) = self.peer.merge_back() {
+                let (id, name) = back.split_once(';').unwrap_or((back.as_str(), ""));
+                let name = urlencoding::decode(name).map(|n| n.into_owned()).unwrap_or_default();
+                return Err(StepError::Fatal(format!(
+                    "site {peer_site} already merges this bucket pair with link \"{name}\" ({id}), which syncs both \
+                     ways; this link stands down. Delete one of the two."
+                )));
+            }
+        }
         Ok(())
     }
 
     /// One unit of progress: a snapshot page or a changelog batch, applied
     /// and checkpointed.
     async fn step(&self) -> Result<(), StepError> {
-        let prefix = self.link.filter.prefix.clone();
         let checkpoint = match self.load().await? {
             Some(checkpoint) if now_ms() - checkpoint.saved_at_ms > self.max_checkpoint_age_ms => {
                 return Err(StepError::Resnapshot(
@@ -201,7 +219,7 @@ impl Worker {
         };
         let Some(mut checkpoint) = checkpoint else {
             // Start: the first snapshot page fixes where live replay begins.
-            let page = self.peer.snapshot(None, SNAPSHOT_PAGE, &prefix, false).await?;
+            let page = self.peer.snapshot(None, SNAPSHOT_PAGE, "", false).await?;
             self.peer_answered();
             self.check_site(&page.site_id)?;
             let mut checkpoint = Checkpoint {
@@ -219,10 +237,18 @@ impl Worker {
             self.apply_snapshot_page(&mut checkpoint, None, page).await?;
             return self.save(Some(&checkpoint)).await;
         };
+        // Resumed from a checkpoint (e.g. after a restart): the peer is
+        // known already. The console shows it, and a merge reader of ours
+        // is told about this link by it (`x-rs3-merge-back`).
+        self.update(|s| {
+            if s.peer_site.as_deref() != Some(checkpoint.peer_site.as_str()) {
+                s.peer_site = Some(checkpoint.peer_site.clone());
+            }
+        });
         match checkpoint.phase.clone() {
             Phase::Snapshot { cursor, tombstones: false, .. } => {
                 self.update(|s| s.state = "snapshot".to_string());
-                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, &prefix, false).await?;
+                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", false).await?;
                 self.peer_answered();
                 if page.log_id != checkpoint.peer_log_id {
                     return Err(StepError::Resnapshot("the peer's changelog changed mid-snapshot".to_string()));
@@ -233,7 +259,7 @@ impl Worker {
             Phase::Snapshot { through, cursor, tombstones: true } => {
                 // Merge mode: the peer's remembered deletes, so a key deleted
                 // there does not survive here.
-                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, &prefix, true).await?;
+                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", true).await?;
                 self.peer_answered();
                 self.apply_all(&page.entries, &checkpoint.peer_site).await?;
                 checkpoint.phase = match page.next_after {
@@ -255,7 +281,7 @@ impl Worker {
                 let wait = if recovering { Duration::ZERO } else { self.long_poll };
                 let page = tokio::select! {
                     _ = self.cancel.cancelled() => return Ok(()),
-                    page = self.peer.changes(after, CHANGES_PAGE, wait, &prefix, Some(&checkpoint.peer_log_id)) => page?,
+                    page = self.peer.changes(after, CHANGES_PAGE, wait, "", Some(&checkpoint.peer_log_id)) => page?,
                 };
                 self.peer_answered();
                 self.check_site(&page.site_id)?;
@@ -304,7 +330,7 @@ impl Worker {
     }
 
     /// Mirror mode: deletes local keys in `(from, upto]` (to the end when
-    /// `upto` is `None`) under the link's prefix that are not in `present`.
+    /// `upto` is `None`) that are not in `present`.
     async fn sweep(
         &self,
         from: Option<&str>,
@@ -316,7 +342,7 @@ impl Worker {
         loop {
             let page = self
                 .store
-                .list_objects(bucket, &self.link.filter.prefix, None, after.as_deref(), 1000)
+                .list_objects(bucket, "", None, after.as_deref(), 1000)
                 .await?;
             for entry in &page.entries {
                 if upto.is_some_and(|upto| entry.object_key.as_str() > upto) {
@@ -355,18 +381,10 @@ impl Worker {
     /// every change is applied, so the caller's checkpoint never runs ahead.
     pub(super) async fn apply_all(&self, events: &[WireEvent], peer_site: &str) -> Result<(), StepError> {
         use futures::StreamExt;
-        let mut latest: std::collections::HashMap<&str, &WireEvent> = std::collections::HashMap::new();
-        for event in events {
-            // Later in the batch = later in the log (snapshot pages hold each
-            // key once).
-            latest.insert(event.key.as_str(), event);
-        }
-        let collapsed = events.len() - latest.len();
+        let (batch, collapsed) = latest_per_key(events);
         if collapsed > 0 {
             self.update(|s| s.collapsed += collapsed as u64);
         }
-        let mut batch: Vec<WireEvent> = latest.into_values().cloned().collect();
-        batch.sort_by_key(|e| e.seq.unwrap_or(0));
         let mut results = futures::stream::iter(batch)
             .map(|event: WireEvent| async move { self.apply(&event, peer_site).await })
             .buffer_unordered(self.parallelism.max(1));
@@ -583,6 +601,22 @@ impl Worker {
         }
         result
     }
+}
+
+/// The latest change per key of a batch, in log order (the earlier ones are
+/// superseded — applying them would fetch data only to discard it), and how
+/// many were dropped.
+pub(super) fn latest_per_key(events: &[WireEvent]) -> (Vec<WireEvent>, usize) {
+    let mut latest: std::collections::HashMap<&str, &WireEvent> = std::collections::HashMap::new();
+    for event in events {
+        // Later in the batch = later in the log (snapshot pages hold each
+        // key once).
+        latest.insert(event.key.as_str(), event);
+    }
+    let collapsed = events.len() - latest.len();
+    let mut batch: Vec<WireEvent> = latest.into_values().cloned().collect();
+    batch.sort_by_key(|e| e.seq.unwrap_or(0));
+    (batch, collapsed)
 }
 
 enum PutError {

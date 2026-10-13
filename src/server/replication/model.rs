@@ -2,8 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::server::notify::model::Filter;
-
 pub(super) const RECORD_VERSION: u32 = 1;
 
 fn default_version() -> u32 {
@@ -17,14 +15,15 @@ pub enum Mode {
     /// snapshot deletes local objects the peer does not have.
     #[default]
     Mirror,
-    /// Two-way member: the local bucket takes the peer's changes but keeps
-    /// what only it has; with a link in each direction both buckets end up
-    /// as the union, every key at its highest-stamped state.
+    /// Two-way: the link pulls the peer's changes into the local bucket and
+    /// pushes the local bucket's changes to the peer, so both buckets end up
+    /// as the union, every key at its highest-stamped state. One link (on
+    /// either site) serves the pair.
     Merge,
 }
 
-/// "Pull `peer_bucket` from the peer at `peer_endpoint` into
-/// `local_bucket`." Configured on the receiving site.
+/// "Replicate `peer_bucket` at `peer_endpoint` with `local_bucket`" — the
+/// whole bucket. A mirror pulls only; a merge pulls and pushes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     #[serde(default = "default_version")]
@@ -41,10 +40,6 @@ pub struct Link {
     pub region: String,
     #[serde(default)]
     pub mode: Mode,
-    /// Only keys under `filter.prefix` are replicated (suffix / ops are not
-    /// used: a replica must see every change of the keys it holds).
-    #[serde(default)]
-    pub filter: Filter,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -94,6 +89,44 @@ pub enum Phase {
     Live { after: u64 },
 }
 
+/// Where a merge link's push is in the local changelog. Kept in the local
+/// bucket's index under `<link id>:push`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushCheckpoint {
+    #[serde(default = "default_version")]
+    pub v: u32,
+    /// The local changelog this position belongs to.
+    pub local_log_id: String,
+    /// The peer's changelog when the push started: a peer whose log was
+    /// replaced (rebuilt, restored from backup) gets everything again.
+    pub peer_log_id: String,
+    pub peer_site: String,
+    pub phase: Phase,
+    #[serde(default)]
+    pub saved_at_ms: i64,
+}
+
+/// The push half of a merge link (the local bucket's changes to the peer).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PushStatus {
+    /// `idle` | `snapshot` | `live` | `error`
+    pub state: String,
+    /// Position in the local changelog.
+    pub position: Option<u64>,
+    pub local_head: Option<u64>,
+    pub snapshot_cursor: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_ms: i64,
+    pub last_progress_ms: i64,
+    pub copied: u64,
+    pub copied_bytes: u64,
+    pub metadata_only: u64,
+    pub deleted: u64,
+    pub skipped: u64,
+    pub superseded: u64,
+    pub collapsed: u64,
+}
+
 /// What the console shows for a link.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LinkStatus {
@@ -118,4 +151,7 @@ pub struct LinkStatus {
     /// same batch.
     pub collapsed: u64,
     pub restarts: u64,
+    /// Merge links: the push direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushStatus>,
 }

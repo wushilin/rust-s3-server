@@ -679,39 +679,47 @@ disables it (`403`).
 
 ### Replication links
 
-A replication link copies a bucket from another rusts3 site (the peer) into a
-local bucket. It is configured in the console (**Webhooks & Replication →
-Replication links**) on the **receiving** site, and that site's server runs it.
+A replication link replicates a whole bucket with a bucket on another rusts3
+site (the peer). It is configured in the console (**Webhooks & Replication →
+Replication links**) on one site, and that site's server runs it. There are no
+prefix filters on links (webhooks can filter by prefix).
 
-- The peer only needs to grant a key `s3:GetObject` and `s3:GetBucketChangelog`
-  on its bucket. Nothing is configured on the peer.
 - **Mirror** (one-way: replicate remote to local, remote wins): the local
   bucket becomes an exact copy of the peer's. Its initial snapshot also deletes
-  local objects the peer doesn't have. Mark the bucket **read-only** (the link
-  dialog does this by default) so only replication writes it; that's what
-  keeps "remote wins" true.
-- **Merge** (two-way: merge both sides, newer wins): configure a merge link on
-  each site, each pulling from the other.
+  local objects the peer doesn't have. The bucket is made **read-only** so only
+  replication writes it; that's what keeps "remote wins" true. The peer key
+  needs only `s3:GetObject` and `s3:GetBucketChangelog` on the peer bucket.
+- **Merge** (two-way: sync both ways, newer wins): one link, created on either
+  site, pulls the peer's changes in and pushes the local bucket's changes out.
+  Both buckets end up as the union of their objects, every key at its
+  highest-stamped state; deletes win or lose by stamp too, via tombstones. The
+  peer key also needs `s3:PutObject`, `s3:DeleteObject` and
+  `s3:ReplicateWrite` on the peer bucket. Nothing is configured on the peer:
+  its console lists the link under **Managed on other sites** (links seen
+  reading its changelogs in the last 5 minutes).
 - **Rules the server enforces:**
   - A mirror link needs a read-only target. The console makes the bucket
     read-only when it creates the link.
-  - A mirror replicates the whole bucket; it can't have a prefix. Otherwise
-    the rest of the read-only bucket would be frozen, writable by no one.
   - A mirror is its bucket's only link.
   - A mirrored bucket can't be switched back to read-write while its mirror
     link exists, even if the link is paused. Deleting the link leaves the bucket
     read-only; making it writable again is a separate, explicit step.
-  - Merge links may filter by prefix: only keys under it are exchanged, and the
-    rest of each bucket stays local and writable. Both buckets end up as the union of their objects, with every key
-  at its highest-stamped state. Deletes win or lose by stamp as well, via
-  tombstones.
+  - One link per bucket pair on a site. If both sites create a merge link for
+    the same pair, the one on the site with the higher site id stops with an
+    error saying so (the peer reports its own link on changelog reads), and
+    the other keeps syncing both ways. Delete one of them.
 
 How it works:
 
-- The link first walks the peer's snapshot, then follows its changelog.
+- The link first walks the peer's snapshot, then follows its changelog. A
+  merge link's push does the same with the local bucket: it walks the local
+  objects and tombstones, then follows the local changelog, writing to the
+  peer with stamped S3 requests.
 - Every change is applied with its original stamp, under last-writer-wins.
-  - A change whose stamp is not newer than the local state is skipped without
-    fetching anything. This is also how echoes in two-way replication stop.
+  - A change whose stamp is not newer than the receiving side's state is
+    skipped without fetching or sending anything (the push asks the peer with
+    a HEAD first). Changes the push would send back to the site they came from
+    are skipped too, which is how echoes stop.
   - Identical content with a newer stamp becomes a metadata-only update; no
     bytes move.
   - Object data is read pinned to the change's version (`x-rs3-if-version`),
@@ -725,8 +733,15 @@ How it works:
   changes that already succeeded are cheap no-ops on replay. Concurrent applies
   are safe because the last-writer-wins check and the commit are atomic under
   each key's lock.
-- Deletes caused by the peer's health-scan repair (`origin: repair`) are never
-  replicated. The local copy is kept.
+- Deletes caused by a health-scan repair (`origin: repair`) are never
+  replicated. The other side's copy is kept.
+- **A change that moved on vs. lost data.** If the object a change names was
+  overwritten or deleted since, the change is skipped: a later change in the
+  log carries the object's current state. If the index still names the
+  object but its bytes are gone (a disk lost them), nothing is skipped: the
+  link stops at that object and reports it (for example `corrupt object: row
+  for photos/a.jpg references unreadable blob`) until it is resolved (restore
+  from peer, or delete the key).
 - **Restore from peer.** When the storage scan finds an object whose bytes are
   missing or corrupt in a bucket that a link pulls into, the recommended repair
   is **Restore from replication peer**. It fetches the object back with its
@@ -737,8 +752,9 @@ How it works:
 
 Operation:
 
-- **Position:** each link's position is stored in the local bucket's own index,
-  next to the data it describes, and is carried across index rebuilds.
+- **Position:** each link's position (and a merge link's push position in the
+  local changelog) is stored in the local bucket's own index, next to the data
+  it describes, and is carried across index rebuilds.
 - **Re-snapshot triggers:** a link re-snapshots on its own when the peer's
   changelog no longer has its position (`410`), when the peer's log was
   replaced, or when its checkpoint is older than the tombstone retention.

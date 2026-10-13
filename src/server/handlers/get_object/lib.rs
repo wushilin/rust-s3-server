@@ -45,6 +45,14 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
                             .headers_mut()
                             .insert("x-rs3-deleted", axum::http::HeaderValue::from_static("true"));
                     }
+                    // What the tombstone ranks by: the version it removed.
+                    if let Ok(Some(rank)) = store.key_rank(&bucket, &key).await {
+                        if rank.deleted {
+                            if let Ok(value) = axum::http::HeaderValue::from_str(&rank.stamp.to_header()) {
+                                response.headers_mut().insert("x-rs3-removed-stamp", value);
+                            }
+                        }
+                    }
                 }
             }
             return response;
@@ -536,7 +544,7 @@ struct PartReadSegment {
 /// files without loading the full content into memory. Single-part objects are
 /// seeked and wrapped directly; multi-part objects are piped through an
 /// in-process duplex channel into one contiguous stream.
-async fn stream_object_range(
+pub(crate) async fn stream_object_range(
     meta: &ObjectMeta,
     part_offsets: &[u64],
     object_dir: &FsPath,

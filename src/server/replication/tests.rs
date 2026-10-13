@@ -150,7 +150,7 @@ impl Site {
                     secret_key: sk.to_string(),
                     region: None,
                     mode,
-                    prefix: String::new(),
+                    prefix: None,
                     enabled: true,
                     make_read_only: mode == Mode::Mirror,
                 },
@@ -323,8 +323,8 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     tokio::time::sleep(Duration::from_millis(5)).await;
     a.store.delete_object("shared", "gone").await.unwrap();
 
-    b.pull_from(&a, "shared", Mode::Merge).await;
-    a.pull_from(&b, "shared", Mode::Merge).await;
+    // One merge link (on b) syncs both ways.
+    let id = b.pull_from(&a, "shared", Mode::Merge).await;
     eventually(30, "initial merge", || same(&a, &b, "shared")).await;
     let merged = a.contents("shared").await;
     assert!(merged.contains_key("only-a") && merged.contains_key("only-b"), "union");
@@ -339,10 +339,29 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     b.put("shared", "k2", b"b2").await;
     a.put("shared", "both", b"a again").await;
     b.store.delete_object("shared", "only-a").await.unwrap();
+    // Pushed from b: metadata, and a multipart object with its layout (so
+    // the same ETag); then a metadata-only change (no bytes resent).
+    b.put_meta("shared", "meta", b"m", "text/x-b", &[("owner", "b")]).await;
+    let etag = b.multipart("shared", "big", &[vec![1u8; MIB], vec![2u8; 1000]]).await;
     eventually(30, "two-way changes", || same(&a, &b, "shared")).await;
     let merged = b.contents("shared").await;
     assert_eq!(merged["both"].5, b"a again");
     assert!(!merged.contains_key("only-a"));
+    assert_eq!(a.contents("shared").await["big"].0, etag);
+    let copied = b.link(&id).status.push.unwrap().copied_bytes;
+    b.store
+        .copy_object_with_metadata("shared", "big", "shared", "big", None, None, Some("text/v2"), None, Default::default())
+        .await
+        .unwrap();
+    eventually(30, "metadata-only push", || same(&a, &b, "shared")).await;
+    // The counter moves just after the peer applied it.
+    eventually(10, "counted", || {
+        let view = b.link(&id);
+        async move { view.status.push.is_some_and(|p| p.metadata_only >= 1) }
+    })
+    .await;
+    let push = b.link(&id).status.push.unwrap();
+    assert_eq!(push.copied_bytes, copied, "no bytes resent for a metadata change");
 
     // No echo loop: once converged, the changelogs stop growing.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -353,6 +372,120 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     let (ha, hb) = (heads(&a).await, heads(&b).await);
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!((heads(&a).await, heads(&b).await), (ha, hb), "changes stop bouncing");
+}
+
+/// An access key on `site` for a user allowed only `actions` on bucket
+/// `data`.
+async fn key_with(site: &Site, user: &str, actions: &[&str]) -> (String, String) {
+    site.iam.create_user(user, "password123").await.unwrap();
+    let key = site.iam.create_access_key(user, &["k".to_string()]).await.unwrap();
+    let policy: crate::server::policy::PolicyDocument = serde_json::from_value(serde_json::json!({
+        "Statement": [{"Effect": "Allow", "Action": actions, "Resource": ["arn:aws:s3:::data", "arn:aws:s3:::data/*"]}]
+    }))
+    .unwrap();
+    site.iam.set_policy(user, Some(&policy)).await.unwrap();
+    (key.access_key, key.secret_key)
+}
+
+#[tokio::test]
+async fn a_merge_link_needs_write_and_replicate_write_on_the_peer() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "from-a", b"a").await;
+    b.put("data", "from-b", b"b").await;
+    // Without s3:ReplicateWrite the pull works and the push reports why not.
+    let (ak, sk) = key_with(&a, "no-stamps", &["s3:GetObject", "s3:GetBucketChangelog", "s3:PutObject", "s3:DeleteObject"]).await;
+    let id = b.pull_with(&a, "data", Mode::Merge, &ak, &sk).await;
+    eventually(30, "the push error shows", || {
+        let view = b.link(&id);
+        async move { view.status.push.and_then(|p| p.last_error).is_some_and(|e| e.contains("ReplicateWrite")) }
+    })
+    .await;
+    eventually(30, "the pull still works", || async { b.contents("data").await.contains_key("from-a") }).await;
+    assert!(!a.contents("data").await.contains_key("from-b"));
+    // With it, both ways.
+    b.replication.delete(&id).await.unwrap();
+    let (ak, sk) = key_with(
+        &a,
+        "merger",
+        &["s3:GetObject", "s3:GetBucketChangelog", "s3:PutObject", "s3:DeleteObject", "s3:ReplicateWrite"],
+    )
+    .await;
+    let id = b.pull_with(&a, "data", Mode::Merge, &ak, &sk).await;
+    b.store.delete_object("data", "from-a").await.unwrap();
+    eventually(30, "merged both ways", || same(&a, &b, "data")).await;
+    assert!(!a.contents("data").await.contains_key("from-a"), "the delete was pushed");
+    eventually(10, "no error left", || {
+        let view = b.link(&id);
+        async move { view.status.last_error.is_none() && view.status.push.is_some_and(|p| p.last_error.is_none()) }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_delete_of_a_key_absent_here_still_reaches_the_peer() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "live", || {
+        let view = b.link(&id);
+        async move { view.status.state == "live" && view.status.push.is_some_and(|p| p.state == "live") }
+    })
+    .await;
+    // Pause, so b does not have a's object yet when a stamped delete (say
+    // from an s3:ReplicateWrite client) removes it here.
+    b.replication.act(&id, LinkAction::Pause).await.unwrap();
+    put_aged(&a, "data", "k", b"v1", 60_000).await;
+    let later = crate::storage::stamp::Stamp { ms: crate::storage::time::now_ms(), c: 0, site: "site-b".into() };
+    b.store.delete_object_stamped("data", "k", Some(later), None).await.unwrap();
+    b.replication.act(&id, LinkAction::Resume).await.unwrap();
+    // The delete removes everything up to its stamp, so v1 goes on a too —
+    // it must not stay on a while b refuses it forever.
+    eventually(30, "deleted on both", || async { !a.contents("data").await.contains_key("k") }).await;
+    assert!(!b.contents("data").await.contains_key("k"));
+}
+
+#[tokio::test]
+async fn merge_links_on_both_sites_one_stands_down() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let on_a = a.pull_from(&b, "data", Mode::Merge).await;
+    let on_b = b.pull_from(&a, "data", Mode::Merge).await;
+    // b has the higher site id: its link stands down, a's keeps both ways.
+    eventually(30, "b's link stands down", || {
+        let view = b.link(&on_b);
+        async move { view.status.state == "stopped" && view.status.last_error.is_some_and(|e| e.contains("stands down")) }
+    })
+    .await;
+    a.put("data", "x", b"from a").await;
+    b.put("data", "y", b"from b").await;
+    eventually(30, "converged through a's link", || same(&a, &b, "data")).await;
+    let view = a.link(&on_a);
+    assert_ne!(view.status.state, "stopped", "{:?}", view.status);
+    // Each side lists the other's link as incoming.
+    let incoming = b.replication.incoming();
+    assert!(incoming.iter().any(|i| i.site == "site-a" && i.link_id == on_a && i.mode == "merge"), "{incoming:?}");
+
+    // Still so after both restart (the links resume from checkpoints).
+    let a = a.restart().await;
+    let b = b.restart().await;
+    eventually(30, "b's link stands down again", || {
+        let view = b.link(&on_b);
+        async move { view.status.state == "stopped" }
+    })
+    .await;
+    a.put("data", "z", b"after restart").await;
+    eventually(30, "converged", || same(&a, &b, "data")).await;
+    assert_eq!(a.link(&on_a).status.peer_site.as_deref(), Some("site-b"));
 }
 
 #[tokio::test]
@@ -389,7 +522,7 @@ async fn least_privilege_credentials_are_enough_to_pull() {
                 secret_key: "wrong".into(),
                 region: None,
                 mode: Mode::Mirror,
-                prefix: String::new(),
+                prefix: None,
                 enabled: true,
                 make_read_only: true,
             },
@@ -455,7 +588,7 @@ async fn a_crashed_or_hung_worker_is_replaced_by_the_supervisor() {
                 secret_key: SK.into(),
                 region: None,
                 mode: Mode::Merge,
-                prefix: String::new(),
+                prefix: None,
                 enabled: true,
                 make_read_only: false,
             },
@@ -662,6 +795,36 @@ async fn a_lost_object_is_restored_from_the_peer() {
 }
 
 #[tokio::test]
+async fn a_lost_blob_holds_the_link_with_an_error_never_skipped() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    put_aged(&b, "data", "lost", b"bytes the disk lost", 60_000).await;
+    b.put("data", "fine", b"ok").await;
+    lose(&b, "data", "lost").await;
+    // The index still names the object but its bytes are gone: not a change
+    // that moved on (that would be skipped — a later event carries it), but
+    // data loss. The push stops at it and says so.
+    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "the push reports the lost object", || {
+        let view = b.link(&id);
+        async move { view.status.push.and_then(|p| p.last_error).is_some_and(|e| e.contains("data/lost")) }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!a.contents("data").await.contains_key("lost"));
+    let push = b.link(&id).status.push.unwrap();
+    assert_eq!(push.state, "error", "{push:?}");
+    assert!(push.last_error.is_some_and(|e| e.contains("data/lost")), "still held at it");
+    // Resolved (here: the key is deleted; a restore from a peer that has it
+    // works too): the push carries on.
+    b.store.delete_object("data", "lost").await.unwrap();
+    eventually(30, "moving again", || same(&a, &b, "data")).await;
+}
+
+#[tokio::test]
 async fn restoring_never_rolls_back_silently() {
     let a = Site::start("site-a").await;
     let b = Site::start("site-b").await;
@@ -669,12 +832,12 @@ async fn restoring_never_rolls_back_silently() {
         site.store.create_bucket("data").await.unwrap();
     }
     put_aged(&a, "data", "k", b"v1", 60_000).await;
-    let id = b.pull_from(&a, "data", Mode::Merge).await;
+    // A key that may read a but not write it: b's changes never reach a.
+    let (ak, sk) = key_with(&a, "reader", &["s3:GetObject", "s3:GetBucketChangelog"]).await;
+    b.pull_with(&a, "data", Mode::Merge, &ak, &sk).await;
     eventually(30, "merged", || same(&a, &b, "data")).await;
-    // Stop pulling, then b writes a newer version that a never gets.
-    b.replication.act(&id, LinkAction::Pause).await.unwrap();
+    // b writes a newer version that a never gets.
     put_aged(&b, "data", "k", b"v2 only on b", 30_000).await;
-    b.replication.act(&id, LinkAction::Resume).await.unwrap();
     lose(&b, "data", "k").await;
     let finding = findings(&b.store, "data")
         .await
@@ -807,7 +970,6 @@ async fn two_way_chaos_converges_exactly() {
         site.store.create_bucket("chaos").await.unwrap();
     }
     let id_b = b.pull_from(&a, "chaos", Mode::Merge).await;
-    a.pull_from(&b, "chaos", Mode::Merge).await;
 
     // Two writers on each site, one of b's with a clock 1.5s fast, all on
     // the same twelve keys, while replication runs both ways.
@@ -840,6 +1002,22 @@ async fn two_way_chaos_converges_exactly() {
                     let ta = a.store.index("chaos").await.unwrap().get_tombstone(key).await.unwrap().map(|t| t.stamp.to_header());
                     let tb = b.store.index("chaos").await.unwrap().get_tombstone(key).await.unwrap().map(|t| t.stamp.to_header());
                     eprintln!("DIFF {key}\n  a: {} tomb={ta:?}\n  b: {} tomb={tb:?}", fmt(x), fmt(y));
+                    for site in [&a, &b] {
+                        let index = site.store.index("chaos").await.unwrap();
+                        let page = index.read_changelog(0, 100_000, usize::MAX).await.unwrap();
+                        for e in page.events.iter().filter(|e| &e.key == key) {
+                            eprintln!(
+                                "  {} seq={} {:?} origin={:?} stamp={:?} removed={:?} ts={}",
+                                site.name,
+                                e.seq,
+                                e.op,
+                                e.origin,
+                                e.stamp.as_ref().map(|s| s.to_header()),
+                                e.removed_stamp.as_ref().map(|s| s.to_header()),
+                                e.ts_ms
+                            );
+                        }
+                    }
                 }
             }
             for view in a.replication.list().into_iter().chain(b.replication.list()) {
@@ -864,6 +1042,7 @@ async fn two_way_chaos_converges_exactly() {
     assert_eq!((head(&a).await, head(&b).await), before, "no ping-pong");
     let status = b.link(&id_b).status;
     assert_eq!(status.state, "live", "{status:?}");
+    assert_eq!(status.push.as_ref().unwrap().state, "live", "{status:?}");
 }
 
 // ── parallel batches ───────────────────────────────────────────────────────
@@ -1003,7 +1182,6 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
             secret_key: SK.into(),
             region: "us-east-1".into(),
             mode: Mode::Mirror,
-            filter: Default::default(),
             enabled: true,
             created_at_ms: 0,
             created_by: String::new(),
@@ -1014,6 +1192,7 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
             access_key: AK.into(),
             secret_key: SK.into(),
             region: "us-east-1".into(),
+            replicator: None,
         })
         .unwrap(),
         status: Arc::new(std::sync::Mutex::new(model::LinkStatus::default())),
@@ -1082,7 +1261,7 @@ fn request(bucket: &str, peer: &Site, mode: Mode, prefix: &str, make_read_only: 
         secret_key: SK.into(),
         region: None,
         mode,
-        prefix: prefix.into(),
+        prefix: (!prefix.is_empty()).then(|| prefix.to_string()),
         enabled: true,
         make_read_only,
     }
@@ -1128,45 +1307,17 @@ async fn mirror_targets_are_read_only_exclusive_and_whole_bucket() {
 }
 
 #[tokio::test]
-async fn a_prefix_filtered_two_way_merge_exchanges_only_that_prefix() {
+async fn links_replicate_whole_buckets_only() {
     let a = Site::start("site-a").await;
     let b = Site::start("site-b").await;
-    for site in [&a, &b] {
-        site.store.create_bucket("data").await.unwrap();
-    }
-    a.put("data", "shared/from-a", b"a").await;
-    a.put("data", "private/a-only", b"a").await;
-    b.put("data", "shared/from-b", b"b").await;
-    b.put("data", "private/b-only", b"b").await;
-    for (site, peer) in [(&b, &a), (&a, &b)] {
-        site.replication
-            .create(
-                LinkRequest { prefix: "shared/".into(), ..request("data", peer, Mode::Merge, "shared/", false) },
-                "t",
-            )
-            .await
-            .unwrap();
-    }
-    let shared = |site: &Site| {
-        let store = site.store.clone();
-        async move {
-            let page = store.list_objects("data", "", None, None, 1000).await.unwrap();
-            page.entries.into_iter().map(|e| e.object_key).collect::<Vec<_>>()
-        }
-    };
-    eventually(30, "the shared prefix converges", || async {
-        let (ka, kb) = (shared(&a).await, shared(&b).await);
-        ka.contains(&"shared/from-b".to_string()) && kb.contains(&"shared/from-a".to_string())
-    })
-    .await;
-    // Outside the prefix nothing moves, and both buckets stay writable.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(shared(&a).await, ["private/a-only", "shared/from-a", "shared/from-b"]);
-    assert_eq!(shared(&b).await, ["private/b-only", "shared/from-a", "shared/from-b"]);
-    b.put("data", "private/another", b"local").await;
-    a.store.delete_object("data", "shared/from-b").await.unwrap();
-    eventually(30, "the delete crossed over", || async { !shared(&b).await.contains(&"shared/from-b".to_string()) }).await;
-    assert!(!shared(&a).await.contains(&"private/another".to_string()));
+    a.store.create_bucket("data").await.unwrap();
+    b.store.create_bucket("data").await.unwrap();
+    let refused = b.replication.create(request("data", &a, Mode::Merge, "shared/", false), "t").await.unwrap_err();
+    assert!(refused.to_string().contains("whole bucket"), "{refused}");
+    // One link per bucket pair.
+    b.replication.create(request("data", &a, Mode::Merge, "", false), "t").await.unwrap();
+    let refused = b.replication.create(request("data", &a, Mode::Merge, "", false), "t").await.unwrap_err();
+    assert!(refused.to_string().contains("already linked"), "{refused}");
 }
 
 #[tokio::test]

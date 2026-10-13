@@ -1,20 +1,28 @@
-//! Server-side replication: links that pull a peer's bucket into a local
-//! one, driven by the peer's changelog.
+//! Server-side replication: links that replicate a whole bucket with a
+//! peer's, driven by changelogs.
 //!
-//! A link is configured on the **receiving** site ("pull bucket X from site
-//! A"). For two-way replication each site configures a link from the other
-//! (mode `merge`). Positions belong to the receiver and live in the local
-//! bucket's index, beside the data they describe.
+//! - **mirror**: the link pulls the peer's bucket into a read-only local
+//!   one (configured on the receiving site);
+//! - **merge**: the link pulls the peer's changes in *and* pushes the local
+//!   bucket's changes out, so one link (on either site) keeps both buckets
+//!   the union. If both sites configure one for the same pair, the link on
+//!   the higher site id stands down (the peer reports its own link back on
+//!   changelog reads, `x-rs3-merge-back`).
 //!
-//! One worker per enabled link. A supervisor ticks every
-//! `replication.check_interval_secs` (5s): it starts a worker for any enabled
-//! link without one — after a crash, a panic, or a restart — and replaces a
-//! worker whose heartbeat (its lease) went stale, so a hung worker cannot
-//! hold a link forever. At most one worker runs per link.
+//! Positions belong to the site running the link and live in the local
+//! bucket's index: the pull position in the peer's log, and (merge) the
+//! push position in the local log.
+//!
+//! One pull worker per enabled link, plus a push worker for a merge link. A
+//! supervisor ticks every `replication.check_interval_secs` (5s): it starts
+//! a worker that is missing — after a crash, a panic, or a restart — and
+//! replaces one whose heartbeat (its lease) went stale, so a hung worker
+//! cannot hold a link forever. At most one of each runs per link.
 
 pub mod db;
 pub mod model;
 pub mod peer;
+mod push;
 #[cfg(test)]
 mod tests;
 mod worker;
@@ -30,7 +38,6 @@ use tokio_util::sync::CancellationToken;
 use self::db::LinkDb;
 use self::model::{Link, LinkStatus, Mode, RECORD_VERSION};
 use self::peer::{PeerClient, PeerConfig};
-use super::notify::model::Filter;
 use crate::storage::store::{DeleteGuard, LocalObjectStore};
 use crate::storage::time::now_ms;
 
@@ -98,8 +105,9 @@ pub struct LinkRequest {
     pub region: Option<String>,
     #[serde(default)]
     pub mode: Mode,
+    /// Not supported: links replicate the whole bucket. Refused when set.
     #[serde(default)]
-    pub prefix: String,
+    pub prefix: Option<String>,
     #[serde(default = "yes")]
     pub enabled: bool,
     /// Mirror links need a read-only target: with this, a read-write target
@@ -144,7 +152,6 @@ pub struct LinkView {
     pub access_key: String,
     pub region: String,
     pub mode: Mode,
-    pub prefix: String,
     pub enabled: bool,
     pub created_at_ms: i64,
     pub created_by: String,
@@ -153,12 +160,48 @@ pub struct LinkView {
     pub status: LinkStatus,
 }
 
+type Task = (CancellationToken, tokio::task::JoinHandle<()>);
+
 struct Runtime {
     link: Link,
     status: Arc<Mutex<LinkStatus>>,
+    /// The pull worker.
     heartbeat: Arc<AtomicI64>,
-    worker: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    worker: Option<Task>,
+    /// The push worker (merge links).
+    push_heartbeat: Arc<AtomicI64>,
+    pusher: Option<Task>,
 }
+
+impl Runtime {
+    /// Stops both workers; true if any was running.
+    fn stop(&mut self) -> bool {
+        let mut stopped = false;
+        for task in [self.worker.take(), self.pusher.take()].into_iter().flatten() {
+            task.0.cancel();
+            task.1.abort();
+            stopped = true;
+        }
+        stopped
+    }
+}
+
+/// A link on another site that reads one of this site's buckets — seen on
+/// its changelog reads (`x-rs3-replicator`).
+#[derive(Debug, Clone, Serialize)]
+pub struct IncomingLink {
+    pub bucket: String,
+    pub site: String,
+    pub mode: String,
+    /// The bucket on the reader's site.
+    pub peer_bucket: String,
+    pub link_id: String,
+    pub link_name: String,
+    pub last_seen_ms: i64,
+}
+
+/// Incoming links not seen for this long are dropped from the list.
+const INCOMING_TTL_MS: i64 = 5 * 60 * 1000;
 
 struct Inner {
     store: LocalObjectStore,
@@ -169,6 +212,8 @@ struct Inner {
     /// Serialises link creation, so the per-bucket rules (a mirror is the
     /// bucket's only link) cannot be raced.
     create_lock: tokio::sync::Mutex<()>,
+    /// Keyed by `(bucket, reader site, reader link id)`.
+    incoming: Mutex<HashMap<(String, String, String), IncomingLink>>,
 }
 
 #[derive(Clone)]
@@ -196,13 +241,56 @@ fn mirror_links_into(inner: &Inner, bucket: &str) -> Vec<String> {
         .collect()
 }
 
-fn peer_config(link: &Link) -> PeerConfig {
+fn peer_config(link: &Link, site: &str) -> PeerConfig {
+    let mode = match link.mode {
+        Mode::Mirror => "mirror",
+        Mode::Merge => "merge",
+    };
     PeerConfig {
         endpoint: link.peer_endpoint.clone(),
         bucket: link.peer_bucket.clone(),
         access_key: link.access_key.clone(),
         secret_key: link.secret_key.clone(),
         region: link.region.clone(),
+        replicator: Some(format!(
+            "{site};{mode};{};{};{}",
+            urlencoding::encode(&link.local_bucket),
+            link.id,
+            urlencoding::encode(&link.name)
+        )),
+    }
+}
+
+/// Parses an `x-rs3-replicator` header:
+/// `<site>;<mode>;<bucket>;<link id>;<name>`.
+fn parse_replicator(value: &str) -> Option<(String, String, String, String, String)> {
+    let mut parts = value.splitn(5, ';');
+    let site = parts.next()?.to_string();
+    let mode = parts.next()?.to_string();
+    let bucket = urlencoding::decode(parts.next()?).ok()?.into_owned();
+    let id = parts.next()?.to_string();
+    let name = urlencoding::decode(parts.next()?).ok()?.into_owned();
+    if site.is_empty() || site.len() > 64 || id.len() > 64 || name.len() > 256 || bucket.len() > 63 {
+        return None;
+    }
+    Some((site, mode, bucket, id, name))
+}
+
+/// Whether a worker slot needs a (new) worker: none yet, exited (fatal
+/// error or panic), or silent past its lease.
+fn needs_start(task: &Option<Task>, heartbeat: &AtomicI64, now: i64, stale_ms: i64, id: &str, what: &str) -> bool {
+    match task {
+        None => true,
+        Some((_, handle)) if handle.is_finished() => true,
+        Some(_) => {
+            let silent = now - heartbeat.load(Ordering::SeqCst);
+            if silent > stale_ms {
+                log::warn!("replication {id} {what} worker silent for {}s: replacing it", silent / 1000);
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -221,6 +309,7 @@ impl ReplicationService {
                 shutdown,
                 links: RwLock::new(HashMap::new()),
                 create_lock: tokio::sync::Mutex::new(()),
+                incoming: Mutex::new(HashMap::new()),
             }),
         };
         for link in service.inner.db.load_all().await? {
@@ -268,6 +357,43 @@ impl ReplicationService {
                 )
             })
         })));
+        // Links on other sites reading our buckets: remember them, and tell a
+        // merge reader when a merge link here already pairs the buckets.
+        let weak = Arc::downgrade(&service.inner);
+        service.inner.store.set_replica_reader(crate::storage::store::ReplicaReader(Arc::new(move |bucket, header| {
+            let inner = weak.upgrade()?;
+            let (site, mode, peer_bucket, link_id, link_name) = parse_replicator(header)?;
+            let now = now_ms();
+            {
+                let mut incoming = inner.incoming.lock().unwrap();
+                incoming.retain(|_, seen| now - seen.last_seen_ms < INCOMING_TTL_MS);
+                incoming.insert(
+                    (bucket.to_string(), site.clone(), link_id.clone()),
+                    IncomingLink {
+                        bucket: bucket.to_string(),
+                        site: site.clone(),
+                        mode: mode.clone(),
+                        peer_bucket: peer_bucket.clone(),
+                        link_id,
+                        link_name,
+                        last_seen_ms: now,
+                    },
+                );
+            }
+            if mode != "merge" {
+                return None;
+            }
+            let links = inner.links.read().unwrap();
+            links.values().find_map(|rt| {
+                let rt = rt.lock().unwrap();
+                let link = &rt.link;
+                let paired = link.mode == Mode::Merge
+                    && link.local_bucket == bucket
+                    && link.peer_bucket == peer_bucket
+                    && rt.status.lock().unwrap().peer_site.as_deref() == Some(site.as_str());
+                paired.then(|| format!("{};{}", link.id, urlencoding::encode(&link.name)))
+            })
+        })));
         service.spawn_supervisor();
         Ok(service)
     }
@@ -279,6 +405,8 @@ impl ReplicationService {
             status: Arc::new(Mutex::new(LinkStatus::default())),
             heartbeat: Arc::new(AtomicI64::new(0)),
             worker: None,
+            push_heartbeat: Arc::new(AtomicI64::new(0)),
+            pusher: None,
         };
         self.inner.links.write().unwrap().insert(id, Arc::new(Mutex::new(runtime)));
     }
@@ -302,13 +430,15 @@ impl ReplicationService {
 
     fn stop_all(&self) {
         for rt in self.inner.links.read().unwrap().values() {
-            if let Some((cancel, _)) = rt.lock().unwrap().worker.take() {
+            let mut rt = rt.lock().unwrap();
+            for (cancel, _) in [rt.worker.take(), rt.pusher.take()].into_iter().flatten() {
                 cancel.cancel();
             }
         }
     }
 
-    /// One supervisor pass: every enabled link gets exactly one live worker.
+    /// One supervisor pass: every enabled link gets exactly one live pull
+    /// worker, and a merge link one push worker.
     pub fn supervise(&self) {
         let now = now_ms();
         let stale_ms = self.inner.timing.stale_after.as_millis() as i64;
@@ -316,66 +446,95 @@ impl ReplicationService {
         for rt in runtimes {
             let mut rt = rt.lock().unwrap();
             if !rt.link.enabled {
+                rt.stop();
+                let mut status = rt.status.lock().unwrap();
+                status.state = "paused".to_string();
+                if let Some(push) = status.push.as_mut() {
+                    push.state = "paused".to_string();
+                }
+                continue;
+            }
+            let id = rt.link.id.clone();
+            let pull_heartbeat = rt.heartbeat.clone();
+            if needs_start(&rt.worker, &pull_heartbeat, now, stale_ms, &id, "pull") {
                 if let Some((cancel, handle)) = rt.worker.take() {
                     cancel.cancel();
                     handle.abort();
+                    rt.status.lock().unwrap().restarts += 1;
                 }
-                rt.status.lock().unwrap().state = "paused".to_string();
+                let Some(peer) = self.peer_client(&rt, now) else { continue };
+                let cancel = self.inner.shutdown.child_token();
+                rt.heartbeat.store(now, Ordering::SeqCst);
+                let worker = worker::Worker {
+                    store: self.inner.store.clone(),
+                    link: rt.link.clone(),
+                    peer,
+                    status: rt.status.clone(),
+                    heartbeat: rt.heartbeat.clone(),
+                    cancel: cancel.clone(),
+                    max_checkpoint_age_ms: self.inner.timing.max_checkpoint_age.as_millis() as i64,
+                    long_poll: self.inner.timing.long_poll,
+                    parallelism: self.inner.timing.parallelism,
+                };
+                rt.worker = Some((cancel, tokio::spawn(worker.run())));
+            }
+            if rt.link.mode != Mode::Merge {
                 continue;
             }
-            let restart = match &rt.worker {
-                None => true,
-                Some((_, handle)) if handle.is_finished() => {
-                    // Exited (fatal error or panic): try again.
-                    true
+            let push_heartbeat = rt.push_heartbeat.clone();
+            if needs_start(&rt.pusher, &push_heartbeat, now, stale_ms, &id, "push") {
+                if let Some((cancel, handle)) = rt.pusher.take() {
+                    cancel.cancel();
+                    handle.abort();
+                    rt.status.lock().unwrap().restarts += 1;
                 }
-                Some(_) => {
-                    let silent = now - rt.heartbeat.load(Ordering::SeqCst);
-                    if silent > stale_ms {
-                        log::warn!(
-                            "replication {} worker silent for {}s: replacing it",
-                            rt.link.id,
-                            silent / 1000
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                }
-            };
-            if !restart {
-                continue;
+                let Some(peer) = self.peer_client(&rt, now) else { continue };
+                let cancel = self.inner.shutdown.child_token();
+                rt.push_heartbeat.store(now, Ordering::SeqCst);
+                let pusher = push::Pusher {
+                    store: self.inner.store.clone(),
+                    link: rt.link.clone(),
+                    peer,
+                    status: rt.status.clone(),
+                    heartbeat: rt.push_heartbeat.clone(),
+                    cancel: cancel.clone(),
+                    max_checkpoint_age_ms: self.inner.timing.max_checkpoint_age.as_millis() as i64,
+                    long_poll: self.inner.timing.long_poll,
+                    parallelism: self.inner.timing.parallelism,
+                };
+                rt.pusher = Some((cancel, tokio::spawn(pusher.run())));
             }
-            if let Some((cancel, handle)) = rt.worker.take() {
-                cancel.cancel();
-                handle.abort();
-                rt.status.lock().unwrap().restarts += 1;
-            }
-            let peer = match PeerClient::new(peer_config(&rt.link)) {
-                Ok(peer) => peer,
-                Err(err) => {
-                    let mut status = rt.status.lock().unwrap();
-                    status.state = "error".to_string();
-                    status.last_error = Some(err);
-                    status.last_error_ms = now;
-                    continue;
-                }
-            };
-            let cancel = self.inner.shutdown.child_token();
-            rt.heartbeat.store(now, Ordering::SeqCst);
-            let worker = worker::Worker {
-                store: self.inner.store.clone(),
-                link: rt.link.clone(),
-                peer,
-                status: rt.status.clone(),
-                heartbeat: rt.heartbeat.clone(),
-                cancel: cancel.clone(),
-                max_checkpoint_age_ms: self.inner.timing.max_checkpoint_age.as_millis() as i64,
-                long_poll: self.inner.timing.long_poll,
-                parallelism: self.inner.timing.parallelism,
-            };
-            rt.worker = Some((cancel, tokio::spawn(worker.run())));
         }
+    }
+
+    fn peer_client(&self, rt: &Runtime, now: i64) -> Option<PeerClient> {
+        match PeerClient::new(peer_config(&rt.link, &self.inner.store.site_id())) {
+            Ok(peer) => Some(peer),
+            Err(err) => {
+                let mut status = rt.status.lock().unwrap();
+                status.state = "error".to_string();
+                status.last_error = Some(err);
+                status.last_error_ms = now;
+                None
+            }
+        }
+    }
+
+    /// Links on other sites that read this site's buckets (seen within the
+    /// last few minutes).
+    pub fn incoming(&self) -> Vec<IncomingLink> {
+        let now = now_ms();
+        let mut list: Vec<IncomingLink> = self
+            .inner
+            .incoming
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|seen| now - seen.last_seen_ms < INCOMING_TTL_MS)
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| (&a.bucket, &a.site, &a.link_name).cmp(&(&b.bucket, &b.site, &b.link_name)));
+        list
     }
 
     fn runtime(&self, id: &str) -> Result<Arc<Mutex<Runtime>>, LinkError> {
@@ -397,7 +556,7 @@ impl ReplicationService {
         }
         crate::storage::encoding::validate_bucket_name(&link.peer_bucket)
             .map_err(|_| LinkError::BadRequest(format!("invalid peer bucket {:?}", link.peer_bucket)))?;
-        PeerClient::new(peer_config(link)).map_err(LinkError::BadRequest)?;
+        PeerClient::new(peer_config(link, &self.inner.store.site_id())).map_err(LinkError::BadRequest)?;
         Ok(())
     }
 
@@ -405,10 +564,18 @@ impl ReplicationService {
         if !self.inner.store.bucket_exists(&request.local_bucket).await {
             return Err(LinkError::NotFound(format!("bucket {} not found", request.local_bucket)));
         }
+        if request.prefix.as_deref().is_some_and(|p| !p.is_empty()) {
+            return Err(LinkError::BadRequest(
+                "replication links replicate the whole bucket; prefixes are not supported (webhooks can filter by \
+                 prefix)"
+                    .into(),
+            ));
+        }
         let _creating = self.inner.create_lock.lock().await;
         let bucket = request.local_bucket.clone();
+        let endpoint = request.peer_endpoint.trim().trim_end_matches('/').to_string();
         // A mirror owns its bucket: no other link may write into it.
-        let existing: Vec<(String, Mode)> = self
+        let existing_links: Vec<Link> = self
             .inner
             .links
             .read()
@@ -416,8 +583,9 @@ impl ReplicationService {
             .values()
             .map(|rt| rt.lock().unwrap().link.clone())
             .filter(|l| l.local_bucket == bucket)
-            .map(|l| (format!("{} ({})", l.name, l.id), l.mode))
             .collect();
+        let existing: Vec<(String, Mode)> =
+            existing_links.iter().map(|l| (format!("{} ({})", l.name, l.id), l.mode)).collect();
         if let Some((name, _)) = existing.iter().find(|(_, mode)| *mode == Mode::Mirror) {
             return Err(LinkError::BadRequest(format!(
                 "bucket {bucket} is already a mirror of {name}; a mirror is the bucket's only link"
@@ -430,12 +598,14 @@ impl ReplicationService {
                 names.join(", ")
             )));
         }
-        if request.mode == Mode::Mirror && !request.prefix.is_empty() {
-            // The whole bucket must be read-only for a mirror, so mirroring
-            // part of it would freeze the rest: nobody could write it.
-            return Err(LinkError::BadRequest(
-                "a mirror replicates the whole bucket; a prefix is only supported for merge links".into(),
-            ));
+        if let Some(same) = existing_links
+            .iter()
+            .find(|l| l.peer_endpoint == endpoint && l.peer_bucket == request.peer_bucket)
+        {
+            return Err(LinkError::BadRequest(format!(
+                "bucket {bucket} is already linked with {}/{} by {} ({})",
+                endpoint, request.peer_bucket, same.name, same.id
+            )));
         }
         if request.mode == Mode::Mirror {
             let read_only = self.inner.store.bucket_meta(&bucket).await?.read_only;
@@ -451,13 +621,12 @@ impl ReplicationService {
             id: format!("rl_{}", random_hex(8)),
             name: request.name.trim().to_string(),
             local_bucket: request.local_bucket,
-            peer_endpoint: request.peer_endpoint.trim().trim_end_matches('/').to_string(),
+            peer_endpoint: endpoint,
             peer_bucket: request.peer_bucket,
             access_key: request.access_key,
             secret_key: request.secret_key,
             region: request.region.filter(|r| !r.is_empty()).unwrap_or_else(|| "us-east-1".to_string()),
             mode: request.mode,
-            filter: Filter { prefix: request.prefix, ..Filter::default() },
             enabled: request.enabled,
             created_at_ms: now_ms(),
             created_by: created_by.to_string(),
@@ -501,10 +670,7 @@ impl ReplicationService {
             let mut rt = rt.lock().unwrap();
             rt.link = link;
             // Restart with the new settings.
-            if let Some((cancel, handle)) = rt.worker.take() {
-                cancel.cancel();
-                handle.abort();
-            }
+            rt.stop();
         }
         self.supervise();
         self.view(id)
@@ -514,16 +680,14 @@ impl ReplicationService {
         let rt = self.runtime(id)?;
         let bucket = {
             let mut rt = rt.lock().unwrap();
-            if let Some((cancel, handle)) = rt.worker.take() {
-                cancel.cancel();
-                handle.abort();
-            }
+            rt.stop();
             rt.link.local_bucket.clone()
         };
         self.inner.db.delete(id).await?;
         self.inner.links.write().unwrap().remove(id);
         if let Ok(index) = self.inner.store.index(&bucket).await {
             let _ = index.put_checkpoint(id, None).await;
+            let _ = index.put_checkpoint(&push::checkpoint_key(id), None).await;
         }
         log::info!("replication link deleted id={id}");
         Ok(())
@@ -541,13 +705,12 @@ impl ReplicationService {
                 let rt = self.runtime(id)?;
                 let bucket = {
                     let mut rt = rt.lock().unwrap();
-                    if let Some((cancel, handle)) = rt.worker.take() {
-                        cancel.cancel();
-                        handle.abort();
-                    }
+                    rt.stop();
                     rt.link.local_bucket.clone()
                 };
-                self.inner.store.index(&bucket).await?.put_checkpoint(id, None).await?;
+                let index = self.inner.store.index(&bucket).await?;
+                index.put_checkpoint(id, None).await?;
+                index.put_checkpoint(&push::checkpoint_key(id), None).await?;
                 self.supervise();
             }
         }
@@ -568,7 +731,6 @@ impl ReplicationService {
             access_key: link.access_key.clone(),
             region: link.region.clone(),
             mode: link.mode,
-            prefix: link.filter.prefix.clone(),
             enabled: link.enabled,
             created_at_ms: link.created_at_ms,
             created_by: link.created_by.clone(),
@@ -610,7 +772,7 @@ impl ReplicationService {
         }
         let mut notes = Vec::new();
         for link in links {
-            let peer = match PeerClient::new(peer_config(&link)) {
+            let peer = match PeerClient::new(peer_config(&link, &self.inner.store.site_id())) {
                 Ok(peer) => peer,
                 Err(err) => {
                     notes.push(format!("{}: {err}", link.name));

@@ -1705,24 +1705,37 @@ async fn put_bucket_cors_s3(
 
 async fn changelog_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
     use axum::response::IntoResponse;
-    if ctx.query.contains_key(notify::read::QUERY_SNAPSHOT) {
+    // A replication link names itself: the console lists who replicates
+    // this bucket, and a merge link here pairing the bucket with the
+    // reader's site is reported back (one merge link per pair suffices).
+    let merge_back = ctx
+        .headers
+        .get(replication::peer::HEADER_REPLICATOR)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|replicator| store.replica_read(&ctx.bucket, replicator));
+    let mut response = if ctx.query.contains_key(notify::read::QUERY_SNAPSHOT) {
         let result = match notify::read::snapshot_params(&ctx.query) {
             Ok(params) => notify::read::snapshot(&store, &ctx.bucket, &params).await,
             Err(err) => Err(err),
         };
-        return match result {
+        match result {
             Ok(page) => axum::Json(page).into_response(),
             Err(err) => err.into_response(),
+        }
+    } else {
+        let result = match notify::read::read_params(&ctx.query) {
+            Ok(params) => notify::read::read(&store, &ctx.bucket, &params).await,
+            Err(err) => Err(err),
         };
-    }
-    let result = match notify::read::read_params(&ctx.query) {
-        Ok(params) => notify::read::read(&store, &ctx.bucket, &params).await,
-        Err(err) => Err(err),
+        match result {
+            Ok(page) => axum::Json(page).into_response(),
+            Err(err) => err.into_response(),
+        }
     };
-    match result {
-        Ok(page) => axum::Json(page).into_response(),
-        Err(err) => err.into_response(),
+    if let Some(value) = merge_back.and_then(|m| HeaderValue::from_str(&m).ok()) {
+        response.headers_mut().insert(replication::peer::HEADER_MERGE_BACK, value);
     }
+    response
 }
 
 async fn delete_bucket_cors_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {

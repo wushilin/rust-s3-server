@@ -103,6 +103,19 @@ impl std::fmt::Debug for PeerRestorer {
     }
 }
 
+/// Told about each replication link reading a bucket's changelog:
+/// `(bucket, the reader's x-rs3-replicator header)`. Returns the
+/// `x-rs3-merge-back` answer (a merge link here already pairs the bucket
+/// with that reader's site), if any. Installed by the replication service.
+#[derive(Clone)]
+pub struct ReplicaReader(pub Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for ReplicaReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplicaReader")
+    }
+}
+
 /// Bucket-deletion veto: returns why `bucket` may not be deleted, if so.
 #[derive(Clone)]
 pub struct DeleteGuard(pub Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
@@ -151,6 +164,8 @@ pub struct LocalObjectStore {
     read_write_guard: Arc<std::sync::RwLock<Vec<DeleteGuard>>>,
     /// Restores lost objects from replication peers (health-scan repair).
     peer_restorer: Arc<std::sync::RwLock<Option<PeerRestorer>>>,
+    /// Records replication links reading this server's changelogs.
+    replica_reader: Arc<std::sync::RwLock<Option<ReplicaReader>>>,
     /// Per-bucket "the changelog moved" signal, for long-polling readers.
     change_signals: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// This site's identity and version-stamp clock. Opened by
@@ -354,6 +369,7 @@ impl LocalObjectStore {
             read_write_guard: Arc::new(std::sync::RwLock::new(Vec::new())),
             change_signals: Arc::new(Mutex::new(HashMap::new())),
             peer_restorer: Arc::new(std::sync::RwLock::new(None)),
+            replica_reader: Arc::new(std::sync::RwLock::new(None)),
             clock: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
@@ -370,6 +386,18 @@ impl LocalObjectStore {
     /// Installs the peer restorer (the replication service).
     pub fn set_peer_restorer(&self, restorer: PeerRestorer) {
         *self.peer_restorer.write().unwrap() = Some(restorer);
+    }
+
+    /// Installs the replica-reader hook (the replication service).
+    pub fn set_replica_reader(&self, reader: ReplicaReader) {
+        *self.replica_reader.write().unwrap() = Some(reader);
+    }
+
+    /// A replication link (header `x-rs3-replicator`) read `bucket`'s
+    /// changelog; returns the `x-rs3-merge-back` answer, if any.
+    pub(crate) fn replica_read(&self, bucket: &str, replicator: &str) -> Option<String> {
+        let reader = self.replica_reader.read().unwrap().clone();
+        reader.and_then(|reader| reader.0(bucket, replicator))
     }
 
     /// Fetches a lost object back from a replication peer.

@@ -3653,7 +3653,11 @@ async fn list_links(State(state): State<UiState>, headers: HeaderMap) -> Respons
         return resp;
     }
     match replication_service(&state) {
-        Ok(service) => Json(json!({ "links": service.list(), "site_id": state.store.site_id() })).into_response(),
+        Ok(service) => Json(json!({
+            "links": service.list(),
+            "incoming": service.incoming(),
+            "site_id": state.store.site_id(),
+        })).into_response(),
         Err(resp) => resp,
     }
 }
