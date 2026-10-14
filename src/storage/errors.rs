@@ -18,7 +18,8 @@ pub enum StorageError {
     EntityTooSmall(String),
     PayloadHashMismatch { expected: String, actual: String },
     CorruptObject(String),
-    /// The bucket's index is being rebuilt; all requests get 503 until done.
+    /// The bucket's index is being rebuilt, or its storage layout upgraded;
+    /// all data requests get 503 until done.
     BucketRebuilding(String),
     /// The on-disk index schema is not current; a rebuild is required.
     IndexOutdated(String),
@@ -35,6 +36,10 @@ pub enum StorageError {
     /// A client write to a read-only bucket (only replicated writes are
     /// accepted). Maps to HTTP 403.
     BucketReadOnly(String),
+    /// The bucket's recorded layout is one this build does not know (a
+    /// newer build wrote it) or a migration step this build cannot run.
+    /// The server refuses to start.
+    UnsupportedLayout { bucket: String, message: String },
 }
 
 impl fmt::Display for StorageError {
@@ -66,7 +71,7 @@ impl fmt::Display for StorageError {
             }
             StorageError::CorruptObject(v) => write!(f, "corrupt object: {v}"),
             StorageError::BucketRebuilding(v) => {
-                write!(f, "bucket index rebuild in progress: {v}")
+                write!(f, "bucket {v} is unavailable while its index is rebuilt or its storage layout upgraded")
             }
             StorageError::IndexOutdated(v) => write!(f, "index schema outdated: {v}"),
             StorageError::PreconditionFailed { bucket, key } => {
@@ -81,6 +86,9 @@ impl fmt::Display for StorageError {
                 f,
                 "{bucket}/{key} already has a state at least as new (stamp {current}); nothing changed"
             ),
+            StorageError::UnsupportedLayout { bucket, message } => {
+                write!(f, "bucket {bucket}: unsupported storage layout: {message}")
+            }
         }
     }
 }

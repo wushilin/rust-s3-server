@@ -1070,6 +1070,21 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         Err(err) => log::warn!("startup rebuild scan failed error={err}"),
     }
 
+    // Storage layouts: refuse to start on a layout a newer build wrote; a
+    // bucket whose upgrade was started and interrupted resumes it now,
+    // behind its 503 gate (it serves nothing until it is stable). Buckets on
+    // an older layout keep serving until an operator upgrades them.
+    for (bucket, layout) in store.check_layouts().await? {
+        jobs::migrate_layout::spawn(
+            store.clone(),
+            bucket,
+            layout,
+            tasks.clone(),
+            shutdown.child_token(),
+            std::time::Duration::from_secs(config.app_config.sweeper.interval_secs.max(1)),
+        );
+    }
+
     // Startup intent drain: resolve every crash-leftover intent before
     // serving. O(operations in flight at crash time) — milliseconds.
     match store.list_buckets().await {
@@ -1405,38 +1420,6 @@ fn spawn_maintenance_jobs(
     spawn_job!("delete_staging", jobs::delete_staging::run_once);
     spawn_job!("delete_trash", jobs::delete_trash::run_once);
 
-    // Layout migration: relocate legacy 4-level objects to the single-level
-    // layout. Its own loop (starts immediately); each run drains all remaining
-    // legacy objects, then idles. Once nothing is left it finds no work.
-    {
-        let store = store.clone();
-        let cancel = shutdown.child_token();
-        let tasks = tasks.clone();
-        let idle_secs = cfg.interval_secs.max(1);
-        tokio::spawn(async move {
-            log::info!(
-                "job scheduler started job=migrate_layout interval_secs={idle_secs} (starts immediately)"
-            );
-            loop {
-                if cancel.is_cancelled() {
-                    log::info!("job scheduler stopping job=migrate_layout");
-                    break;
-                }
-                let run_id = new_request_id();
-                let fut = jobs::migrate_layout::run_once(&store, &cancel, &tasks, &run_id);
-                if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await.is_err() {
-                    log::error!("job migrate_layout panicked run_id={run_id}; scheduler continues");
-                }
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        log::info!("job scheduler stopping job=migrate_layout");
-                        break;
-                    }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(idle_secs)) => {}
-                }
-            }
-        });
-    }
 
     // Empty-directory reclaimer: its own self-paced loop rather than the fixed
     // scheduler above. It starts immediately, runs a full drain (which itself
@@ -2465,7 +2448,7 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
             let mut response = s3_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SlowDown",
-                "Bucket index rebuild in progress; retry shortly",
+                "Bucket index rebuild or storage layout upgrade in progress; retry shortly",
                 resource,
             );
             response

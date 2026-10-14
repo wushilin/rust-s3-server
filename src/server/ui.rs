@@ -26,6 +26,7 @@ use super::iam::{Group, IamStore};
 use super::policy::{
     compile_rules, decompile_rules, PolicyDocument, PolicyRule, Requirement,
 };
+use crate::storage::metadata::{BucketLayout, CURRENT_LAYOUT};
 use crate::storage::errors::StorageError;
 use crate::storage::rawdb;
 use crate::storage::metadata::CorsRule;
@@ -98,6 +99,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/{name}/rebuild", post(rebuild_bucket))
         .route("/api/buckets/{name}/cors", get(get_bucket_cors).put(set_bucket_cors))
         .route("/api/buckets/{name}/read-only", put(set_bucket_read_only))
+        .route("/api/buckets/{name}/upgrade-layout", post(upgrade_bucket_layout))
         // Changelog subscriptions: webhooks and replication tokens (admin only).
         .route("/api/subscriptions", get(list_subscriptions).post(create_subscription))
         .route(
@@ -1557,11 +1559,20 @@ async fn list_buckets(
                 // bucket, so it rides along with the listing rather than
                 // costing the console one request per bucket.
                 let multipart_uploads = state.store.count_multipart_uploads(&name).await;
+                // The bucket's storage layout, so the console can prompt for
+                // an upgrade and show one in progress.
+                let layout = match meta.layout {
+                    Some(layout) => layout,
+                    None => state.store.bucket_layout(&name).await.unwrap_or(BucketLayout::current()),
+                };
                 visible.push(json!({
                     "name": name,
                     "read_only": meta.read_only,
                     "created_at_ms": meta.created_at_ms,
                     "multipart_uploads": multipart_uploads,
+                    "layout": layout,
+                    "layout_current": CURRENT_LAYOUT,
+                    "layout_upgrade": LocalObjectStore::layout_upgrade_available(layout),
                 }));
             }
             Json(json!({ "buckets": visible })).into_response()
@@ -3828,6 +3839,39 @@ async fn rename_site(
         }
         Err(crate::storage::errors::StorageError::Io(message)) => error_response(StatusCode::BAD_REQUEST, message),
         Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+// ── bucket storage layout upgrade (admin only) ───────────────────────────────
+
+/// Starts the upgrade of a bucket on an older storage layout. The bucket
+/// answers 503 until the upgrade completes (progress in the tasks panel);
+/// an upgrade interrupted by a restart resumes at the next start.
+async fn upgrade_bucket_layout(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.start_layout_upgrade(&name).await {
+        Ok(layout) => {
+            audit(&state, &rid.0, &session.username, "upgrade_bucket_layout", format!("/{name}"));
+            super::jobs::migrate_layout::spawn(
+                state.store.clone(),
+                name,
+                layout,
+                state.tasks.clone(),
+                state.store.shutdown_token().child_token(),
+                std::time::Duration::from_secs(state.config.sweeper.interval_secs.max(1)),
+            );
+            (StatusCode::ACCEPTED, Json(json!({ "ok": true, "layout": layout }))).into_response()
+        }
+        Err(StorageError::BucketInUse(message)) => error_response(StatusCode::CONFLICT, message),
+        Err(err) => storage_error(err),
     }
 }
 

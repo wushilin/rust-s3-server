@@ -48,7 +48,7 @@ use super::index::{
 };
 use super::layout::StorageLayout;
 use super::locks::ObjectLockTable;
-use super::metadata::{
+use super::metadata::{BucketLayout, CURRENT_LAYOUT, 
     content_encoding_or_none, content_language_or_none, content_type_or_default,
     storage_class_or_default, unquote_etag, BucketMeta, CorsRule, ObjectMeta, ObjectStorageKind, PartMeta,
     PutMeta, UploadMeta,
@@ -576,7 +576,8 @@ impl LocalObjectStore {
         if !bucket_meta_path.exists() {
             let meta = BucketMeta {
                 created_at_ms: now_ms(),
-                storage_version: "v2".to_string(),
+                storage_version: String::new(),
+                layout: Some(BucketLayout::current()),
                 cors: Vec::new(),
                 read_only: false,
             };
@@ -763,11 +764,22 @@ impl LocalObjectStore {
     /// background rebuild and fail with `BucketRebuilding` until it
     /// completes.
     pub async fn index(&self, bucket: &str) -> Result<ObjectIndex> {
+        self.index_impl(bucket, true).await
+    }
+
+    /// [`Self::index`] for maintenance that runs *behind* the 503 gate (a
+    /// layout migration holds the gate up while it rewrites the bucket):
+    /// opens the index whether or not the gate is up. Never for a request.
+    pub(crate) async fn index_unchecked(&self, bucket: &str) -> Result<ObjectIndex> {
+        self.index_impl(bucket, false).await
+    }
+
+    async fn index_impl(&self, bucket: &str, gated: bool) -> Result<ObjectIndex> {
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        if self.rebuilding.lock().unwrap().contains(bucket) {
+        if gated && self.rebuilding.lock().unwrap().contains(bucket) {
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
         }
         if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
@@ -784,7 +796,7 @@ impl LocalObjectStore {
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        if self.rebuilding.lock().unwrap().contains(bucket) {
+        if gated && self.rebuilding.lock().unwrap().contains(bucket) {
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
         }
         if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
@@ -2857,7 +2869,7 @@ impl LocalObjectStore {
     pub async fn migrate_object_layout(&self, bucket: &str, key: &str) -> Result<bool> {
         validate_bucket_name(bucket)?;
         let bucket_dir = self.layout.bucket_dir(bucket)?;
-        let index = self.index(bucket).await?;
+        let index = self.index_unchecked(bucket).await?;
         let _guard = self.locks.lock(bucket, key).await;
 
         let Some(row) = index.get(key).await? else {
@@ -2934,7 +2946,201 @@ impl LocalObjectStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<String>> {
-        self.index(bucket).await?.legacy_layout_keys(after, limit).await
+        self.index_unchecked(bucket).await?.legacy_layout_keys(after, limit).await
+    }
+
+    // ── bucket layout versions ─────────────────────────────────────────────
+
+    /// The bucket's layout as recorded in its `bucket.json`, or, for a
+    /// bucket from before layouts were recorded, as detected from its tree
+    /// (any legacy 4-level fanout dir means layout 1).
+    pub async fn bucket_layout(&self, bucket: &str) -> Result<BucketLayout> {
+        if let Some(layout) = self.bucket_meta(bucket).await?.layout {
+            return Ok(layout);
+        }
+        Ok(BucketLayout::Stable {
+            version: if self.has_legacy_layout_dirs(bucket).await? { 1 } else { CURRENT_LAYOUT },
+        })
+    }
+
+    /// Records the bucket's layout (durably).
+    pub async fn set_bucket_layout(&self, bucket: &str, layout: BucketLayout) -> Result<()> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        meta.layout = Some(layout);
+        write_json_atomic(&path, &meta).await?;
+        fsync_file(&path).await?;
+        fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        Ok(())
+    }
+
+    /// Drops the cached `bucket.json` (tests edit the file directly).
+    #[cfg(test)]
+    pub(crate) fn forget_bucket_meta(&self, bucket: &str) {
+        self.bucket_meta_cache.remove(&bucket.to_string());
+    }
+
+    /// Whether `layout` is an older layout this build still serves, so an
+    /// upgrade can be started ([`Self::start_layout_upgrade`]).
+    pub fn layout_upgrade_available(layout: BucketLayout) -> bool {
+        matches!(layout, BucketLayout::Stable { version } if version < CURRENT_LAYOUT)
+    }
+
+    /// The startup layout check, run before the server serves. For every
+    /// bucket: records a layout that was never recorded; refuses a layout,
+    /// or a migration target, newer than this build knows (the server must
+    /// not start); leaves a bucket stable on an older layout serving (this
+    /// build reads it; an operator upgrades it explicitly). A bucket found
+    /// `migrating` — an upgrade was started and did not finish — is
+    /// returned **with its 503 gate raised**: it serves nothing until
+    /// [`Self::migrate_bucket_layout`] finishes and the caller lowers the
+    /// gate ([`Self::end_rebuild`]).
+    pub async fn check_layouts(&self) -> Result<Vec<(String, BucketLayout)>> {
+        let mut resume = Vec::new();
+        for (bucket, _) in self.list_buckets().await? {
+            let recorded = self.bucket_meta(&bucket).await?.layout;
+            let layout = match recorded {
+                Some(layout) => layout,
+                None => self.bucket_layout(&bucket).await?,
+            };
+            let unsupported = |message: String| StorageError::UnsupportedLayout { bucket: bucket.clone(), message };
+            match layout {
+                BucketLayout::Stable { version } if version > CURRENT_LAYOUT => {
+                    return Err(unsupported(format!(
+                        "layout {version} was written by a newer build; this build knows up to layout {CURRENT_LAYOUT}"
+                    )))
+                }
+                BucketLayout::Migrating { to, .. } if to > CURRENT_LAYOUT => {
+                    return Err(unsupported(format!(
+                        "a migration to layout {to} was started by a newer build; this build knows up to layout {CURRENT_LAYOUT}"
+                    )))
+                }
+                BucketLayout::Stable { .. } => {
+                    if recorded.is_none() {
+                        self.set_bucket_layout(&bucket, layout).await?;
+                    }
+                }
+                BucketLayout::Migrating { from, to } => {
+                    // Continue the interrupted step; an older target becomes
+                    // the current layout.
+                    let next = BucketLayout::Migrating { from, to: to.max(CURRENT_LAYOUT) };
+                    if recorded != Some(next) {
+                        self.set_bucket_layout(&bucket, next).await?;
+                    }
+                    self.try_begin_rebuild(&bucket);
+                    resume.push((bucket, next));
+                }
+            }
+        }
+        Ok(resume)
+    }
+
+    /// Starts the upgrade of a bucket on an older layout: marks it
+    /// `migrating` and raises its 503 gate, which the caller lowers once
+    /// [`Self::migrate_bucket_layout`] has made it stable. Refused when the
+    /// bucket is already current (`BucketInUse` with the reason) or an
+    /// upgrade is in progress.
+    pub async fn start_layout_upgrade(&self, bucket: &str) -> Result<BucketLayout> {
+        let layout = self.bucket_layout(bucket).await?;
+        let next = match layout {
+            BucketLayout::Stable { version } if version < CURRENT_LAYOUT => {
+                BucketLayout::Migrating { from: version, to: CURRENT_LAYOUT }
+            }
+            BucketLayout::Stable { .. } => {
+                return Err(StorageError::BucketInUse(format!(
+                    "bucket {bucket} is already on layout {CURRENT_LAYOUT}"
+                )))
+            }
+            BucketLayout::Migrating { from, to } => {
+                return Err(StorageError::BucketInUse(format!(
+                    "bucket {bucket} is already being upgraded from layout {from} to {to}"
+                )))
+            }
+        };
+        if !self.try_begin_rebuild(bucket) {
+            return Err(StorageError::BucketRebuilding(bucket.to_string()));
+        }
+        if let Err(err) = self.set_bucket_layout(bucket, next).await {
+            self.end_rebuild(bucket);
+            return Err(err);
+        }
+        Ok(next)
+    }
+
+    /// Runs the bucket's recorded migration step to completion, behind the
+    /// gate the caller holds, and marks the bucket stable on the target
+    /// layout. Resumable: every object is either on the old or the new
+    /// layout, and a key already moved is skipped. Fails (leaving the
+    /// bucket `migrating`, to be retried) if any object could not be
+    /// moved. Returns the number of objects moved.
+    pub async fn migrate_bucket_layout(&self, bucket: &str, cancel: &CancellationToken) -> Result<u64> {
+        let layout = self.bucket_layout(bucket).await?;
+        let BucketLayout::Migrating { from, to } = layout else {
+            return Ok(0);
+        };
+        let unsupported = |message: String| StorageError::UnsupportedLayout { bucket: bucket.to_string(), message };
+        if to != CURRENT_LAYOUT {
+            return Err(unsupported(format!("cannot migrate to layout {to}; this build writes layout {CURRENT_LAYOUT}")));
+        }
+        let moved = match from {
+            1 => self.relocate_legacy_fanout(bucket, cancel).await?,
+            other => return Err(unsupported(format!("no migration step from layout {other} to {to}"))),
+        };
+        if cancel.is_cancelled() {
+            return Err(StorageError::Io(format!("layout migration of bucket {bucket} cancelled")));
+        }
+        // Done only when nothing is left on the old layout, in the index
+        // and in the tree.
+        let left = self.legacy_layout_keys(bucket, None, 1).await?;
+        if !left.is_empty() {
+            return Err(StorageError::Io(format!(
+                "layout migration of bucket {bucket} incomplete: {} (and possibly more) could not be moved",
+                left[0]
+            )));
+        }
+        if self.has_legacy_layout_dirs(bucket).await? {
+            // Index rows are all current; stray legacy dirs hold nothing the
+            // index names (an index rebuild would trash them).
+            log::warn!("bucket {bucket}: legacy fanout dirs remain after migration (orphans; a rebuild trashes them)");
+        }
+        self.set_bucket_layout(bucket, BucketLayout::Stable { version: to }).await?;
+        Ok(moved)
+    }
+
+    /// Layout 1 → 2: relocates every object from the 4-level fanout to the
+    /// single-level one (hardlink → index flip → unlink per object). Keys
+    /// that fail are skipped for this pass and reported by the caller's
+    /// final check.
+    async fn relocate_legacy_fanout(&self, bucket: &str, cancel: &CancellationToken) -> Result<u64> {
+        const BATCH: usize = 500;
+        let mut moved = 0u64;
+        let mut after: Option<String> = None;
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(moved);
+            }
+            let keys = self.legacy_layout_keys(bucket, after.as_deref(), BATCH).await?;
+            let Some(last) = keys.last().cloned() else {
+                return Ok(moved);
+            };
+            after = Some(last);
+            for key in keys {
+                if cancel.is_cancelled() {
+                    return Ok(moved);
+                }
+                match self.migrate_object_layout(bucket, &key).await {
+                    Ok(true) => moved += 1,
+                    Ok(false) => {}
+                    Err(err) => log::warn!("layout migration bucket={bucket} key={key} error={err}"),
+                }
+            }
+        }
     }
 
     /// Cheap check for whether `bucket` still has any legacy layout structure:

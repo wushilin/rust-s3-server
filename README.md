@@ -267,6 +267,21 @@ HMAC key.
 throughput but can lose the last acknowledged writes after power loss. A normal
 process crash preserves committed writes in either mode.
 
+**Storage layout versions.** Each bucket records its on-disk layout in its
+`bucket.json`: `"layout": {"state": "stable", "version": 2}`, or while an
+upgrade runs `{"state": "migrating", "from": 1, "to": 2}`. This build writes
+layout 2 (single-level fanout) and still serves layout 1 (the older 4-level
+fanout). At startup the server records the layout of buckets that never had
+one, refuses to start on a layout written by a newer build, and resumes any
+upgrade that was started and interrupted. An upgrade is started by an admin
+(bucket settings → **Storage layout** → **Upgrade now**, or
+`POST /api/buckets/{name}/upgrade-layout`); the console flags buckets that
+can be upgraded. While it runs the bucket answers `503` to every data request
+and shows in the tasks panel; a bucket is never served on a half-migrated
+layout, and a step that fails is retried every `sweeper.interval_secs` with
+the bucket still unavailable. Moving an object is a hardlink and an index
+update, so no data is copied.
+
 ### Authentication and IAM
 
 | Field | Default | Description |
@@ -299,7 +314,7 @@ a private reverse proxy's `X-Forwarded-For`/`X-Real-IP`, otherwise the TCP peer.
 
 | Field | Default | Description |
 |---|---:|---|
-| `sweeper.interval_secs` | `300` | Schedule interval for intent resolution, staging/trash cleanup, and legacy-layout migration. |
+| `sweeper.interval_secs` | `300` | Schedule interval for intent resolution and staging/trash cleanup; also the retry interval of a failed storage layout upgrade. |
 | `sweeper.intent_batch_size` | `100` | Stale intents processed per batch; a run drains all eligible batches. |
 | `sweeper.intent_grace_period_secs` | `3600` | Minimum intent age during normal operation. Startup recovery bypasses the grace period. |
 | `sweeper.staging_expiry_secs` | `86400` | Idle age before abandoned single-PUT staging is removed. |

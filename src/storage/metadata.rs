@@ -87,12 +87,57 @@ pub struct UploadMeta {
     pub user_meta: BTreeMap<String, String>,
 }
 
+/// The blob layout this build writes and serves: single-level fanout
+/// (`objects/<4hex>/<leaf>`). Layout 1 was the 4-level fanout
+/// (`objects/aa/bb/cc/dd/<leaf>`).
+pub const CURRENT_LAYOUT: u32 = 2;
+
+/// Where a bucket stands with respect to the on-disk layout, recorded in
+/// its `bucket.json`. A bucket serves only while `stable` on the current
+/// layout: at startup the server marks every bucket on an older layout
+/// `migrating` and migrates it behind the 503 gate; a bucket found
+/// `migrating` (the previous run stopped half way) resumes the same step
+/// before it serves. A layout newer than the build knows refuses to start.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum BucketLayout {
+    /// The bucket is entirely on layout `version`.
+    Stable { version: u32 },
+    /// An upgrade from layout `from` to layout `to` was started and has
+    /// not finished: objects may be on either.
+    Migrating { from: u32, to: u32 },
+}
+
+impl BucketLayout {
+    pub fn current() -> Self {
+        BucketLayout::Stable { version: CURRENT_LAYOUT }
+    }
+
+    /// The layout version the bucket is (ending up) on.
+    pub fn target(self) -> u32 {
+        match self {
+            BucketLayout::Stable { version } => version,
+            BucketLayout::Migrating { to, .. } => to,
+        }
+    }
+
+    pub fn is_stable_current(self) -> bool {
+        self == Self::current()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketMeta {
     pub created_at_ms: i64,
-    /// On-disk storage layout version. Current unreleased format is "v1".
-    #[serde(default)]
+    /// Superseded by `layout`; older files carry `"v1"` or `"v2"`, read by
+    /// nothing. Kept so they still parse.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub storage_version: String,
+    /// The bucket's on-disk layout and whether an upgrade is in progress.
+    /// Absent in files written before layouts were recorded: the startup
+    /// check detects the layout from the tree and records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<BucketLayout>,
     /// User-managed bucket CORS rules. The management console's own origin is
     /// an implicit server rule and is deliberately not persisted here.
     #[serde(default)]
@@ -196,6 +241,22 @@ pub fn unquote_etag(etag: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bucket_layout_is_recorded_as_a_tagged_state() {
+        let stable = serde_json::to_value(BucketLayout::current()).unwrap();
+        assert_eq!(stable, serde_json::json!({"state": "stable", "version": CURRENT_LAYOUT}));
+        let migrating = serde_json::to_value(BucketLayout::Migrating { from: 1, to: 2 }).unwrap();
+        assert_eq!(migrating, serde_json::json!({"state": "migrating", "from": 1, "to": 2}));
+        let back: BucketLayout = serde_json::from_value(migrating).unwrap();
+        assert_eq!(back, BucketLayout::Migrating { from: 1, to: 2 });
+        assert_eq!(back.target(), 2);
+        // A bucket.json from before layouts were recorded still parses, with no layout.
+        let old: BucketMeta = serde_json::from_str(r#"{"created_at_ms":1,"storage_version":"v2"}"#).unwrap();
+        assert_eq!(old.layout, None);
+        let written = serde_json::to_string(&BucketMeta { created_at_ms: 1, storage_version: String::new(), layout: Some(BucketLayout::current()), cors: vec![], read_only: false }).unwrap();
+        assert!(written.contains(r#""layout":{"state":"stable","version":2}"#) && !written.contains("storage_version"), "{written}");
+    }
+
     use super::*;
 
     #[test]
