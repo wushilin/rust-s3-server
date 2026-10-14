@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use super::model::{Filter, WireEvent};
+use super::model::{Filter, WireEvent, WireOp};
 use crate::storage::changelog::ChangeOp;
 use crate::storage::errors::StorageError;
 use crate::storage::store::LocalObjectStore;
@@ -375,7 +375,7 @@ pub async fn snapshot(
                 .filter(|t| params.filter.matches_key(&t.object_key))
                 .map(|t| WireEvent {
                     seq: None,
-                    op: "deleted".to_string(),
+                    op: WireOp::Deleted,
                     key: t.object_key,
                     etag: t.etag,
                     size: t.size,

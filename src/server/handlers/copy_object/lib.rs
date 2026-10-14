@@ -82,15 +82,10 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         );
     }
     drop(src_object);
-    let stamp = match srv::replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &ctx.resource()) {
-        Ok(stamp) => stamp,
+    let options = match srv::write_options(&store, &ctx, &resource).await {
+        Ok(options) => options,
         Err(response) => return response,
     };
-    if stamp.is_none() {
-        if let Err(err) = store.ensure_writable(&ctx.bucket).await {
-            return srv::storage_error_response(err, &ctx.resource());
-        }
-    }
     match store
         .copy_object_with_metadata(
             &src_bucket,
@@ -101,7 +96,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             user_meta.as_ref(),
             replacement_content_type,
             replacement_content_language,
-            crate::storage::store::PublishOptions { precondition: None, stamp, ..Default::default() },
+            options,
         )
         .await
     {

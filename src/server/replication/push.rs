@@ -16,12 +16,13 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::model::{Checkpoint, Link, LinkStatus, Phase, PushCheckpoint, PushStatus, RECORD_VERSION};
-use super::peer::{event_stamp, ObjectHeaders, PeerClient, PeerError};
+use super::change::{Change, Kind};
+use super::peer::{ObjectHeaders, PeerClient, PeerError};
 use super::worker::{latest_per_key, StepError};
 use crate::server::notify::model::{Filter, WireEvent};
 use crate::server::notify::read::{self, ReadError, ReadParams, SnapshotParams};
 use crate::storage::errors::StorageError;
-use crate::storage::stamp::{Rank, Stamp};
+use crate::storage::write::outranks;
 use crate::storage::time::now_ms;
 
 const SNAPSHOT_PAGE: usize = 200;
@@ -308,45 +309,44 @@ impl Pusher {
 
     async fn apply(&self, event: &WireEvent, peer_site: &str, live: bool) -> Result<(), StepError> {
         self.beat();
-        let stamp = event_stamp(event, &self.store.site_id());
+        let change = Change::from_event(event, &self.store.site_id()).map_err(StepError::Fatal)?;
         // Came from the peer (pulled by this link): it has it, or newer.
-        if live && stamp.site == peer_site {
+        if live && change.stamp.site == peer_site {
             self.update(|s| s.skipped += 1);
             return Ok(());
         }
-        let is_delete = matches!(event.op.as_str(), "delete" | "deleted");
-        if is_delete && event.origin.as_deref() == Some("repair") {
+        if change.is_repair_delete() {
             // A lost local copy is not a client's delete.
             self.update(|s| s.skipped += 1);
             return Ok(());
         }
-        let removed = event.removed_stamp.clone().unwrap_or_else(|| stamp.clone());
-        let incoming = if is_delete { Rank::deleted(removed.clone()) } else { Rank::live(stamp.clone()) };
-        let remote = self.alive(self.peer.state(&event.key)).await.map_err(StepError::from)?;
+        let remote = self.alive(self.peer.state(&change.key)).await.map_err(StepError::from)?;
         // Still the site the link was made with? Checked before every write.
         if let Some(changed) = self.peer.last_site().and_then(|site| super::worker::peer_site_changed(&self.link, &site)) {
             self.status.lock().unwrap().site_changed = Some(changed.clone());
             return Err(StepError::Fatal(changed));
         }
-        if remote.as_ref().is_some_and(|(rank, _)| *rank >= incoming) {
+        if !outranks(&change.rank(), remote.as_ref().map(|(rank, _)| rank)) {
             self.update(|s| s.skipped += 1);
             return Ok(());
         }
-        let result = if is_delete {
-            self.alive(self.peer.delete(&event.key, &stamp, &removed))
+        let result = match &change.kind {
+            Kind::Delete { removed } => self
+                .alive(self.peer.delete(&change.key, &change.stamp, removed))
                 .await
-                .map(|()| self.update(|s| s.deleted += 1))
-        } else {
-            let remote_headers = remote.and_then(|(_, headers)| headers);
-            match self.push_put(event, &stamp, remote_headers).await {
-                Ok(()) => Ok(()),
-                Err(PushError::Gone) => {
-                    // Changed or deleted here since: a later event carries it.
-                    self.update(|s| s.skipped += 1);
-                    return Ok(());
+                .map(|()| self.update(|s| s.deleted += 1)),
+            Kind::Put => {
+                let remote_headers = remote.and_then(|(_, headers)| headers);
+                match self.push_put(&change, remote_headers).await {
+                    Ok(()) => Ok(()),
+                    Err(PushError::Gone) => {
+                        // Changed or deleted here since: a later event carries it.
+                        self.update(|s| s.skipped += 1);
+                        return Ok(());
+                    }
+                    Err(PushError::Local(err)) => return Err(err.into()),
+                    Err(PushError::Peer(err)) => Err(err),
                 }
-                Err(PushError::Local(err)) => return Err(err.into()),
-                Err(PushError::Peer(err)) => Err(err),
             }
         };
         match result {
@@ -359,18 +359,19 @@ impl Pusher {
         }
     }
 
-    /// Sends the local object of `event` (exactly its version) to the peer:
+    /// Sends the local object of `change` (exactly its version) to the peer:
     /// metadata only when the peer holds the same bytes, else the data, with
     /// the original part layout for multipart objects (same ETag).
-    async fn push_put(&self, event: &WireEvent, stamp: &Stamp, remote: Option<ObjectHeaders>) -> Result<(), PushError> {
+    async fn push_put(&self, change: &Change, remote: Option<ObjectHeaders>) -> Result<(), PushError> {
         let bucket = &self.link.local_bucket;
-        let key = &event.key;
+        let key = &change.key;
+        let stamp = &change.stamp;
         let object = match self.store.read_object(bucket, key).await {
             Ok(object) => object,
             Err(StorageError::ObjectNotFound { .. }) => return Err(PushError::Gone),
             Err(err) => return Err(PushError::Local(err)),
         };
-        if crate::storage::changelog::version_of(&object.object_dir.to_string_lossy()) != event.version {
+        if crate::storage::changelog::version_of(&object.object_dir.to_string_lossy()) != change.version {
             return Err(PushError::Gone);
         }
         let meta = ObjectHeaders {
@@ -407,7 +408,7 @@ impl Pusher {
                 Ok::<_, PushError>(reqwest::Body::wrap_stream(stream))
             }
         };
-        match event.parts.as_ref().filter(|layout| layout.multipart) {
+        match change.multipart_layout() {
             None => {
                 self.alive(self.peer.put(key, &meta, stamp, size, body(0, size).await?)).await.map_err(PushError::Peer)?;
             }

@@ -2512,6 +2512,40 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
     }
 }
 
+/// The write model of an object request: who the write is from
+/// ([`WriteOrigin`](crate::storage::write::WriteOrigin)), decided by its
+/// `x-rs3-stamp` header (a replicated write keeps that stamp; it needs
+/// `s3:ReplicateWrite`), and checked against a read-only bucket up front —
+/// before any body is uploaded — so the refusal is cheap and the same for
+/// PUT, copy, multipart completion and DELETE.
+pub(crate) async fn write_options(
+    store: &LocalObjectStore,
+    ctx: &handlers::ObjectCtx,
+    resource: &str,
+) -> Result<crate::storage::store::WriteOptions, Response> {
+    let stamp = replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, resource)?;
+    let options = crate::storage::store::WriteOptions::stamped(stamp);
+    store
+        .check_write_allowed(&ctx.bucket, &options.origin)
+        .await
+        .map_err(|err| storage_error_response(err, resource))?;
+    Ok(options)
+}
+
+/// The `x-rs3-removed-stamp` header of a replicated DELETE: the stamp of
+/// the version the delete removed, which it ranks by. Only with a stamped
+/// (replicated) delete.
+pub(crate) fn removed_stamp(
+    headers: &HeaderMap,
+    origin: &crate::storage::write::WriteOrigin,
+) -> Result<Option<crate::storage::stamp::Stamp>, String> {
+    match headers.get("x-rs3-removed-stamp").map(|v| v.to_str().map(crate::storage::stamp::Stamp::parse_header)) {
+        None => Ok(None),
+        Some(Ok(Ok(removed))) if origin.given_stamp().is_some() => Ok(Some(removed)),
+        Some(_) => Err("x-rs3-removed-stamp must be <ms>.<counter>.<site> and needs x-rs3-stamp".to_string()),
+    }
+}
+
 /// The `x-rs3-stamp` request header of a replicated write: the version
 /// stamp the object keeps instead of a fresh local one. Setting it means
 /// backdating (or forward-dating) the object, which decides last-writer-wins
@@ -2540,19 +2574,63 @@ pub(crate) fn replicated_stamp(
             resource,
         ));
     }
+    require_replicate_write(identity, bucket, key, resource, "x-rs3-stamp")?;
+    Ok(Some(stamp))
+}
+
+/// `s3:ReplicateWrite` on the object, or `403` naming the header that
+/// needs it.
+fn require_replicate_write(
+    identity: Option<&Identity>,
+    bucket: &str,
+    key: &str,
+    resource: &str,
+    header: &str,
+) -> Result<(), Response> {
     if let Some(identity) = identity {
         let needed = [self::policy::Requirement::object("s3:ReplicateWrite", bucket, key)];
         if !identity.authorize(&needed) {
             return Err(s3_error(
                 StatusCode::FORBIDDEN,
                 "AccessDenied",
-                "x-rs3-stamp requires s3:ReplicateWrite",
+                format!("{header} requires s3:ReplicateWrite"),
                 resource,
             ));
         }
     }
-    Ok(Some(stamp))
+    Ok(())
 }
+
+/// The `x-rs3-replicate: true` header of a CreateMultipartUpload: the
+/// upload is replication's (its completion carries the stamp the object
+/// keeps), so a read-only bucket accepts it. Needs `s3:ReplicateWrite`
+/// like a stamp does. A stamp is never sent here: no state exists yet for
+/// it to name.
+pub(crate) fn replicated_upload(
+    identity: Option<&Identity>,
+    headers: &HeaderMap,
+    bucket: &str,
+    key: &str,
+    resource: &str,
+) -> Result<bool, Response> {
+    let Some(value) = headers.get(REPLICATE_HEADER) else {
+        return Ok(false);
+    };
+    let value = value.to_str().unwrap_or("").trim();
+    if !(value.eq_ignore_ascii_case("true") || value == "1") {
+        return Err(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            format!("{REPLICATE_HEADER} must be true"),
+            resource,
+        ));
+    }
+    require_replicate_write(identity, bucket, key, resource, REPLICATE_HEADER)?;
+    Ok(true)
+}
+
+/// Marks a CreateMultipartUpload as replication's (see [`replicated_upload`]).
+pub(crate) const REPLICATE_HEADER: &str = "x-rs3-replicate";
 
 fn s3_error(
     status: StatusCode,
@@ -2638,5 +2716,7 @@ mod auth_regression_tests;
 mod iam_e2e_tests;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod spec_tests;
 #[cfg(test)]
 mod tests;

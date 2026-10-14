@@ -15,3 +15,4 @@ pub mod staging;
 pub mod store;
 pub mod sweeper;
 pub mod time;
+pub mod write;

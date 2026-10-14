@@ -33,11 +33,10 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         }
     };
     // A replicated upload takes its stamp at completion.
-    let stamp = match srv::replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &resource) {
-        Ok(stamp) => stamp,
+    let options = match srv::write_options(&store, &ctx, &resource).await {
+        Ok(options) => options,
         Err(response) => return response,
     };
-    let options = crate::storage::store::PublishOptions { precondition: None, stamp, ..Default::default() };
     match store
         .complete_multipart_with(&ctx.bucket, &ctx.key, &upload_id, &parts, options)
         .await

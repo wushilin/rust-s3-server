@@ -217,7 +217,7 @@ impl Site {
                 false,
                 None,
                 None,
-                crate::storage::store::PublishOptions::default(),
+                crate::storage::store::WriteOptions::default(),
             )
             .await
             .unwrap();
@@ -373,7 +373,7 @@ async fn one_way_mirror_copies_everything_exactly_and_follows_changes() {
             Some(&BTreeMap::from([("tier".to_string(), "cold".to_string())])),
             None,
             None,
-            crate::storage::store::PublishOptions::default(),
+            crate::storage::store::WriteOptions::default(),
         )
         .await
         .unwrap();
@@ -417,6 +417,21 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     // version a never saw — deletes are version-scoped, so it survives.
     assert_eq!(merged["gone"].5, b"x", "b's unseen version survives a's delete");
     assert_eq!(merged["gone"].2, b.contents("shared").await["gone"].2);
+    // Each side logs what replication applied as such, stamped by the site
+    // that made the change (the spec's `origin: "replication"`).
+    let origin_of = |site: &Site, key: &str| {
+        let store = site.store.clone();
+        let key = key.to_string();
+        async move {
+            let index = store.index("shared").await.unwrap();
+            let page = index.read_changelog(0, 10_000, usize::MAX).await.unwrap();
+            let event = page.events.iter().rev().find(|e| e.key == key).unwrap().clone();
+            (event.origin, event.stamp.unwrap().site)
+        }
+    };
+    assert_eq!(origin_of(&a, "only-b").await, (crate::storage::changelog::ChangeOrigin::Replication, "site-b".to_string()));
+    assert_eq!(origin_of(&b, "only-a").await, (crate::storage::changelog::ChangeOrigin::Replication, "site-a".to_string()));
+    assert_eq!(origin_of(&a, "only-a").await, (crate::storage::changelog::ChangeOrigin::Client, "site-a".to_string()));
 
     // Writes on both sides, including the same key.
     a.put("shared", "k1", b"a1").await;
@@ -1105,7 +1120,7 @@ async fn put_aged(site: &Site, bucket: &str, key: &str, body: &[u8], age_ms: i64
             false,
             None,
             None,
-            crate::storage::store::PublishOptions { stamp: Some(stamp), ..Default::default() },
+            crate::storage::store::WriteOptions::replicated(stamp),
         )
         .await
         .unwrap();
@@ -1137,7 +1152,7 @@ async fn a_lost_object_is_restored_from_the_peer() {
     let old = crate::storage::stamp::Stamp { ms: crate::storage::time::now_ms() - 60_000, c: 1, site: "site-a".into() };
     let etag = a
         .store
-        .complete_multipart_with("data", "big.bin", &upload, &done, crate::storage::store::PublishOptions { stamp: Some(old), ..Default::default() })
+        .complete_multipart_with("data", "big.bin", &upload, &done, crate::storage::store::WriteOptions::replicated(old))
         .await
         .unwrap()
         .etag;
@@ -1282,7 +1297,7 @@ async fn writer(store: LocalObjectStore, site: String, seed: u64, ops: usize, sk
                         false,
                         None,
                         None,
-                        crate::storage::store::PublishOptions { stamp, ..Default::default() },
+                        crate::storage::store::WriteOptions::stamped(stamp),
                     )
                     .await;
             }
@@ -1303,7 +1318,7 @@ async fn writer(store: LocalObjectStore, site: String, seed: u64, ops: usize, sk
                         Some(&meta),
                         None,
                         None,
-                        crate::storage::store::PublishOptions { stamp, ..Default::default() },
+                        crate::storage::store::WriteOptions::stamped(stamp),
                     )
                     .await;
             }
@@ -1317,7 +1332,7 @@ async fn writer(store: LocalObjectStore, site: String, seed: u64, ops: usize, sk
                             done.push(CompletePartRequest { number, etag: put.etag });
                         }
                     }
-                    let options = crate::storage::store::PublishOptions { stamp, ..Default::default() };
+                    let options = crate::storage::store::WriteOptions::stamped(stamp);
                     if store.complete_multipart_with("chaos", &key, &upload, &done, options).await.is_err() {
                         let _ = store.abort_multipart("chaos", &key, &upload).await;
                     }

@@ -19,6 +19,7 @@
 //! replaces one whose heartbeat (its lease) went stale, so a hung worker
 //! cannot hold a link forever. At most one of each runs per link.
 
+pub mod change;
 pub mod db;
 pub mod model;
 pub mod peer;
@@ -1042,7 +1043,14 @@ impl ReplicationService {
                 notes.push(format!("{}: the peer does not have it", link.name));
                 continue;
             };
-            let stamp = peer::event_stamp(&entry, &page.site_id);
+            let change = match change::Change::from_event(&entry, &page.site_id) {
+                Ok(change) => change,
+                Err(err) => {
+                    notes.push(format!("{}: {err}", link.name));
+                    continue;
+                }
+            };
+            let stamp = change.stamp.clone();
             if stamp < request.lost_stamp && !request.allow_older {
                 notes.push(format!(
                     "{}: the peer only has an older version (stamp {}, lost {}); restoring it would roll the \
@@ -1071,12 +1079,11 @@ impl ReplicationService {
                 notes.push(format!("{}: {err}", link.name));
                 continue;
             }
-            let options = crate::storage::store::PublishOptions {
+            let options = crate::storage::store::WriteOptions {
+                origin: crate::storage::store::WriteOrigin::Restore(stamp.clone()),
                 precondition: Some(crate::storage::store::Precondition::IfMatch(request.lost_etag.clone())),
-                stamp: Some(stamp.clone()),
-                restore: true,
             };
-            match worker.restore(&entry, options).await {
+            match worker.restore(&change, options).await {
                 Ok(()) => {
                     return Ok(format!(
                         "restored from {} (site {}, stamp {})",

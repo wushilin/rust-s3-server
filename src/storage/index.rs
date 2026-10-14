@@ -925,7 +925,7 @@ impl ObjectIndex {
             if let Some(existing) = &existing {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, (-1i64).to_le_bytes());
                 let g = changes.begin(now_ms);
-                let mut change = change_for(&g, ChangeOp::Delete, existing, origin);
+                let change = change_for_delete(&g, existing, origin, stamp.clone(), removed.clone());
                 if let Some(stamp) = &stamp {
                     let tombstone = Tombstone {
                         object_key: key.clone(),
@@ -938,8 +938,6 @@ impl ObjectIndex {
                     };
                     batch.put_cf(&cf(&db, CF_TOMBSTONES)?, key.as_bytes(), encode_tombstone(&tombstone));
                 }
-                change.stamp = stamp;
-                change.removed_stamp = removed;
                 batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
                 guard = Some(g);
             }
@@ -1010,7 +1008,14 @@ impl ObjectIndex {
     /// reach every other site and reader — a site that has the removed
     /// version (or an older one) would otherwise keep it while this one
     /// refuses it forever. Called under the key lock.
-    pub async fn record_tombstone(&self, key: &str, stamp: &Stamp, removed: &Stamp, now_ms: i64) -> Result<bool> {
+    pub async fn record_tombstone(
+        &self,
+        key: &str,
+        stamp: &Stamp,
+        removed: &Stamp,
+        now_ms: i64,
+        origin: ChangeOrigin,
+    ) -> Result<bool> {
         let db = self.db.clone();
         let durability = self.durability;
         let key = key.to_string();
@@ -1036,20 +1041,7 @@ impl ObjectIndex {
             let mut batch = WriteBatch::default();
             batch.put_cf(&tombstones, key.as_bytes(), encode_tombstone(&tombstone));
             let guard = changes.begin(now_ms);
-            let change = ChangeEvent {
-                seq: guard.seq,
-                op: ChangeOp::Delete,
-                key: key.clone(),
-                etag: String::new(),
-                size: 0,
-                last_modified_ms: stamp.ms,
-                version: String::new(),
-                origin: ChangeOrigin::Client,
-                ts_ms: guard.ts,
-                parts: None,
-                stamp: Some(stamp),
-                removed_stamp: Some(removed),
-            };
+            let change = change_for_tombstone(&guard, &key, origin, stamp, removed);
             batch.put_cf(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change));
             db.write_opt(batch, &write_opts(durability))?;
             drop(guard);
@@ -1754,8 +1746,13 @@ pub(crate) fn same_blob_dir(a: &str, b: &str) -> bool {
             .all(|(x, y)| x == y || (matches!(x, b'/' | b'\\') && matches!(y, b'/' | b'\\')))
 }
 
-/// The changelog entry for a commit of `record`, at the guard's seq and
-/// commit time.
+// ── changelog entries: the side effect of every commit ──────────────────
+//
+// Every committed change is described by exactly one of these, built from
+// the committed row (never from request data), so the log can never disagree
+// with the index.
+
+/// The entry for a published state (`put`): the row's attributes and stamp.
 fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectRecord, origin: ChangeOrigin) -> ChangeEvent {
     ChangeEvent {
         seq: guard.seq,
@@ -1770,6 +1767,50 @@ fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectReco
         parts: record.parts.clone(),
         stamp: record.stamp.clone(),
         removed_stamp: None,
+    }
+}
+
+/// The entry for a removed row (`delete`): names the removed version (its
+/// ETag, size, layout) and carries the delete's own `stamp` and the
+/// `removed` stamp it ranks by.
+fn change_for_delete(
+    guard: &changelog::SeqGuard<'_>,
+    removed_row: &ObjectRecord,
+    origin: ChangeOrigin,
+    stamp: Option<Stamp>,
+    removed: Option<Stamp>,
+) -> ChangeEvent {
+    ChangeEvent {
+        stamp,
+        removed_stamp: removed,
+        ..change_for(guard, ChangeOp::Delete, removed_row, origin)
+    }
+}
+
+/// The entry for a delete of a key with no row here (a replicated delete
+/// arriving before, or instead of, the version it removed): a `delete` with
+/// no ETag, size 0 and no version — nothing visible changed here, but the
+/// delete must still reach every other site and reader.
+fn change_for_tombstone(
+    guard: &changelog::SeqGuard<'_>,
+    key: &str,
+    origin: ChangeOrigin,
+    stamp: Stamp,
+    removed: Stamp,
+) -> ChangeEvent {
+    ChangeEvent {
+        seq: guard.seq,
+        op: ChangeOp::Delete,
+        key: key.to_string(),
+        etag: String::new(),
+        size: 0,
+        last_modified_ms: stamp.ms,
+        version: String::new(),
+        origin,
+        ts_ms: guard.ts,
+        parts: None,
+        stamp: Some(stamp),
+        removed_stamp: Some(removed),
     }
 }
 

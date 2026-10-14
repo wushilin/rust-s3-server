@@ -19,10 +19,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::model::{Checkpoint, Link, LinkStatus, Mode, Phase, RECORD_VERSION};
-use super::peer::{event_stamp, PeerClient, PeerError};
+use super::change::{Change, Kind};
+use super::peer::{PeerClient, PeerError};
 use crate::server::notify::model::WireEvent;
 use crate::storage::errors::StorageError;
-use crate::storage::store::{CompletePartRequest, LocalObjectStore, PublishOptions};
+use crate::storage::store::{CompletePartRequest, LocalObjectStore, WriteOptions, WriteOrigin};
+use crate::storage::write::outranks;
 use crate::storage::time::now_ms;
 
 const SNAPSHOT_PAGE: usize = 200;
@@ -455,14 +457,14 @@ impl Worker {
                     return Ok(());
                 }
                 if !present.contains(entry.object_key.as_str()) {
-                    // A replication write (stamped), so a read-only replica
-                    // accepts it; it removes exactly the version seen here.
+                    // The mirror's own write (a read-only replica accepts
+                    // it); it removes exactly the version listed here.
                     let removed = self
                         .store
                         .effective_stamp(entry.stamp.as_ref(), entry.last_modified_ms);
                     match self
                         .store
-                        .delete_object_stamped(bucket, &entry.object_key, Some(self.store.next_stamp()), Some(removed))
+                        .delete_object_with(bucket, &entry.object_key, WriteOptions::from_origin(WriteOrigin::Mirror), Some(removed))
                         .await
                     {
                         Ok(_) => self.update(|s| s.deleted += 1),
@@ -510,38 +512,27 @@ impl Worker {
     async fn apply(&self, event: &WireEvent, peer_site: &str) -> Result<(), StepError> {
         self.beat();
         let bucket = &self.link.local_bucket;
-        let stamp = event_stamp(event, peer_site);
-        let is_delete = matches!(event.op.as_str(), "delete" | "deleted");
-        // A delete ranks by the version it removed (falling back to its own
-        // stamp for changes logged before that was recorded).
-        let removed = event.removed_stamp.clone().unwrap_or_else(|| stamp.clone());
-        let incoming = if is_delete {
-            crate::storage::stamp::Rank::deleted(removed.clone())
-        } else {
-            crate::storage::stamp::Rank::live(stamp.clone())
-        };
+        let change = Change::from_event(event, peer_site).map_err(StepError::Fatal)?;
         // Not ranked above what is here: nothing to fetch (an echo, a replay,
         // or a change that lost to another).
-        if let Some(current) = self.store.key_rank(bucket, &event.key).await? {
-            if current >= incoming {
-                self.update(|s| s.skipped += 1);
-                return Ok(());
-            }
+        let current = self.store.key_rank(bucket, &change.key).await?;
+        if !outranks(&change.rank(), current.as_ref()) {
+            self.update(|s| s.skipped += 1);
+            return Ok(());
         }
-        let result = match event.op.as_str() {
-            "delete" | "deleted" => {
-                if event.origin.as_deref() == Some("repair") {
-                    // The peer lost its copy; that is not a client's delete.
-                    // Keep ours (the peer can restore from it).
-                    self.update(|s| s.skipped += 1);
-                    return Ok(());
-                }
-                self.store
-                    .delete_object_stamped(bucket, &event.key, Some(stamp), Some(removed))
-                    .await
-                    .map(|_| self.update(|s| s.deleted += 1))
-            }
-            _ => match self.apply_put(event, stamp, true).await {
+        if change.is_repair_delete() {
+            // The peer lost its copy; that is not a client's delete. Keep
+            // ours (the peer can restore from it).
+            self.update(|s| s.skipped += 1);
+            return Ok(());
+        }
+        let result = match &change.kind {
+            Kind::Delete { removed } => self
+                .store
+                .delete_object_with(bucket, &change.key, WriteOptions::replicated(change.stamp.clone()), Some(removed.clone()))
+                .await
+                .map(|_| self.update(|s| s.deleted += 1)),
+            Kind::Put => match self.apply_put(&change).await {
                 Ok(()) => Ok(()),
                 Err(PutError::Peer(PeerError::Superseded | PeerError::NotFound)) => {
                     // Changed or deleted on the peer since: a later event
@@ -565,26 +556,30 @@ impl Worker {
     }
 
     /// Restores a lost object from this link's peer: the bytes of the peer's
-    /// state `event`, published with `options` (a restore stamp, guarded).
-    pub async fn restore(&self, event: &WireEvent, options: PublishOptions) -> Result<(), String> {
-        let stamp = options.stamp.clone().ok_or("a restore needs the stamp")?;
-        match self.copy(event, stamp, options).await {
+    /// state `change`, written with `options` (a restore origin, guarded by
+    /// a precondition on the broken state).
+    pub async fn restore(&self, change: &Change, options: WriteOptions) -> Result<(), String> {
+        if !matches!(options.origin, WriteOrigin::Restore(_)) {
+            return Err("a restore needs a restore origin".to_string());
+        }
+        match self.copy(change, options).await {
             Ok(()) => Ok(()),
             Err(PutError::Peer(err)) => Err(format!("peer: {err}")),
             Err(PutError::Local(err)) => Err(format!("local: {err}")),
         }
     }
 
-    async fn apply_put(&self, event: &WireEvent, stamp: crate::storage::stamp::Stamp, metadata_only_ok: bool) -> Result<(), PutError> {
+    /// Applies a put: the peer's state `change`, with its stamp. Same bytes
+    /// here already (same ETag and size): adopt the peer's metadata and
+    /// stamp without moving data.
+    async fn apply_put(&self, change: &Change) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
-        let key = &event.key;
+        let key = &change.key;
+        let options = WriteOptions::replicated(change.stamp.clone());
         let local = self.store.index(bucket).await.map_err(PutError::Local)?.get(key).await.map_err(PutError::Local)?;
-        let same_bytes = local.filter(|row| metadata_only_ok && row.etag == event.etag && row.size == event.size);
-        if let Some(local) = same_bytes {
-            // Same bytes here already: adopt the peer's metadata and stamp
-            // without moving data.
-            let _ = local;
-            let headers = self.alive(self.peer.head(key, &event.version)).await.map_err(PutError::Peer)?;
+        let same_bytes = local.is_some_and(|row| row.etag == change.etag && row.size == change.size);
+        if same_bytes {
+            let headers = self.alive(self.peer.head(key, &change.version)).await.map_err(PutError::Peer)?;
             self.store
                 .copy_object_with_metadata(
                     bucket,
@@ -595,27 +590,25 @@ impl Worker {
                     Some(&headers.user_meta),
                     headers.content_type.as_deref(),
                     headers.content_language.as_deref(),
-                    PublishOptions { precondition: None, stamp: Some(stamp), ..Default::default() },
+                    options,
                 )
                 .await
                 .map_err(PutError::Local)?;
             self.update(|s| s.metadata_only += 1);
             return Ok(());
         }
-        let options = PublishOptions { precondition: None, stamp: Some(stamp.clone()), ..Default::default() };
-        self.copy(event, stamp, options).await
+        self.copy(change, options).await
     }
 
-    /// Copies the bytes of the peer's state `event` (with its layout).
-    async fn copy(&self, event: &WireEvent, stamp: crate::storage::stamp::Stamp, options: PublishOptions) -> Result<(), PutError> {
+    /// Copies the bytes of the peer's state `change` (with its layout).
+    async fn copy(&self, change: &Change, options: WriteOptions) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
-        let key = &event.key;
-        let _ = &stamp;
-        match event.parts.as_ref().filter(|layout| layout.multipart) {
-            Some(layout) => self.copy_multipart(event, layout, options).await,
+        let key = &change.key;
+        match change.multipart_layout() {
+            Some(layout) => self.copy_multipart(change, layout, options).await,
             None => {
                 use futures::StreamExt;
-                let (headers, stream) = self.alive(self.peer.body(key, &event.version, None)).await.map_err(PutError::Peer)?;
+                let (headers, stream) = self.alive(self.peer.body(key, &change.version, None)).await.map_err(PutError::Peer)?;
                 let stream = stream.inspect(|_| renew_lease(&self.heartbeat, self.lease_renew));
                 self.store
                     .put_object_stream_with_metadata(
@@ -636,7 +629,7 @@ impl Worker {
                     .map_err(PutError::Local)?;
                 self.update(|s| {
                     s.copied += 1;
-                    s.copied_bytes += event.size;
+                    s.copied_bytes += change.size;
                 });
                 Ok(())
             }
@@ -647,13 +640,13 @@ impl Worker {
     /// local ETag is identical.
     async fn copy_multipart(
         &self,
-        event: &WireEvent,
+        change: &Change,
         layout: &crate::storage::changelog::PartLayout,
-        options: PublishOptions,
+        options: WriteOptions,
     ) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
-        let key = &event.key;
-        let headers = self.alive(self.peer.head(key, &event.version)).await.map_err(PutError::Peer)?;
+        let key = &change.key;
+        let headers = self.alive(self.peer.head(key, &change.version)).await.map_err(PutError::Peer)?;
         let upload_id = self
             .store
             .initiate_multipart_replicated(
@@ -670,12 +663,12 @@ impl Worker {
         let result: Result<(), PutError> = async {
             let mut parts = Vec::new();
             let mut offset = 0u64;
-            for (i, size) in layout.part_sizes(event.size).into_iter().enumerate() {
+            for (i, size) in layout.part_sizes(change.size).into_iter().enumerate() {
                 self.beat();
                 let number = (i + 1) as u16;
                 let range = if size == 0 { None } else { Some((offset, offset + size - 1)) };
                 use futures::StreamExt;
-                let (_, stream) = self.alive(self.peer.body(key, &event.version, range)).await.map_err(PutError::Peer)?;
+                let (_, stream) = self.alive(self.peer.body(key, &change.version, range)).await.map_err(PutError::Peer)?;
                 let stream = stream.inspect(|_| renew_lease(&self.heartbeat, self.lease_renew));
                 let put = self
                     .store
@@ -690,12 +683,12 @@ impl Worker {
                 .complete_multipart_with(bucket, key, &upload_id, &parts, options)
                 .await
                 .map_err(PutError::Local)?;
-            if done.etag != event.etag {
+            if done.etag != change.etag {
                 log::warn!(
                     "replication {}: {key} copied with ETag {} but the peer's is {} (layout mismatch)",
                     self.link.id,
                     done.etag,
-                    event.etag
+                    change.etag
                 );
             }
             Ok(())
@@ -706,7 +699,7 @@ impl Worker {
         } else {
             self.update(|s| {
                 s.copied += 1;
-                s.copied_bytes += event.size;
+                s.copied_bytes += change.size;
             });
         }
         result

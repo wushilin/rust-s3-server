@@ -42,6 +42,7 @@ use super::encoding::{
 use super::errors::{Result, StorageError};
 use super::changelog::ChangeOrigin;
 use super::stamp::{Rank, SiteClock, Stamp};
+use super::write::outranks;
 use super::index::{
     self, Durability, IntentRecord, ListPage, ObjectRecord, ObjectIndex, INTENT_RETIRE,
 };
@@ -193,27 +194,7 @@ pub struct ObjectVersionPage {
     pub next_key_marker: Option<String>,
 }
 
-/// How a publish (PUT, copy, multipart complete) is performed.
-#[derive(Debug, Clone, Default)]
-pub struct PublishOptions {
-    pub precondition: Option<Precondition>,
-    /// A replicated write: keep this stamp (the writing site's) instead of
-    /// minting a local one. Last-Modified becomes `stamp.ms`.
-    pub stamp: Option<Stamp>,
-    /// Restoring a lost object: apply `stamp` even if it is not newer than
-    /// the (broken) current state. Guard with a precondition.
-    pub restore: bool,
-}
-
-impl PublishOptions {
-    pub fn precondition(precondition: Option<Precondition>) -> Self {
-        Self {
-            precondition,
-            stamp: None,
-            restore: false,
-        }
-    }
-}
+pub use super::write::{WriteOptions, WriteOrigin};
 
 /// Returned by a successful PUT or multipart complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -682,6 +663,15 @@ impl LocalObjectStore {
     }
 
     /// Refuses a client (unstamped) write to a read-only bucket.
+    /// Refuses a write a read-only bucket does not take: a client's. Every
+    /// other origin (replication, a mirror's sweep, a repair) writes it.
+    pub async fn check_write_allowed(&self, bucket: &str, origin: &WriteOrigin) -> Result<()> {
+        if origin.allowed_on_read_only() {
+            return Ok(());
+        }
+        self.ensure_writable(bucket).await
+    }
+
     pub async fn ensure_writable(&self, bucket: &str) -> Result<()> {
         if self.bucket_meta(bucket).await.map(|m| m.read_only).unwrap_or(false) {
             return Err(StorageError::BucketReadOnly(bucket.to_string()));
@@ -918,7 +908,7 @@ impl LocalObjectStore {
             aws_chunked,
             expected_sha256,
             None,
-            PublishOptions::default(),
+            WriteOptions::default(),
         )
         .await
     }
@@ -936,7 +926,7 @@ impl LocalObjectStore {
         aws_chunked: bool,
         expected_sha256: Option<&str>,
         expected_decoded_len: Option<u64>,
-        options: PublishOptions,
+        options: WriteOptions,
     ) -> Result<PutResult>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -1207,18 +1197,18 @@ impl LocalObjectStore {
         staging_id: &str,
         precondition: Option<Precondition>,
     ) -> Result<PutResult> {
-        self.commit_staged_put_with(bucket, key, staging_id, PublishOptions::precondition(precondition))
+        self.commit_staged_put_with(bucket, key, staging_id, WriteOptions::precondition(precondition))
             .await
     }
 
-    /// [`Self::commit_staged_put`] with full [`PublishOptions`] (a replicated
+    /// [`Self::commit_staged_put`] with full [`WriteOptions`] (a replicated
     /// stamp).
     pub async fn commit_staged_put_with(
         &self,
         bucket: &str,
         key: &str,
         staging_id: &str,
-        options: PublishOptions,
+        options: WriteOptions,
     ) -> Result<PutResult> {
         validate_staging_id(staging_id)?;
         let staging_dir = self.layout.put_staging_dir(bucket, staging_id)?;
@@ -1285,17 +1275,13 @@ impl LocalObjectStore {
         key: &str,
         publish_dir: &Path,
         mut object_meta: ObjectMeta,
-        options: PublishOptions,
+        options: WriteOptions,
     ) -> Result<PutResult> {
-        let PublishOptions { precondition, stamp: replicated, restore } = options;
-        // A read-only bucket takes only replicated (stamped) states.
-        if replicated.is_none() && !restore {
-            if let Err(err) = self.ensure_writable(bucket).await {
-                let _ = tokio::fs::remove_dir_all(publish_dir).await;
-                return Err(err);
-            }
+        let WriteOptions { origin, precondition } = options;
+        if let Err(err) = self.check_write_allowed(bucket, &origin).await {
+            let _ = tokio::fs::remove_dir_all(publish_dir).await;
+            return Err(err);
         }
-        let replicated_for_check = replicated.clone();
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if self.durability == Durability::Full {
             fsync_publish_dir(publish_dir, &object_meta).await?;
@@ -1329,42 +1315,24 @@ impl LocalObjectStore {
 
         // The key's current state: the object, or its tombstone.
         let current = self.current_rank(&index, key, old.as_ref()).await?;
-        // A replicated state applies only over a lower-ranked one, so the
-        // same state wins on every site, whatever order changes arrive in.
-        if let Some(incoming) = replicated_for_check.as_ref().filter(|_| !restore) {
-            if let Some((current, _)) = current.as_ref().filter(|(current, _)| Rank::live(incoming.clone()) <= *current) {
+        let stamp = match self.decide(bucket, key, &origin, origin.put_rank(), current.as_ref()) {
+            Ok(stamp) => stamp,
+            Err(err) => {
                 let _ = index.delete_intent(intent_id).await;
                 let _ = tokio::fs::remove_dir_all(publish_dir).await;
-                return Err(Self::stale(bucket, key, current));
+                return Err(err);
             }
-        }
-
-        // The new state's version stamp. Seeing the current one first means
-        // a local write always outranks what it replaces (object or
-        // tombstone), even if that came from a site whose clock runs ahead.
-        if let Some((_, newest)) = &current {
-            self.clock().observe(newest);
-        }
-        let (stamp, last_modified_ms) = match replicated {
-            // A replicated state keeps its origin's stamp and shows its
-            // origin's time.
-            Some(stamp) => {
-                self.clock().observe(&stamp);
-                let ms = stamp.ms;
-                (stamp, ms)
-            }
-            None => {
-                let stamp = self.clock().next();
-                // Monotonic per-key clamp: newer-wins adjudication (rebuild,
-                // DR) requires timestamps to order versions even across
-                // clock steps.
-                let ms = old
-                    .as_ref()
-                    .map(|o| o.last_modified_ms.saturating_add(1))
-                    .unwrap_or(i64::MIN)
-                    .max(stamp.ms);
-                (stamp, ms)
-            }
+        };
+        let last_modified_ms = match origin.given_stamp() {
+            // A replicated state shows its origin's time.
+            Some(_) => stamp.ms,
+            // Monotonic per-key clamp: newer-wins adjudication (rebuild, DR)
+            // requires timestamps to order versions even across clock steps.
+            None => old
+                .as_ref()
+                .map(|o| o.last_modified_ms.saturating_add(1))
+                .unwrap_or(i64::MIN)
+                .max(stamp.ms),
         };
         if last_modified_ms != object_meta.last_modified_ms || object_meta.stamp.as_ref() != Some(&stamp) {
             object_meta.last_modified_ms = last_modified_ms;
@@ -1474,11 +1442,12 @@ impl LocalObjectStore {
             stamp: Some(stamp.clone()),
         };
         let retire_id = index
-            .commit_publish(
+            .commit_publish_from(
                 &record,
                 intent_id,
                 old.as_ref().map(|o| o.blob_dir.as_str()),
                 now_ms(),
+                origin.change_origin(),
             )
             .await?;
         self.crash_point("publish_after_commit");
@@ -1639,14 +1608,62 @@ impl LocalObjectStore {
         Ok(index.get_tombstone(key).await?.map(|t| (t.stamp, true)))
     }
 
-    /// Deletes `key`. A replicated delete carries its own `stamp` and the
-    /// stamp of the version it `removed` (defaulting to `stamp` for a peer
-    /// that does not send it); it applies only if it ranks above the key's
-    /// current state ([`StorageError::StaleStamp`] otherwise) — i.e. it never
-    /// removes a version newer than the one its author deleted. A key that is
-    /// already absent still records the tombstone, so the removed version (or
-    /// an older one) arriving later cannot come back. Returns the deleted
-    /// size.
+    /// Deletes `key` as `options.origin`. Like every write it is decided
+    /// under the key lock by rank: a delete ranks by the version it
+    /// `removed` (just above it), so it never removes a version newer than
+    /// the one its author saw. `removed` is that version's stamp: a
+    /// replicated delete brings its origin's (`x-rs3-removed-stamp`; the
+    /// delete's own stamp when the peer sends none), a mirror's sweep the
+    /// version it listed, and a client's delete (`None`) removes whatever
+    /// is current. A delete that does not outrank the current state fails
+    /// with [`StorageError::StaleStamp`] and changes nothing. A key already
+    /// absent still records the tombstone when the delete names a version,
+    /// so that version (or an older one) arriving later cannot come back;
+    /// a client's delete of an absent key is a no-op (S3: idempotent).
+    /// Returns the deleted size.
+    pub async fn delete_object_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        options: WriteOptions,
+        removed: Option<Stamp>,
+    ) -> Result<Option<u64>> {
+        let WriteOptions { origin, precondition } = options;
+        self.ensure_bucket_and_key(bucket, key).await?;
+        self.check_write_allowed(bucket, &origin).await?;
+        let index = self.index(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+        let row = index.get(key).await?;
+        if let Some(precondition) = &precondition {
+            if !precondition.is_met(row.as_ref().map(|r| r.etag.as_str())) {
+                return Err(StorageError::PreconditionFailed {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        }
+        let removed = match (removed, &row, origin.given_stamp()) {
+            (Some(removed), _, _) => removed,
+            // A peer that sends no removed stamp: the delete ranks by its own.
+            (None, _, Some(given)) => given.clone(),
+            // A local delete removes exactly the version it sees.
+            (None, Some(row), None) => self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms),
+            (None, None, None) => return Ok(None),
+        };
+        let current = self.current_rank(&index, key, row.as_ref()).await?;
+        let stamp = self.decide(bucket, key, &origin, Some(Rank::deleted(removed.clone())), current.as_ref())?;
+        match row {
+            Some(row) => self.delete_locked(bucket, key, &index, row, origin.change_origin(), stamp, removed).await,
+            None => {
+                index.record_tombstone(key, &stamp, &removed, now_ms(), origin.change_origin()).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// [`Self::delete_object_with`] from a request's optional `x-rs3-stamp`
+    /// and `x-rs3-removed-stamp`.
+    #[cfg(test)]
     pub async fn delete_object_stamped(
         &self,
         bucket: &str,
@@ -1654,64 +1671,72 @@ impl LocalObjectStore {
         stamp: Option<Stamp>,
         removed: Option<Stamp>,
     ) -> Result<Option<u64>> {
-        let Some(stamp) = stamp else {
-            return self.delete_object_with_size(bucket, key).await;
-        };
-        let removed = removed.unwrap_or_else(|| stamp.clone());
-        let incoming = Rank::deleted(removed.clone());
-        self.ensure_bucket_and_key(bucket, key).await?;
-        let index = self.index(bucket).await?;
-        let _guard = self.locks.lock(bucket, key).await;
-        let row = index.get(key).await?;
-        if let Some((current, _)) = self.current_rank(&index, key, row.as_ref()).await? {
-            if incoming <= current {
-                return Err(Self::stale(bucket, key, &current));
-            }
-        }
-        self.clock().observe(&stamp);
-        match row {
-            Some(row) => self.delete_locked(bucket, key, &index, row, stamp, Some(removed)).await,
-            None => {
-                index.record_tombstone(key, &stamp, &removed, now_ms()).await?;
-                Ok(None)
-            }
-        }
+        self.delete_object_with(bucket, key, WriteOptions::stamped(stamp), removed).await
     }
 
+    /// A client's delete of `key`.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.delete_object_with_size(bucket, key).await.map(|_| ())
     }
 
-    /// Deletes an object and returns its indexed size when it existed. This
-    /// avoids an extra metadata read for operation audit logging.
+    /// A client's delete, returning the indexed size when the object
+    /// existed (for operation audit logging, without a metadata read).
     pub async fn delete_object_with_size(&self, bucket: &str, key: &str) -> Result<Option<u64>> {
-        self.ensure_bucket_and_key(bucket, key).await?;
-        self.ensure_writable(bucket).await?;
-        let index = self.index(bucket).await?;
-        let _guard = self.locks.lock(bucket, key).await;
-        let Some(row) = index.get(key).await? else {
-            return Ok(None); // Idempotent: deleting an absent key succeeds.
-        };
-        let stamp = self.clock().next();
-        // A local delete removes exactly the version it sees.
-        let removed = self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms);
-        self.delete_locked(bucket, key, &index, row, stamp, Some(removed)).await
+        self.delete_object_with(bucket, key, WriteOptions::client(), None).await
+    }
+
+    /// Decides a write under the key lock — the one place every origin goes
+    /// through. `incoming` is the write's rank when it has one to compare
+    /// (a put with a given stamp; every delete, by the version it removes);
+    /// it must outrank the key's `current` state, or the write is stale
+    /// ([`StorageError::StaleStamp`]) — except for an origin that is not
+    /// adjudicated (a restore). Returns the new state's stamp: the one the
+    /// write brings, or a fresh local one, minted after observing the
+    /// current state so it outranks what it replaces even if that came
+    /// from a site whose clock runs ahead.
+    fn decide(
+        &self,
+        bucket: &str,
+        key: &str,
+        origin: &WriteOrigin,
+        incoming: Option<Rank>,
+        current: Option<&(Rank, Stamp)>,
+    ) -> Result<Stamp> {
+        if origin.adjudicated() {
+            if let (Some(incoming), Some((current, _))) = (&incoming, current) {
+                if !outranks(incoming, Some(current)) {
+                    return Err(Self::stale(bucket, key, current));
+                }
+            }
+        }
+        if let Some((_, newest)) = current {
+            self.clock().observe(newest);
+        }
+        Ok(match origin.given_stamp() {
+            Some(stamp) => {
+                self.clock().observe(stamp);
+                stamp.clone()
+            }
+            None => self.clock().next(),
+        })
     }
 
     /// Commits the delete of `row` with `stamp` and retires its blob dir.
     /// The caller holds the key lock.
+    #[allow(clippy::too_many_arguments)]
     async fn delete_locked(
         &self,
         bucket: &str,
         key: &str,
         index: &ObjectIndex,
         row: ObjectRecord,
+        origin: ChangeOrigin,
         stamp: Stamp,
-        removed: Option<Stamp>,
+        removed: Stamp,
     ) -> Result<Option<u64>> {
         let deleted_size = row.size;
         let retire_id = index
-            .commit_delete_from(key, &row.blob_dir, now_ms(), ChangeOrigin::Client, Some(stamp), removed)
+            .commit_delete_from(key, &row.blob_dir, now_ms(), origin, Some(stamp), Some(removed))
             .await?;
         self.crash_point("delete_after_commit");
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
@@ -2004,8 +2029,29 @@ impl LocalObjectStore {
         content_language: Option<&str>,
         user_meta: &BTreeMap<String, String>,
     ) -> Result<String> {
-        // Refused up front on a read-only bucket, before any part is sent.
-        self.ensure_writable(bucket).await?;
+        self.initiate_multipart_as(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta, false)
+            .await
+    }
+
+    /// Starts a multipart upload: a client's (`replicated: false`) is
+    /// refused up front on a read-only bucket, before any part is sent;
+    /// replication's is accepted there (its completion carries the stamp,
+    /// which is where the write's origin is decided).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn initiate_multipart_as(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
+        replicated: bool,
+    ) -> Result<String> {
+        if !replicated {
+            self.ensure_writable(bucket).await?;
+        }
         self.initiate_multipart_replicated(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta)
             .await
     }
@@ -2327,11 +2373,11 @@ impl LocalObjectStore {
         upload_id: &str,
         requested_parts: &[CompletePartRequest],
     ) -> Result<PutResult> {
-        self.complete_multipart_with(bucket, key, upload_id, requested_parts, PublishOptions::default())
+        self.complete_multipart_with(bucket, key, upload_id, requested_parts, WriteOptions::default())
             .await
     }
 
-    /// [`Self::complete_multipart`] with [`PublishOptions`] — a replicated
+    /// [`Self::complete_multipart`] with [`WriteOptions`] — a replicated
     /// upload takes its stamp here, at completion, not at create.
     pub async fn complete_multipart_with(
         &self,
@@ -2339,14 +2385,14 @@ impl LocalObjectStore {
         key: &str,
         upload_id: &str,
         requested_parts: &[CompletePartRequest],
-        options: PublishOptions,
+        options: WriteOptions,
     ) -> Result<PutResult> {
         // A replicated upload older than what is here is refused before
         // anything is assembled, leaving the upload intact (to abort). The
         // publish re-checks under the key lock.
-        if let Some(incoming) = options.stamp.as_ref().filter(|_| !options.restore) {
+        if let Some(incoming) = options.origin.put_rank().filter(|_| options.origin.adjudicated()) {
             if let Some(current) = self.key_rank(bucket, key).await? {
-                if Rank::live(incoming.clone()) <= current {
+                if !outranks(&incoming, Some(&current)) {
                     return Err(Self::stale(bucket, key, &current));
                 }
             }
@@ -2485,7 +2531,7 @@ impl LocalObjectStore {
             None,
             None,
             None,
-            PublishOptions::default(),
+            WriteOptions::default(),
         )
         .await
     }
@@ -2510,7 +2556,7 @@ impl LocalObjectStore {
         replacement_user_meta: Option<&BTreeMap<String, String>>,
         replacement_content_type: Option<&str>,
         replacement_content_language: Option<&str>,
-        options: PublishOptions,
+        options: WriteOptions,
     ) -> Result<Option<PutResult>> {
         // A concurrent overwrite between reading and publishing makes the
         // guard below refuse; re-read and try again (the caller asked for no
@@ -2583,7 +2629,7 @@ impl LocalObjectStore {
         replacement_user_meta: Option<&BTreeMap<String, String>>,
         replacement_content_type: Option<&str>,
         replacement_content_language: Option<&str>,
-        options: PublishOptions,
+        options: WriteOptions,
     ) -> Result<PutResult> {
         self.ensure_bucket_and_key(dst_bucket, dst_key).await?;
         if src_bucket == dst_bucket && src_key == dst_key {

@@ -15,7 +15,7 @@ use axum::Router;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
-use super::model::{Batch, Filter, PauseReason, Phase, SubscriptionKind};
+use super::model::{Batch, Filter, PauseReason, Phase, SubscriptionKind, WireOrigin};
 use super::*;
 use crate::server::config::{ChangelogConfig, WebhookConfig};
 use crate::server::iam::IamStore;
@@ -329,7 +329,7 @@ async fn webhook_delivers_signed_batches_with_custom_headers() {
     assert_eq!(events[3].version, events[1].version);
     assert_eq!(events[3].etag, events[1].etag);
     assert_eq!(events[1].size, 2);
-    assert!(events.iter().all(|e| e.origin.as_deref() == Some("client")));
+    assert!(events.iter().all(|e| e.origin == Some(WireOrigin::Client)));
 
     for attempt in rx.attempts() {
         assert_eq!(attempt.headers["authorization"], "Bearer hook-a");
@@ -787,7 +787,7 @@ async fn repair_changes_are_marked_as_such() {
     wait_until(10, "two events", || rx.live_keys().len() == 2).await;
     let events: Vec<_> = rx.accepted().iter().flat_map(|b| b.events.clone()).collect();
     assert_eq!(events[1].op, "delete");
-    assert_eq!(events[1].origin.as_deref(), Some("repair"));
+    assert_eq!(events[1].origin, Some(WireOrigin::Repair));
 }
 
 #[tokio::test]
@@ -1417,7 +1417,7 @@ async fn a_replicated_multipart_upload_is_stamped_at_completion() {
             "big",
             &upload_id,
             &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
-            crate::storage::store::PublishOptions { precondition: None, stamp: Some(origin.clone()), ..Default::default() },
+            crate::storage::store::WriteOptions::replicated(origin.clone()),
         )
         .await
         .unwrap();
@@ -1547,7 +1547,7 @@ async fn copying_onto_itself_updates_metadata_without_touching_the_bytes() {
             Some(&meta),
             Some("application/x-test"),
             None,
-            crate::storage::store::PublishOptions::default(),
+            crate::storage::store::WriteOptions::default(),
         )
         .await
         .unwrap();
@@ -1633,7 +1633,7 @@ async fn self_copy_over_http_and_stamp_only_updates() {
 
 // ── tombstones and conditional (last-writer-wins) apply ─────────────────────
 
-use crate::storage::store::PublishOptions;
+use crate::storage::store::WriteOptions;
 
 async fn put_stamped(store: &LocalObjectStore, bucket: &str, key: &str, body: &[u8], stamp: Option<Stamp>) -> crate::storage::errors::Result<crate::storage::store::PutResult> {
     let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(body))));
@@ -1650,7 +1650,7 @@ async fn put_stamped(store: &LocalObjectStore, bucket: &str, key: &str, body: &[
             false,
             None,
             None,
-            PublishOptions { precondition: None, stamp, ..Default::default() },
+            WriteOptions::stamped(stamp),
         )
         .await
 }
@@ -1775,7 +1775,7 @@ async fn a_stale_replicated_multipart_upload_is_refused_before_assembly() {
             "k",
             &upload_id,
             &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
-            PublishOptions { precondition: None, stamp: Some(st(1, "a")), ..Default::default() },
+            WriteOptions::replicated(st(1, "a")),
         )
         .await
         .unwrap_err();
@@ -2065,7 +2065,7 @@ async fn a_read_only_bucket_accepts_only_replicated_writes() {
             Some(&BTreeMap::from([("m".to_string(), "1".to_string())])),
             None,
             None,
-            PublishOptions { stamp: Some(st(base + 1, "peer")), ..Default::default() },
+            WriteOptions::replicated(st(base + 1, "peer")),
         )
         .await
         .unwrap();
@@ -2077,7 +2077,7 @@ async fn a_read_only_bucket_accepts_only_replicated_writes() {
             "big",
             &upload,
             &[crate::storage::store::CompletePartRequest { number: 1, etag: part.etag }],
-            PublishOptions { stamp: Some(st(base + 2, "peer")), ..Default::default() },
+            WriteOptions::replicated(st(base + 2, "peer")),
         )
         .await
         .unwrap();

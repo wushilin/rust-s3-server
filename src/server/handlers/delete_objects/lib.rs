@@ -32,6 +32,11 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
             return srv::s3_error(StatusCode::BAD_REQUEST, "MalformedXML", message, &resource)
         }
     };
+    // A read-only bucket refuses every client write as one (403), rather
+    // than a per-key error for each.
+    if let Err(err) = store.check_write_allowed(&ctx.bucket, &crate::storage::store::WriteOrigin::Client).await {
+        return srv::storage_error_response(err, &resource);
+    }
 
     // Authorize each key. No identity (auth disabled) means allow.
     let allowed = keys

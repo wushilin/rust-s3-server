@@ -64,9 +64,25 @@ impl ChangeOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangeOrigin {
+    /// A client of this site wrote it.
     #[default]
     Client,
+    /// Replication applied it here: a change made on another site (its
+    /// stamp names that site), or a mirror's own sweep.
+    Replication,
+    /// The health scan changed local state (a lost object's row removed, a
+    /// row resynced from its blob, a lost object restored).
     Repair,
+}
+
+impl ChangeOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeOrigin::Client => "client",
+            ChangeOrigin::Replication => "replication",
+            ChangeOrigin::Repair => "repair",
+        }
+    }
 }
 
 /// How an object's bytes were uploaded — what a replicator must reproduce

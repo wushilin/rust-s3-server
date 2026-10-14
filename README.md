@@ -478,6 +478,12 @@ narrowing their policy revokes or narrows existing links.
 
 ## Changelog, webhooks and replication
 
+The wire protocol is specified in [docs/spec-replication.md](docs/spec-replication.md)
+(changelog reads, events, stamps, replicated writes, peer checks) and
+[docs/spec-webhooks.md](docs/spec-webhooks.md) (webhook requests and
+batches); `src/server/spec_tests.rs` checks the server against both. What
+follows is the guide.
+
 Every bucket keeps a **changelog**: each committed PUT, copy, multipart
 completion and delete is recorded, in the same atomic write as the change
 itself, with a per-bucket sequence number (`seq`). Sequence numbers increase
@@ -542,9 +548,10 @@ below).
     ETag ends in `-1`).
   - Absent for objects stored before layouts were recorded; use
     GetObjectAttributes for those.
-- `origin` is `client` or `repair`. A `repair` delete means the health scan
-  removed an index row whose data was lost. It does not mean a client deleted
-  the object.
+- `origin` is `client` (a client of that site wrote it), `replication`
+  (replication applied it there; the stamp's `site` says where it was made)
+  or `repair`. A `repair` delete means the health scan removed an index row
+  whose data was lost. It does not mean a client deleted the object.
 - A snapshot arrives as `phase: "snapshot"` batches of `op: "exists"` entries,
   which have no `seq`:
   - The first batch has `snapshot_begin`; the last has `snapshot_end`.
@@ -632,7 +639,10 @@ key is still a full copy, stored as a single part.
 **Replicated writes.** A PUT, CompleteMultipartUpload, CopyObject or DELETE
 that sends `x-rs3-stamp: <ms>.<c>.<site>` keeps that stamp instead of getting a
 new local one. For a write, `Last-Modified` becomes the stamp's time. This is
-how a replica keeps the origin's stamp.
+how a replica keeps the origin's stamp. A CreateMultipartUpload sent with
+`x-rs3-replicate: true` (also needing `s3:ReplicateWrite`) starts a replicated
+upload, which a read-only bucket accepts; the stamp the object keeps is the
+one sent with the completion.
 
 - **Last-writer-wins, with version-scoped deletes.** Every state of a key has a
   rank, computed identically on every site.

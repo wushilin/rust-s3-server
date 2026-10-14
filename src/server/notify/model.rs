@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::changelog::{ChangeEvent, ChangeOp};
+use crate::storage::changelog::{ChangeEvent, ChangeOp, ChangeOrigin};
 
 /// Highest record version this build reads.
 pub(super) const RECORD_VERSION: u32 = 1;
@@ -189,20 +189,108 @@ pub enum Phase {
     Live,
 }
 
+/// An event's operation on the wire (`op`). Live changes are `put` and
+/// `delete`; snapshot entries are `exists` (an object stored now) and
+/// `deleted` (a tombstone: a deleted key still remembered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireOp {
+    Put,
+    Delete,
+    Exists,
+    Deleted,
+    /// An operation this build does not know (a newer peer's). A reader
+    /// must not guess what it means.
+    #[serde(other)]
+    Unknown,
+}
+
+impl WireOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WireOp::Put => "put",
+            WireOp::Delete => "delete",
+            WireOp::Exists => "exists",
+            WireOp::Deleted => "deleted",
+            WireOp::Unknown => "unknown",
+        }
+    }
+
+    /// A state removed: a live `delete` or a snapshot tombstone.
+    pub fn is_delete(self) -> bool {
+        matches!(self, WireOp::Delete | WireOp::Deleted)
+    }
+
+    /// A state present: a live `put` or a snapshot object.
+    pub fn is_put(self) -> bool {
+        matches!(self, WireOp::Put | WireOp::Exists)
+    }
+}
+
+impl PartialEq<str> for WireOp {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for WireOp {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/// Who caused an event (`origin`): see [`ChangeOrigin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireOrigin {
+    Client,
+    Replication,
+    Repair,
+    #[serde(other)]
+    Unknown,
+}
+
+impl WireOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WireOrigin::Client => "client",
+            WireOrigin::Replication => "replication",
+            WireOrigin::Repair => "repair",
+            WireOrigin::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<ChangeOrigin> for WireOrigin {
+    fn from(origin: ChangeOrigin) -> Self {
+        match origin {
+            ChangeOrigin::Client => WireOrigin::Client,
+            ChangeOrigin::Replication => WireOrigin::Replication,
+            ChangeOrigin::Repair => WireOrigin::Repair,
+        }
+    }
+}
+
+impl PartialEq<str> for WireOrigin {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
 /// One event on the wire. Live events carry their `seq`; snapshot entries
-/// (`op: "exists"`) have none.
+/// (`op: "exists"` / `"deleted"`) have none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub seq: Option<u64>,
-    pub op: String,
+    pub op: WireOp,
     pub key: String,
     pub etag: String,
     pub size: u64,
     pub last_modified_ms: i64,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub origin: Option<String>,
+    pub origin: Option<WireOrigin>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ts_ms: Option<i64>,
     /// Upload layout to reproduce for an identical ETag; absent for objects
@@ -224,7 +312,7 @@ impl WireEvent {
     pub fn exists(record: &crate::storage::index::ObjectRecord, site: &str) -> Self {
         Self {
             seq: None,
-            op: "exists".to_string(),
+            op: WireOp::Exists,
             key: record.object_key.clone(),
             etag: record.etag.clone(),
             size: record.size,
@@ -248,19 +336,16 @@ impl From<&ChangeEvent> for WireEvent {
     fn from(event: &ChangeEvent) -> Self {
         Self {
             seq: Some(event.seq),
-            op: event.op.as_str().to_string(),
+            op: match event.op {
+                ChangeOp::Put => WireOp::Put,
+                ChangeOp::Delete => WireOp::Delete,
+            },
             key: event.key.clone(),
             etag: event.etag.clone(),
             size: event.size,
             last_modified_ms: event.last_modified_ms,
             version: event.version.clone(),
-            origin: Some(
-                match event.origin {
-                    crate::storage::changelog::ChangeOrigin::Client => "client",
-                    crate::storage::changelog::ChangeOrigin::Repair => "repair",
-                }
-                .to_string(),
-            ),
+            origin: Some(event.origin.into()),
             ts_ms: Some(event.ts_ms),
             parts: event.parts.clone(),
             stamp: event.stamp.clone(),

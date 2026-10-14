@@ -6,7 +6,7 @@ use axum::response::Response;
 
 use crate::server as srv;
 use crate::server::handlers::ObjectCtx;
-use crate::storage::store::{LocalObjectStore, Precondition, PublishOptions};
+use crate::storage::store::{LocalObjectStore, Precondition};
 
 /// Parses the conditional-write preconditions S3 (and the `object_store` crate)
 /// place on `PutObject`. `If-None-Match: *` means create-only; `If-Match:
@@ -63,16 +63,10 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         None
     };
     let precondition = parse_precondition(&ctx.headers);
-    let stamp = match srv::replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &resource) {
-        Ok(stamp) => stamp,
+    let options = match srv::write_options(&store, &ctx, &resource).await {
+        Ok(options) => options.with_precondition(precondition),
         Err(response) => return response,
     };
-    // A read-only bucket: refuse before the body is uploaded.
-    if stamp.is_none() {
-        if let Err(err) = store.ensure_writable(&ctx.bucket).await {
-            return srv::storage_error_response(err, &resource);
-        }
-    }
     match store
         .put_object_stream_with_metadata(
             &ctx.bucket,
@@ -86,7 +80,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             aws_chunked,
             expected_sha256.as_deref(),
             expected_decoded_len,
-            PublishOptions { precondition, stamp, ..Default::default() },
+            options,
         )
         .await
     {

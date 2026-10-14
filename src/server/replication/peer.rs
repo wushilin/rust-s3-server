@@ -14,7 +14,6 @@ use futures::Stream;
 use reqwest::{Method, StatusCode};
 
 use crate::server::notify::read::{ReadResponse, SnapshotResponse};
-use crate::server::notify::model::WireEvent;
 use crate::storage::stamp::{Rank, Stamp};
 
 /// Request header naming the replication link that reads a changelog — a
@@ -614,7 +613,9 @@ impl PeerClient {
     /// Starts a multipart upload of `key` with its metadata.
     pub async fn create_multipart(&self, key: &str, meta: &ObjectHeaders) -> Result<String, PeerError> {
         let path = object_path(&self.config.bucket, key);
-        let headers = Self::meta_headers(meta);
+        let mut headers = Self::meta_headers(meta);
+        // Replication's upload (a read-only peer bucket accepts it).
+        headers.push((crate::server::REPLICATE_HEADER.to_string(), "true".to_string()));
         let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let builder = Self::with_content_headers(self.signed(Method::POST, &path, "uploads=", &extra), meta);
         let response = self.send_write(builder, &format!("create multipart {key}")).await?;
@@ -689,14 +690,6 @@ fn xml_tag(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
-/// The stamp an event is applied with: its own, or for changes logged
-/// before stamps existed, `(last_modified_ms, 0, peer site)`.
-pub fn event_stamp(event: &WireEvent, peer_site: &str) -> crate::storage::stamp::Stamp {
-    event
-        .stamp
-        .clone()
-        .unwrap_or_else(|| crate::storage::stamp::Stamp::fallback(event.last_modified_ms, peer_site))
-}
 
 #[cfg(test)]
 mod tests {

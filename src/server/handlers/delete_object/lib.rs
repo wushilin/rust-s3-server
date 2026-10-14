@@ -14,26 +14,17 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     if force_delete_enabled(&ctx) {
         return force_delete_prefix(store, ctx).await;
     }
-    // A replicated delete carries the origin's stamp (s3:ReplicateWrite).
-    let stamp = match srv::replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &resource) {
-        Ok(stamp) => stamp,
+    // A replicated delete carries the origin's stamp (s3:ReplicateWrite) and
+    // the stamp of the version it removed (what it ranks by).
+    let options = match srv::write_options(&store, &ctx, &resource).await {
+        Ok(options) => options,
         Err(response) => return response,
     };
-    // With it, the stamp of the version the delete removed (what it ranks
-    // by); without, the delete's own stamp is used.
-    let removed = match ctx.headers.get("x-rs3-removed-stamp").map(|v| v.to_str().map(crate::storage::stamp::Stamp::parse_header)) {
-        None => None,
-        Some(Ok(Ok(removed))) if stamp.is_some() => Some(removed),
-        Some(_) => {
-            return srv::s3_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "x-rs3-removed-stamp must be <ms>.<counter>.<site> and needs x-rs3-stamp",
-                &resource,
-            )
-        }
+    let removed = match srv::removed_stamp(&ctx.headers, &options.origin) {
+        Ok(removed) => removed,
+        Err(message) => return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &resource),
     };
-    match store.delete_object_stamped(&ctx.bucket, &ctx.key, stamp, removed).await {
+    match store.delete_object_with(&ctx.bucket, &ctx.key, options, removed).await {
         Ok(size) => srv::with_measure(
             srv::empty_response(StatusCode::NO_CONTENT),
             srv::OperationMeasure::Bytes(size.unwrap_or(0)),
