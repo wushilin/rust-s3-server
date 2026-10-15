@@ -1229,6 +1229,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             long_poll: std::time::Duration::from_secs(20),
             parallelism: config.app_config.replication.parallelism.clamp(1, 256),
             lease_renew: std::time::Duration::from_secs(5),
+            fatal_pause: std::time::Duration::from_secs(30),
         },
         shutdown.clone(),
     )
@@ -1770,6 +1771,7 @@ async fn access_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Respons
         read_only: meta.read_only,
         actions,
         merge_back,
+        versioning: meta.versioning.as_str().to_string(),
     })
     .into_response()
 }
@@ -2591,7 +2593,18 @@ pub(crate) async fn write_options(
     resource: &str,
 ) -> Result<crate::storage::store::WriteOptions, Response> {
     let stamp = replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, resource)?;
-    let options = crate::storage::store::WriteOptions::stamped(stamp);
+    // `x-rs3-versioned`: whether the replicated state is a real version on
+    // its site (kept as such on a versioning-enabled bucket).
+    let versioned = match ctx.headers.get("x-rs3-versioned").map(|v| v.to_str().unwrap_or("")) {
+        None => None,
+        Some(_) if stamp.is_none() => {
+            return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "x-rs3-versioned needs x-rs3-stamp", resource))
+        }
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "x-rs3-versioned must be true or false", resource)),
+    };
+    let options = crate::storage::store::WriteOptions::stamped(stamp).with_versioned(versioned);
     store
         .check_write_allowed(&ctx.bucket, &options.origin)
         .await

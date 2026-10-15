@@ -38,6 +38,7 @@ fn fast_timing() -> Timing {
         long_poll: Duration::from_secs(1),
         parallelism: 8,
         lease_renew: Duration::from_millis(200),
+        fatal_pause: Duration::from_millis(500),
     }
 }
 
@@ -1591,6 +1592,7 @@ async fn a_change_superseded_before_the_fetch_is_skipped_never_mixed() {
         local_check: Arc::new(|| Ok(())),
         bind_peer: Arc::new(|_| {}),
         lease_renew: Duration::from_secs(5),
+        fatal_pause: Duration::from_secs(30),
     };
     let w = worker(&b);
     // Applying the stale v1 event: the peer answers 412 to the pinned reads,
@@ -1775,32 +1777,194 @@ async fn the_error_clears_promptly_even_with_a_long_poll() {
     eventually(30, "replicating", || same(&a, &b, "data")).await;
 }
 
+
+// ── version-aware replication ───────────────────────────────────────────────
+// A version is immutable and named by its stamp on every site, so two
+// versioning-enabled sites hold the same set of versions: history is a
+// union, last-writer-wins only decides which one is current.
+
+/// `(version id, is current, is delete marker, etag)` of every version of
+/// `key`, newest first.
+async fn versions_of(site: &Site, bucket: &str, key: &str) -> Vec<(String, bool, bool, String)> {
+    site.store
+        .list_versions(bucket, key)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.version_id(), v.is_current, v.record.delete_marker, v.record.etag.clone()))
+        .collect()
+}
+
+async fn same_versions(a: &Site, b: &Site, bucket: &str, key: &str) -> bool {
+    versions_of(a, bucket, key).await == versions_of(b, bucket, key).await
+}
+
 #[tokio::test]
-async fn a_versioned_target_keeps_every_replicated_version_and_marker() {
+async fn versioned_sites_hold_the_same_versions_through_snapshot_bursts_and_removals() {
+    use crate::storage::metadata::BucketVersioning;
     let a = Site::start("site-a").await;
     let b = Site::start("site-b").await;
     for site in [&a, &b] {
         site.store.create_bucket("data").await.unwrap();
     }
-    b.store.set_bucket_versioning("data", crate::storage::metadata::BucketVersioning::Enabled).await.unwrap();
-    b.pull_from(&a, "data", Mode::Mirror).await;
-    a.put("data", "k", b"one").await;
-    a.put("data", "k", b"two").await;
-    eventually(30, "mirrored", || same(&a, &b, "data")).await;
-    eventually(30, "two versions on b", || async { b.store.list_versions("data", "k").await.unwrap().len() == 2 }).await;
-    let versions = b.store.list_versions("data", "k").await.unwrap();
-    let a_stamp = a.store.key_stamp("data", "k").await.unwrap().unwrap().0;
-    assert!(versions[0].is_current && versions[0].record.stamp == a_stamp, "the current version carries the origin's stamp");
-    assert!(versions.iter().all(|v| v.record.versioned), "replicated writes are versions of the target");
-    assert!(versions[1].record.stamp < versions[0].record.stamp);
-    assert_eq!(versions[0].version_id(), crate::storage::layouts::v3::stamp_dir(&a_stamp), "the version id is the stamp");
-
-    // A delete on the source leaves a marker on the versioned target, the
-    // versions behind it.
+    // History before the link exists: a null version, then versioning, a
+    // burst of versions, a delete marker, and a write on top.
+    a.put("data", "k", b"null").await;
+    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    for n in 0..5 {
+        a.put("data", "k", format!("v{n}").as_bytes()).await;
+    }
     a.store.delete_object("data", "k").await.unwrap();
-    eventually(30, "deleted on b", || async { b.store.read_object("data", "k").await.is_err() }).await;
-    let versions = b.store.list_versions("data", "k").await.unwrap();
-    assert_eq!(versions.len(), 3);
-    assert!(versions[0].is_current && versions[0].record.delete_marker && versions[0].record.versioned);
-    assert!(versions[1..].iter().all(|v| !v.is_current && !v.record.delete_marker));
+    a.put("data", "k", b"after").await;
+    let on_a = versions_of(&a, "data", "k").await;
+    assert_eq!(on_a.len(), 8);
+    assert!(on_a.iter().any(|v| v.0 == "null"), "the null version is history");
+    assert_eq!(on_a.iter().filter(|v| v.2).count(), 1, "one marker");
+
+    // The snapshot carries every version, the null one as null.
+    b.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    let link = b.pull_from(&a, "data", Mode::Mirror).await;
+    eventually(30, "every version on b", || same_versions(&a, &b, "data", "k")).await;
+    assert_eq!(versions_of(&b, "data", "k").await, on_a);
+    assert!(same(&a, &b, "data").await);
+    for v in &on_a {
+        if !v.2 {
+            let (ra, rb) = (
+                a.store.read_object_version("data", "k", &v.0).await.unwrap(),
+                b.store.read_object_version("data", "k", &v.0).await.unwrap(),
+            );
+            assert_eq!((ra.meta.etag, ra.meta.size, ra.meta.stamp), (rb.meta.etag, rb.meta.size, rb.meta.stamp), "{}", v.0);
+        }
+    }
+
+    // A live burst: nothing is collapsed on the way.
+    for n in 0..5 {
+        a.put("data", "k", format!("w{n}").as_bytes()).await;
+    }
+    eventually(30, "the burst on b", || async { versions_of(&b, "data", "k").await.len() == 13 }).await;
+    assert!(same_versions(&a, &b, "data", "k").await);
+
+    // Removing versions on a removes them on b: a noncurrent one, the
+    // current one (the next newest takes over on both), and a marker on
+    // top of it all (undelete).
+    let victim = versions_of(&a, "data", "k").await[6].0.clone();
+    a.store.delete_object_version("data", "k", &victim, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    let current = versions_of(&a, "data", "k").await[0].0.clone();
+    a.store.delete_object_version("data", "k", &current, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(30, "removals on b", || same_versions(&a, &b, "data", "k")).await;
+    let on_b = versions_of(&b, "data", "k").await;
+    assert_eq!(on_b.len(), 11);
+    assert!(on_b.iter().all(|v| v.0 != victim && v.0 != current));
+    assert_eq!(b.store.read_object("data", "k").await.unwrap().meta.etag, a.store.read_object("data", "k").await.unwrap().meta.etag);
+    // A copy of a removed version arriving later is refused: b remembers it.
+    let victim_stamp = crate::storage::layouts::v3::parse_stamp_dir(&victim).unwrap();
+    assert!(b.store.version_known("data", "k", &victim_stamp).await.unwrap(), "a version tombstone");
+    a.store.delete_object("data", "k").await.unwrap();
+    eventually(30, "the marker on b", || async { b.store.read_object("data", "k").await.is_err() && same_versions(&a, &b, "data", "k").await }).await;
+    let marker = versions_of(&a, "data", "k").await[0].0.clone();
+    a.store.delete_object_version("data", "k", &marker, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(30, "undeleted on b", || async { b.store.read_object("data", "k").await.is_ok() && same_versions(&a, &b, "data", "k").await }).await;
+    assert!(b.link(&link).status.last_error.is_none());
+}
+
+#[tokio::test]
+async fn a_merge_link_pushes_every_version_and_removal_to_a_versioned_peer() {
+    use crate::storage::metadata::BucketVersioning;
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+        site.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    }
+    // Versions on b before the link, and a burst after it: all pushed.
+    for n in 0..3 {
+        b.put("data", "k", format!("b{n}").as_bytes()).await;
+    }
+    let link = b.pull_from(&a, "data", Mode::Merge).await;
+    for n in 3..6 {
+        b.put("data", "k", format!("b{n}").as_bytes()).await;
+    }
+    eventually(30, "every version on a", || async { versions_of(&a, "data", "k").await.len() == 6 && same_versions(&a, &b, "data", "k").await }).await;
+    // Both sides write: the union, with the same current everywhere.
+    a.put("data", "k", b"a0").await;
+    b.put("data", "k", b"b6").await;
+    eventually(30, "the union", || async { versions_of(&a, "data", "k").await.len() == 8 && same_versions(&a, &b, "data", "k").await }).await;
+    // A removal on b reaches a.
+    let victim = versions_of(&b, "data", "k").await[4].0.clone();
+    b.store.delete_object_version("data", "k", &victim, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(30, "the removal on a", || same_versions(&a, &b, "data", "k")).await;
+    assert_eq!(versions_of(&a, "data", "k").await.len(), 7);
+    assert!(b.link(&link).status.last_error.is_none());
+}
+
+#[tokio::test]
+async fn a_link_needs_the_same_versioning_on_both_buckets() {
+    use crate::storage::metadata::BucketVersioning;
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    // Refused at creation, with the reason.
+    let err = b.link_with(&a, "data", Mode::Mirror, AK, SK, true).await.unwrap_err();
+    assert!(err.to_string().contains("versioning differs"), "{err}");
+    // An unchecked link (made while the peer was unreachable, say) stops at
+    // its first page instead of replicating.
+    let link = b.link_with(&a, "data", Mode::Mirror, AK, SK, false).await.unwrap();
+    a.put("data", "k", b"x").await;
+    eventually(30, "stopped", || async { b.link(&link).status.state == "stopped" }).await;
+    assert!(b.link(&link).status.last_error.as_deref().is_some_and(|e| e.contains("versioning differs")), "{:?}", b.link(&link).status.last_error);
+    assert!(b.store.read_object("data", "k").await.is_err(), "nothing replicated");
+    // The same setting on both sides: the link resumes on its own.
+    b.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    eventually(30, "mirrored", || same(&a, &b, "data")).await;
+    eventually(30, "live", || async { b.link(&link).status.state == "live" }).await;
+}
+
+#[tokio::test]
+async fn a_versioning_change_stops_a_merge_link_both_ways_until_both_match_then_it_continues() {
+    use crate::storage::metadata::BucketVersioning;
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "from-a", b"a").await;
+    b.put("data", "from-b", b"b").await;
+    let link = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "merged", || same(&a, &b, "data")).await;
+
+    // Versioning turned on at a only: pull and push both stop at once,
+    // and nothing crosses meanwhile.
+    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    a.put("data", "while-apart-a", b"a2").await;
+    b.put("data", "while-apart-b", b"b2").await;
+    // The pull side sees the peer's setting on its next page and stops the
+    // link; the push side checks on its next batch and backs off. Nothing
+    // crosses either way meanwhile.
+    eventually(30, "the link stopped", || async { b.link(&link).status.state == "stopped" }).await;
+    assert!(b.link(&link).status.last_error.as_deref().is_some_and(|e| e.contains("versioning differs")), "{:?}", b.link(&link).status.last_error);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(b.store.read_object("data", "while-apart-a").await.is_err(), "nothing pulled while apart");
+    assert!(a.store.read_object("data", "while-apart-b").await.is_err(), "nothing pushed while apart");
+
+    // Both enabled: nothing was checkpointed while apart, so both
+    // directions continue from their positions (no re-snapshot) and
+    // everything written apart crosses, as versions on both sides.
+    let position_before = b.link(&link).status.position;
+    b.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    eventually(60, "converged", || same(&a, &b, "data")).await;
+    assert!(b.link(&link).status.position >= position_before, "continued from the position, not from a snapshot");
+    assert!(b.link(&link).status.snapshot_cursor.is_none());
+    for key in ["from-a", "from-b", "while-apart-a", "while-apart-b"] {
+        assert!(same_versions(&a, &b, "data", key).await, "{key}");
+    }
+    assert_eq!(b.link(&link).status.state, "live");
+    a.put("data", "from-a", b"a3").await;
+    b.put("data", "from-b", b"b3").await;
+    eventually(30, "versions on both", || async {
+        same_versions(&a, &b, "data", "from-a").await && same_versions(&a, &b, "data", "from-b").await && versions_of(&a, "data", "from-a").await.len() == 2
+    })
+    .await;
 }

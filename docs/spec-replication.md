@@ -118,7 +118,7 @@ reads (§4.3) and webhooks.
 | Field | Type | Present | Meaning |
 |---|---|---|---|
 | `seq` | u64 | live events only | Position in the bucket's changelog. Strictly increasing, not contiguous. |
-| `op` | string | always | `put`, `delete` (live); `exists`, `deleted` (snapshot). A reader MUST NOT guess the meaning of an op it does not know. |
+| `op` | string | always | `put`, `delete`, `remove_version` (live); `exists`, `deleted` (snapshot). A reader MUST NOT guess the meaning of an op it does not know. |
 | `key` | string | always | The object key. |
 | `etag` | string | always | `put`/`exists`: the state's ETag (bare, no quotes). `delete`/`deleted`: the removed version's; empty when the delete removed nothing here (§3.1). |
 | `size` | u64 | always | Bytes of the state (`0` with an empty `etag`). |
@@ -129,6 +129,14 @@ reads (§4.3) and webhooks.
 | `parts` | object | when known | Upload layout to reproduce for an identical ETag (§3.2). Absent for objects indexed before layouts were recorded. |
 | `stamp` | stamp | always (fallback for old states) | `put`/`exists`: the state's stamp. `delete`/`deleted`: the delete's own stamp. |
 | `removed_stamp` | stamp | deletes | The stamp of the version the delete removed: what it ranks by. A reader MUST use `stamp` when it is absent. |
+| `versioned` | bool | when known | `true`: the state is a real version of a versioning-enabled bucket (its stamp is its version id). `false`: the key's `null` version. Absent from events written before versioning existed; a reader treats that as unknown (§5.4). |
+
+`remove_version` is logged by `DeleteObject?versionId`: the version named
+by `stamp` (and `version`, its directory form) was permanently removed —
+a noncurrent version, the current one (the next newest became current),
+or a delete marker (the key is undeleted). `etag`, `size` and `parts`
+describe what was removed. It is applied by identity (§5.4), never by
+rank.
 
 ### 3.1 Deletes that removed nothing
 
@@ -217,18 +225,24 @@ Errors (JSON `{"error": "<message>", …}`):
 
 ```
 GET /{bucket}?x-rs3-changelog-snapshot[&after=<key>][&limit=N][&prefix=][&suffix=][&deleted=1]
+GET /{bucket}?x-rs3-changelog-snapshot&versions=1[&after=<key>&after_version=<version>][&limit=N][&prefix=]
 ```
 
 Pages through the current objects in key order as `exists` entries (no
 `seq`), or with `deleted=1` through the tombstones as `deleted` entries.
+With `versions=1` it pages through **every version of every key** in key
+order, newest first per key: live versions as `exists`, delete markers as
+`deleted`, each with its `stamp`, `versioned` bit and (markers)
+`removed_stamp`; a key's versions may be split across pages.
 
 ```json
 {"bucket": "photos", "site_id": "…", "site_name": "…", "log_id": "…", "head": 250,
- "entries": [ … ], "next_after": "2026/zz.jpg"}
+ "entries": [ … ], "next_after": "2026/zz.jpg", "next_after_version": "0000001791…"}
 ```
 
 - `next_after`: pass as `after` for the next page; `null` when the listing
-  is done.
+  is done. With `versions=1`, `next_after_version` comes with it and is
+  passed as `after_version`.
 - `head`: the changelog head when the page was read. A reader saves the
   **first** page's `head`, walks to the end, then reads changes with
   `after=<that head>`; that replays anything that changed during the walk.
@@ -293,6 +307,10 @@ requires the IAM action `s3:ReplicateWrite` on the object in addition to
 the write or delete action; without it the request is `403
 AccessDenied`. A malformed stamp is `400 InvalidArgument`.
 
+- `x-rs3-versioned: true|false` beside the stamp says whether the state
+  is a real version on the site it comes from; a versioning-enabled bucket
+  keeps it so (a `null` version stays `null`). Without the stamp it is
+  `400 InvalidArgument`; another value is too.
 - PUT: the body and metadata as usual (`Content-Type`, `x-amz-meta-*`,
   `x-amz-storage-class`, `Content-Encoding`, `Content-Language`). The
   stamp is kept; the ETag is computed from the bytes.
@@ -361,6 +379,44 @@ A link seeing a merge-back for its pair MUST stand down if its site id is
 the higher of the two (the pair is already served); creation of a second
 merge link for a served pair MUST be refused.
 
+### 5.4 Versioning-enabled buckets: history by identity
+
+A version is immutable and named by its stamp on every site, so two
+versioning-enabled buckets hold the **same set of versions**: history is
+a union, and rank (§2.4) only decides which member is current — every
+site computes that the same way. On a bucket with versioning enabled:
+
+- A replicated write or delete that does **not** outrank the current
+  state is not stale: it is kept as a noncurrent version (a marker, for a
+  delete) under its stamp, with its `x-rs3-versioned` bit, and answers as
+  a success. A version the site already holds, or already removed, is
+  dropped silently. A `null` state never joins a key that has one.
+- `GET`/`HEAD ?versionId=<stamp dir>` reads any version the site holds,
+  current or not (§5.1 pins still apply).
+- `DELETE ?versionId=<stamp dir>` with `x-rs3-stamp` is a replicated
+  removal: the version goes if held, and the site remembers it as removed
+  for the tombstone retention, so a copy arriving later is refused. It is
+  logged as `remove_version` either way.
+
+A replicator between two versioning-enabled buckets therefore applies
+**every** event (nothing collapses within a batch), decides by identity
+(is this version known here?) rather than by rank, fetches a put by its
+version id, and forwards `remove_version` events. An unversioned side
+keeps today's rules: one state per key, latest by rank; a superseded
+state it is asked for by version id answers `404 NoSuchVersion`, which
+the reader skips.
+
+**A link requires the same versioning setting on both buckets** (both
+`off`, both `enabled`, or both `suspended`): what is replicated — every
+version, or the current states — must be the same thing on both sides.
+The access report (§6.1), every changelog page (§4.1) and every snapshot
+page (§4.2) carry the answering bucket's `versioning`; a link is refused
+at creation when the settings differ, and a running link stops at once
+when it sees a page from a bucket whose setting differs from its own. A
+link checkpoints only after a batch is applied, so once both settings
+match again it continues from its position; no re-snapshot is needed as
+long as the position is within the peer's retention.
+
 ## 7. Named header fields
 
 `x-rs3-replicator`, `x-rs3-merge-back` and `merge_back` use one encoding:
@@ -374,17 +430,23 @@ fields, and do not depend on order. Required fields of `x-rs3-replicator`:
 
 A link following this specification:
 
-1. Checks the peer (§6.1): different site id, bucket present, actions.
-2. Walks the snapshot (§4.2), saving the first page's `head`; a mirror
+1. Checks the peer (§6.1): different site id, bucket present, actions,
+   the same versioning setting as its own bucket (§5.4).
+2. Walks the snapshot (§4.2), saving the first page's `head` — with
+   `versions=1` when its own bucket has versioning enabled; a mirror
    deletes local keys the peer does not list; a merge also walks the
    tombstones (`deleted=1`).
 3. Reads changes from that head (§4.1), batching with `limit`/`wait`.
-4. Applies each event by rank: skips it if the local state ranks at or
-   above it; skips repair deletes (§3.3); otherwise fetches the exact
-   version (§5.1, `x-rs3-if-version` and `x-rs3-if-stamp`; a `412` means
-   the state moved on and a later event carries the current one) and
-   writes it with the event's stamp (§5.2), reproducing the part layout
-   (§3.2).
+4. Applies each event: on an unversioned bucket by rank (skips it if the
+   local state ranks at or above it; only the latest event per key in a
+   batch matters), on a versioning-enabled bucket by identity (§5.4,
+   every event, skipping versions already held); skips repair deletes
+   (§3.3); forwards `remove_version` as `DELETE ?versionId` with the
+   stamp; otherwise fetches the exact version (§5.1, `?versionId` plus
+   `x-rs3-if-version` and `x-rs3-if-stamp`; a `412` or `404 NoSuchVersion`
+   means the state moved on and a later event carries the current one)
+   and writes it with the event's stamp and `versioned` bit (§5.2),
+   reproducing the part layout (§3.2).
 5. Checkpoints `next` only after every event in the batch is applied.
 6. On `410` or a changed `log_id` (`409`): re-snapshots.
 7. Refuses to run if the peer's site id equals its own, or changes.

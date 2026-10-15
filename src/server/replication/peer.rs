@@ -44,6 +44,14 @@ pub struct AccessReport {
     /// caller's: a [`MergeBack`] in the [`encode_fields`] form.
     #[serde(default)]
     pub merge_back: Option<String>,
+    /// The bucket's versioning state (`off`, `enabled`, `suspended`). A
+    /// link requires both buckets to have the same one.
+    #[serde(default = "default_versioning")]
+    pub versioning: String,
+}
+
+fn default_versioning() -> String {
+    "off".to_string()
 }
 
 /// Response header: the answering site already has a merge link pairing
@@ -213,6 +221,9 @@ pub struct ObjectHeaders {
     pub user_meta: BTreeMap<String, String>,
     pub etag: String,
     pub size: u64,
+    /// `x-amz-version-id`: a real version (`Some(true)`), the `null`
+    /// version (`Some(false)`), or a bucket without versioning (`None`).
+    pub versioned: Option<bool>,
 }
 
 pub struct PeerClient {
@@ -386,13 +397,23 @@ impl PeerClient {
     }
 
     /// One page of the peer's objects (or tombstones with `deleted`).
-    pub async fn snapshot(&self, after: Option<&str>, limit: usize, prefix: &str, deleted: bool) -> Result<SnapshotResponse, PeerError> {
+    pub async fn snapshot(&self, after: Option<&str>, limit: usize, prefix: &str, deleted: bool, versions: bool) -> Result<SnapshotResponse, PeerError> {
         let mut params = vec![
             ("limit", limit.to_string()),
             (crate::server::notify::read::QUERY_SNAPSHOT, String::new()),
         ];
+        // A versions cursor is `<key>\0<version dir>` (see the worker).
         if let Some(after) = after {
-            params.push(("after", after.to_string()));
+            match after.split_once('\0') {
+                Some((key, version)) => {
+                    params.push(("after", key.to_string()));
+                    params.push(("after_version", version.to_string()));
+                }
+                None => params.push(("after", after.to_string())),
+            }
+        }
+        if versions {
+            params.push(("versions", "1".to_string()));
         }
         if !prefix.is_empty() {
             params.push(("prefix", prefix.to_string()));
@@ -414,8 +435,12 @@ impl PeerClient {
         if let Some(range) = &range_value {
             extra.push(("range", range.as_str()));
         }
+        // Asked for by version id (the stamp): a versioned peer still has
+        // the state after the key moved on; an unversioned one answers 404
+        // for a superseded state, which the caller skips.
+        let query = format!("versionId={}", crate::storage::layouts::v3::stamp_dir(stamp));
         let response = self
-            .signed(method, &path, "", &extra)
+            .signed(method, &path, &query, &extra)
             .send()
             .await
             .map_err(|err| PeerError::Other(format!("peer unreachable: {err}")))?;
@@ -446,6 +471,7 @@ impl PeerClient {
             user_meta,
             etag: text("etag").unwrap_or_default().trim_matches('"').to_string(),
             size: text("content-length").and_then(|v| v.parse().ok()).unwrap_or(0),
+            versioned: text("x-amz-version-id").map(|v| v != "null"),
         }
     }
 
@@ -511,6 +537,9 @@ impl PeerClient {
     fn write_headers(meta: &ObjectHeaders, stamp: &Stamp) -> Vec<(String, String)> {
         let mut headers = Self::meta_headers(meta);
         headers.push(("x-rs3-stamp".to_string(), stamp.to_header()));
+        if let Some(versioned) = meta.versioned {
+            headers.push(("x-rs3-versioned".to_string(), versioned.to_string()));
+        }
         headers
     }
 
@@ -605,13 +634,35 @@ impl PeerClient {
 
     /// DELETE `key` with the delete's `stamp` and the stamp of the version
     /// it `removed`.
-    pub async fn delete(&self, key: &str, stamp: &Stamp, removed: &Stamp) -> Result<(), PeerError> {
+    pub async fn delete(&self, key: &str, stamp: &Stamp, removed: &Stamp, versioned: Option<bool>) -> Result<(), PeerError> {
         let path = object_path(&self.config.bucket, key);
         let stamp = stamp.to_header();
         let removed = removed.to_header();
-        let extra = [("x-rs3-stamp", stamp.as_str()), ("x-rs3-removed-stamp", removed.as_str())];
+        let versioned = versioned.map(|v| v.to_string());
+        let mut extra = vec![("x-rs3-stamp", stamp.as_str()), ("x-rs3-removed-stamp", removed.as_str())];
+        if let Some(v) = &versioned {
+            extra.push(("x-rs3-versioned", v.as_str()));
+        }
         let builder = self.signed(Method::DELETE, &path, "", &extra);
         self.send_write(builder, &format!("DELETE {key}")).await.map(|_| ())
+    }
+
+    /// Permanently removes version `stamp` of `key` on the peer
+    /// (`DELETE ?versionId`, a replicated write).
+    pub async fn delete_version(&self, key: &str, stamp: &Stamp) -> Result<(), PeerError> {
+        let path = object_path(&self.config.bucket, key);
+        let header = stamp.to_header();
+        let extra = [("x-rs3-stamp", header.as_str())];
+        let query = format!("versionId={}", crate::storage::layouts::v3::stamp_dir(stamp));
+        let builder = self.signed(Method::DELETE, &path, &query, &extra);
+        self.send_write(builder, &format!("DELETE {key}?versionId")).await.map(|_| ())
+    }
+
+    /// The peer bucket's versioning state, read from a one-entry snapshot
+    /// page (which the link's key can always read).
+    pub async fn versioning(&self) -> Result<String, PeerError> {
+        let page = self.snapshot(None, 1, "", false, false).await?;
+        Ok(page.versioning)
     }
 
     /// Starts a multipart upload of `key` with its metadata.

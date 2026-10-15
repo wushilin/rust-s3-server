@@ -549,11 +549,22 @@ zero-padded, sortable form, so it is the same on every site that holds the
 version. On disk every version is a directory beside the others under its
 key, so an index rebuild recovers versions and delete markers from the tree
 alone. The console's object details panel lists a key's versions with a
-download and a permanent delete for each. Replication writes into a
-versioned bucket like any other write, so a versioned replica keeps the
-history of an unversioned source. Not yet: lifecycle expiry of noncurrent
-versions, and replication of version-scoped deletes (a replica drops only
-what the source's current state drops).
+download and a permanent delete for each.
+
+**Versions and replication.** A version is immutable and named by its
+stamp on every site, so two versioning-enabled buckets hold the same set
+of versions: history is a union, and last-writer-wins only decides which
+version is current. A link into a versioning-enabled bucket applies every
+event (nothing is collapsed within a batch), fetches each state by its
+version id, keeps a state older than the current one as a noncurrent
+version instead of refusing it, and forwards version removals
+(`DeleteObject ?versionId`, logged as `remove_version`) so a removed
+version, or a removed delete marker, goes on every site and cannot come
+back from a late copy. A link requires the same versioning setting on both
+buckets, so that both replicate the same thing: it is refused at creation
+otherwise, and a running link stops at once when a setting changes on one
+side (the console shows the reason) and continues from its position once
+both match again. Not yet: lifecycle expiry of noncurrent versions.
 
 ## Changelog, webhooks and replication
 

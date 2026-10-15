@@ -48,6 +48,11 @@ pub enum ChangeOp {
     Put,
     /// An object was removed.
     Delete,
+    /// One version of a key (named by `stamp`) was permanently removed —
+    /// `DeleteObject?versionId`: a noncurrent version, the current one, or
+    /// a delete marker. The key's current state is whatever remains.
+    #[serde(rename = "remove_version")]
+    RemoveVersion,
 }
 
 impl ChangeOp {
@@ -55,6 +60,7 @@ impl ChangeOp {
         match self {
             ChangeOp::Put => "put",
             ChangeOp::Delete => "delete",
+            ChangeOp::RemoveVersion => "remove_version",
         }
     }
 }
@@ -189,6 +195,9 @@ pub struct ChangeEvent {
     /// `delete` only: the stamp of the version it removed — what the delete
     /// ranks by (see `stamp::Rank`).
     pub removed_stamp: Option<super::stamp::Stamp>,
+    /// The state is a real version of a versioning-enabled bucket (its
+    /// stamp is its version id); `false` is the key's `null` version.
+    pub versioned: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -216,6 +225,8 @@ struct ChangeValueV1 {
     stamp: Option<super::stamp::Stamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     removed_stamp: Option<super::stamp::Stamp>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    versioned: bool,
 }
 
 fn default_version() -> u32 {
@@ -246,6 +257,7 @@ pub fn encode_change(event: &ChangeEvent) -> Vec<u8> {
         parts: event.parts.clone(),
         stamp: event.stamp.clone(),
         removed_stamp: event.removed_stamp.clone(),
+        versioned: event.versioned,
     })
     .expect("ChangeValueV1 serializes")
 }
@@ -271,6 +283,7 @@ pub fn decode_change(seq: u64, value: &[u8]) -> Result<ChangeEvent> {
         parts: v.parts,
         stamp: v.stamp,
         removed_stamp: v.removed_stamp,
+        versioned: v.versioned,
     })
 }
 
@@ -442,7 +455,12 @@ mod tests {
             parts: Some(PartLayout::multipart(&[5, 5, 2])),
             stamp: Some(super::super::stamp::Stamp { ms: 9, c: 1, site: "s".into() }),
             removed_stamp: Some(super::super::stamp::Stamp { ms: 5, c: 0, site: "s".into() }),
+            versioned: true,
         };
         assert_eq!(decode_change(7, &encode_change(&event)).unwrap(), event);
+        let removal = ChangeEvent { op: ChangeOp::RemoveVersion, versioned: false, ..event };
+        let encoded = encode_change(&removal);
+        assert!(std::str::from_utf8(&encoded).unwrap().contains(r#""op":"remove_version""#));
+        assert_eq!(decode_change(7, &encoded).unwrap(), removal);
     }
 }

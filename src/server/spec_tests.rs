@@ -285,7 +285,7 @@ async fn s3_a_put_is_logged_with_every_field_and_matches_the_object_headers() {
     let page = page.json();
     assert_eq!(
         keys_of(&page),
-        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events"])
+        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events", "versioning"])
     );
     assert_eq!(page["bucket"], BUCKET);
     assert_eq!(page["site_id"], SITE);
@@ -298,7 +298,7 @@ async fn s3_a_put_is_logged_with_every_field_and_matches_the_object_headers() {
     let event = &events[0];
     assert_eq!(
         keys_of(event),
-        set(&["seq", "op", "key", "etag", "size", "last_modified_ms", "version", "origin", "ts_ms", "parts", "stamp"]),
+        set(&["seq", "op", "key", "etag", "size", "last_modified_ms", "version", "origin", "ts_ms", "parts", "stamp", "versioned"]),
         "a live put carries exactly these fields: {event}"
     );
     assert_eq!(event["op"], "put");
@@ -342,7 +342,7 @@ async fn s3_a_delete_names_the_removed_version_and_the_key_keeps_a_tombstone() {
     let event = s.last_event().await;
     assert_eq!(
         keys_of(&event),
-        set(&["seq", "op", "key", "etag", "size", "last_modified_ms", "version", "origin", "ts_ms", "parts", "stamp", "removed_stamp"]),
+        set(&["seq", "op", "key", "etag", "size", "last_modified_ms", "version", "origin", "ts_ms", "parts", "stamp", "removed_stamp", "versioned"]),
         "{event}"
     );
     assert_eq!(event["op"], "delete");
@@ -527,13 +527,13 @@ async fn s4_2_snapshot_pages_objects_then_tombstones() {
     let first = s.snapshot("limit=2").await;
     assert_eq!(first.status, StatusCode::OK);
     let first = first.json();
-    assert_eq!(keys_of(&first), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after"]));
+    assert_eq!(keys_of(&first), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after", "versioning"]));
     assert_eq!(first["next_after"], "b");
     let head = first["head"].as_u64().unwrap();
     let entry = &first["entries"][0];
     assert_eq!(
         keys_of(entry),
-        set(&["op", "key", "etag", "size", "last_modified_ms", "version", "parts", "stamp"]),
+        set(&["op", "key", "etag", "size", "last_modified_ms", "version", "parts", "stamp", "versioned"]),
         "a snapshot entry has no seq, origin or ts_ms: {entry}"
     );
     assert_eq!(entry["op"], "exists");
@@ -607,7 +607,7 @@ async fn s4_3_a_replication_token_reads_the_same_shapes() {
     let page: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         keys_of(&page),
-        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events"])
+        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events", "versioning"])
     );
     assert_eq!(page["events"].as_array().unwrap().len(), 1, "the token's filter is its scope");
     assert_eq!(page["events"][0]["key"], "in/a");
@@ -628,7 +628,7 @@ async fn s4_3_a_replication_token_reads_the_same_shapes() {
         .unwrap();
     assert_eq!(snapshot.status(), StatusCode::OK);
     let snapshot: Value = serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(keys_of(&snapshot), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after"]));
+    assert_eq!(keys_of(&snapshot), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after", "versioning"]));
     assert_eq!(snapshot["entries"][0]["op"], "exists");
     for bad in ["", "rs3cl_wrong"] {
         let response = s.app.clone().oneshot(bearer(bad)).await.unwrap();
@@ -860,7 +860,7 @@ async fn s6_1_the_access_report_names_the_five_actions() {
     let report = s.send(&s.replicator, "GET", "/bkt", "x-rs3-access", &[], b"").await;
     assert_eq!(report.status, StatusCode::OK);
     let report = report.json();
-    assert_eq!(keys_of(&report), set(&["site_id", "site_name", "bucket", "read_only", "actions", "merge_back"]));
+    assert_eq!(keys_of(&report), set(&["site_id", "site_name", "bucket", "read_only", "actions", "merge_back", "versioning"]));
     assert_eq!(report["site_id"], SITE);
     assert_eq!(report["site_name"], "Spec site");
     assert_eq!(report["bucket"], BUCKET);
@@ -1080,7 +1080,7 @@ async fn w1_w3_the_request_and_the_live_batch_have_the_specified_shape() {
     assert_eq!(events.iter().map(|e| e["op"].as_str().unwrap()).collect::<Vec<_>>(), ["put", "delete"]);
     assert_eq!(
         keys_of(&events[0]),
-        set(&["seq", "op", "key", "etag", "size", "last_modified_ms", "version", "origin", "ts_ms", "parts", "stamp"])
+        set(&["seq", "op", "key", "etag", "size", "last_modified_ms", "version", "origin", "ts_ms", "parts", "stamp", "versioned"])
     );
     assert_eq!(events[1]["removed_stamp"], events[0]["stamp"]);
     // The same events the changelog read returns.
@@ -1239,4 +1239,87 @@ async fn s9_versioning_enabled_suspended_and_version_scoped_requests() {
     // Off is not a state a bucket can return to.
     let r = versioning(&s, "<VersioningConfiguration></VersioningConfiguration>").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn s5_4_a_versioned_bucket_keeps_replicated_history_by_identity() {
+    let s = Server::start().await;
+    let admin = s.admin();
+    let r = s.send(&admin, "PUT", &format!("/{BUCKET}"), "versioning", &[], b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::OK);
+    // The current state, stamped now.
+    let now = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h"), "", &[("x-rs3-stamp", &st(now_ms(), 0, "feedfacefeedface")), ("x-rs3-versioned", "true")], b"now").await;
+    assert_eq!(now.status, StatusCode::OK, "{}", now.text());
+    let now_id = now.header("x-amz-version-id").unwrap().to_string();
+    // An older state arriving later is history, not stale: kept under its
+    // stamp, answered as a success, listed, readable by id.
+    let old_stamp = st(now_ms() - 60_000, 3, "feedfacefeedface");
+    let old = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h"), "", &[("x-rs3-stamp", &old_stamp), ("x-rs3-versioned", "true")], b"old").await;
+    assert_eq!(old.status, StatusCode::OK, "{}", old.text());
+    let old_id = old.header("x-amz-version-id").unwrap().to_string();
+    assert!(old_id < now_id);
+    let head = s.head("h").await;
+    assert_eq!(head.header("x-amz-version-id"), Some(now_id.as_str()), "the current state is untouched");
+    let by_id = s.send(&admin, "GET", &format!("/{BUCKET}/h"), &format!("versionId={old_id}"), &[], b"").await;
+    assert_eq!((by_id.status, by_id.body.as_slice()), (StatusCode::OK, &b"old"[..]));
+    // The same version again: dropped silently.
+    let again = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h"), "", &[("x-rs3-stamp", &old_stamp), ("x-rs3-versioned", "true")], b"old").await;
+    assert_eq!(again.status, StatusCode::OK);
+    let listing = s.send(&admin, "GET", &format!("/{BUCKET}"), "versions&prefix=h", &[], b"").await.text();
+    assert_eq!(listing.matches("<Version>").count(), 2, "{listing}");
+    // A null state from the source stays null here.
+    let null = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h"), "", &[("x-rs3-stamp", &st(now_ms() - 120_000, 0, "feedfacefeedface")), ("x-rs3-versioned", "false")], b"null").await;
+    assert_eq!((null.status, null.header("x-amz-version-id")), (StatusCode::OK, Some("null")));
+    let by_null = s.send(&admin, "GET", &format!("/{BUCKET}/h"), "versionId=null", &[], b"").await;
+    assert_eq!(by_null.body, b"null");
+    // An older delete is a noncurrent marker.
+    let marker_stamp = st(now_ms() - 30_000, 0, "feedfacefeedface");
+    let marker = s.send(&s.replicator, "DELETE", &format!("/{BUCKET}/h"), "", &[("x-rs3-stamp", &marker_stamp), ("x-rs3-removed-stamp", &old_stamp), ("x-rs3-versioned", "true")], b"").await;
+    assert_eq!(marker.status, StatusCode::NO_CONTENT, "{}", marker.text());
+    assert_eq!(s.head("h").await.status, StatusCode::OK, "the current state is untouched");
+    let listing = s.send(&admin, "GET", &format!("/{BUCKET}"), "versions&prefix=h", &[], b"").await.text();
+    assert_eq!((listing.matches("<Version>").count(), listing.matches("<DeleteMarker>").count()), (3, 1), "{listing}");
+    // Header rules.
+    let bad = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h2"), "", &[("x-rs3-versioned", "true")], b"x").await;
+    assert_eq!((bad.status, bad.s3_code()), (StatusCode::BAD_REQUEST, "InvalidArgument".to_string()));
+    let bad = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h2"), "", &[("x-rs3-stamp", &st(now_ms(), 0, "feedfacefeedface")), ("x-rs3-versioned", "yes")], b"x").await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+
+    // Removing a version is logged as remove_version and remembered: the
+    // version cannot come back, and a removal of a version never held is
+    // remembered too.
+    let r = s.send(&admin, "DELETE", &format!("/{BUCKET}/h"), &format!("versionId={old_id}"), &[], b"").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let event = s.last_event().await;
+    assert_eq!((event["op"].as_str(), event["key"].as_str(), event["version"].as_str(), event["versioned"].as_bool()), (Some("remove_version"), Some("h"), Some(old_id.as_str()), Some(true)));
+    assert_eq!(stamp_of(&event["stamp"]).to_header(), old_stamp);
+    let back = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h"), "", &[("x-rs3-stamp", &old_stamp), ("x-rs3-versioned", "true")], b"old").await;
+    assert_eq!(back.status, StatusCode::OK);
+    let gone = s.send(&admin, "GET", &format!("/{BUCKET}/h"), &format!("versionId={old_id}"), &[], b"").await;
+    assert_eq!((gone.status, gone.s3_code()), (StatusCode::NOT_FOUND, "NoSuchVersion".to_string()), "a removed version does not come back");
+    let never = st(now_ms() - 90_000, 0, "feedfacefeedface");
+    let never_id = crate::storage::layouts::v3::stamp_dir(&Stamp::parse_header(&never).unwrap());
+    let r = s.send(&s.replicator, "DELETE", &format!("/{BUCKET}/h"), &format!("versionId={never_id}"), &[("x-rs3-stamp", &never)], b"").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(s.last_event().await["op"].as_str(), Some("remove_version"));
+    let refused = s.send(&s.replicator, "PUT", &format!("/{BUCKET}/h"), "", &[("x-rs3-stamp", &never), ("x-rs3-versioned", "true")], b"never").await;
+    assert_eq!(refused.status, StatusCode::OK);
+    let listing = s.send(&admin, "GET", &format!("/{BUCKET}"), "versions&prefix=h", &[], b"").await.text();
+    assert!(!listing.contains(&never_id), "{listing}");
+
+    // The versions snapshot pages through everything, newest first per key.
+    let page = s.snapshot("versions=1&limit=2").await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    let body = page.json();
+    assert_eq!(body["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(body["entries"][0]["op"], "exists");
+    assert_eq!(body["entries"][0]["version"].as_str(), Some(now_id.as_str()));
+    assert_eq!(body["entries"][0]["versioned"], true);
+    assert_eq!(body["entries"][1]["op"], "deleted");
+    assert!(body["next_after"].as_str() == Some("h") && body["next_after_version"].is_string(), "{body}");
+    let rest = s.snapshot(&format!("versions=1&after=h&after_version={}", body["next_after_version"].as_str().unwrap())).await.json();
+    assert_eq!(rest["entries"].as_array().unwrap().len(), 1, "{rest}");
+    assert_eq!(rest["entries"][0]["versioned"], false, "the null version, by its stamp: {rest}");
+    assert_ne!(rest["entries"][0]["version"].as_str(), Some(now_id.as_str()));
+    assert!(rest["next_after"].is_null());
 }

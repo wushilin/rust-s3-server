@@ -199,6 +199,9 @@ pub enum WireOp {
     Delete,
     Exists,
     Deleted,
+    /// One version of the key (its `stamp`) was permanently removed.
+    #[serde(rename = "remove_version")]
+    RemoveVersion,
     /// An operation this build does not know (a newer peer's). A reader
     /// must not guess what it means.
     #[serde(other)]
@@ -212,6 +215,7 @@ impl WireOp {
             WireOp::Delete => "delete",
             WireOp::Exists => "exists",
             WireOp::Deleted => "deleted",
+            WireOp::RemoveVersion => "remove_version",
             WireOp::Unknown => "unknown",
         }
     }
@@ -304,9 +308,34 @@ pub struct WireEvent {
     /// it never defeats a newer version than the one its author saw.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub removed_stamp: Option<crate::storage::stamp::Stamp>,
+    /// The state is a real version of a versioning-enabled bucket (its
+    /// stamp is its version id); `false` is the key's `null` version.
+    /// Absent from events written before versioning existed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub versioned: Option<bool>,
 }
 
 impl WireEvent {
+    /// A snapshot entry for one version of a key: `exists` for a live
+    /// version, `deleted` for a delete marker.
+    pub fn version(v: &crate::storage::index::VersionRecord) -> Self {
+        Self {
+            seq: None,
+            op: if v.delete_marker { WireOp::Deleted } else { WireOp::Exists },
+            key: v.object_key.clone(),
+            etag: v.etag.clone(),
+            size: v.size,
+            last_modified_ms: v.last_modified_ms,
+            version: v.version_dir(),
+            origin: None,
+            ts_ms: None,
+            parts: v.parts.clone(),
+            stamp: Some(v.stamp.clone()),
+            removed_stamp: v.removed.clone(),
+            versioned: Some(v.versioned),
+        }
+    }
+
     /// A snapshot entry for a stored object. Objects written before stamps
     /// existed get the fallback stamp `(last_modified_ms, 0, site)`.
     pub fn exists(record: &crate::storage::index::ObjectRecord, site: &str) -> Self {
@@ -328,6 +357,7 @@ impl WireEvent {
                     .unwrap_or_else(|| crate::storage::stamp::Stamp::fallback(record.last_modified_ms, site)),
             ),
             removed_stamp: None,
+            versioned: Some(record.versioned),
         }
     }
 }
@@ -339,6 +369,7 @@ impl From<&ChangeEvent> for WireEvent {
             op: match event.op {
                 ChangeOp::Put => WireOp::Put,
                 ChangeOp::Delete => WireOp::Delete,
+                ChangeOp::RemoveVersion => WireOp::RemoveVersion,
             },
             key: event.key.clone(),
             etag: event.etag.clone(),
@@ -350,6 +381,7 @@ impl From<&ChangeEvent> for WireEvent {
             parts: event.parts.clone(),
             stamp: event.stamp.clone(),
             removed_stamp: event.removed_stamp.clone(),
+            versioned: Some(event.versioned),
         }
     }
 }

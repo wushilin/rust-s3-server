@@ -1329,7 +1329,7 @@ impl LocalObjectStore {
         mut object_meta: ObjectMeta,
         options: WriteOptions,
     ) -> Result<PutResult> {
-        let WriteOptions { origin, precondition } = options;
+        let WriteOptions { origin, precondition, versioned: versioned_hint } = options;
         if let Err(err) = self.check_write_allowed(bucket, &origin).await {
             let _ = tokio::fs::remove_dir_all(publish_dir).await;
             return Err(err);
@@ -1362,6 +1362,20 @@ impl LocalObjectStore {
         // The key's current state: the object, or its tombstone.
         let old_tombstone = index.get_tombstone(key).await?;
         let current = self.current_rank(&index, key, old.as_ref()).await?;
+        let versioned = self.versioned_bit(&index, key, versioning, versioned_hint).await?;
+        // On a versioning-enabled bucket a replicated state that does not
+        // outrank the current one is not stale: it is history, kept as a
+        // noncurrent version (every site holds the same set of versions).
+        if versioning == BucketVersioning::Enabled {
+            if let Some(given) = origin.given_stamp().filter(|_| origin.adjudicated()) {
+                let below = current.as_ref().is_some_and(|(rank, _)| !outranks(&Rank::live(given.clone()), Some(rank)));
+                if below {
+                    return self
+                        .insert_history_version(bucket, key, &index, publish_dir, object_meta, given.clone(), versioned, &origin)
+                        .await;
+                }
+            }
+        }
         let stamp = match self.decide(bucket, key, &origin, origin.put_rank(), current.as_ref()) {
             Ok(stamp) => stamp,
             Err(err) => {
@@ -1380,7 +1394,6 @@ impl LocalObjectStore {
                 .unwrap_or(i64::MIN)
                 .max(stamp.ms),
         };
-        let versioned = versioning.writes_versions();
         if last_modified_ms != object_meta.last_modified_ms
             || object_meta.stamp.as_ref() != Some(&stamp)
             || object_meta.versioned != versioned
@@ -1556,6 +1569,175 @@ impl LocalObjectStore {
             }
         }
         Ok(())
+    }
+
+    /// Whether a state written now is a real version. Only on a
+    /// versioning-enabled bucket; there, a replicated state that was the
+    /// `null` version on its site (`hint` `Some(false)`) stays `null` here
+    /// if the key has no `null` state yet, and is a real version otherwise
+    /// (a key holds one `null` state, so the history of an unversioned
+    /// source is still kept). Called under the key lock.
+    async fn versioned_bit(&self, index: &ObjectIndex, key: &str, versioning: BucketVersioning, hint: Option<bool>) -> Result<bool> {
+        Ok(match (versioning, hint) {
+            (BucketVersioning::Enabled, Some(false)) => self.has_null_state(index, key).await?,
+            (BucketVersioning::Enabled, _) => true,
+            _ => false,
+        })
+    }
+
+    /// Whether this site already holds (or permanently removed) version
+    /// `stamp` of `key`: as the current object, the current marker, a
+    /// noncurrent version, or a version tombstone.
+    pub async fn version_known(&self, bucket: &str, key: &str, stamp: &Stamp) -> Result<bool> {
+        let index = self.index(bucket).await?;
+        self.version_known_in(&index, key, stamp).await
+    }
+
+    async fn version_known_in(&self, index: &ObjectIndex, key: &str, stamp: &Stamp) -> Result<bool> {
+        if let Some(row) = index.get(key).await? {
+            if self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms) == *stamp {
+                return Ok(true);
+            }
+        }
+        if index.get_tombstone(key).await?.is_some_and(|t| t.stamp == *stamp) {
+            return Ok(true);
+        }
+        let dir = v3::stamp_dir(stamp);
+        Ok(index.get_version(key, &dir).await?.is_some() || index.has_version_tombstone(key, &dir).await?)
+    }
+
+    /// Whether the key has a `null` state anywhere (current or kept).
+    async fn has_null_state(&self, index: &ObjectIndex, key: &str) -> Result<bool> {
+        if index.get(key).await?.is_some_and(|row| !row.versioned) {
+            return Ok(true);
+        }
+        if index.get_tombstone(key).await?.is_some_and(|t| !t.versioned && t.blob_dir.is_some()) {
+            return Ok(true);
+        }
+        Ok(index.versions_of(key).await?.iter().any(|v| !v.versioned))
+    }
+
+    /// Commits `publish_dir` as a noncurrent version `stamp` of `key` (a
+    /// replicated state older than the current one, on a versioning-enabled
+    /// bucket). Idempotent: a version this site already knows is dropped.
+    /// A `null` state never joins a key that has one. The caller holds the
+    /// key lock.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_history_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        index: &ObjectIndex,
+        publish_dir: &Path,
+        mut meta: ObjectMeta,
+        stamp: Stamp,
+        versioned: bool,
+        origin: &WriteOrigin,
+    ) -> Result<PutResult> {
+        let result = PutResult {
+            etag: meta.etag.clone(),
+            size: meta.size,
+            last_modified_ms: stamp.ms,
+            version_id: Some(if versioned { v3::stamp_dir(&stamp) } else { "null".to_string() }),
+            stamp: Some(stamp.clone()),
+        };
+        if self.version_known_in(index, key, &stamp).await? || (!versioned && self.has_null_state(index, key).await?) {
+            let _ = tokio::fs::remove_dir_all(publish_dir).await;
+            return Ok(result);
+        }
+        meta.format_version = META_FORMAT;
+        meta.stamp = Some(stamp.clone());
+        meta.versioned = versioned;
+        meta.last_modified_ms = stamp.ms;
+        write_json_atomic(&publish_dir.join("meta.json"), &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&publish_dir.join("meta.json")).await?;
+            fsync_dir(publish_dir).await?;
+        }
+        let blob_rel = v3::blob_rel(bucket, key, &stamp);
+        let intent_id = index.insert_publish_intent(key, &blob_rel, now_ms()).await?;
+        self.rename_into_tree(bucket, publish_dir, &blob_rel).await?;
+        let record = VersionRecord {
+            object_key: key.to_string(),
+            stamp: stamp.clone(),
+            blob_dir: blob_rel,
+            size: meta.size,
+            etag: meta.etag.clone(),
+            last_modified_ms: stamp.ms,
+            parts: Some(crate::storage::changelog::PartLayout::of(&meta)),
+            versioned,
+            delete_marker: false,
+            removed: None,
+        };
+        index
+            .commit_version_insert(&record, Some(intent_id), Displaced::default(), now_ms(), origin.change_origin())
+            .await?;
+        Ok(result)
+    }
+
+    /// Commits a delete marker `stamp` (removing `removed`) as a noncurrent
+    /// version of `key`: a replicated delete older than the key's current
+    /// state, on a versioning-enabled bucket. Idempotent. The caller holds
+    /// the key lock.
+    async fn insert_history_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+        index: &ObjectIndex,
+        stamp: Stamp,
+        removed: Stamp,
+        versioned: bool,
+        origin: &WriteOrigin,
+    ) -> Result<DeleteResult> {
+        let result = DeleteResult {
+            size: None,
+            version_id: Some(if versioned { v3::stamp_dir(&stamp) } else { "null".to_string() }),
+            delete_marker: true,
+        };
+        if self.version_known_in(index, key, &stamp).await? || (!versioned && self.has_null_state(index, key).await?) {
+            return Ok(result);
+        }
+        let marker_rel = self.write_delete_marker(bucket, key, &stamp, &removed, versioned).await?;
+        let record = VersionRecord {
+            object_key: key.to_string(),
+            stamp: stamp.clone(),
+            blob_dir: marker_rel,
+            size: 0,
+            etag: String::new(),
+            last_modified_ms: stamp.ms,
+            parts: None,
+            versioned,
+            delete_marker: true,
+            removed: Some(removed),
+        };
+        index
+            .commit_version_insert(&record, None, Displaced::default(), now_ms(), origin.change_origin())
+            .await?;
+        Ok(result)
+    }
+
+    /// Moves a prepared blob dir to `blob_rel` in the live tree (a leftover
+    /// at that path is trashed first), making the new entries durable.
+    async fn rename_into_tree(&self, bucket: &str, publish_dir: &Path, blob_rel: &str) -> Result<PathBuf> {
+        let bucket_dir = self.layout.bucket_dir(bucket)?;
+        let dest = bucket_dir.join(blob_rel);
+        let leaf = bucket_dir.join(blob_rel_parent(blob_rel));
+        for attempt in 0..100 {
+            tokio::fs::create_dir_all(&leaf).await?;
+            match tokio::fs::rename(publish_dir, &dest).await {
+                Ok(()) => break,
+                Err(err) if err.kind() == ErrorKind::AlreadyExists || err.kind() == ErrorKind::DirectoryNotEmpty => {
+                    move_object_dir_to_trash(&self.layout, bucket, &dest).await?;
+                }
+                Err(err) if is_leaf_reclaimed_race(&err) && attempt < 99 => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if self.durability == Durability::Full {
+            fsync_dir(&leaf).await?;
+            fsync_dir(&bucket_dir.join("objects")).await?;
+        }
+        Ok(dest)
     }
 
     /// The `x-amz-version-id` of a state written with `stamp` under
@@ -1738,7 +1920,7 @@ impl LocalObjectStore {
         options: WriteOptions,
         removed: Option<Stamp>,
     ) -> Result<DeleteResult> {
-        let WriteOptions { origin, precondition } = options;
+        let WriteOptions { origin, precondition, versioned: versioned_hint } = options;
         self.ensure_bucket_and_key(bucket, key).await?;
         self.check_write_allowed(bucket, &origin).await?;
         let versioning = self.bucket_meta(bucket).await?.versioning;
@@ -1762,8 +1944,18 @@ impl LocalObjectStore {
             (None, None, None) => return Ok(DeleteResult::default()),
         };
         let current = self.current_rank(&index, key, row.as_ref()).await?;
+        let versioned = self.versioned_bit(&index, key, versioning, versioned_hint).await?;
+        // History on a versioning-enabled bucket: a replicated delete that
+        // does not outrank the current state is kept as a noncurrent marker.
+        if versioning == BucketVersioning::Enabled {
+            if let Some(given) = origin.given_stamp().filter(|_| origin.adjudicated()) {
+                let below = current.as_ref().is_some_and(|(rank, _)| !outranks(&Rank::deleted(removed.clone()), Some(rank)));
+                if below {
+                    return self.insert_history_marker(bucket, key, &index, given.clone(), removed, versioned, &origin).await;
+                }
+            }
+        }
         let stamp = self.decide(bucket, key, &origin, Some(Rank::deleted(removed.clone())), current.as_ref())?;
-        let versioned = versioning.writes_versions();
         let old_tombstone = index.get_tombstone(key).await?;
         // The marker goes to disk first: a rebuild after a crash past the
         // commit must find the delete.
@@ -2236,6 +2428,18 @@ impl LocalObjectStore {
         let index = self.index(bucket).await?;
         let _guard = self.locks.lock(bucket, key).await;
         let Ok(version) = self.find_version(bucket, key, version_id).await else {
+            // A replicated removal of a version this site never got (or
+            // already removed): remember it, so a copy arriving later is
+            // refused, and pass it on.
+            if let (Some(given), Some(stamp)) = (origin.given_stamp(), v3::parse_stamp_dir(version_id)) {
+                let dir = v3::stamp_dir(&stamp);
+                if !index.has_version_tombstone(key, &dir).await? {
+                    self.clock().observe(given);
+                    index
+                        .record_version_tombstone(key, &stamp, true, now_ms(), origin.change_origin())
+                        .await?;
+                }
+            }
             return Ok(None);
         };
         let target = match (version.is_current, version.record.delete_marker) {
@@ -2309,6 +2513,7 @@ impl LocalObjectStore {
         let index = self.index(bucket).await?;
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         let purged = index.purge_tombstones(cutoff_ms, max_entries).await?;
+        index.purge_version_tombstones(cutoff_ms, max_entries).await?;
         for t in &purged {
             if let Some(dir) = &t.blob_dir {
                 let _guard = self.locks.lock(bucket, &t.object_key).await;
@@ -2716,9 +2921,12 @@ impl LocalObjectStore {
         // anything is assembled, leaving the upload intact (to abort). The
         // publish re-checks under the key lock.
         if let Some(incoming) = options.origin.put_rank().filter(|_| options.origin.adjudicated()) {
-            if let Some(current) = self.key_rank(bucket, key).await? {
-                if !outranks(&incoming, Some(&current)) {
-                    return Err(Self::stale(bucket, key, &current));
+            // (A versioning-enabled bucket keeps an older state as history.)
+            if self.bucket_versioning(bucket).await? != BucketVersioning::Enabled {
+                if let Some(current) = self.key_rank(bucket, key).await? {
+                    if !outranks(&incoming, Some(&current)) {
+                        return Err(Self::stale(bucket, key, &current));
+                    }
                 }
             }
         }

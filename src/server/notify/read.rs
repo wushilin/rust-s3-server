@@ -66,6 +66,11 @@ pub struct SnapshotParams {
     /// List the tombstones (deleted keys still remembered) instead of the
     /// objects: `op: "deleted"` entries with the delete's stamp.
     pub deleted: bool,
+    /// List every version of every key (newest first per key, delete
+    /// markers as `deleted` entries), not just the current state; the page
+    /// resumes after (`after`, `after_version`).
+    pub versions: bool,
+    pub after_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +93,10 @@ pub struct ReadResponse {
     /// More changes are already available after `next`.
     pub more: bool,
     pub events: Vec<WireEvent>,
+    /// The bucket's versioning state (`off`, `enabled`, `suspended`); a
+    /// link stops when its two buckets differ.
+    #[serde(default = "default_versioning")]
+    pub versioning: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +114,17 @@ pub struct SnapshotResponse {
     pub entries: Vec<WireEvent>,
     /// Pass as `after=` for the next page; `None` when the listing is done.
     pub next_after: Option<String>,
+    /// With `versions`: pass as `after_version=` beside `next_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after_version: Option<String>,
+    /// The bucket's versioning state (`off`, `enabled`, `suspended`): a
+    /// pusher sends every version to a bucket that keeps them.
+    #[serde(default = "default_versioning")]
+    pub versioning: String,
+}
+
+fn default_versioning() -> String {
+    "off".to_string()
 }
 
 #[derive(Debug)]
@@ -230,6 +250,10 @@ pub fn snapshot_params(query: &HashMap<String, String>) -> Result<SnapshotParams
         deleted: query
             .get("deleted")
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        versions: query
+            .get("versions")
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        after_version: query.get("after_version").cloned().filter(|v| !v.is_empty()),
     })
 }
 
@@ -347,6 +371,7 @@ async fn read_once(store: &LocalObjectStore, bucket: &str, params: &ReadParams) 
         next,
         more,
         events,
+        versioning: store.bucket_versioning(bucket).await?.as_str().to_string(),
     })
 }
 
@@ -358,6 +383,7 @@ pub async fn snapshot(
     params: &SnapshotParams,
 ) -> Result<SnapshotResponse, ReadError> {
     let index = store.index(bucket).await?;
+    let versioning = store.bucket_versioning(bucket).await?.as_str().to_string();
     if params.deleted {
         let head = index.changelog_head();
         let (tombstones, more) = index
@@ -385,10 +411,42 @@ pub async fn snapshot(
                     ts_ms: None,
                     parts: None,
                     removed_stamp: t.removed.clone(),
+                    versioned: Some(t.versioned),
                     stamp: Some(t.stamp),
                 })
                 .collect(),
             next_after,
+            next_after_version: None,
+            versioning: versioning.clone(),
+        });
+    }
+    if params.versions {
+        let head = index.changelog_head();
+        let page = index
+            .list_versions_page(
+                &params.filter.prefix,
+                params.after.as_deref(),
+                params.after_version.as_deref(),
+                params.limit,
+                &store.site_id(),
+                true,
+            )
+            .await?;
+        return Ok(SnapshotResponse {
+            bucket: bucket.to_string(),
+            site_id: store.site_id(),
+            site_name: store.site_name(),
+            log_id: index.changelog_id().to_string(),
+            head,
+            entries: page
+                .entries
+                .iter()
+                .filter(|(v, _)| params.filter.matches_key(&v.object_key))
+                .map(|(v, _)| WireEvent::version(v))
+                .collect(),
+            next_after: if page.is_truncated { page.next_key_marker } else { None },
+            next_after_version: if page.is_truncated { page.next_version_marker } else { None },
+            versioning: versioning.clone(),
         });
     }
     if !params.filter.wants_puts() {
@@ -401,6 +459,8 @@ pub async fn snapshot(
             head: index.changelog_head(),
             entries: Vec::new(),
             next_after: None,
+            next_after_version: None,
+            versioning: versioning.clone(),
         });
     }
     // Head first: everything committed after it is replayed live.
@@ -424,5 +484,7 @@ pub async fn snapshot(
         head,
         entries,
         next_after: if page.is_truncated { page.next_after } else { None },
+        next_after_version: None,
+        versioning,
     })
 }

@@ -98,6 +98,11 @@ impl WriteOrigin {
 pub struct WriteOptions {
     pub origin: WriteOrigin,
     pub precondition: Option<Precondition>,
+    /// A replicated write: whether the state is a real version on the site
+    /// it came from (`x-rs3-versioned`). On a versioning-enabled bucket
+    /// the state keeps that: a `null` version stays `null`. `None`: the
+    /// bucket's own rule.
+    pub versioned: Option<bool>,
 }
 
 impl WriteOptions {
@@ -107,7 +112,12 @@ impl WriteOptions {
 
     /// A write of `origin`, unconditional.
     pub fn from_origin(origin: WriteOrigin) -> Self {
-        Self { origin, precondition: None }
+        Self { origin, precondition: None, versioned: None }
+    }
+
+    pub fn with_versioned(mut self, versioned: Option<bool>) -> Self {
+        self.versioned = versioned;
+        self
     }
 
     /// A replicated write keeping `stamp`.
@@ -121,7 +131,7 @@ impl WriteOptions {
     }
 
     pub fn precondition(precondition: Option<Precondition>) -> Self {
-        Self { origin: WriteOrigin::Client, precondition }
+        Self { origin: WriteOrigin::Client, precondition, versioned: None }
     }
 
     pub fn with_precondition(mut self, precondition: Option<Precondition>) -> Self {

@@ -23,6 +23,7 @@ use super::change::{Change, Kind};
 use super::peer::{PeerClient, PeerError};
 use crate::server::notify::model::WireEvent;
 use crate::storage::errors::StorageError;
+use crate::storage::metadata::BucketVersioning;
 use crate::storage::store::{CompletePartRequest, LocalObjectStore, WriteOptions, WriteOrigin};
 use crate::storage::write::outranks;
 use crate::storage::time::now_ms;
@@ -53,6 +54,8 @@ pub(super) struct Worker {
     /// How often a transfer in progress renews the lease (the heartbeat):
     /// every chunk counts as progress, the renewal is throttled to this.
     pub lease_renew: Duration,
+    /// See `Timing::fatal_pause`.
+    pub fatal_pause: Duration,
 }
 
 /// Renews `heartbeat` (the worker's lease) if `renew` has passed since it
@@ -199,7 +202,7 @@ impl Worker {
                     // (the configuration may get fixed meanwhile).
                     tokio::select! {
                         _ = self.cancel.cancelled() => {}
-                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                        _ = tokio::time::sleep(self.fatal_pause) => {}
                     }
                     return;
                 }
@@ -245,6 +248,26 @@ impl Worker {
             Ok(checkpoint) => Ok(Some(checkpoint)),
             Err(err) => Err(StepError::Resnapshot(format!("unreadable checkpoint: {err}"))),
         }
+    }
+
+    /// The local bucket's versioning state.
+    async fn local_versioning(&self) -> Result<String, StepError> {
+        Ok(self.store.bucket_versioning(&self.link.local_bucket).await?.as_str().to_string())
+    }
+
+    /// A link needs the same versioning setting on both buckets: a mismatch
+    /// (a setting changed on one side) stops it at once. Nothing is
+    /// checkpointed until a batch is applied, so once the settings match
+    /// again the link continues from its position.
+    async fn check_versioning(&self, peer: &str) -> Result<(), StepError> {
+        let local = self.local_versioning().await?;
+        if peer != local {
+            return Err(StepError::Fatal(format!(
+                "versioning differs: bucket {} here is {local}, the peer's is {peer}; the link resumes once both                  buckets have the same setting",
+                self.link.local_bucket
+            )));
+        }
+        Ok(())
     }
 
     async fn save(&self, checkpoint: Option<&Checkpoint>) -> Result<(), StepError> {
@@ -322,11 +345,15 @@ impl Worker {
             }
             other => other,
         };
+        // A versioning-enabled bucket snapshots the peer's versions, not
+        // just its current states.
+        let versions = self.versioned().await?;
         let Some(mut checkpoint) = checkpoint else {
             // Start: the first snapshot page fixes where live replay begins.
-            let page = self.peer.snapshot(None, SNAPSHOT_PAGE, "", false).await?;
+            let page = self.peer.snapshot(None, SNAPSHOT_PAGE, "", false, versions).await?;
             self.peer_answered();
             self.check_site(&page.site_id)?;
+            self.check_versioning(&page.versioning).await?;
             self.peer_named(&page.site_name);
             let mut checkpoint = Checkpoint {
                 v: RECORD_VERSION,
@@ -354,8 +381,9 @@ impl Worker {
         match checkpoint.phase.clone() {
             Phase::Snapshot { cursor, tombstones: false, .. } => {
                 self.update(|s| s.state = "snapshot".to_string());
-                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", false).await?;
+                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", false, versions).await?;
                 self.peer_answered();
+                self.check_versioning(&page.versioning).await?;
                 if page.log_id != checkpoint.peer_log_id {
                     return Err(StepError::Resnapshot("the peer's changelog changed mid-snapshot".to_string()));
                 }
@@ -365,8 +393,9 @@ impl Worker {
             Phase::Snapshot { through, cursor, tombstones: true } => {
                 // Merge mode: the peer's remembered deletes, so a key deleted
                 // there does not survive here.
-                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", true).await?;
+                let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", true, false).await?;
                 self.peer_answered();
+                self.check_versioning(&page.versioning).await?;
                 self.apply_all(&page.entries, &checkpoint.peer_site).await?;
                 checkpoint.phase = match page.next_after {
                     Some(next) => Phase::Snapshot { through, cursor: Some(next), tombstones: true },
@@ -391,6 +420,7 @@ impl Worker {
                 };
                 self.peer_answered();
                 self.check_site(&page.site_id)?;
+                self.check_versioning(&page.versioning).await?;
                 self.peer_named(&page.site_name);
                 self.apply_all(&page.events, &checkpoint.peer_site).await?;
                 checkpoint.phase = Phase::Live { after: page.next };
@@ -420,16 +450,24 @@ impl Worker {
             return Ok(());
         };
         self.apply_all(&page.entries, &checkpoint.peer_site).await?;
+        // The sweep works in keys; a versions listing may split a key
+        // across pages, and that key is `present` on both.
+        let from_key = from.as_deref().map(|c| c.split('\0').next().unwrap_or(c).to_string());
         if self.link.mode == Mode::Mirror {
             let upto = page.next_after.clone();
             let present: std::collections::HashSet<&str> = page.entries.iter().map(|e| e.key.as_str()).collect();
-            self.sweep(from.as_deref(), upto.as_deref(), &present).await?;
+            self.sweep(from_key.as_deref(), upto.as_deref(), &present).await?;
         }
         self.update(|s| {
             s.snapshot_cursor = page.next_after.clone();
             s.last_progress_ms = now_ms();
         });
-        checkpoint.phase = match (page.next_after, self.link.mode) {
+        // A versions cursor carries the version too: `<key>\0<version dir>`.
+        let next_cursor = page.next_after.clone().map(|key| match &page.next_after_version {
+            Some(version) => format!("{key}\0{version}"),
+            None => key,
+        });
+        checkpoint.phase = match (next_cursor, self.link.mode) {
             (Some(next), _) => Phase::Snapshot { through, cursor: Some(next), tombstones: false },
             (None, Mode::Merge) => Phase::Snapshot { through, cursor: None, tombstones: true },
             (None, Mode::Mirror) => Phase::Live { after: through },
@@ -489,7 +527,9 @@ impl Worker {
     /// every change is applied, so the caller's checkpoint never runs ahead.
     pub(super) async fn apply_all(&self, events: &[WireEvent], peer_site: &str) -> Result<(), StepError> {
         use futures::StreamExt;
-        let (batch, collapsed) = latest_per_key(events);
+        // A versioning-enabled bucket keeps every state it is sent, so
+        // nothing is collapsed: each event is a version to hold.
+        let (batch, collapsed) = if self.versioned().await? { (events.to_vec(), 0) } else { latest_per_key(events) };
         if collapsed > 0 {
             self.update(|s| s.collapsed += collapsed as u64);
         }
@@ -508,28 +548,58 @@ impl Worker {
         }
     }
 
+    /// Whether the local bucket has versioning enabled: it then holds every
+    /// version the peer has, applied by identity rather than by rank.
+    async fn versioned(&self) -> Result<bool, StepError> {
+        Ok(self.store.bucket_versioning(&self.link.local_bucket).await? == BucketVersioning::Enabled)
+    }
+
     /// Applies one change (or snapshot entry) with its own stamp.
     async fn apply(&self, event: &WireEvent, peer_site: &str) -> Result<(), StepError> {
         self.beat();
         let bucket = &self.link.local_bucket;
         let change = Change::from_event(event, peer_site).map_err(StepError::Fatal)?;
-        // Not ranked above what is here: nothing to fetch (an echo, a replay,
-        // or a change that lost to another).
-        let current = self.store.key_rank(bucket, &change.key).await?;
-        if !outranks(&change.rank(), current.as_ref()) {
-            self.update(|s| s.skipped += 1);
-            return Ok(());
-        }
         if change.is_repair_delete() {
             // The peer lost its copy; that is not a client's delete. Keep
             // ours (the peer can restore from it).
             self.update(|s| s.skipped += 1);
             return Ok(());
         }
+        if change.kind == Kind::RemoveVersion {
+            // A version permanently removed on the peer: remove it here (or
+            // remember that it is gone), whatever ranks where.
+            self.store
+                .delete_object_version(bucket, &change.key, &change.version, WriteOrigin::Replicated(change.stamp.clone()))
+                .await?;
+            self.update(|s| s.deleted += 1);
+            return Ok(());
+        }
+        if self.versioned().await? {
+            // Held already (as the current state, a kept version, or a
+            // removed one): nothing to fetch.
+            if self.store.version_known(bucket, &change.key, &change.stamp).await? {
+                self.update(|s| s.skipped += 1);
+                return Ok(());
+            }
+        } else {
+            // Not ranked above what is here: nothing to fetch (an echo, a
+            // replay, or a change that lost to another).
+            let current = self.store.key_rank(bucket, &change.key).await?;
+            if !outranks(&change.rank(), current.as_ref()) {
+                self.update(|s| s.skipped += 1);
+                return Ok(());
+            }
+        }
         let result = match &change.kind {
+            Kind::RemoveVersion => unreachable!("handled above"),
             Kind::Delete { removed } => self
                 .store
-                .delete_object_with(bucket, &change.key, WriteOptions::replicated(change.stamp.clone()), Some(removed.clone()))
+                .delete_object_with(
+                    bucket,
+                    &change.key,
+                    WriteOptions::replicated(change.stamp.clone()).with_versioned(change.versioned),
+                    Some(removed.clone()),
+                )
                 .await
                 .map(|_| self.update(|s| s.deleted += 1)),
             Kind::Put => match self.apply_put(&change).await {
@@ -575,7 +645,7 @@ impl Worker {
     async fn apply_put(&self, change: &Change) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
         let key = &change.key;
-        let options = WriteOptions::replicated(change.stamp.clone());
+        let options = WriteOptions::replicated(change.stamp.clone()).with_versioned(change.versioned);
         let local = self.store.index(bucket).await.map_err(PutError::Local)?.get(key).await.map_err(PutError::Local)?;
         let same_bytes = local.is_some_and(|row| row.etag == change.etag && row.size == change.size);
         if same_bytes {

@@ -115,6 +115,9 @@ pub struct Timing {
     pub parallelism: usize,
     /// A transfer in progress renews the worker's lease this often.
     pub lease_renew: Duration,
+    /// How long a worker stays stopped after a fatal error before the
+    /// supervisor tries it again (the configuration may be fixed meanwhile).
+    pub fatal_pause: Duration,
 }
 
 impl Default for Timing {
@@ -126,6 +129,7 @@ impl Default for Timing {
             long_poll: Duration::from_secs(20),
             parallelism: 8,
             lease_renew: Duration::from_secs(5),
+            fatal_pause: Duration::from_secs(30),
         }
     }
 }
@@ -572,6 +576,7 @@ impl ReplicationService {
                     local_check: self.local_check(&rt.link),
                     bind_peer: self.bind_peer(&rt.link.id),
                     lease_renew: self.inner.timing.lease_renew,
+                    fatal_pause: self.inner.timing.fatal_pause,
                 };
                 rt.worker = Some((cancel, tokio::spawn(worker.run())));
             }
@@ -740,6 +745,13 @@ impl ReplicationService {
                 "access key {} lacks {} on {at} ({why})",
                 link.access_key,
                 missing.join(", ")
+            )));
+        }
+        let local_versioning = self.inner.store.bucket_versioning(&link.local_bucket).await?.as_str().to_string();
+        if report.versioning != local_versioning {
+            return Err(LinkError::BadRequest(format!(
+                "versioning differs: bucket {} here is {local_versioning}, {at} is {}; a link needs the same setting                  on both buckets (both off, or both enabled, so that both hold the same versions)",
+                link.local_bucket, report.versioning
             )));
         }
         if link.mode == Mode::Merge && report.read_only {
@@ -1032,7 +1044,7 @@ impl ReplicationService {
             };
             // The peer's current state of the key: the first entry of a
             // listing under the key itself.
-            let page = match peer.snapshot(None, 1, &request.key, false).await {
+            let page = match peer.snapshot(None, 1, &request.key, false, false).await {
                 Ok(page) => page,
                 Err(err) => {
                     notes.push(format!("{}: {err}", link.name));
@@ -1074,6 +1086,7 @@ impl ReplicationService {
                 local_check: self.local_check(&link),
                 bind_peer: Arc::new(|_| {}),
                 lease_renew: self.inner.timing.lease_renew,
+                    fatal_pause: self.inner.timing.fatal_pause,
             };
             if let Err(err) = check_local(&self.inner.local_auth, &link) {
                 notes.push(format!("{}: {err}", link.name));
@@ -1082,6 +1095,7 @@ impl ReplicationService {
             let options = crate::storage::store::WriteOptions {
                 origin: crate::storage::store::WriteOrigin::Restore(stamp.clone()),
                 precondition: Some(crate::storage::store::Precondition::IfMatch(request.lost_etag.clone())),
+                versioned: None,
             };
             match worker.restore(&change, options).await {
                 Ok(()) => {

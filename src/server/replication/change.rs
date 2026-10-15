@@ -16,6 +16,9 @@ pub enum Kind {
     /// The key's version stamped `removed` was deleted (a delete, or a
     /// snapshot tombstone). The delete ranks by `removed`.
     Delete { removed: Stamp },
+    /// The version stamped `stamp` was permanently removed
+    /// (`DeleteObject?versionId`). Applied by identity, never by rank.
+    RemoveVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +34,9 @@ pub struct Change {
     /// delete.
     pub stamp: Stamp,
     pub origin: WireOrigin,
+    /// Whether the state is a real version on the site it came from
+    /// (`None` from a site that predates versioning).
+    pub versioned: Option<bool>,
 }
 
 impl Change {
@@ -49,6 +55,7 @@ impl Change {
             WireOp::Delete | WireOp::Deleted => Kind::Delete {
                 removed: event.removed_stamp.clone().unwrap_or_else(|| stamp.clone()),
             },
+            WireOp::RemoveVersion => Kind::RemoveVersion,
             WireOp::Unknown => return Err(format!("event for {} has an unknown op (a newer peer?)", event.key)),
         };
         Ok(Self {
@@ -60,6 +67,7 @@ impl Change {
             kind,
             stamp,
             origin: event.origin.unwrap_or(WireOrigin::Client),
+            versioned: event.versioned,
         })
     }
 
@@ -67,7 +75,7 @@ impl Change {
     /// delete by the version it removed.
     pub fn rank(&self) -> Rank {
         match &self.kind {
-            Kind::Put => Rank::live(self.stamp.clone()),
+            Kind::Put | Kind::RemoveVersion => Rank::live(self.stamp.clone()),
             Kind::Delete { removed } => Rank::deleted(removed.clone()),
         }
     }
@@ -80,7 +88,7 @@ impl Change {
     pub fn removed(&self) -> Option<&Stamp> {
         match &self.kind {
             Kind::Delete { removed } => Some(removed),
-            Kind::Put => None,
+            Kind::Put | Kind::RemoveVersion => None,
         }
     }
 
@@ -116,6 +124,7 @@ mod tests {
             parts: None,
             stamp,
             removed_stamp: removed,
+            versioned: None,
         }
     }
 

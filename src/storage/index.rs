@@ -93,6 +93,10 @@ const CF_TOMBSTONES: &str = "tombstones";
 /// version (see [`VersionRecord`]). Empty unless the bucket has (or had)
 /// versioning enabled.
 const CF_VERSIONS: &str = "versions";
+/// Versions permanently removed (`<key>\0<stamp dir>` → when), kept for
+/// the tombstone retention so a copy of the version arriving later (from
+/// a peer, or a crash leftover) cannot bring it back.
+const CF_VERSION_TOMBSTONES: &str = "version_tombstones";
 /// Separator between the object key and the version dir in `versions`
 /// keys; object keys never contain it (`validate_object_key`).
 const VERSION_KEY_SEP: u8 = 0;
@@ -620,6 +624,7 @@ fn column_families() -> Vec<ColumnFamilyDescriptor> {
         ColumnFamilyDescriptor::new(CF_CHANGELOG, Options::default()),
         ColumnFamilyDescriptor::new(CF_TOMBSTONES, Options::default()),
         ColumnFamilyDescriptor::new(CF_VERSIONS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_VERSION_TOMBSTONES, Options::default()),
     ]
 }
 
@@ -848,7 +853,7 @@ impl ObjectIndex {
         let db = self.db.clone();
         let _ = run_blocking(move || {
             let _ = db.flush();
-            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META, CF_CHANGELOG, CF_TOMBSTONES, CF_VERSIONS] {
+            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META, CF_CHANGELOG, CF_TOMBSTONES, CF_VERSIONS, CF_VERSION_TOMBSTONES] {
                 if let Ok(handle) = cf(&db, name) {
                     let _ = db.flush_cf(&handle);
                 }
@@ -1169,7 +1174,7 @@ impl ObjectIndex {
             if let Some(existing) = &existing {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, (-1i64).to_le_bytes());
                 let g = changes.begin(now_ms);
-                let change = change_for_delete(&g, existing, origin, stamp.clone(), removed.clone());
+                let change = change_for_delete(&g, existing, origin, stamp.clone(), removed.clone(), versioned);
                 if let Some(stamp) = &stamp {
                     let tombstone = Tombstone {
                         object_key: key.clone(),
@@ -1232,28 +1237,38 @@ impl ObjectIndex {
             let log = cf(&db, CF_CHANGELOG)?;
             let versions = cf(&db, CF_VERSIONS)?;
             let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let version_tombstones = cf(&db, CF_VERSION_TOMBSTONES)?;
             let mut batch = WriteBatch::default();
             let mut delta = 0i64;
             let mut guards = Vec::new();
-            let removed_dir: Option<String> = match &target {
+            // The removed version, as a record (for the event and tombstone).
+            let removed: VersionRecord = match &target {
                 VersionTarget::Current => {
                     let Some(existing) = db.get_cf(&objects, key.as_bytes())?.map(|v| decode_object(key.as_bytes(), &v)).transpose()? else {
                         return Ok(None);
                     };
                     batch.delete_cf(&objects, key.as_bytes());
                     delta -= 1;
-                    let g = changes.begin(now_ms);
-                    let change = change_for_delete(&g, &existing, origin, Some(stamp.clone()), existing.stamp.clone());
-                    batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
-                    guards.push(g);
-                    Some(existing.blob_dir)
+                    let stamp = existing.stamp.clone().unwrap_or_else(|| stamp.clone());
+                    VersionRecord::from_row(&existing, stamp)
                 }
                 VersionTarget::Marker => {
                     let Some(t) = db.get_cf(&tombstones, key.as_bytes())?.map(|v| decode_tombstone(key.as_bytes(), &v)).transpose()? else {
                         return Ok(None);
                     };
                     batch.delete_cf(&tombstones, key.as_bytes());
-                    t.blob_dir
+                    VersionRecord {
+                        object_key: key.clone(),
+                        stamp: t.stamp.clone(),
+                        blob_dir: t.blob_dir.clone().unwrap_or_default(),
+                        size: 0,
+                        etag: String::new(),
+                        last_modified_ms: t.stamp.ms,
+                        parts: None,
+                        versioned: t.versioned,
+                        delete_marker: true,
+                        removed: t.removed.clone(),
+                    }
                 }
                 VersionTarget::Noncurrent(dir) => {
                     let raw = versions_key(&key, dir);
@@ -1261,15 +1276,17 @@ impl ObjectIndex {
                         return Ok(None);
                     };
                     batch.delete_cf(&versions, &raw);
-                    if !v.delete_marker {
-                        let g = changes.begin(now_ms);
-                        let change = change_for_delete(&g, &v.clone().into_row(), origin, Some(stamp.clone()), Some(v.stamp.clone()));
-                        batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
-                        guards.push(g);
-                    }
-                    Some(v.blob_dir)
+                    v
                 }
             };
+            // The removal itself, and a tombstone for the version so a copy
+            // arriving later cannot bring it back.
+            let g = changes.begin(now_ms);
+            batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change_for_removed_version(&g, &removed, origin)));
+            guards.push(g);
+            batch.put_cf(&version_tombstones, versions_key(&key, &removed.version_dir()), now_ms.to_le_bytes());
+            let removed_dir = (!removed.blob_dir.is_empty()).then(|| removed.blob_dir.clone());
+            let _ = &stamp;
             if !matches!(target, VersionTarget::Noncurrent(_)) {
                 if let Some(next) = promote {
                     batch.delete_cf(&versions, versions_key(&next.object_key, &next.version_dir()));
@@ -1307,6 +1324,135 @@ impl ObjectIndex {
     }
 
     // ── versions ────────────────────────────────────────────────────────────
+
+    /// Commits a version that does not become current: a replicated state
+    /// that ranks below the key's current one on a versioning-enabled
+    /// bucket (history arriving late, or out of order). The `versions` row,
+    /// the publish intent's removal, what `displaced` says (a `null`
+    /// version it replaces) and the changelog entry (a `put`, or a `delete`
+    /// for a marker — the same event the originating site logged) are one
+    /// batch. Called under the key lock.
+    pub async fn commit_version_insert(
+        &self,
+        record: &VersionRecord,
+        publish_intent_id: Option<i64>,
+        displaced: Displaced,
+        now_ms: i64,
+        origin: ChangeOrigin,
+    ) -> Result<Vec<i64>> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let record = record.clone();
+        let retire_ids: Vec<i64> = displaced.retire.iter().map(|_| self.next_intent_id()).collect();
+        let changes = self.changes.clone();
+        let committed = run_blocking(move || {
+            let intents = cf(&db, CF_INTENTS)?;
+            let log = cf(&db, CF_CHANGELOG)?;
+            let versions = cf(&db, CF_VERSIONS)?;
+            let mut batch = WriteBatch::default();
+            batch.put_cf(&versions, versions_key(&record.object_key, &record.version_dir()), encode_version(&record));
+            if let Some(id) = publish_intent_id {
+                batch.delete_cf(&intents, id_key(id));
+            }
+            for (dir, id) in displaced.retire.iter().zip(&retire_ids) {
+                batch.put_cf(&intents, id_key(*id), encode_intent(INTENT_RETIRE, &record.object_key, dir, now_ms, 0));
+            }
+            for dir in &displaced.drop_versions {
+                batch.delete_cf(&versions, versions_key(&record.object_key, dir));
+            }
+            let guard = changes.begin(now_ms);
+            let change = if record.delete_marker {
+                change_for_tombstone(
+                    &guard,
+                    &record.object_key,
+                    origin,
+                    record.stamp.clone(),
+                    record.removed.clone().unwrap_or_else(|| record.stamp.clone()),
+                    record.versioned,
+                )
+            } else {
+                change_for(&guard, ChangeOp::Put, &record.clone().into_row(), origin)
+            };
+            batch.put_cf(&log, changelog::seq_key(guard.seq), changelog::encode_change(&change));
+            db.write_opt(batch, &write_opts(durability))?;
+            drop(guard);
+            Ok(retire_ids)
+        })
+        .await;
+        if committed.is_ok() {
+            self.notify_commit();
+        }
+        committed
+    }
+
+    /// Whether version `version_dir` of `key` was permanently removed (and
+    /// its tombstone has not expired).
+    pub async fn has_version_tombstone(&self, key: &str, version_dir: &str) -> Result<bool> {
+        let db = self.db.clone();
+        let raw = versions_key(key, version_dir);
+        run_blocking(move || Ok(db.get_cf(&cf(&db, CF_VERSION_TOMBSTONES)?, &raw)?.is_some())).await
+    }
+
+    /// Records the removal of a version this site does not hold (a
+    /// replicated `remove_version` arriving before, or instead of, the
+    /// version), logging it on so it reaches every other site. Called
+    /// under the key lock.
+    pub async fn record_version_tombstone(&self, key: &str, stamp: &Stamp, versioned: bool, now_ms: i64, origin: ChangeOrigin) -> Result<()> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let changes = self.changes.clone();
+        let removed = VersionRecord {
+            object_key: key.to_string(),
+            stamp: stamp.clone(),
+            blob_dir: String::new(),
+            size: 0,
+            etag: String::new(),
+            last_modified_ms: stamp.ms,
+            parts: None,
+            versioned,
+            delete_marker: false,
+            removed: None,
+        };
+        run_blocking(move || {
+            let mut batch = WriteBatch::default();
+            batch.put_cf(&cf(&db, CF_VERSION_TOMBSTONES)?, versions_key(&removed.object_key, &removed.version_dir()), now_ms.to_le_bytes());
+            let guard = changes.begin(now_ms);
+            batch.put_cf(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change_for_removed_version(&guard, &removed, origin)));
+            db.write_opt(batch, &write_opts(durability))?;
+            drop(guard);
+            Ok(())
+        })
+        .await?;
+        self.notify_commit();
+        Ok(())
+    }
+
+    /// Removes version tombstones recorded before `cutoff_ms`, at most
+    /// `max_entries` per call.
+    pub async fn purge_version_tombstones(&self, cutoff_ms: i64, max_entries: usize) -> Result<usize> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        run_blocking(move || {
+            let tombstones = cf(&db, CF_VERSION_TOMBSTONES)?;
+            let mut batch = WriteBatch::default();
+            for item in db.iterator_cf(&tombstones, IteratorMode::Start) {
+                let (key, value) = item?;
+                let at = value.as_ref().try_into().map(i64::from_le_bytes).unwrap_or(0);
+                if at < cutoff_ms {
+                    batch.delete_cf(&tombstones, &key);
+                    if batch.len() >= max_entries {
+                        break;
+                    }
+                }
+            }
+            let n = batch.len();
+            if n > 0 {
+                db.write_opt(batch, &write_opts(durability))?;
+            }
+            Ok(n)
+        })
+        .await
+    }
 
     /// A noncurrent version of `key` by its version dir.
     pub async fn get_version(&self, key: &str, version_dir: &str) -> Result<Option<VersionRecord>> {
@@ -1675,7 +1821,7 @@ impl ObjectIndex {
                 batch.delete_cf(&versions, versions_key(&key, dir));
             }
             let guard = changes.begin(now_ms);
-            let change = change_for_tombstone(&guard, &key, origin, tombstone.stamp.clone(), removed);
+            let change = change_for_tombstone(&guard, &key, origin, tombstone.stamp.clone(), removed, tombstone.versioned);
             batch.put_cf(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change));
             db.write_opt(batch, &write_opts(durability))?;
             drop(guard);
@@ -2243,6 +2389,15 @@ impl ObjectIndex {
                     dst_db.write(std::mem::take(&mut batch))?;
                 }
             }
+            let src_vt = cf(&src, CF_VERSION_TOMBSTONES)?;
+            let dst_vt = cf(&dst_db, CF_VERSION_TOMBSTONES)?;
+            for item in src.iterator_cf(&src_vt, IteratorMode::Start) {
+                let (key, value) = item?;
+                batch.put_cf(&dst_vt, key, value);
+                if batch.len() >= 10_000 {
+                    dst_db.write(std::mem::take(&mut batch))?;
+                }
+            }
             for item in src.iterator_cf(
                 &src_meta,
                 IteratorMode::From(CHECKPOINT_PREFIX.as_bytes(), Direction::Forward),
@@ -2482,23 +2637,47 @@ fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectReco
         parts: record.parts.clone(),
         stamp: record.stamp.clone(),
         removed_stamp: None,
+        versioned: record.versioned,
     }
 }
 
 /// The entry for a removed row (`delete`): names the removed version (its
-/// ETag, size, layout) and carries the delete's own `stamp` and the
-/// `removed` stamp it ranks by.
+/// ETag, size, layout) and carries the delete's own `stamp`, the
+/// `removed` stamp it ranks by, and whether the marker it leaves is a real
+/// version (`versioned`).
 fn change_for_delete(
     guard: &changelog::SeqGuard<'_>,
     removed_row: &ObjectRecord,
     origin: ChangeOrigin,
     stamp: Option<Stamp>,
     removed: Option<Stamp>,
+    versioned: bool,
 ) -> ChangeEvent {
     ChangeEvent {
         stamp,
         removed_stamp: removed,
+        versioned,
         ..change_for(guard, ChangeOp::Delete, removed_row, origin)
+    }
+}
+
+/// The entry for a permanently removed version (`remove_version`): names
+/// the version by its stamp (and dir) and what it was.
+fn change_for_removed_version(guard: &changelog::SeqGuard<'_>, v: &VersionRecord, origin: ChangeOrigin) -> ChangeEvent {
+    ChangeEvent {
+        seq: guard.seq,
+        op: ChangeOp::RemoveVersion,
+        key: v.object_key.clone(),
+        etag: v.etag.clone(),
+        size: v.size,
+        last_modified_ms: v.last_modified_ms,
+        version: v.version_dir(),
+        origin,
+        ts_ms: guard.ts,
+        parts: v.parts.clone(),
+        stamp: Some(v.stamp.clone()),
+        removed_stamp: v.removed.clone(),
+        versioned: v.versioned,
     }
 }
 
@@ -2512,6 +2691,7 @@ fn change_for_tombstone(
     origin: ChangeOrigin,
     stamp: Stamp,
     removed: Stamp,
+    versioned: bool,
 ) -> ChangeEvent {
     ChangeEvent {
         seq: guard.seq,
@@ -2526,6 +2706,7 @@ fn change_for_tombstone(
         parts: None,
         stamp: Some(stamp),
         removed_stamp: Some(removed),
+        versioned,
     }
 }
 

@@ -144,6 +144,23 @@ impl Pusher {
         }
     }
 
+    async fn local_versioning(&self) -> Result<String, StepError> {
+        Ok(self.store.bucket_versioning(&self.link.local_bucket).await?.as_str().to_string())
+    }
+
+    /// A link needs the same versioning setting on both buckets (see the
+    /// pull worker): a mismatch stops the push at once.
+    async fn check_versioning(&self, peer: &str) -> Result<(), StepError> {
+        let local = self.local_versioning().await?;
+        if peer != local {
+            return Err(StepError::Fatal(format!(
+                "versioning differs: bucket {} here is {local}, the peer's is {peer}; the link resumes once both                  buckets have the same setting",
+                self.link.local_bucket
+            )));
+        }
+        Ok(())
+    }
+
     async fn save(&self, checkpoint: Option<&PushCheckpoint>) -> Result<(), StepError> {
         let index = self.store.index(&self.link.local_bucket).await?;
         let value = checkpoint.map(|checkpoint| {
@@ -189,7 +206,7 @@ impl Pusher {
         };
         let Some(mut checkpoint) = checkpoint else {
             // Start: learn who the peer is, then list from the local head.
-            let probe = self.alive(self.peer.snapshot(None, 1, "", false)).await?;
+            let probe = self.alive(self.peer.snapshot(None, 1, "", false, false)).await?;
             self.peer_answered();
             if let Some(changed) = super::worker::peer_site_changed(&self.link, &probe.site_id) {
                 return Err(StepError::Fatal(changed));
@@ -200,6 +217,7 @@ impl Pusher {
                     probe.site_id
                 )));
             }
+            self.check_versioning(&probe.versioning).await?;
             let checkpoint = PushCheckpoint {
                 v: RECORD_VERSION,
                 local_log_id: log_id,
@@ -221,11 +239,22 @@ impl Pusher {
         match checkpoint.phase.clone() {
             Phase::Snapshot { through, cursor, tombstones } => {
                 self.update(|s| s.state = "snapshot".to_string());
-                let params = SnapshotParams { after: cursor, limit: SNAPSHOT_PAGE, filter: Filter::default(), deleted: tombstones };
+                // A versioning-enabled peer gets every local version, not
+                // just the current states (cursor `<key>\0<version dir>`).
+                let versions = !tombstones && self.local_versioning().await? == "enabled";
+                let (after, after_version) = match cursor.as_deref().and_then(|c| c.split_once('\0')) {
+                    Some((key, version)) => (Some(key.to_string()), Some(version.to_string())),
+                    None => (cursor.clone(), None),
+                };
+                let params = SnapshotParams { after, limit: SNAPSHOT_PAGE, filter: Filter::default(), deleted: tombstones, versions, after_version };
                 let page = read::snapshot(&self.store, &bucket, &params).await?;
                 self.apply_all(&page.entries, &checkpoint.peer_site, false).await?;
                 self.peer_answered();
-                checkpoint.phase = match (page.next_after.clone(), tombstones) {
+                let next_cursor = page.next_after.clone().map(|key| match &page.next_after_version {
+                    Some(version) => format!("{key}\0{version}"),
+                    None => key,
+                });
+                checkpoint.phase = match (next_cursor, tombstones) {
                     (Some(next), _) => Phase::Snapshot { through, cursor: Some(next), tombstones },
                     (None, false) => Phase::Snapshot { through, cursor: None, tombstones: true },
                     (None, true) => Phase::Live { after: through },
@@ -291,12 +320,21 @@ impl Pusher {
     /// ahead).
     async fn apply_all(&self, events: &[WireEvent], peer_site: &str, live: bool) -> Result<(), StepError> {
         use futures::StreamExt;
-        let (batch, collapsed) = latest_per_key(events);
+        if events.is_empty() {
+            return Ok(());
+        }
+        // The same setting on both sides (checked on every batch), and a
+        // versioning-enabled peer keeps every state it is sent, so nothing
+        // is collapsed on the way there.
+        let peer_versioning = self.alive(self.peer.versioning()).await?;
+        self.check_versioning(&peer_versioning).await?;
+        let peer_versioned = peer_versioning == "enabled";
+        let (batch, collapsed) = if peer_versioned { (events.to_vec(), 0) } else { latest_per_key(events) };
         if collapsed > 0 {
             self.update(|s| s.collapsed += collapsed as u64);
         }
         let mut results = futures::stream::iter(batch)
-            .map(|event: WireEvent| async move { self.apply(&event, peer_site, live).await })
+            .map(|event: WireEvent| async move { self.apply(&event, peer_site, live, peer_versioned).await })
             .buffer_unordered(self.parallelism.max(1));
         let mut first_error = None;
         while let Some(result) = results.next().await {
@@ -307,7 +345,7 @@ impl Pusher {
         first_error.map_or(Ok(()), Err)
     }
 
-    async fn apply(&self, event: &WireEvent, peer_site: &str, live: bool) -> Result<(), StepError> {
+    async fn apply(&self, event: &WireEvent, peer_site: &str, live: bool, peer_versioned: bool) -> Result<(), StepError> {
         self.beat();
         let change = Change::from_event(event, &self.store.site_id()).map_err(StepError::Fatal)?;
         // Came from the peer (pulled by this link): it has it, or newer.
@@ -320,19 +358,27 @@ impl Pusher {
             self.update(|s| s.skipped += 1);
             return Ok(());
         }
-        let remote = self.alive(self.peer.state(&change.key)).await.map_err(StepError::from)?;
-        // Still the site the link was made with? Checked before every write.
-        if let Some(changed) = self.peer.last_site().and_then(|site| super::worker::peer_site_changed(&self.link, &site)) {
-            self.status.lock().unwrap().site_changed = Some(changed.clone());
-            return Err(StepError::Fatal(changed));
+        if change.kind == Kind::RemoveVersion {
+            // A version permanently removed here: removed there too (or
+            // remembered as gone), whatever ranks where.
+            self.alive(self.peer.delete_version(&change.key, &change.stamp)).await?;
+            self.peer_site_check()?;
+            self.update(|s| s.deleted += 1);
+            return Ok(());
         }
-        if !outranks(&change.rank(), remote.as_ref().map(|(rank, _)| rank)) {
+        let remote = self.alive(self.peer.state(&change.key)).await.map_err(StepError::from)?;
+        self.peer_site_check()?;
+        // An unversioned peer holds one state per key: only a higher-ranked
+        // one is worth sending. A versioned peer keeps every version, and
+        // decides for itself what it already has.
+        if !peer_versioned && !outranks(&change.rank(), remote.as_ref().map(|(rank, _)| rank)) {
             self.update(|s| s.skipped += 1);
             return Ok(());
         }
         let result = match &change.kind {
+            Kind::RemoveVersion => unreachable!("handled above"),
             Kind::Delete { removed } => self
-                .alive(self.peer.delete(&change.key, &change.stamp, removed))
+                .alive(self.peer.delete(&change.key, &change.stamp, removed, change.versioned))
                 .await
                 .map(|()| self.update(|s| s.deleted += 1)),
             Kind::Put => {
@@ -359,25 +405,34 @@ impl Pusher {
         }
     }
 
-    /// Sends the local object of `change` (exactly its version) to the peer:
-    /// metadata only when the peer holds the same bytes, else the data, with
-    /// the original part layout for multipart objects (same ETag).
+    /// Still the site the link was made with? Checked after every answer.
+    fn peer_site_check(&self) -> Result<(), StepError> {
+        if let Some(changed) = self.peer.last_site().and_then(|site| super::worker::peer_site_changed(&self.link, &site)) {
+            self.status.lock().unwrap().site_changed = Some(changed.clone());
+            return Err(StepError::Fatal(changed));
+        }
+        Ok(())
+    }
+
+    /// Sends the local state `change` (exactly that version: the current
+    /// one, or a version this bucket keeps) to the peer: metadata only when
+    /// the peer holds the same bytes, else the data, with the original part
+    /// layout for multipart objects (same ETag).
     async fn push_put(&self, change: &Change, remote: Option<ObjectHeaders>) -> Result<(), PushError> {
         let bucket = &self.link.local_bucket;
         let key = &change.key;
         let stamp = &change.stamp;
-        let object = match self.store.read_object(bucket, key).await {
+        // By version id (the stamp): the current state, or a kept version.
+        // Gone (overwritten on an unversioned bucket, or removed): a later
+        // event carries what replaced it.
+        let version_id = crate::storage::layouts::v3::stamp_dir(stamp);
+        let object = match self.store.read_object_version(bucket, key, &version_id).await {
             Ok(object) => object,
-            Err(StorageError::ObjectNotFound { .. }) => return Err(PushError::Gone),
+            Err(StorageError::ObjectNotFound { .. } | StorageError::NoSuchVersion { .. } | StorageError::VersionIsDeleteMarker { .. }) => {
+                return Err(PushError::Gone)
+            }
             Err(err) => return Err(PushError::Local(err)),
         };
-        // The local object must be the event's state: by version, or by
-        // stamp (a layout upgrade renames versions, never stamps).
-        if crate::storage::changelog::version_of(&object.object_dir.to_string_lossy()) != change.version
-            && object.meta.stamp.as_ref() != Some(stamp)
-        {
-            return Err(PushError::Gone);
-        }
         let meta = ObjectHeaders {
             content_type: Some(object.meta.content_type.clone()),
             content_encoding: object.meta.content_encoding.clone(),
@@ -386,6 +441,7 @@ impl Pusher {
             user_meta: object.meta.user_meta.clone(),
             etag: object.meta.etag.clone(),
             size: object.meta.size,
+            versioned: change.versioned,
         };
         if remote.is_some_and(|r| r.etag == object.meta.etag && r.size == object.meta.size) {
             self.alive(self.peer.copy_metadata(key, &meta, stamp)).await.map_err(PushError::Peer)?;
