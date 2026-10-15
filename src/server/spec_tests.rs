@@ -1401,3 +1401,62 @@ async fn s5_5_object_tags_are_per_version_mutable_and_replicated_as_events() {
     let missing = s.send(&s.replicator, "PUT", &path, "tagging&versionId=0000000000000000001.0000000000.feedfacefeedface", &[("x-rs3-stamp", "1.0.feedfacefeedface")], b"<Tagging><TagSet></TagSet></Tagging>").await;
     assert_eq!((missing.status, missing.s3_code()), (StatusCode::NOT_FOUND, "NoSuchVersion".to_string()));
 }
+
+#[tokio::test]
+async fn s5_5_bucket_settings_are_replicated_writes_with_a_stamp_in_the_query() {
+    let s = Server::start().await;
+    let admin = s.admin();
+    let bucket = format!("/{BUCKET}");
+    let cors = |origin: &str| format!("<CORSConfiguration><CORSRule><AllowedOrigin>{origin}</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>");
+    // A replicated settings write needs s3:ReplicateWrite on the bucket: the
+    // replicator may, the writer may not; a client's write needs its own
+    // action (the writer has neither).
+    let newer = st(now_ms() + 1_000, 0, "feedfacefeedface");
+    let older = st(now_ms() - 60_000, 0, "feedfacefeedface");
+    let r = s.send(&s.writer, "PUT", &bucket, &format!("cors&x-rs3-stamp={newer}"), &[], cors("https://w.test").as_bytes()).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let r = s.send(&s.writer, "PUT", &bucket, "versioning", &[], b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = s.send(&s.replicator, "PUT", &bucket, &format!("cors&x-rs3-stamp={newer}"), &[], cors("https://peer.test").as_bytes()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(s.send(&admin, "GET", &bucket, "cors", &[], b"").await.text().contains("https://peer.test"));
+    let event = s.last_event().await;
+    assert_eq!((event["op"].as_str(), event["origin"].as_str(), event["key"].as_str(), event["author"].as_str()), (Some("bucket"), Some("replication"), Some(""), Some("feedfacefeedface")));
+    assert_eq!(stamp_of(&event["stamp"]).to_header(), newer);
+    assert_eq!(event["settings"]["cors"][0]["allowed_origins"][0], "https://peer.test");
+    assert_eq!(stamp_of(&event["settings"]["cors_stamp"]).to_header(), newer);
+    // An older change is ignored (last writer wins), and logs nothing.
+    let seq = event["seq"].as_u64().unwrap();
+    let r = s.send(&s.replicator, "PUT", &bucket, &format!("cors&x-rs3-stamp={older}"), &[], cors("https://old.test").as_bytes()).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(!s.send(&admin, "GET", &bucket, "cors", &[], b"").await.text().contains("old.test"));
+    assert_eq!(s.last_event().await["seq"].as_u64(), Some(seq));
+    // A client's change gets a fresh (newer) stamp and wins over the peer's.
+    let r = s.send(&admin, "PUT", &bucket, "cors", &[], cors("https://local.test").as_bytes()).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let event = s.last_event().await;
+    assert_eq!((event["op"].as_str(), event["origin"].as_str(), event["author"].as_str()), (Some("bucket"), Some("client"), Some(SITE)));
+    assert!(stamp_of(&event["stamp"]) > Stamp::parse_header(&newer).unwrap());
+    // Versioning the same way; off never arrives from a peer, enabled
+    // beats off whatever the stamp.
+    let r = s.send(&s.replicator, "PUT", &bucket, &format!("versioning&x-rs3-stamp={older}"), &[], b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(s.send(&admin, "GET", &bucket, "versioning", &[], b"").await.text().contains("<Status>Enabled</Status>"));
+    let event = s.last_event().await;
+    assert_eq!((event["op"].as_str(), event["settings"]["versioning"].as_str()), (Some("bucket"), Some("enabled")));
+    // Suspended with an older stamp than the enabling: ignored; with a
+    // newer one: applied.
+    let r = s.send(&s.replicator, "PUT", &bucket, &format!("versioning&x-rs3-stamp={}", st(now_ms() - 120_000, 0, "feedfacefeedface")), &[], b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(s.send(&admin, "GET", &bucket, "versioning", &[], b"").await.text().contains("<Status>Enabled</Status>"));
+    let r = s.send(&s.replicator, "PUT", &bucket, &format!("versioning&x-rs3-stamp={newer}"), &[], b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(s.send(&admin, "GET", &bucket, "versioning", &[], b"").await.text().contains("<Status>Suspended</Status>"));
+    // Pages carry the settings with their stamps.
+    let page = s.snapshot("limit=1").await.json();
+    assert_eq!(page["settings"]["versioning"], "suspended");
+    assert_eq!(stamp_of(&page["settings"]["versioning_stamp"]).to_header(), newer);
+    assert!(page["settings"]["cors_stamp"].is_object());
+    let bad = s.send(&s.replicator, "PUT", &bucket, "versioning&x-rs3-stamp=nope", &[], b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>").await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+}

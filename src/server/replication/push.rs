@@ -19,7 +19,7 @@ use super::model::{Checkpoint, Link, LinkStatus, Phase, PushCheckpoint, PushStat
 use super::change::{Change, Kind};
 use super::peer::{ObjectHeaders, PeerClient, PeerError};
 use super::worker::{latest_per_key, StepError};
-use crate::server::notify::model::{Filter, WireEvent, WireOrigin};
+use crate::server::notify::model::{Filter, WireEvent};
 use crate::server::notify::read::{self, ReadError, ReadParams, SnapshotParams};
 use crate::storage::errors::StorageError;
 use crate::storage::write::outranks;
@@ -360,10 +360,11 @@ impl Pusher {
         // put or delete is the peer's when its stamp is; a removal or a tag
         // change names the version's stamp, not its author's, so for those
         // the origin tells: applied here by replication means pulled.
-        let echo = match &change.kind {
-            Kind::RemoveVersion | Kind::Tags(_) | Kind::Bucket(_) => change.origin == WireOrigin::Replication,
-            Kind::Put | Kind::Delete { .. } => change.stamp.site == peer_site,
-        };
+        // Came from the peer (pulled by this link): it has it. The author
+        // is where a client made the change — a put's or delete's stamp
+        // site, and for a removal, a tag change or a setting (whose stamp
+        // names a version or a setting) the site the event carries.
+        let echo = change.author == peer_site;
         if live && echo {
             self.update(|s| s.skipped += 1);
             return Ok(());
@@ -376,7 +377,7 @@ impl Pusher {
         if change.kind == Kind::RemoveVersion {
             // A version permanently removed here: removed there too (or
             // remembered as gone), whatever ranks where.
-            self.alive(self.peer.delete_version(&change.key, &change.stamp)).await?;
+            self.alive(self.peer.delete_version(&change.key, &change.stamp, &change.author)).await?;
             self.peer_site_check()?;
             self.update(|s| s.deleted += 1);
             return Ok(());
@@ -388,7 +389,7 @@ impl Pusher {
             return Ok(());
         }
         if let Kind::Tags(tags) = &change.kind {
-            match self.alive(self.peer.put_tags(&change.key, &change.stamp, tags)).await {
+            match self.alive(self.peer.put_tags(&change.key, &change.stamp, tags, &change.author)).await {
                 Ok(()) => self.update(|s| s.metadata_only += 1),
                 // The peer does not have the version: the tags come with it.
                 Err(PeerError::NotFound) => self.update(|s| s.skipped += 1),

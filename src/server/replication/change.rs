@@ -43,6 +43,9 @@ pub struct Change {
     /// Whether the state is a real version on the site it came from
     /// (`None` from a site that predates versioning).
     pub versioned: Option<bool>,
+    /// The site where a client made the change: the event's `author`, else
+    /// the stamp's site (a put's or delete's author is where it was made).
+    pub author: String,
 }
 
 impl Change {
@@ -73,9 +76,10 @@ impl Change {
             size: event.size,
             parts: event.parts.clone(),
             kind,
-            stamp,
             origin: event.origin.unwrap_or(WireOrigin::Client),
+            author: event.author.clone().unwrap_or_else(|| stamp.site.clone()),
             versioned: event.versioned,
+            stamp,
         })
     }
 
@@ -135,6 +139,7 @@ mod tests {
             versioned: None,
             tags: None,
             settings: None,
+            author: None,
         }
     }
 

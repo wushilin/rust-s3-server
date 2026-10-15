@@ -130,6 +130,7 @@ reads (§4.3) and webhooks.
 | `stamp` | stamp | always (fallback for old states) | `put`/`exists`: the state's stamp. `delete`/`deleted`: the delete's own stamp. |
 | `removed_stamp` | stamp | deletes | The stamp of the version the delete removed: what it ranks by. A reader MUST use `stamp` when it is absent. |
 | `versioned` | bool | when known | `true`: the state is a real version of a versioning-enabled bucket (its stamp is its version id). `false`: the key's `null` version. Absent from events written before versioning existed; a reader treats that as unknown (§5.4). |
+| `author` | string | `remove_version`, `tags`, `bucket` | The site where a client made the change, kept as the change is replicated on. For a put or delete the author is `stamp.site`; for these three the stamp names a version or a setting, so the author is carried separately. A replicator forwards it (`x-rs3-author` in the query of the replicated write) and uses it to recognise its own peer's change coming back (§8). |
 
 `tags` is logged when a version's tags are replaced
 (`PutObjectTagging` / `DeleteObjectTagging`): `stamp` and `version` name
@@ -420,6 +421,10 @@ site computes that the same way. On a bucket with versioning enabled:
   version's tags (`404 NoSuchVersion` when the site does not hold it: the
   tags come with the version). Unchanged tags log nothing, so a change
   that has gone round a merge pair stops there.
+- These replicated writes, and `DELETE ?versionId`, carry
+  `x-rs3-author=<site id>` in the query: the change's author, logged with
+  the event so that a chain of sites forwards the change while a merge
+  pair does not echo it.
 
 A replicator between two versioning-enabled buckets therefore applies
 **every** event (nothing collapses within a batch), decides by identity
@@ -494,6 +499,10 @@ A link following this specification:
    means the state moved on and a later event carries the current one)
    and writes it with the event's stamp and `versioned` bit (§5.2),
    reproducing the part layout (§3.2).
-5. Checkpoints `next` only after every event in the batch is applied.
-6. On `410` or a changed `log_id` (`409`): re-snapshots.
-7. Refuses to run if the peer's site id equals its own, or changes.
+5. Pushes (a merge link) every event of its own changelog that its peer
+   did not author (`author`, or the stamp's site for puts and deletes,
+   differs from the peer's site id), so a change crosses a chain of sites
+   and never bounces between a pair.
+6. Checkpoints `next` only after every event in the batch is applied.
+7. On `410` or a changed `log_id` (`409`): re-snapshots.
+8. Refuses to run if the peer's site id equals its own, or changes.

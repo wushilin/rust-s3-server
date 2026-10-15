@@ -141,7 +141,9 @@ contains cannot run without object lock.
 `tests/sdk_compat.rs` additionally drives the official AWS SDK for Rust
 against freshly started servers: versioning, tagging, copies and bulk
 deletes by version id, and two replication-linked sites converging on the
-same versions, markers and tags.
+same versions, markers and tags. The replication tests also run a chain of
+three merge-linked sites and a chain of two mirrors, so a change made at
+either end reaches the other, including removals, tag and setting changes.
 
 ### The Rust data stack (`object_store`)
 

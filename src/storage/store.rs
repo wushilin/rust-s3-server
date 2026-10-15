@@ -2436,6 +2436,19 @@ impl LocalObjectStore {
     /// tombstone). Returns the removed version's size, or `None` when the
     /// version did not exist (S3: idempotent).
     pub async fn delete_object_version(&self, bucket: &str, key: &str, version_id: &str, origin: WriteOrigin) -> Result<Option<u64>> {
+        self.delete_object_version_by(bucket, key, version_id, origin, None).await
+    }
+
+    /// The site where a change was made: the given `author` of a
+    /// replicated change, else this site.
+    fn author_of(&self, author: Option<&str>) -> String {
+        author.map(str::to_string).unwrap_or_else(|| self.site_id())
+    }
+
+    /// [`Self::delete_object_version`] with the change's `author` site (a
+    /// replicated removal keeps the site where a client made it).
+    pub async fn delete_object_version_by(&self, bucket: &str, key: &str, version_id: &str, origin: WriteOrigin, author: Option<&str>) -> Result<Option<u64>> {
+        let author = self.author_of(author);
         self.ensure_bucket_and_key(bucket, key).await?;
         self.check_write_allowed(bucket, &origin).await?;
         let index = self.index(bucket).await?;
@@ -2449,7 +2462,7 @@ impl LocalObjectStore {
                 if !index.has_version_tombstone(key, &dir).await? {
                     self.clock().observe(given);
                     index
-                        .record_version_tombstone(key, &stamp, true, now_ms(), origin.change_origin())
+                        .record_version_tombstone(key, &stamp, true, now_ms(), origin.change_origin(), &author)
                         .await?;
                 }
             }
@@ -2468,7 +2481,7 @@ impl LocalObjectStore {
         let current = self.current_rank(&index, key, index.get(key).await?.as_ref()).await?;
         let stamp = self.decide(bucket, key, &WriteOrigin::Repair, None, current.as_ref())?;
         let removed = index
-            .commit_remove_version(key, target, promote, now_ms(), origin.change_origin(), stamp)
+            .commit_remove_version(key, target, promote, now_ms(), origin.change_origin(), stamp, &author)
             .await?;
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
         if let Some((id, dir)) = removed {
@@ -2504,6 +2517,20 @@ impl LocalObjectStore {
         tags: BTreeMap<String, String>,
         origin: WriteOrigin,
     ) -> Result<String> {
+        self.set_object_tags_by(bucket, key, version_id, tags, origin, None).await
+    }
+
+    /// [`Self::set_object_tags`] with the change's `author` site.
+    pub async fn set_object_tags_by(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: BTreeMap<String, String>,
+        origin: WriteOrigin,
+        author: Option<&str>,
+    ) -> Result<String> {
+        let author = self.author_of(author);
         super::metadata::validate_tags(&tags).map_err(StorageError::InvalidObjectKey)?;
         self.ensure_bucket_and_key(bucket, key).await?;
         self.check_write_allowed(bucket, &origin).await?;
@@ -2537,7 +2564,7 @@ impl LocalObjectStore {
             fsync_dir(&dir).await?;
         }
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
-        index.log_tags(&version.record, &tags, now_ms(), origin.change_origin()).await?;
+        index.log_tags(&version.record, &tags, now_ms(), origin.change_origin(), &author).await?;
         Ok(version.version_id())
     }
 
@@ -2628,7 +2655,7 @@ impl LocalObjectStore {
         let settings = BucketSettings::of(&meta);
         self.bucket_meta_cache.insert(bucket.to_string(), meta);
         log::info!("bucket {bucket} versioning is now {} (by {:?})", versioning.as_str(), origin.change_origin());
-        self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin()).await?;
+        self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin(), &stamp.site).await?;
         Ok(true)
     }
 
@@ -2664,7 +2691,7 @@ impl LocalObjectStore {
         let settings = BucketSettings::of(&meta);
         self.bucket_meta_cache.insert(bucket.to_string(), meta);
         if changed {
-            self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin()).await?;
+            self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin(), &stamp.site).await?;
         }
         Ok(changed)
     }

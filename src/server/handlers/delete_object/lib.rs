@@ -28,7 +28,8 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     // version goes, the next newest becomes current; a `null` id names the
     // key's null version).
     if let Some(version_id) = ctx.query.get("versionId").filter(|v| !v.is_empty()) {
-        return match store.delete_object_version(&ctx.bucket, &ctx.key, version_id, options.origin).await {
+        let author = srv::replicated_author(&ctx.query, &options.origin);
+        return match store.delete_object_version_by(&ctx.bucket, &ctx.key, version_id, options.origin, author.as_deref()).await {
             Ok(size) => {
                 let mut response = srv::empty_response(StatusCode::NO_CONTENT);
                 if let Ok(value) = axum::http::HeaderValue::from_str(version_id) {

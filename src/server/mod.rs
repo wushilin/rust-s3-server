@@ -2479,6 +2479,16 @@ async fn put_bucket_versioning_s3(store: LocalObjectStore, ctx: handlers::Bucket
     }
 }
 
+/// `x-rs3-author=` in a replicated write's query: the site where a client
+/// made the change (only with a replicated origin; ignored otherwise).
+pub(crate) fn replicated_author(query: &HashMap<String, String>, origin: &crate::storage::write::WriteOrigin) -> Option<String> {
+    origin.given_stamp()?;
+    query
+        .get("x-rs3-author")
+        .filter(|site| crate::storage::stamp::validate_site_id(site).is_ok())
+        .cloned()
+}
+
 /// `x-rs3-stamp=` in a settings write's query: a peer's change, replicated.
 fn settings_stamp(query: &HashMap<String, String>) -> Result<Option<crate::storage::stamp::Stamp>, String> {
     match query.get("x-rs3-stamp") {

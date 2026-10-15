@@ -56,7 +56,8 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
                     Err(message) => return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidTag", message, &resource),
                 }
             };
-            match store.set_object_tags(&ctx.bucket, &ctx.key, version_id.as_deref(), tags, options.origin).await {
+            let author = srv::replicated_author(&ctx.query, &options.origin);
+            match store.set_object_tags_by(&ctx.bucket, &ctx.key, version_id.as_deref(), tags, options.origin, author.as_deref()).await {
                 Ok(version_id) => {
                     let status = if ctx.method == Method::DELETE { StatusCode::NO_CONTENT } else { StatusCode::OK };
                     srv::with_version_id(srv::empty_response(status), Some(&version_id))

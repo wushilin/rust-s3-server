@@ -423,6 +423,7 @@ pub async fn snapshot(
                     stamp: Some(t.stamp),
                     tags: None,
                     settings: None,
+                    author: None,
                 })
                 .collect(),
             next_after,

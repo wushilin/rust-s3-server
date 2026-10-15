@@ -593,7 +593,7 @@ impl Worker {
             // A version permanently removed on the peer: remove it here (or
             // remember that it is gone), whatever ranks where.
             self.store
-                .delete_object_version(bucket, &change.key, &change.version, WriteOrigin::Replicated(change.stamp.clone()))
+                .delete_object_version_by(bucket, &change.key, &change.version, WriteOrigin::Replicated(change.stamp.clone()), Some(&change.author))
                 .await?;
             self.update(|s| s.deleted += 1);
             return Ok(());
@@ -611,7 +611,7 @@ impl Worker {
             // with the version itself).
             match self
                 .store
-                .set_object_tags(bucket, &change.key, Some(&change.version), tags.clone(), WriteOrigin::Replicated(change.stamp.clone()))
+                .set_object_tags_by(bucket, &change.key, Some(&change.version), tags.clone(), WriteOrigin::Replicated(change.stamp.clone()), Some(&change.author))
                 .await
             {
                 Ok(_) => self.update(|s| s.metadata_only += 1),

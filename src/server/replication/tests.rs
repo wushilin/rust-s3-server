@@ -2044,3 +2044,93 @@ async fn a_merge_link_carries_settings_both_ways_and_the_newer_change_wins() {
     assert_eq!(a.store.bucket_meta("data").await.unwrap().cors, vec![rule("https://b.example")], "a keeps its own");
     assert!(same(&a, &b, "data").await);
 }
+
+// ── three sites ─────────────────────────────────────────────────────────────
+
+async fn tags_at(site: &Site, bucket: &str, key: &str, version: &str) -> std::collections::BTreeMap<String, String> {
+    site.store.object_tags(bucket, key, Some(version)).await.unwrap().0
+}
+
+/// A chain of merge links (b with a, c with b): every change, from any of
+/// the three, reaches the other two — including the ones whose events
+/// name a version rather than their author (removals, tags, settings).
+#[tokio::test]
+async fn a_chain_of_three_merge_links_converges_on_everything() {
+    use crate::storage::metadata::BucketVersioning;
+    use std::collections::BTreeMap;
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    let c = Site::start("site-c").await;
+    for site in [&a, &b, &c] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    let ab = b.pull_from(&a, "data", Mode::Merge).await;
+    let bc = c.pull_from(&b, "data", Mode::Merge).await;
+    let all_same = || async {
+        same(&a, &b, "data").await && same(&b, &c, "data").await
+    };
+    // Versioning turned on at c only: a and b adopt it through the chain.
+    c.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    eventually(60, "versioning everywhere", || async {
+        versioning_of(&a, "data").await == BucketVersioning::Enabled && versioning_of(&b, "data").await == BucketVersioning::Enabled
+    })
+    .await;
+    // Writes from each site, two versions each.
+    for (site, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        site.put("data", "k", format!("{name}1").as_bytes()).await;
+        site.put("data", "k", format!("{name}2").as_bytes()).await;
+    }
+    let six = || async { versions_of(&a, "data", "k").await.len() == 6 && same_versions(&a, &b, "data", "k").await && same_versions(&b, &c, "data", "k").await };
+    eventually(60, "six versions everywhere", six).await;
+    assert!(all_same().await);
+    let ids: Vec<String> = versions_of(&a, "data", "k").await.into_iter().map(|v| v.0).collect();
+    // A tag change at c on a version made at a; a removal at a of a version
+    // made at c; a removal at b of a version made at b.
+    let (a_version, c_version, b_version) = (ids[5].clone(), ids[1].clone(), ids[3].clone());
+    let tags = BTreeMap::from([("set-at".to_string(), "c".to_string())]);
+    c.store.set_object_tags("data", "k", Some(&a_version), tags.clone(), crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(60, "the tag at a", || async { tags_at(&a, "data", "k", &a_version).await == tags }).await;
+    a.store.delete_object_version("data", "k", &c_version, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    b.store.delete_object_version("data", "k", &b_version, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(60, "the removals everywhere", || async {
+        versions_of(&c, "data", "k").await.len() == 4 && same_versions(&a, &b, "data", "k").await && same_versions(&b, &c, "data", "k").await
+    })
+    .await;
+    // A delete marker from a, undeleted from c.
+    a.store.delete_object("data", "k").await.unwrap();
+    eventually(60, "deleted at c", || async { c.store.read_object("data", "k").await.is_err() }).await;
+    let marker = versions_of(&c, "data", "k").await[0].0.clone();
+    c.store.delete_object_version("data", "k", &marker, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(60, "undeleted at a", || async { a.store.read_object("data", "k").await.is_ok() && same_versions(&a, &b, "data", "k").await && same_versions(&b, &c, "data", "k").await }).await;
+    assert!(all_same().await);
+    for (site, link) in [(&b, &ab), (&c, &bc)] {
+        assert!(site.link(link).status.last_error.is_none(), "{:?}", site.link(link).status.last_error);
+    }
+}
+
+/// A chain of mirrors (b mirrors a, c mirrors b): everything made at a,
+/// and nothing else, ends up at c.
+#[tokio::test]
+async fn a_chain_of_two_mirrors_follows_the_source() {
+    use crate::storage::metadata::BucketVersioning;
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    let c = Site::start("site-c").await;
+    for site in [&a, &b, &c] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    a.put("data", "k", b"1").await;
+    let _ab = b.pull_from(&a, "data", Mode::Mirror).await;
+    let bc = c.pull_from(&b, "data", Mode::Mirror).await;
+    eventually(60, "c enabled", || async { versioning_of(&c, "data").await == BucketVersioning::Enabled }).await;
+    a.put("data", "k", b"2").await;
+    a.put("data", "k", b"3").await;
+    eventually(60, "three versions at c", || async { versions_of(&c, "data", "k").await.len() == 3 && same_versions(&a, &c, "data", "k").await }).await;
+    let middle = versions_of(&a, "data", "k").await[1].0.clone();
+    a.store.delete_object_version("data", "k", &middle, crate::storage::write::WriteOrigin::Client).await.unwrap();
+    a.store.delete_object("data", "k").await.unwrap();
+    eventually(60, "the removal and marker at c", || async { c.store.read_object("data", "k").await.is_err() && same_versions(&a, &c, "data", "k").await }).await;
+    assert_eq!(versions_of(&c, "data", "k").await.len(), 3, "marker, 3, 1");
+    assert!(c.link(&bc).status.last_error.is_none(), "{:?}", c.link(&bc).status.last_error);
+}

@@ -325,6 +325,10 @@ pub struct WireEvent {
     /// `bucket` events: the bucket's settings after the change.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub settings: Option<crate::storage::metadata::BucketSettings>,
+    /// The site where a client made the change (`remove_version`, `tags`,
+    /// `bucket`: their `stamp` names a version, not the change's author).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub author: Option<String>,
 }
 
 impl WireEvent {
@@ -347,6 +351,7 @@ impl WireEvent {
             versioned: Some(v.versioned),
             tags: None,
             settings: None,
+            author: None,
         }
     }
 
@@ -374,6 +379,7 @@ impl WireEvent {
             versioned: Some(record.versioned),
             tags: None,
             settings: None,
+            author: None,
         }
     }
 }
@@ -402,6 +408,7 @@ impl From<&ChangeEvent> for WireEvent {
             versioned: Some(event.versioned),
             tags: event.tags.clone(),
             settings: event.settings.clone(),
+            author: event.author.clone(),
         }
     }
 }

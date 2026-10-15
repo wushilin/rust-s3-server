@@ -662,11 +662,11 @@ impl PeerClient {
 
     /// Replaces the tags of version `stamp` of `key` on the peer
     /// (`PUT ?tagging&versionId`, a replicated write).
-    pub async fn put_tags(&self, key: &str, stamp: &Stamp, tags: &BTreeMap<String, String>) -> Result<(), PeerError> {
+    pub async fn put_tags(&self, key: &str, stamp: &Stamp, tags: &BTreeMap<String, String>, author: &str) -> Result<(), PeerError> {
         let path = object_path(&self.config.bucket, key);
         let header = stamp.to_header();
         let extra = [("x-rs3-stamp", header.as_str())];
-        let query = format!("tagging&versionId={}", crate::storage::layouts::v3::stamp_dir(stamp));
+        let query = format!("tagging&versionId={}&x-rs3-author={author}", crate::storage::layouts::v3::stamp_dir(stamp));
         let set = tags
             .iter()
             .map(|(k, v)| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", crate::server::xml::escape_xml(k), crate::server::xml::escape_xml(v)))
@@ -718,11 +718,11 @@ impl PeerClient {
 
     /// Permanently removes version `stamp` of `key` on the peer
     /// (`DELETE ?versionId`, a replicated write).
-    pub async fn delete_version(&self, key: &str, stamp: &Stamp) -> Result<(), PeerError> {
+    pub async fn delete_version(&self, key: &str, stamp: &Stamp, author: &str) -> Result<(), PeerError> {
         let path = object_path(&self.config.bucket, key);
         let header = stamp.to_header();
         let extra = [("x-rs3-stamp", header.as_str())];
-        let query = format!("versionId={}", crate::storage::layouts::v3::stamp_dir(stamp));
+        let query = format!("versionId={}&x-rs3-author={author}", crate::storage::layouts::v3::stamp_dir(stamp));
         let builder = self.signed(Method::DELETE, &path, &query, &extra);
         self.send_write(builder, &format!("DELETE {key}?versionId")).await.map(|_| ())
     }

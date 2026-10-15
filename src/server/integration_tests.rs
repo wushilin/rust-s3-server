@@ -3625,6 +3625,75 @@
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The CORS rule matrix on an object request: origin patterns
+    /// (exact, wildcard, any), methods, requested headers, the first
+    /// matching rule's exposure and max-age, and what an actual (non
+    /// preflight) response carries.
+    #[tokio::test]
+    async fn bucket_cors_rules_decide_by_origin_method_and_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = make_app(&tmp);
+        let bucket = "cors-matrix";
+        let create = app.clone().oneshot(Request::builder().method("PUT").uri(format!("/{bucket}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let document = r#"<CORSConfiguration>
+            <CORSRule><AllowedOrigin>https://app.example.test</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedHeader>content-type</AllowedHeader><AllowedHeader>x-amz-*</AllowedHeader><ExposeHeader>ETag</ExposeHeader><ExposeHeader>x-amz-version-id</ExposeHeader><MaxAgeSeconds>120</MaxAgeSeconds></CORSRule>
+            <CORSRule><AllowedOrigin>https://*.wild.test</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>
+            <CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>HEAD</AllowedMethod></CORSRule>
+        </CORSConfiguration>"#;
+        let put = app.clone().oneshot(Request::builder().method("PUT").uri(format!("/{bucket}?cors")).body(Body::from(document)).unwrap()).await.unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        app.clone().oneshot(Request::builder().method("PUT").uri(format!("/{bucket}/k")).body(Body::from("x")).unwrap()).await.unwrap();
+
+        let preflight = |origin: &'static str, method: &'static str, headers: &'static str| {
+            let app = app.clone();
+            async move {
+                let mut req = Request::builder().method("OPTIONS").uri(format!("/{bucket}/k")).header("origin", origin).header("access-control-request-method", method);
+                if !headers.is_empty() {
+                    req = req.header("access-control-request-headers", headers);
+                }
+                app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+            }
+        };
+        // Exact origin, allowed method and headers: the first rule answers.
+        let ok = preflight("https://app.example.test", "PUT", "content-type, x-amz-meta-a").await;
+        assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+        assert_eq!(ok.headers()["access-control-allow-origin"], "https://app.example.test");
+        assert_eq!(ok.headers()["access-control-allow-methods"], "PUT");
+        assert_eq!(ok.headers()["access-control-max-age"], "120");
+        // A method the origin's rules do not allow.
+        assert_eq!(preflight("https://app.example.test", "DELETE", "").await.status(), StatusCode::FORBIDDEN);
+        // A header the rule does not allow.
+        assert_eq!(preflight("https://app.example.test", "PUT", "authorization").await.status(), StatusCode::FORBIDDEN);
+        // A wildcard origin, and a sub-domain it does not cover.
+        assert_eq!(preflight("https://a.wild.test", "GET", "").await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(preflight("https://a.wild.test", "PUT", "").await.status(), StatusCode::FORBIDDEN, "GET only");
+        assert_eq!(preflight("https://wild.test", "GET", "").await.status(), StatusCode::FORBIDDEN, "no dot: not a match");
+        // `*` origin, HEAD only; an unknown origin gets nothing else.
+        assert_eq!(preflight("https://anyone.test", "HEAD", "").await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(preflight("https://anyone.test", "GET", "").await.status(), StatusCode::FORBIDDEN);
+        // The second rule's max-age is unset: 0.
+        assert_eq!(preflight("https://a.wild.test", "GET", "").await.headers()["access-control-max-age"], "0");
+
+        // An actual request from an allowed origin carries the allow-origin
+        // and the rule's exposed headers; from another origin, neither.
+        let get = app.clone().oneshot(Request::builder().method("GET").uri(format!("/{bucket}/k")).header("origin", "https://app.example.test").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(get.headers()["access-control-allow-origin"], "https://app.example.test");
+        assert_eq!(get.headers()["access-control-expose-headers"], "ETag, x-amz-version-id");
+        assert!(get.headers().get_all("vary").iter().any(|v| v == "Origin"));
+        let other = app.clone().oneshot(Request::builder().method("GET").uri(format!("/{bucket}/k")).header("origin", "https://other.test").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(other.status(), StatusCode::OK, "CORS is a browser rule, not an access rule");
+        assert!(other.headers().get("access-control-allow-origin").is_none());
+        // No origin header: no CORS headers at all.
+        let plain = app.clone().oneshot(Request::builder().method("GET").uri(format!("/{bucket}/k")).body(Body::empty()).unwrap()).await.unwrap();
+        assert!(plain.headers().get("access-control-allow-origin").is_none());
+        // Rules removed: the origin that matched is refused again.
+        let delete = app.clone().oneshot(Request::builder().method("DELETE").uri(format!("/{bucket}?cors")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+        assert_eq!(preflight("https://app.example.test", "GET", "").await.status(), StatusCode::FORBIDDEN);
+    }
+
     fn now_datetime() -> String {
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
     }

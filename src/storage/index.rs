@@ -1226,11 +1226,13 @@ impl ObjectIndex {
         now_ms: i64,
         origin: ChangeOrigin,
         stamp: Stamp,
+        author: &str,
     ) -> Result<Option<(i64, String)>> {
         let db = self.db.clone();
         let durability = self.durability;
         let id = self.next_intent_id();
         let key = key.to_string();
+        let author = author.to_string();
         let changes = self.changes.clone();
         let committed = run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
@@ -1284,7 +1286,7 @@ impl ObjectIndex {
             // The removal itself, and a tombstone for the version so a copy
             // arriving later cannot bring it back.
             let g = changes.begin(now_ms);
-            batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change_for_removed_version(&g, &removed, origin)));
+            batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change_for_removed_version(&g, &removed, origin, &author)));
             guards.push(g);
             batch.put_cf(&version_tombstones, versions_key(&key, &removed.version_dir()), now_ms.to_le_bytes());
             let removed_dir = (!removed.blob_dir.is_empty()).then(|| removed.blob_dir.clone());
@@ -1389,12 +1391,13 @@ impl ObjectIndex {
 
     /// Logs the replacement of a version's tags (the `meta.json` rewrite
     /// is the caller's; nothing in the index changes).
-    pub async fn log_tags(&self, v: &VersionRecord, tags: &std::collections::BTreeMap<String, String>, now_ms: i64, origin: ChangeOrigin) -> Result<()> {
+    pub async fn log_tags(&self, v: &VersionRecord, tags: &std::collections::BTreeMap<String, String>, now_ms: i64, origin: ChangeOrigin, author: &str) -> Result<()> {
         let db = self.db.clone();
         let durability = self.durability;
         let changes = self.changes.clone();
         let v = v.clone();
         let tags = tags.clone();
+        let author = author.to_string();
         run_blocking(move || {
             let guard = changes.begin(now_ms);
             let change = ChangeEvent {
@@ -1413,6 +1416,7 @@ impl ObjectIndex {
                 versioned: v.versioned,
                 tags: Some(tags),
                 settings: None,
+                author: Some(author),
             };
             db.put_cf_opt(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change), &write_opts(durability))?;
             drop(guard);
@@ -1425,12 +1429,13 @@ impl ObjectIndex {
 
     /// Logs a bucket setting change (`bucket`): the settings after it, and
     /// the change's stamp.
-    pub async fn log_bucket(&self, settings: &super::metadata::BucketSettings, stamp: &Stamp, now_ms: i64, origin: ChangeOrigin) -> Result<()> {
+    pub async fn log_bucket(&self, settings: &super::metadata::BucketSettings, stamp: &Stamp, now_ms: i64, origin: ChangeOrigin, author: &str) -> Result<()> {
         let db = self.db.clone();
         let durability = self.durability;
         let changes = self.changes.clone();
         let settings = settings.clone();
         let stamp = stamp.clone();
+        let author = author.to_string();
         run_blocking(move || {
             let guard = changes.begin(now_ms);
             let change = ChangeEvent {
@@ -1449,6 +1454,7 @@ impl ObjectIndex {
                 versioned: false,
                 tags: None,
                 settings: Some(settings),
+                author: Some(author),
             };
             db.put_cf_opt(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change), &write_opts(durability))?;
             drop(guard);
@@ -1471,10 +1477,11 @@ impl ObjectIndex {
     /// replicated `remove_version` arriving before, or instead of, the
     /// version), logging it on so it reaches every other site. Called
     /// under the key lock.
-    pub async fn record_version_tombstone(&self, key: &str, stamp: &Stamp, versioned: bool, now_ms: i64, origin: ChangeOrigin) -> Result<()> {
+    pub async fn record_version_tombstone(&self, key: &str, stamp: &Stamp, versioned: bool, now_ms: i64, origin: ChangeOrigin, author: &str) -> Result<()> {
         let db = self.db.clone();
         let durability = self.durability;
         let changes = self.changes.clone();
+        let author = author.to_string();
         let removed = VersionRecord {
             object_key: key.to_string(),
             stamp: stamp.clone(),
@@ -1491,7 +1498,7 @@ impl ObjectIndex {
             let mut batch = WriteBatch::default();
             batch.put_cf(&cf(&db, CF_VERSION_TOMBSTONES)?, versions_key(&removed.object_key, &removed.version_dir()), now_ms.to_le_bytes());
             let guard = changes.begin(now_ms);
-            batch.put_cf(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change_for_removed_version(&guard, &removed, origin)));
+            batch.put_cf(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change_for_removed_version(&guard, &removed, origin, &author)));
             db.write_opt(batch, &write_opts(durability))?;
             drop(guard);
             Ok(())
@@ -2738,6 +2745,7 @@ fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectReco
         versioned: record.versioned,
         tags: None,
         settings: None,
+        author: None,
     }
 }
 
@@ -2763,7 +2771,7 @@ fn change_for_delete(
 
 /// The entry for a permanently removed version (`remove_version`): names
 /// the version by its stamp (and dir) and what it was.
-fn change_for_removed_version(guard: &changelog::SeqGuard<'_>, v: &VersionRecord, origin: ChangeOrigin) -> ChangeEvent {
+fn change_for_removed_version(guard: &changelog::SeqGuard<'_>, v: &VersionRecord, origin: ChangeOrigin, author: &str) -> ChangeEvent {
     ChangeEvent {
         seq: guard.seq,
         op: ChangeOp::RemoveVersion,
@@ -2780,6 +2788,7 @@ fn change_for_removed_version(guard: &changelog::SeqGuard<'_>, v: &VersionRecord
         versioned: v.versioned,
         tags: None,
         settings: None,
+        author: Some(author.to_string()),
     }
 }
 
@@ -2811,6 +2820,7 @@ fn change_for_tombstone(
         versioned,
         tags: None,
         settings: None,
+        author: None,
     }
 }
 

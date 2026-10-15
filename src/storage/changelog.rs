@@ -210,6 +210,10 @@ pub struct ChangeEvent {
     pub tags: Option<std::collections::BTreeMap<String, String>>,
     /// `bucket` only: the bucket's settings after the change.
     pub settings: Option<super::metadata::BucketSettings>,
+    /// The site where a client made the change (kept as the change is
+    /// replicated on): what a replicator uses to recognise its own peer's
+    /// change coming back. For a put or delete it is the stamp's site.
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,6 +247,8 @@ struct ChangeValueV1 {
     tags: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settings: Option<super::metadata::BucketSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -276,6 +282,7 @@ pub fn encode_change(event: &ChangeEvent) -> Vec<u8> {
         versioned: event.versioned,
         tags: event.tags.clone(),
         settings: event.settings.clone(),
+        author: event.author.clone(),
     })
     .expect("ChangeValueV1 serializes")
 }
@@ -304,6 +311,7 @@ pub fn decode_change(seq: u64, value: &[u8]) -> Result<ChangeEvent> {
         versioned: v.versioned,
         tags: v.tags,
         settings: v.settings,
+        author: v.author,
     })
 }
 
@@ -478,6 +486,7 @@ mod tests {
             versioned: true,
             tags: None,
             settings: None,
+            author: Some("s".into()),
         };
         assert_eq!(decode_change(7, &encode_change(&event)).unwrap(), event);
         let removal = ChangeEvent { op: ChangeOp::RemoveVersion, versioned: false, ..event };
