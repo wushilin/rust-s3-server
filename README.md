@@ -8,15 +8,19 @@ Rust-S3-Server uses 0% CPU when you are not using it. It does zero background ma
 It does FSYNC when you upload objects (you mean realize the upload of many objects might look slower), 
 it prioritizes integrity over naive speed.
 
-A lightweight, single-node S3-compatible server in Rust, with a built-in
-management console. The core AWS S3 API — authentication, bucket/object CRUD,
-listings, multipart, copy, presigning, browser POST, and both path-style and
-virtual-hosted-style addressing — is verified continuously against the MinIO
-Mint suite and real AWS SDKs.
+A lightweight S3-compatible server in Rust with a built-in management
+console. The AWS S3 API — authentication, bucket/object CRUD, listings,
+multipart, copy, presigning, browser POST, path-style and virtual-hosted-style
+addressing, **object versioning** and **object tagging** — is verified against
+the MinIO Mint suite, the official AWS SDK for Rust and a recorded session
+against Amazon S3. Several sites keep buckets in sync through
+**changelog-driven replication** (one-way mirrors or two-way merges, every
+version, marker, tag and bucket setting included).
 
 Good fit for local development, integration tests, CI, and small trusted
 production deployments. Features that only make sense at AWS scale (ACLs,
 S3 Select, object lock) are [deliberately out of scope](#intentional-limits).
+See [Status](#status) for what is in, what is not, and how it is tested.
 
 ## Quick start
 
@@ -77,9 +81,20 @@ vice versa. Each surface can be firewalled or proxied independently.
   folder drag-and-drop upload, transparent multipart for large files (to the
   5 TiB S3 ceiling), in-flight multipart visibility with one-click abort, IAM
   administration, share links, and a live task monitor.
+- **Object versioning** with S3's semantics: enabled, suspended, `null`
+  versions, delete markers, version-scoped reads and deletes,
+  `ListObjectVersions`; every version is a directory on disk, so a rebuild
+  recovers history. The console lists a key's versions with download and
+  delete per version.
+- **Object tagging**, per version, mutable without a new version.
+- **Replication between sites**: changelog-driven mirror and merge links
+  with last-writer-wins by version stamp, every version and marker on
+  versioning-enabled buckets, tags, and bucket settings (versioning, CORS)
+  adopted by the newer change; webhooks on the same changelog.
 - **Crash-safe storage**: RocksDB-primary indexes over immutable blob
   directories, write-ahead intents, atomic publication, automatic index
-  rebuilds, and configurable durability.
+  rebuilds, versioned on-disk layouts with explicit gated upgrades, a
+  health scan with repair actions, and configurable durability.
 - Request/auth/authz/operation audit logs, live throughput, and
   MinIO-compatible health and metrics paths.
 
@@ -111,6 +126,54 @@ vice versa. Each surface can be firewalled or proxied independently.
 <img width="1082" height="799" alt="Object scanner" src="https://github.com/user-attachments/assets/06745c48-5660-4b3c-aed7-c1d0807ced2e" />
 
 </details>
+
+## Status
+
+As of 2026-10-15, on the `feat/replication-foundation` branch.
+
+**Implemented**
+
+| Area | State |
+|---|---|
+| Core S3 API | Buckets, objects, listings v1/v2, multipart, copy, conditional reads and writes (`If-Match`, `If-None-Match`), presigned URLs, browser POST, path and virtual-hosted style, SigV4/SigV2, `aws-chunked`. |
+| Object versioning | `PutBucketVersioning` (enabled/suspended), version ids on writes, `GET`/`HEAD`/`DELETE ?versionId`, delete markers, `ListObjectVersions` with delimiter and both markers, `DeleteObjects` by version id, `CopyObject` from a version. S3's suspended-mode and marker-stacking rules. |
+| Object tagging | `x-amz-tagging` on PUT, copy (`x-amz-tagging-directive`) and multipart create; `GET`/`PUT`/`DELETE ?tagging` per version; `x-amz-tagging-count`. |
+| Bucket CORS | Rules via `?cors` and the console; enforced on preflight and actual requests. |
+| IAM | Users, groups, API keys, AWS-style policies with conditions, a policy builder; actions for every operation above, including `s3:ReplicateWrite` for replicated writes. |
+| Changelog and webhooks | Per-bucket ordered changelog (`put`, `delete`, `remove_version`, `tags`, `bucket`), long-poll reads, snapshots, signed webhook deliveries with retries and mute, replication tokens. |
+| Replication | Mirror (one-way, read-only replica) and merge (two-way) links between sites; last-writer-wins by stamp; every version, marker, removal and tag change on versioning-enabled buckets; bucket settings (versioning, CORS) adopted by the newer change; chains of sites; restore of lost objects from a peer. |
+| Storage | Layouts 1, 2 and 3 read, 3 written; explicit, gated, resumable upgrades started from the console; index rebuild from the tree alone (versions, markers and tags included); health scan with repair; `full` and `relaxed` durability. |
+| Console | Object browser, uploads, versions panel, bucket settings (versioning, CORS, keep-CORS-local, read-only, layout upgrade), IAM, webhooks, replication links with live status, tasks, stats, health scan. |
+
+**Not implemented**
+
+- Object lock, retention and legal hold; MFA delete.
+- Lifecycle rules, including expiry of noncurrent versions: versions
+  accumulate until deleted.
+- Bucket policies via the S3 API (console IAM policies instead), ACLs,
+  bucket tagging, website hosting, S3 event notifications (the changelog and
+  webhooks take their place), S3 Select, server-side encryption, storage
+  tiers (storage class is metadata only).
+- `UploadPartCopy` from a specific version of the source (the current
+  version is copied).
+- Replication of the storage layout and the read-only flag: both are local
+  to a site by design.
+- MinIO admin APIs, Snowball archive extraction, TLS termination (use a
+  reverse proxy).
+
+**How it is tested** (`cargo test`, with a built `rusts3` for the two
+integration suites)
+
+| Suite | What it checks | Last result |
+|---|---|---|
+| Unit and integration tests (in-process) | Storage commit paths and crash points, layout upgrades from every supported layout (interrupted and resumed), versioning and tagging semantics, the version-removal matrix, IAM, webhooks, replication between two and three sites | 604 pass, 1 ignored |
+| Protocol conformance (`src/server/spec_tests.rs`) | Every header, parameter and event field of [the replication spec](docs/spec-replication.md) and [the webhook spec](docs/spec-webhooks.md), over SigV4 | all pass |
+| AWS golden replay (`tests/aws_compat.rs`) | 39 operations compared with a recording of what Amazon S3 returned | pass, with the listed accepted divergences |
+| AWS SDK for Rust (`tests/sdk_compat.rs`) | Versioning, tagging, copies and bulk deletes by version id, and two linked sites converging, as the official SDK sees them | 2 pass |
+| MinIO Mint `versioning` suite (built natively, see `test_report.md`) | 13 versioning and tagging tests | 13 pass; the object lock tests cannot run |
+
+One in-process test, the webhook offset replay, is sensitive to machine
+load and can fail under the full suite while passing alone.
 
 ## Compatibility
 
@@ -170,11 +233,12 @@ for filtering, port overrides, and running against an existing server.
 
 ## Intentional limits
 
-Not implemented:
+Not implemented (see [Status](#status) for the full list):
 
 - bucket policies via the S3 API (use console IAM policies instead), ACLs,
   websites, lifecycle rules, bucket tagging;
-- object lock, retention/legal hold, replication, notifications, S3 Select;
+- object lock, retention/legal hold, S3 event notifications (the changelog
+  and webhooks take their place), S3 Select;
 - server-side encryption and storage-tier behavior (storage class is metadata only);
 - MinIO admin APIs and Snowball archive extraction;
 - **TLS termination** — put rusts3 behind a reverse proxy (see below).
@@ -1018,8 +1082,10 @@ request/byte totals and rates are in the periodic logs and the console task view
 |---|---|---|
 | `PUT` | `/{bucket}/{key}` | Streaming upload, including `aws-chunked`, content hashes, metadata, and storage class. |
 | `GET` / `HEAD` | `/{bucket}/{key}` | Streaming read, single byte ranges, conditional reads, response-header overrides, and metadata. |
-| `DELETE` | `/{bucket}/{key}` | Idempotent delete. `forceDelete=true` / `x-minio-force-delete` deletes a prefix for MinIO compatibility. |
-| `PUT` | object + `x-amz-copy-source` | Server-side copy with metadata directive and source preconditions. |
+| `DELETE` | `/{bucket}/{key}` | Idempotent delete; a delete marker on a versioned bucket. `forceDelete=true` / `x-minio-force-delete` deletes a prefix for MinIO compatibility. |
+| `GET` / `HEAD` / `DELETE` | object + `?versionId` | Read, inspect or permanently remove one version (`null` for the null version). |
+| `GET` / `PUT` / `DELETE` | object + `?tagging[&versionId]` | Read, replace or remove a version's tags. |
+| `PUT` | object + `x-amz-copy-source` | Server-side copy with metadata and tagging directives and source preconditions; the source may name a version. |
 | `POST` | object + `?uploads` | Initiate multipart upload. |
 | `PUT` | object + `uploadId`, `partNumber` | Upload a part, or copy a source/range into a part. |
 | `GET` | object + `uploadId` | List uploaded parts. |
