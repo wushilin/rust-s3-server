@@ -1,4 +1,4 @@
-# rusts3 — single-node S3-compatible server
+# rusts3 — S3-compatible object storage with multi-site replication
 
 Why not RustFS? RustFS uses a lot of CPU for useless stuff. I used ZFS with integrity check 
 yet RustFS spends huge amount of CPU time when idling. 
@@ -17,10 +17,18 @@ against Amazon S3. Several sites keep buckets in sync through
 **changelog-driven replication** (one-way mirrors or two-way merges, every
 version, marker, tag and bucket setting included).
 
-Good fit for local development, integration tests, CI, and small trusted
-production deployments. Features that only make sense at AWS scale (ACLs,
-S3 Select, object lock) are [deliberately out of scope](#intentional-limits).
-See [Status](#status) for what is in, what is not, and how it is tested.
+**Positioning.** Each site is one node: one process, one data directory,
+one filesystem. There is no clustering, sharding or erasure coding, and
+there will not be; durability within a site comes from the filesystem
+(Btrfs or ZFS are recommended, see [Storage](#storage)) and from fsync on
+every write. Across sites, buckets replicate asynchronously through
+mirror or merge links, so several single-node sites can hold the same
+data for disaster recovery, geographic proximity or read scaling. Good
+fit for local development, integration tests, CI, and small to medium
+trusted production deployments where a site fits on one machine.
+Features that only make sense at AWS scale (ACLs, S3 Select, object lock)
+are [deliberately out of scope](#intentional-limits). See
+[Status](#status) for what is in, what is not, and how it is tested.
 
 ## Quick start
 
@@ -144,6 +152,7 @@ As of 2026-10-15, on the `feat/replication-foundation` branch.
 | Replication | Mirror (one-way, read-only replica) and merge (two-way) links between sites; last-writer-wins by stamp; every version, marker, removal and tag change on versioning-enabled buckets; bucket settings (versioning, CORS) adopted by the newer change; chains of sites; restore of lost objects from a peer. |
 | Storage | Layouts 1, 2 and 3 read, 3 written; explicit, gated, resumable upgrades started from the console; index rebuild from the tree alone (versions, markers and tags included); health scan with repair; `full` and `relaxed` durability. |
 | Console | Object browser, uploads, versions panel, bucket settings (versioning, CORS, keep-CORS-local, read-only, layout upgrade), IAM, webhooks, replication links with live status, tasks, stats, health scan. |
+| `rs3` client | mc-compatible command line: aliases, ls, cp, mirror, find, share, and `rs3 watch` to follow a bucket's changelog. |
 
 **Not implemented**
 
@@ -659,6 +668,13 @@ storage layout. The storage layout and the read-only flag never
 replicate. Not yet: lifecycle expiry of noncurrent versions.
 
 ## Changelog, webhooks and replication
+
+Three kinds of subscriber read a bucket's changelog: webhooks (pushed
+batches), replication links (other sites), and `rs3 watch
+ALIAS/BUCKET[/PREFIX]` from the command line, which prints every change as
+it commits (`--json` for the raw events, `--from-start` to replay,
+`--snapshot --versions` to list every version first). It needs
+`s3:GetBucketChangelog` on the bucket.
 
 The wire protocol is specified in [docs/spec-replication.md](docs/spec-replication.md)
 (changelog reads, events, stamps, replicated writes, peer checks) and

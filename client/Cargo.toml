@@ -25,6 +25,9 @@ md-5 = "0.11"
 percent-encoding = "2"
 pin-project-lite = "0.2"
 regex = "1"
+# `rs3 watch` reads a bucket's changelog (a rusts3 extension the SDK has no
+# operation for): a signed GET over rustls, bundled roots.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

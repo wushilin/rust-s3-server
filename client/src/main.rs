@@ -9,6 +9,7 @@ mod mirror;
 mod output;
 mod progress;
 mod share;
+mod watch;
 mod timefilter;
 mod transfer;
 mod urls;
@@ -168,6 +169,8 @@ enum Commands {
     Find(FindArgs),
     #[command(about = "generate URL for temporary access to an object")]
     Share(ShareArgs),
+    #[command(about = "follow a bucket's changelog: print every change as it commits")]
+    Watch(watch::WatchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -646,6 +649,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Diff(args) => diff(args).await,
         Commands::Find(args) => findcmd::run_find(args).await,
         Commands::Share(args) => share::run_share(args).await,
+        Commands::Watch(args) => watch::run_watch(args).await,
     }
 }
 
