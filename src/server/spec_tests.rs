@@ -925,6 +925,18 @@ async fn s5_1_reads_pinned_to_a_version_fail_once_the_state_moves_on() {
     assert_eq!(moved.s3_code(), "PreconditionFailed");
     assert!(moved.text().contains("x-rs3-if-version"), "{}", moved.text());
     assert_eq!(s.head("k").await.header("etag"), pinned.header("etag"), "the ETag did not change");
+
+    // A pin by stamp names the same state: a version renamed by a layout
+    // upgrade still reads when the stamp matches, and a stale stamp fails.
+    let head = s.head("k").await;
+    let (now_version, now_stamp) = (head.header("x-rs3-version").unwrap().to_string(), head.header("x-rs3-stamp").unwrap().to_string());
+    let renamed = s.send(&s.admin(), "GET", "/bkt/k", "", &[("x-rs3-if-version", "V1RENAMED_0000"), ("x-rs3-if-stamp", &now_stamp)], b"").await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.text());
+    assert_eq!(renamed.header("x-rs3-version"), Some(now_version.as_str()));
+    let stale = s.send(&s.admin(), "GET", "/bkt/k", "", &[("x-rs3-if-version", &version), ("x-rs3-if-stamp", &pinned.header("x-rs3-stamp").unwrap().to_string())], b"").await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    let by_stamp_only = s.send(&s.admin(), "GET", "/bkt/k", "", &[("x-rs3-if-stamp", "1.0.0000000000000000")], b"").await;
+    assert_eq!(by_stamp_only.status, StatusCode::OK, "a stamp pin alone does not refuse (only x-rs3-if-version does)");
 }
 
 // ── webhooks ─────────────────────────────────────────────────────────────

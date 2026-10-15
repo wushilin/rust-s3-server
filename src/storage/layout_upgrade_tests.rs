@@ -293,8 +293,9 @@ async fn an_upgrade_interrupted_at_every_step_resumes_without_loss() {
     assert_fixture_intact(&store, &fixture).await;
     store.try_begin_rebuild(BUCKET);
 
-    // Crash after one object moved: the tree is mixed, every object is
-    // readable through its row.
+    // Crash once an object has moved (others may be mid-move, since
+    // relocation runs concurrently): the tree may be mixed, and every
+    // object is readable through its row either way.
     store.arm_crash_point("migrate_after_object");
     let s = store.clone();
     assert!(crashing(move || async move {
@@ -304,7 +305,7 @@ async fn an_upgrade_interrupted_at_every_step_resumes_without_loss() {
     store.disarm_crash_point("migrate_after_object");
     let index = store.index_unchecked(BUCKET).await.unwrap();
     let left = index.rows_off_layout(None, 10).await.unwrap();
-    assert!(!left.is_empty() && left.len() < 3, "some moved, some not: {left:?}");
+    assert!(left.len() < 3, "at least one moved: {left:?}");
     assert_eq!(store.bucket_layout(BUCKET).await.unwrap(), migrating);
     store.end_rebuild(BUCKET);
     assert_fixture_intact(&store, &fixture).await;

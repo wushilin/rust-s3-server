@@ -371,7 +371,11 @@ impl Pusher {
             Err(StorageError::ObjectNotFound { .. }) => return Err(PushError::Gone),
             Err(err) => return Err(PushError::Local(err)),
         };
-        if crate::storage::changelog::version_of(&object.object_dir.to_string_lossy()) != change.version {
+        // The local object must be the event's state: by version, or by
+        // stamp (a layout upgrade renames versions, never stamps).
+        if crate::storage::changelog::version_of(&object.object_dir.to_string_lossy()) != change.version
+            && object.meta.stamp.as_ref() != Some(stamp)
+        {
             return Err(PushError::Gone);
         }
         let meta = ObjectHeaders {

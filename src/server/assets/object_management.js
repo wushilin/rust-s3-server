@@ -134,8 +134,10 @@ function setBucketMultipartCount(name,count){const target=buckets.find(b=>b.name
 async function refreshBucketBadges(){
   if(!buckets.length)return;
   try{
-    const data=await api('GET','/api/buckets');const counts=new Map((data.buckets||[]).map(b=>[b.name,b.multipart_uploads||0]));
-    let changed=false;buckets.forEach(b=>{const n=counts.get(b.name)||0;if((b.multipart_uploads||0)!==n){b.multipart_uploads=n;changed=true;}});
+    const data=await api('GET','/api/buckets');const fresh=new Map((data.buckets||[]).map(b=>[b.name,b]));
+    let changed=false;buckets.forEach(b=>{const f=fresh.get(b.name);if(!f)return;const n=f.multipart_uploads||0;if((b.multipart_uploads||0)!==n){b.multipart_uploads=n;changed=true;}
+      // A layout upgrade finishing, or a versioning change made elsewhere, must reach the rail without a reload.
+      for(const k of ['layout','layout_upgrade','versioning','read_only']){if(JSON.stringify(b[k])!==JSON.stringify(f[k])){b[k]=f[k];changed=true;}}});
     if(changed)renderBuckets();
   }catch{}
 }

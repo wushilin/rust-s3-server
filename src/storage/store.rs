@@ -3523,29 +3523,43 @@ impl LocalObjectStore {
     /// caller's final check.
     async fn relocate_to_current_layout(&self, bucket: &str, cancel: &CancellationToken) -> Result<u64> {
         const BATCH: usize = 500;
-        let mut moved = 0u64;
+        /// Objects relocated at once: each move is a few fsyncs, which
+        /// overlap across keys (different keys, different locks).
+        const CONCURRENCY: usize = 8;
+        let moved = std::sync::atomic::AtomicU64::new(0);
         let mut after: Option<String> = None;
         loop {
             if cancel.is_cancelled() {
-                return Ok(moved);
+                return Ok(moved.into_inner());
             }
             let keys = self.keys_off_layout(bucket, after.as_deref(), BATCH).await?;
             let Some(last) = keys.last().cloned() else {
                 break;
             };
             after = Some(last);
-            for key in keys {
-                if cancel.is_cancelled() {
-                    return Ok(moved);
-                }
-                match self.relocate_object(bucket, &key).await {
-                    Ok(true) => moved += 1,
-                    Ok(false) => {}
-                    Err(err) => log::warn!("layout migration bucket={bucket} key={key} error={err}"),
-                }
-                self.crash_point("migrate_after_object");
+            futures::stream::iter(keys)
+                .for_each_concurrent(CONCURRENCY, |key| {
+                    let moved = &moved;
+                    async move {
+                        if cancel.is_cancelled() {
+                            return;
+                        }
+                        match self.relocate_object(bucket, &key).await {
+                            Ok(true) => {
+                                moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Ok(false) => {}
+                            Err(err) => log::warn!("layout migration bucket={bucket} key={key} error={err}"),
+                        }
+                        self.crash_point("migrate_after_object");
+                    }
+                })
+                .await;
+            if cancel.is_cancelled() {
+                return Ok(moved.into_inner());
             }
         }
+        let mut moved = moved.into_inner();
         let mut after: Option<String> = None;
         loop {
             if cancel.is_cancelled() {

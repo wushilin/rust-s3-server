@@ -271,7 +271,12 @@ GET and HEAD of an object return, besides the S3 headers:
 Request header `x-rs3-if-version: <version>` makes the read fail with
 `412 PreconditionFailed` unless the object is exactly that state, so a
 replicator never tags newer bytes with an older version. (`If-Match` on
-the ETag is not enough: a metadata update keeps the ETag.)
+the ETag is not enough: a metadata update keeps the ETag.) Request header
+`x-rs3-if-stamp: <stamp>` pins the same state by its stamp; when both are
+sent the read succeeds if either matches. A replicator SHOULD send both:
+a storage layout upgrade on the serving site renames every version (§2.3)
+without logging a change, while stamps never change, so a pin by version
+alone would skip every object whose event predates the upgrade.
 
 A deleted key (one with a tombstone) answers `404 NoSuchKey` with
 `x-rs3-site`, `x-rs3-stamp` (the delete's own stamp), `x-rs3-deleted:
@@ -376,9 +381,10 @@ A link following this specification:
 3. Reads changes from that head (§4.1), batching with `limit`/`wait`.
 4. Applies each event by rank: skips it if the local state ranks at or
    above it; skips repair deletes (§3.3); otherwise fetches the exact
-   version (§5.1, `x-rs3-if-version`; a `412` means the state moved on and
-   a later event carries the current one) and writes it with the event's
-   stamp (§5.2), reproducing the part layout (§3.2).
+   version (§5.1, `x-rs3-if-version` and `x-rs3-if-stamp`; a `412` means
+   the state moved on and a later event carries the current one) and
+   writes it with the event's stamp (§5.2), reproducing the part layout
+   (§3.2).
 5. Checkpoints `next` only after every event in the batch is applied.
 6. On `410` or a changed `log_id` (`409`): re-snapshots.
 7. Refuses to run if the peer's site id equals its own, or changes.

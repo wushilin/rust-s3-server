@@ -579,7 +579,7 @@ impl Worker {
         let local = self.store.index(bucket).await.map_err(PutError::Local)?.get(key).await.map_err(PutError::Local)?;
         let same_bytes = local.is_some_and(|row| row.etag == change.etag && row.size == change.size);
         if same_bytes {
-            let headers = self.alive(self.peer.head(key, &change.version)).await.map_err(PutError::Peer)?;
+            let headers = self.alive(self.peer.head(key, &change.version, &change.stamp)).await.map_err(PutError::Peer)?;
             self.store
                 .copy_object_with_metadata(
                     bucket,
@@ -608,7 +608,7 @@ impl Worker {
             Some(layout) => self.copy_multipart(change, layout, options).await,
             None => {
                 use futures::StreamExt;
-                let (headers, stream) = self.alive(self.peer.body(key, &change.version, None)).await.map_err(PutError::Peer)?;
+                let (headers, stream) = self.alive(self.peer.body(key, &change.version, &change.stamp, None)).await.map_err(PutError::Peer)?;
                 let stream = stream.inspect(|_| renew_lease(&self.heartbeat, self.lease_renew));
                 self.store
                     .put_object_stream_with_metadata(
@@ -646,7 +646,7 @@ impl Worker {
     ) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
         let key = &change.key;
-        let headers = self.alive(self.peer.head(key, &change.version)).await.map_err(PutError::Peer)?;
+        let headers = self.alive(self.peer.head(key, &change.version, &change.stamp)).await.map_err(PutError::Peer)?;
         let upload_id = self
             .store
             .initiate_multipart_replicated(
@@ -668,7 +668,7 @@ impl Worker {
                 let number = (i + 1) as u16;
                 let range = if size == 0 { None } else { Some((offset, offset + size - 1)) };
                 use futures::StreamExt;
-                let (_, stream) = self.alive(self.peer.body(key, &change.version, range)).await.map_err(PutError::Peer)?;
+                let (_, stream) = self.alive(self.peer.body(key, &change.version, &change.stamp, range)).await.map_err(PutError::Peer)?;
                 let stream = stream.inspect(|_| renew_lease(&self.heartbeat, self.lease_renew));
                 let put = self
                     .store

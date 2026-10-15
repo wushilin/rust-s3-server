@@ -403,11 +403,14 @@ impl PeerClient {
         self.json(&query_string(&params), Duration::from_secs(60)).await
     }
 
-    /// GET (optionally a byte range) of exactly `version` of `key`.
-    async fn get(&self, key: &str, version: &str, range: Option<(u64, u64)>, method: Method) -> Result<reqwest::Response, PeerError> {
+    /// GET (optionally a byte range) of exactly the state `version` /
+    /// `stamp` of `key`: pinned by both, since a storage layout upgrade on
+    /// the peer renames versions but never changes a stamp (§5.1).
+    async fn get(&self, key: &str, version: &str, stamp: &Stamp, range: Option<(u64, u64)>, method: Method) -> Result<reqwest::Response, PeerError> {
         let path = object_path(&self.config.bucket, key);
         let range_value = range.map(|(start, end)| format!("bytes={start}-{end}"));
-        let mut extra: Vec<(&str, &str)> = vec![("x-rs3-if-version", version)];
+        let stamp_value = stamp.to_header();
+        let mut extra: Vec<(&str, &str)> = vec![("x-rs3-if-version", version), ("x-rs3-if-stamp", stamp_value.as_str())];
         if let Some(range) = &range_value {
             extra.push(("range", range.as_str()));
         }
@@ -446,20 +449,21 @@ impl PeerClient {
         }
     }
 
-    /// Metadata of exactly `version` of `key`.
-    pub async fn head(&self, key: &str, version: &str) -> Result<ObjectHeaders, PeerError> {
-        let response = self.get(key, version, None, Method::HEAD).await?;
+    /// Metadata of exactly `version` / `stamp` of `key`.
+    pub async fn head(&self, key: &str, version: &str, stamp: &Stamp) -> Result<ObjectHeaders, PeerError> {
+        let response = self.get(key, version, stamp, None, Method::HEAD).await?;
         Ok(Self::headers_of(&response))
     }
 
-    /// The bytes (all, or `range`) of exactly `version` of `key`.
+    /// The bytes (all, or `range`) of exactly `version` / `stamp` of `key`.
     pub async fn body(
         &self,
         key: &str,
         version: &str,
+        stamp: &Stamp,
         range: Option<(u64, u64)>,
     ) -> Result<(ObjectHeaders, impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin), PeerError> {
-        let response = self.get(key, version, range, Method::GET).await?;
+        let response = self.get(key, version, stamp, range, Method::GET).await?;
         let headers = Self::headers_of(&response);
         Ok((headers, response.bytes_stream()))
     }

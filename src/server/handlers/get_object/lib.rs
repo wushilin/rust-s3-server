@@ -96,8 +96,14 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     // 0. x-rs3-if-version: a replicator pins the exact state a changelog
     // event named. Anything else (overwritten since, even with the same
     // ETag) is a 412, so it never tags newer data with an older version.
+    // `x-rs3-if-stamp` pins the same state by its stamp: a storage layout
+    // upgrade renames versions, never stamps, so a pin by both survives it.
+    let stamp_pinned = headers
+        .get("x-rs3-if-stamp")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|want| want.trim() == stamp.to_header());
     if let Some(want) = headers.get("x-rs3-if-version").and_then(|v| v.to_str().ok()) {
-        if want.trim() != version {
+        if want.trim() != version && !stamp_pinned {
             return srv::s3_error_detailed(
                 StatusCode::PRECONDITION_FAILED,
                 "PreconditionFailed",
