@@ -66,6 +66,36 @@ than asserting against a fabricated success. See "Behavior Changes" below.
 | s3select | 0 | 1 | 0 | 0/1/0 |
 | versioning | 0 | 1 | 0 | 0/1/0 |
 
+## Versioning suite, re-run 2026-10-15 (natively built)
+
+The Mint image is amd64 only and the test host is arm64, so the
+`versioning` suite was built from the Mint sources
+(`build/versioning`, Go 1.26, `CGO_ENABLED=0`) and run test by test
+against this build (`target/release/rusts3` on `127.0.0.1:29015`, the
+config above). Mint's own runner stops the suite at its first failure;
+running each test in its own process shows the state of all of them:
+
+| Test | Result |
+|---|---|
+| testMakeBucket (create + PutBucketVersioning) | pass |
+| testPutObject | pass |
+| testGetObject | pass |
+| testStatObject | pass |
+| testDeleteObject | pass |
+| testDeleteObjects (with VersionId) | pass |
+| testListObjectVersionsSimple (10 versions + marker, bad markers, bad encoding, bad credentials) | pass |
+| testListObjectVersionsWithPrefixAndDelimiter | pass |
+| testListObjectVersionsKeysContinuation | pass |
+| testListObjectVersionsVersionIDContinuation | pass |
+| testListObjectsVersionsWithEmptyDirObject | pass |
+| testPutObjectWithTaggingAndMetadata | fail: object tagging not implemented |
+| testTagging | fail: object tagging not implemented |
+| testLockingLegalhold, retention tests | not run: object lock not implemented (the test dereferences a nil legal-hold result) |
+
+Every versioning-specific test passes. The two failures are the object
+tagging feature, which the versioning suite exercises per version; the
+object lock tests cannot run against a server without it.
+
 ## Behavior Changes Since the Previous Run
 
 Two fixes in this run alter what Mint sees.
@@ -101,8 +131,9 @@ All 25 failures are in feature areas listed as out of scope in the README:
 
 - **S3 Select**: `aws-sdk-go`, `minio-js`, and the `s3select` suite fail on
   `SelectObjectContent` with `501 NotImplemented`.
-- **Object versioning**: the dedicated `versioning` suite fails at
-  `GetBucketVersioning` with `501 NotImplemented`.
+- **Object versioning**: in the original run the dedicated `versioning`
+  suite failed at `GetBucketVersioning` with `501 NotImplemented`; see
+  the 2026-10-15 re-run above.
 - **Bucket policy via the S3 API**: MinIO Go `SetBucketPolicy` fails with
   `SignatureDoesNotMatch`; MinIO JS `setBucketPolicy` fails.
 - **MinIO admin APIs**: eight Java admin tests (add/list/delete users and canned

@@ -1926,7 +1926,7 @@ const MAX_DELETE_OBJECTS_KEYS: usize = 1000;
 /// byte-for-byte (`"report "` must not become `"report"`), entities --
 /// named, decimal and hex -- are decoded exactly once, and CDATA is honoured.
 /// The error is the message of a `MalformedXML` reply.
-fn parse_delete_objects_xml(xml: &str) -> Result<(Vec<String>, bool), &'static str> {
+fn parse_delete_objects_xml(xml: &str) -> Result<(Vec<(String, Option<String>)>, bool), &'static str> {
     let root = parse_xml_tree(xml)?;
     if root.name != "Delete" {
         return Err("The XML you provided was not well-formed or did not validate against our published schema");
@@ -1944,7 +1944,13 @@ fn parse_delete_objects_xml(xml: &str) -> Result<(Vec<String>, bool), &'static s
             .iter()
             .find(|child| child.name == "Key")
             .ok_or("The XML you provided was not well-formed or did not validate against our published schema")?;
-        keys.push(key.text.clone());
+        let version_id = object
+            .children
+            .iter()
+            .find(|child| child.name == "VersionId")
+            .map(|v| v.text.trim().to_string())
+            .filter(|v| !v.is_empty());
+        keys.push((key.text.clone(), version_id));
         if keys.len() > MAX_DELETE_OBJECTS_KEYS {
             return Err("The XML you provided was not well-formed or did not validate against our published schema");
         }

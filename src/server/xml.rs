@@ -213,8 +213,10 @@ pub fn list_objects_v1_xml(
 pub fn list_object_versions_xml(
     bucket: &str,
     prefix: &str,
+    delimiter: Option<&str>,
     encoding_type: Option<&str>,
     versions: &[ObjectVersionEntry],
+    common_prefixes: &[String],
     max_keys: usize,
     key_marker: &str,
     version_id_marker: &str,
@@ -245,8 +247,17 @@ pub fn list_object_versions_xml(
             ));
         }
     }
+    for group in common_prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            escape_xml(&encode_list_value(group, encode_keys))
+        ));
+    }
     let encoding_xml = encoding_type
         .map(|v| format!("<EncodingType>{}</EncodingType>", escape_xml(v)))
+        .unwrap_or_default();
+    let delimiter_xml = delimiter
+        .map(|d| format!("<Delimiter>{}</Delimiter>", escape_xml(&encode_list_value(d, encode_keys))))
         .unwrap_or_default();
     let next_markers_xml = if is_truncated {
         format!(
@@ -258,7 +269,7 @@ pub fn list_object_versions_xml(
         String::new()
     };
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix>{encoding_xml}<KeyMarker>{}</KeyMarker><VersionIdMarker>{}</VersionIdMarker><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{is_truncated}</IsTruncated>{next_markers_xml}{body}</ListVersionsResult>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix>{delimiter_xml}{encoding_xml}<KeyMarker>{}</KeyMarker><VersionIdMarker>{}</VersionIdMarker><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{is_truncated}</IsTruncated>{next_markers_xml}{body}</ListVersionsResult>"#,
         escape_xml(bucket),
         escape_xml(&encode_list_value(prefix, encode_keys)),
         escape_xml(&encode_list_value(key_marker, encode_keys)),
@@ -400,6 +411,10 @@ pub fn list_multipart_uploads_xml(
 
 pub struct DeleteObjectResult {
     pub key: String,
+    /// The version the request named (`VersionId`), echoed back.
+    pub version_id: Option<String>,
+    /// A delete marker was left (versioned bucket), with its id.
+    pub delete_marker: Option<String>,
     pub error: Option<(String, String)>, // (code, message)
 }
 
@@ -409,8 +424,18 @@ pub fn delete_objects_xml(results: &[DeleteObjectResult], quiet: bool) -> String
         match &r.error {
             None => {
                 if !quiet {
+                    let version = r
+                        .version_id
+                        .as_deref()
+                        .map(|v| format!("<VersionId>{}</VersionId>", escape_xml(v)))
+                        .unwrap_or_default();
+                    let marker = r
+                        .delete_marker
+                        .as_deref()
+                        .map(|v| format!("<DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>{}</DeleteMarkerVersionId>", escape_xml(v)))
+                        .unwrap_or_default();
                     body.push_str(&format!(
-                        "<Deleted><Key>{}</Key></Deleted>",
+                        "<Deleted><Key>{}</Key>{version}{marker}</Deleted>",
                         escape_xml(&r.key)
                     ));
                 }
@@ -698,7 +723,7 @@ mod tests {
                 stamp,
             },
         ];
-        let xml = list_object_versions_xml("bucket", "my-prefix", None, &versions, 1000, "", "", true, Some("my-prefix/datafile"), Some("null"));
+        let xml = list_object_versions_xml("bucket", "my-prefix", None, None, &versions, &[], 1000, "", "", true, Some("my-prefix/datafile"), Some("null"));
         assert!(xml.contains("<Version><Key>my-prefix/datafile</Key><VersionId>null</VersionId><IsLatest>false</IsLatest>"), "{xml}");
         assert!(xml.contains("<DeleteMarker><Key>my-prefix/datafile</Key><VersionId>0000001700000000000.0000000000.0123456789abcdef</VersionId><IsLatest>true</IsLatest>"), "{xml}");
         assert!(xml.contains("<NextKeyMarker>my-prefix/datafile</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>"), "{xml}");

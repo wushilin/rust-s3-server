@@ -110,7 +110,7 @@ async fn enabled_keeps_every_version_and_a_delete_leaves_a_marker() {
         [(marker.clone(), true, true), (v2.clone(), false, false), (v1.clone(), false, false), ("null".to_string(), false, false)]
     );
     assert!(store.list_objects(BUCKET, "", None, None, 10).await.unwrap().entries.is_empty(), "a deleted key is not listed");
-    let page = store.list_object_versions(BUCKET, "", "", "", 10).await.unwrap();
+    let page = store.list_object_versions(BUCKET, "", None, "", "", 10).await.unwrap();
     let listed: Vec<(String, bool, bool)> = page.entries.iter().map(|e| (e.version_id.clone(), e.is_latest, e.delete_marker)).collect();
     assert_eq!(listed, versions(&store, "k").await, "ListObjectVersions sees the same");
     assert!(findings(&store).await.is_empty(), "the health scan knows every version and marker");
@@ -195,7 +195,7 @@ async fn an_unversioned_bucket_retires_what_it_replaces_but_keeps_deletes_on_dis
     let index = store.index(BUCKET).await.unwrap();
     let t = index.get_tombstone("k").await.unwrap().unwrap();
     assert!(t.blob_dir.is_some() && !t.versioned);
-    assert!(store.list_object_versions(BUCKET, "", "", "", 10).await.unwrap().entries.is_empty());
+    assert!(store.list_object_versions(BUCKET, "", None, "", "", 10).await.unwrap().entries.is_empty());
     assert!(findings(&store).await.is_empty());
     drop(index);
 
@@ -226,14 +226,14 @@ async fn a_versioned_bucket_rebuilds_its_versions_and_markers_from_the_tree() {
     store.delete_object(BUCKET, "a").await.unwrap();
     let before_a = versions(&store, "a").await;
     let before_b = versions(&store, "b").await;
-    let before = store.list_object_versions(BUCKET, "", "", "", 100).await.unwrap();
+    let before = store.list_object_versions(BUCKET, "", None, "", "", 100).await.unwrap();
 
     store.forget_index(BUCKET);
     tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
     assert_eq!(store.rebuild_index(BUCKET).await.unwrap(), 7, "every version and marker is indexed");
     assert_eq!(versions(&store, "a").await, before_a);
     assert_eq!(versions(&store, "b").await, before_b);
-    assert_eq!(store.list_object_versions(BUCKET, "", "", "", 100).await.unwrap(), before);
+    assert_eq!(store.list_object_versions(BUCKET, "", None, "", "", 100).await.unwrap(), before);
     assert_eq!(body_of(&store, "b", None).await, b"333");
     assert!(matches!(store.read_object(BUCKET, "a").await, Err(StorageError::ObjectNotFound { .. })));
     assert!(findings(&store).await.is_empty());
@@ -253,7 +253,7 @@ async fn list_object_versions_pages_through_versions_with_both_markers() {
     let (mut key_marker, mut version_marker) = (String::new(), String::new());
     let mut pages = 0;
     loop {
-        let page = store.list_object_versions(BUCKET, "", &key_marker, &version_marker, 4).await.unwrap();
+        let page = store.list_object_versions(BUCKET, "", None, &key_marker, &version_marker, 4).await.unwrap();
         pages += 1;
         assert!(page.entries.len() <= 4);
         all.extend(page.entries.iter().map(|e| (e.key.clone(), e.version_id.clone(), e.is_latest, e.delete_marker)));

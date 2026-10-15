@@ -293,6 +293,8 @@ pub enum VersionTarget {
 #[derive(Debug, Clone, Default)]
 pub struct VersionsPage {
     pub entries: Vec<(VersionRecord, bool)>,
+    /// With a delimiter: the groups rolled up, in key order with the entries.
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
     pub next_version_marker: Option<String>,
@@ -1525,6 +1527,7 @@ impl ObjectIndex {
     pub async fn list_versions_page(
         &self,
         prefix: &str,
+        delimiter: Option<&str>,
         key_marker: Option<&str>,
         version_marker: Option<&str>,
         max: usize,
@@ -1533,6 +1536,7 @@ impl ObjectIndex {
     ) -> Result<VersionsPage> {
         let db = self.db.clone();
         let prefix = prefix.to_string();
+        let delimiter = delimiter.filter(|d| !d.is_empty()).map(str::to_string);
         let key_marker = key_marker.map(str::to_string);
         let version_marker = version_marker.map(str::to_string);
         let site = site.to_string();
@@ -1564,6 +1568,28 @@ impl ObjectIndex {
                     break;
                 }
                 let key_str = String::from_utf8_lossy(&key).into_owned();
+                // With a delimiter, keys under a common prefix roll up into
+                // it (every version of every key there), counted as one
+                // entry; the scan skips past the whole group.
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = key_str[prefix.len()..].find(delimiter.as_str()) {
+                        let group = format!("{}{}", prefix, &key_str[prefix.len()..prefix.len() + idx + delimiter.len()]);
+                        if page.entries.len() + page.common_prefixes.len() >= max {
+                            page.is_truncated = true;
+                            return Ok(page);
+                        }
+                        page.common_prefixes.push(group.clone());
+                        page.next_key_marker = Some(group.clone());
+                        page.next_version_marker = None;
+                        if let Some(past) = prefix_successor(group.as_bytes()) {
+                            rows.seek(&past);
+                            tombs.seek(&past);
+                        } else {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 // The key's current state, then its noncurrent versions.
                 let mut current: Vec<VersionRecord> = Vec::new();
                 if row_key.as_deref() == Some(key.as_slice()) {
@@ -1605,7 +1631,7 @@ impl ObjectIndex {
                     if after_marker && version_marker.as_deref().is_some_and(|m| vdir.as_str() >= m) {
                         continue;
                     }
-                    if page.entries.len() >= max {
+                    if page.entries.len() + page.common_prefixes.len() >= max {
                         page.is_truncated = true;
                         return Ok(page);
                     }

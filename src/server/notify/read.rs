@@ -425,6 +425,7 @@ pub async fn snapshot(
         let page = index
             .list_versions_page(
                 &params.filter.prefix,
+                None,
                 params.after.as_deref(),
                 params.after_version.as_deref(),
                 params.limit,

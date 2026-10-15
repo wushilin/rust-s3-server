@@ -41,7 +41,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
     // Authorize each key. No identity (auth disabled) means allow.
     let allowed = keys
         .iter()
-        .map(|key| {
+        .map(|(key, _)| {
             ctx.identity
                 .as_ref()
                 .map(|identity| {
@@ -61,7 +61,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
 
     let requested_count = keys.len();
     let mut results = Vec::with_capacity(keys.len());
-    for (key, allowed) in keys.into_iter().zip(allowed.iter().copied()) {
+    for ((key, version_id), allowed) in keys.into_iter().zip(allowed.iter().copied()) {
         if !allowed {
             log::warn!(
                 "[{}] s3 batch delete denied user={} bucket={} key={}",
@@ -75,6 +75,8 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
             );
             results.push(DeleteObjectResult {
                 key,
+                version_id,
+                delete_marker: None,
                 error: Some((
                     "AccessDenied".to_string(),
                     "Access Denied by IAM policy".to_string(),
@@ -82,11 +84,27 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, body: Body) 
             });
             continue;
         }
-        let err = store.delete_object(&ctx.bucket, &key).await.err();
-        results.push(DeleteObjectResult {
-            key,
-            error: err.map(|e| ("InternalError".to_string(), e.to_string())),
-        });
+        // A version id names one version to remove permanently; without
+        // one the delete leaves a marker on a versioned bucket.
+        let result = match &version_id {
+            Some(version_id) => store
+                .delete_object_version(&ctx.bucket, &key, version_id, crate::storage::store::WriteOrigin::Client)
+                .await
+                .map(|_| None),
+            None => store
+                .delete_object_with(&ctx.bucket, &key, crate::storage::store::WriteOptions::client(), None)
+                .await
+                .map(|r| r.delete_marker.then_some(r.version_id).flatten()),
+        };
+        match result {
+            Ok(delete_marker) => results.push(DeleteObjectResult { key, version_id, delete_marker, error: None }),
+            Err(e) => results.push(DeleteObjectResult {
+                key,
+                version_id,
+                delete_marker: None,
+                error: Some(("InternalError".to_string(), e.to_string())),
+            }),
+        }
     }
 
     let mut response = srv::with_measure(

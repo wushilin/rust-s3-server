@@ -14,8 +14,32 @@ use crate::storage::store::LocalObjectStore;
 pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, _body: Body) -> Response {
     let prefix = ctx.query.get("prefix").map(String::as_str).unwrap_or("");
     let encoding_type = ctx.query.get("encoding-type").map(String::as_str);
+    if encoding_type.is_some_and(|v| v != "url") {
+        return srv::s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Invalid Encoding Method specified in Request",
+            &ctx.resource(),
+        );
+    }
     let key_marker = ctx.query.get("key-marker").map(String::as_str).unwrap_or("");
     let version_id_marker = ctx.query.get("version-id-marker").map(String::as_str).unwrap_or("");
+    let delimiter = ctx.query.get("delimiter").map(String::as_str).filter(|d| !d.is_empty());
+    // A version-id marker names a version of the key marker: it needs one,
+    // and must be `null` or a version id.
+    if !version_id_marker.is_empty() {
+        if key_marker.is_empty() {
+            return srv::s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "A version-id marker cannot be specified without a key marker.",
+                &ctx.resource(),
+            );
+        }
+        if version_id_marker != "null" && crate::storage::layouts::v3::parse_stamp_dir(version_id_marker).is_none() {
+            return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "Invalid version id specified", &ctx.resource());
+        }
+    }
     // `max-keys` is capped at S3's 1000 ceiling; anything unparseable falls back
     // to the default.
     let max_keys = ctx
@@ -27,7 +51,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, _body: Body)
     // The store resolves ordering, the markers and truncation: only this
     // page's key range is read.
     match store
-        .list_object_versions(&ctx.bucket, prefix, key_marker, version_id_marker, max_keys)
+        .list_object_versions(&ctx.bucket, prefix, delimiter, key_marker, version_id_marker, max_keys)
         .await
     {
         Ok(page) => {
@@ -38,8 +62,10 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: BucketCtx, _body: Body)
                     list_object_versions_xml(
                         &ctx.bucket,
                         prefix,
+                        delimiter,
                         encoding_type,
                         &page.entries,
+                        &page.common_prefixes,
                         max_keys,
                         key_marker,
                         version_id_marker,

@@ -250,13 +250,13 @@ async fn every_supported_layout_still_opens_and_upgrades() {
 
         // A rebuild from the tree alone (the index lost) reproduces the
         // catalog: rows, the deleted key's tombstone, and the version ids.
-        let before = store.list_object_versions(BUCKET, "", "", "", 100).await.unwrap();
+        let before = store.list_object_versions(BUCKET, "", None, "", "", 100).await.unwrap();
         store.forget_index(BUCKET);
         tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
         assert_eq!(store.rebuild_index(BUCKET).await.unwrap(), 4, "3 objects and the delete marker");
         assert_fixture_intact(&store, &fixture).await;
         assert_on_current_layout(&store).await;
-        let after = store.list_object_versions(BUCKET, "", "", "", 100).await.unwrap();
+        let after = store.list_object_versions(BUCKET, "", None, "", "", 100).await.unwrap();
         assert_eq!(before, after, "layout {}", spec.version);
     }
 }

@@ -195,6 +195,7 @@ pub struct ObjectVersionEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectVersionPage {
     pub entries: Vec<ObjectVersionEntry>,
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
     pub next_version_id_marker: Option<String>,
@@ -2293,6 +2294,7 @@ impl LocalObjectStore {
         &self,
         bucket: &str,
         prefix: &str,
+        delimiter: Option<&str>,
         key_marker: &str,
         version_id_marker: &str,
         max_keys: usize,
@@ -2318,6 +2320,7 @@ impl LocalObjectStore {
         let page = index
             .list_versions_page(
                 prefix,
+                delimiter,
                 key_marker,
                 version_marker.as_deref().filter(|m| *m != "null"),
                 max_keys,
@@ -2339,14 +2342,20 @@ impl LocalObjectStore {
                 stamp: v.stamp.clone(),
             })
             .collect::<Vec<_>>();
+        // The marker is the last version's id as listed (`null` for a null
+        // version); after a rolled-up group there is no version: `null`.
         let next_version_id_marker = page.is_truncated.then(|| {
-            entries.last().map(|e| e.version_id.clone()).unwrap_or_default()
+            match (&page.next_version_marker, entries.last()) {
+                (Some(_), Some(last)) => last.version_id.clone(),
+                _ => "null".to_string(),
+            }
         });
         Ok(ObjectVersionPage {
             is_truncated: page.is_truncated,
             next_key_marker: page.is_truncated.then(|| page.next_key_marker.clone().unwrap_or_default()),
             next_version_id_marker,
             entries,
+            common_prefixes: page.common_prefixes,
         })
     }
 
@@ -5563,14 +5572,14 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let page = store.list_object_versions("bucket", "", "", "", 3).await.unwrap();
+        let page = store.list_object_versions("bucket", "", None, "", "", 3).await.unwrap();
         assert_eq!(page.entries.len(), 3, "only one page of versions is read");
         assert!(page.is_truncated);
         assert_eq!(page.next_key_marker.as_deref(), Some("obj-02"));
         assert_eq!(page.next_version_id_marker.as_deref(), Some("null"));
 
         let resumed = store
-            .list_object_versions("bucket", "", "obj-02", "null", 3)
+            .list_object_versions("bucket", "", None, "obj-02", "null", 3)
             .await
             .unwrap();
         assert_eq!(
@@ -5604,7 +5613,7 @@ mod tests {
         let mut pages = 0usize;
         loop {
             let page = store
-                .list_object_versions("bucket", "", &marker, if marker.is_empty() { "" } else { "null" }, 2)
+                .list_object_versions("bucket", "", None, &marker, if marker.is_empty() { "" } else { "null" }, 2)
                 .await
                 .unwrap();
             pages += 1;
@@ -5628,7 +5637,7 @@ mod tests {
         assert_eq!(seen, vec!["a", "b", "c"], "one live version per key");
         // Every row is the live version, and the trash blobs are still on disk —
         // they are simply not listable.
-        let page = store.list_object_versions("bucket", "", "", "", 10).await.unwrap();
+        let page = store.list_object_versions("bucket", "", None, "", "", 10).await.unwrap();
         assert!(page.entries.iter().all(|v| v.is_latest));
         let trash = store.layout().trash_dir("bucket").unwrap();
         let mut trash_dirs = tokio::fs::read_dir(&trash).await.unwrap();
