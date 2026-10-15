@@ -37,6 +37,10 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         Ok(replicated) => replicated,
         Err(response) => return response,
     };
+    let tags = match srv::extract_tags(&ctx.headers) {
+        Ok(tags) => tags.unwrap_or_default(),
+        Err(message) => return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidTag", message, &resource),
+    };
     match store
         .initiate_multipart_as(
             &ctx.bucket,
@@ -46,6 +50,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             storage_class,
             content_language,
             &user_meta,
+            &tags,
             replicated,
         )
         .await

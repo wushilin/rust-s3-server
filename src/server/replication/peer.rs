@@ -224,6 +224,8 @@ pub struct ObjectHeaders {
     /// `x-amz-version-id`: a real version (`Some(true)`), the `null`
     /// version (`Some(false)`), or a bucket without versioning (`None`).
     pub versioned: Option<bool>,
+    /// The object's tags (`x-rs3-tags`, named fields).
+    pub tags: BTreeMap<String, String>,
 }
 
 pub struct PeerClient {
@@ -472,6 +474,7 @@ impl PeerClient {
             etag: text("etag").unwrap_or_default().trim_matches('"').to_string(),
             size: text("content-length").and_then(|v| v.parse().ok()).unwrap_or(0),
             versioned: text("x-amz-version-id").map(|v| v != "null"),
+            tags: text("x-rs3-tags").map(|v| parse_fields(&v)).unwrap_or_default(),
         }
     }
 
@@ -546,6 +549,15 @@ impl PeerClient {
     fn meta_headers(meta: &ObjectHeaders) -> Vec<(String, String)> {
         let fold = |v: &str| v.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut headers = Vec::new();
+        if !meta.tags.is_empty() {
+            let tagging = meta
+                .tags
+                .iter()
+                .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            headers.push(("x-amz-tagging".to_string(), tagging));
+        }
         for (name, value) in &meta.user_meta {
             headers.push((format!("x-amz-meta-{name}"), fold(value)));
         }
@@ -593,6 +605,7 @@ impl PeerClient {
         match response.status() {
             status if status.is_success() => Ok(response),
             StatusCode::PRECONDITION_FAILED => Err(PeerError::Stale),
+            StatusCode::NOT_FOUND => Err(PeerError::NotFound),
             status => {
                 let body = response.text().await.unwrap_or_default();
                 let message = s3_error_text(&body).unwrap_or_else(|| body.chars().take(300).collect());
@@ -645,6 +658,22 @@ impl PeerClient {
         }
         let builder = self.signed(Method::DELETE, &path, "", &extra);
         self.send_write(builder, &format!("DELETE {key}")).await.map(|_| ())
+    }
+
+    /// Replaces the tags of version `stamp` of `key` on the peer
+    /// (`PUT ?tagging&versionId`, a replicated write).
+    pub async fn put_tags(&self, key: &str, stamp: &Stamp, tags: &BTreeMap<String, String>) -> Result<(), PeerError> {
+        let path = object_path(&self.config.bucket, key);
+        let header = stamp.to_header();
+        let extra = [("x-rs3-stamp", header.as_str())];
+        let query = format!("tagging&versionId={}", crate::storage::layouts::v3::stamp_dir(stamp));
+        let set = tags
+            .iter()
+            .map(|(k, v)| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", crate::server::xml::escape_xml(k), crate::server::xml::escape_xml(v)))
+            .collect::<String>();
+        let body = format!(r#"<Tagging><TagSet>{set}</TagSet></Tagging>"#);
+        let builder = self.signed(Method::PUT, &path, &query, &extra).header("content-length", body.len()).body(body);
+        self.send_write(builder, &format!("PUT {key}?tagging")).await.map(|_| ())
     }
 
     /// Permanently removes version `stamp` of `key` on the peer

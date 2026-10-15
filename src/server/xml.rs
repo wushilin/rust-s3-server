@@ -741,6 +741,7 @@ mod tests {
             content_language: None,
             storage_class: "STANDARD".to_string(),
             user_meta: std::collections::BTreeMap::new(),
+            tags: std::collections::BTreeMap::new(),
         }];
         let xml =
             list_multipart_uploads_xml("bucket", &uploads, "", 1000, "", "", false, None, None);

@@ -59,6 +59,46 @@ pub struct ObjectMeta {
     pub delete_marker: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed: Option<super::stamp::Stamp>,
+    /// Object tags (S3 object tagging): up to 10 key/value pairs, the one
+    /// mutable part of a version — replacing them changes neither the
+    /// ETag nor the version.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Object tags as S3 limits them: at most 10, keys 1–128 and values 0–256
+/// characters, from letters, digits, space and `+ - = . _ : / @`, keys
+/// unique. Returns the reason when not.
+pub fn validate_tags(tags: &BTreeMap<String, String>) -> std::result::Result<(), String> {
+    if tags.len() > 10 {
+        return Err("Object tags cannot be greater than 10".to_string());
+    }
+    let ok = |s: &str| s.chars().all(|c| c.is_alphanumeric() || " +-=._:/@".contains(c));
+    for (key, value) in tags {
+        if key.is_empty() || key.chars().count() > 128 || !ok(key) {
+            return Err("The TagKey you have provided is invalid".to_string());
+        }
+        if value.chars().count() > 256 || !ok(value) {
+            return Err("The TagValue you have provided is invalid".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Parses the `x-amz-tagging` header / `Tagging` query form:
+/// `key=value&key2=value2`, URL-encoded. A repeated key is an error.
+pub fn parse_tagging_header(value: &str) -> std::result::Result<BTreeMap<String, String>, String> {
+    let mut tags = BTreeMap::new();
+    for part in value.split('&').filter(|p| !p.is_empty()) {
+        let (key, val) = part.split_once('=').unwrap_or((part, ""));
+        let decode = |s: &str| urlencoding::decode(&s.replace('+', " ")).map(|c| c.into_owned()).map_err(|_| "The TagKey you have provided is invalid".to_string());
+        let (key, val) = (decode(key)?, decode(val)?);
+        if tags.insert(key, val).is_some() {
+            return Err("Cannot provide multiple Tags with the same key".to_string());
+        }
+    }
+    validate_tags(&tags)?;
+    Ok(tags)
 }
 
 /// The `meta.json` format this build writes. Format 1 (`stamp` optional,
@@ -111,6 +151,8 @@ pub struct PutMeta {
     pub storage_class: String,
     #[serde(default)]
     pub user_meta: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +170,8 @@ pub struct UploadMeta {
     pub storage_class: String,
     #[serde(default)]
     pub user_meta: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// The blob layout this build writes. See [`super::layouts`] for every
@@ -349,6 +393,7 @@ mod tests {
             versioned: false,
             delete_marker: false,
             removed: None,
+            tags: std::collections::BTreeMap::new(),
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

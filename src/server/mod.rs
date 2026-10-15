@@ -1831,6 +1831,11 @@ async fn object_route(
             "partNumber requires an uploadId",
             &ctx.resource(),
         ),
+        // Object tagging, on the current version or the one `versionId`
+        // names.
+        Method::GET | Method::PUT | Method::DELETE if ctx.query.contains_key("tagging") => {
+            handlers::object_tagging::handle(store, ctx, body).await
+        }
         Method::PUT if is_copy => handlers::copy_object::handle(store, ctx, body).await,
         Method::PUT => handlers::put_object::handle(store, ctx, body).await,
         Method::GET if has_upload_id => handlers::list_parts::handle(store, ctx, body).await,
@@ -2071,7 +2076,7 @@ fn parse_xml_tree(xml: &str) -> Result<XmlNode, &'static str> {
 /// Decodes XML character data exactly once: the five predefined entities plus
 /// decimal (`&#10;`) and hex (`&#x1F600;`) character references. Anything that
 /// is not a recognisable reference is kept literally.
-fn unescape_xml(value: &str) -> String {
+pub(crate) fn unescape_xml(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(amp) = rest.find('&') {
@@ -2116,10 +2121,19 @@ fn unescape_xml(value: &str) -> String {
     out
 }
 
+/// The `?versionId=` of an `x-amz-copy-source`, when it names one.
+pub(crate) fn parse_copy_source_version(raw: &str) -> Option<String> {
+    let query = raw.split_once('?')?.1;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("versionId="))
+        .map(|v| percent_decode(v))
+        .filter(|v| !v.is_empty())
+}
+
 pub(crate) fn parse_copy_source(raw: &str) -> Option<(String, String)> {
-    // An `x-amz-copy-source` may carry a `?versionId=…` suffix; strip it so it
-    // never becomes part of the source key. This server addresses only the
-    // current version, so the version id is simply ignored.
+    // An `x-amz-copy-source` may carry a `?versionId=…` suffix (see
+    // `parse_copy_source_version`); it is not part of the key.
     let raw = raw.split('?').next().unwrap_or(raw);
     let path = percent_decode(raw.trim_start_matches('/'));
     let slash = path.find('/')?;
@@ -2384,6 +2398,18 @@ fn unimplemented_bucket_subresource(query: &HashMap<String, String>) -> bool {
     ]
     .iter()
     .any(|k| query.contains_key(*k))
+}
+
+/// The `x-amz-tagging` request header of a write: the new object's tags.
+/// `Ok(None)` when absent; a malformed value is the S3 message.
+pub(crate) fn extract_tags(headers: &HeaderMap) -> Result<Option<BTreeMap<String, String>>, String> {
+    match headers.get("x-amz-tagging") {
+        None => Ok(None),
+        Some(value) => {
+            let value = value.to_str().map_err(|_| "The TagKey you have provided is invalid".to_string())?;
+            crate::storage::metadata::parse_tagging_header(value).map(Some)
+        }
+    }
 }
 
 /// Adds `x-amz-version-id` to a write's response when the store reported

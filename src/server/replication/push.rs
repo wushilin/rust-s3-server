@@ -19,7 +19,7 @@ use super::model::{Checkpoint, Link, LinkStatus, Phase, PushCheckpoint, PushStat
 use super::change::{Change, Kind};
 use super::peer::{ObjectHeaders, PeerClient, PeerError};
 use super::worker::{latest_per_key, StepError};
-use crate::server::notify::model::{Filter, WireEvent};
+use crate::server::notify::model::{Filter, WireEvent, WireOrigin};
 use crate::server::notify::read::{self, ReadError, ReadParams, SnapshotParams};
 use crate::storage::errors::StorageError;
 use crate::storage::write::outranks;
@@ -348,8 +348,15 @@ impl Pusher {
     async fn apply(&self, event: &WireEvent, peer_site: &str, live: bool, peer_versioned: bool) -> Result<(), StepError> {
         self.beat();
         let change = Change::from_event(event, &self.store.site_id()).map_err(StepError::Fatal)?;
-        // Came from the peer (pulled by this link): it has it, or newer.
-        if live && change.stamp.site == peer_site {
+        // Came from the peer (pulled by this link): it has it, or newer. A
+        // put or delete is the peer's when its stamp is; a removal or a tag
+        // change names the version's stamp, not its author's, so for those
+        // the origin tells: applied here by replication means pulled.
+        let echo = match &change.kind {
+            Kind::RemoveVersion | Kind::Tags(_) => change.origin == WireOrigin::Replication,
+            Kind::Put | Kind::Delete { .. } => change.stamp.site == peer_site,
+        };
+        if live && echo {
             self.update(|s| s.skipped += 1);
             return Ok(());
         }
@@ -366,6 +373,16 @@ impl Pusher {
             self.update(|s| s.deleted += 1);
             return Ok(());
         }
+        if let Kind::Tags(tags) = &change.kind {
+            match self.alive(self.peer.put_tags(&change.key, &change.stamp, tags)).await {
+                Ok(()) => self.update(|s| s.metadata_only += 1),
+                // The peer does not have the version: the tags come with it.
+                Err(PeerError::NotFound) => self.update(|s| s.skipped += 1),
+                Err(err) => return Err(err.into()),
+            }
+            self.peer_site_check()?;
+            return Ok(());
+        }
         let remote = self.alive(self.peer.state(&change.key)).await.map_err(StepError::from)?;
         self.peer_site_check()?;
         // An unversioned peer holds one state per key: only a higher-ranked
@@ -376,7 +393,7 @@ impl Pusher {
             return Ok(());
         }
         let result = match &change.kind {
-            Kind::RemoveVersion => unreachable!("handled above"),
+            Kind::RemoveVersion | Kind::Tags(_) => unreachable!("handled above"),
             Kind::Delete { removed } => self
                 .alive(self.peer.delete(&change.key, &change.stamp, removed, change.versioned))
                 .await
@@ -442,6 +459,7 @@ impl Pusher {
             etag: object.meta.etag.clone(),
             size: object.meta.size,
             versioned: change.versioned,
+            tags: object.meta.tags.clone(),
         };
         if remote.is_some_and(|r| r.etag == object.meta.etag && r.size == object.meta.size) {
             self.alive(self.peer.copy_metadata(key, &meta, stamp)).await.map_err(PushError::Peer)?;

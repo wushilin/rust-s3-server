@@ -88,13 +88,17 @@ running each test in its own process shows the state of all of them:
 | testListObjectVersionsKeysContinuation | pass |
 | testListObjectVersionsVersionIDContinuation | pass |
 | testListObjectsVersionsWithEmptyDirObject | pass |
-| testPutObjectWithTaggingAndMetadata | fail: object tagging not implemented |
-| testTagging | fail: object tagging not implemented |
+| testPutObjectWithTaggingAndMetadata | pass (object tagging added the same day) |
+| testTagging | pass |
 | testLockingLegalhold, retention tests | not run: object lock not implemented (the test dereferences a nil legal-hold result) |
 
-Every versioning-specific test passes. The two failures are the object
-tagging feature, which the versioning suite exercises per version; the
-object lock tests cannot run against a server without it.
+Every versioning and tagging test passes; only the object lock tests
+cannot run against a server without it.
+
+Beside Mint, `tests/sdk_compat.rs` drives the official AWS SDK for Rust
+against freshly started servers: versioning, per-version tagging, copies
+by version id, bulk deletes by version id, and two linked sites that
+converge on the same versions, markers and tags.
 
 ## Behavior Changes Since the Previous Run
 

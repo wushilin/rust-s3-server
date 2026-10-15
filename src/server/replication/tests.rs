@@ -1968,3 +1968,51 @@ async fn a_versioning_change_stops_a_merge_link_both_ways_until_both_match_then_
     })
     .await;
 }
+
+#[tokio::test]
+async fn object_tags_travel_with_objects_and_tag_changes_replicate_both_ways() {
+    use crate::storage::metadata::BucketVersioning;
+    use std::collections::BTreeMap;
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+        site.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    }
+    let tags = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+    let put_tagged = |site: &Site, key: &str, body: &[u8], t: BTreeMap<String, String>| {
+        let (site, key, body) = (site.store.clone(), key.to_string(), body.to_vec());
+        async move {
+            let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(bytes::Bytes::from(body))));
+            site.put_object_stream_with_metadata("data", &key, stream, None, None, None, None, &BTreeMap::new(), false, None, None, crate::storage::store::WriteOptions::client().with_tags(Some(t)))
+                .await
+                .unwrap();
+        }
+    };
+    // Tagged before the link (snapshot) and after it (live), single and
+    // multipart.
+    put_tagged(&a, "k", b"one", tags(&[("env", "prod")])).await;
+    let link = b.pull_from(&a, "data", Mode::Merge).await;
+    put_tagged(&a, "k", b"two", tags(&[("env", "staging"), ("team", "x")])).await;
+    let upload = a.store.initiate_multipart_replicated("data", "big", None, None, None, None, &BTreeMap::new(), &tags(&[("kind", "big")])).await.unwrap();
+    let put = a.store.put_multipart_part("data", "big", &upload, 1, &vec![7u8; MIB], false).await.unwrap();
+    a.store.complete_multipart("data", "big", &upload, &[CompletePartRequest { number: 1, etag: put.etag }]).await.unwrap();
+    eventually(30, "mirrored", || async { same(&a, &b, "data").await && same_versions(&a, &b, "data", "k").await }).await;
+    let tags_of = |site: &Site, key: &str, version: Option<&str>| {
+        let (site, key, version) = (site.store.clone(), key.to_string(), version.map(str::to_string));
+        async move { site.object_tags("data", &key, version.as_deref()).await.unwrap().0 }
+    };
+    assert_eq!(tags_of(&b, "k", None).await, tags(&[("env", "staging"), ("team", "x")]));
+    assert_eq!(tags_of(&b, "big", None).await, tags(&[("kind", "big")]));
+    let v1 = versions_of(&a, "data", "k").await[1].0.clone();
+    assert_eq!(tags_of(&b, "k", Some(&v1)).await, tags(&[("env", "prod")]), "the older version's tags came with it");
+
+    // A tag change on a reaches b (pull), one on b reaches a (push), on
+    // the exact version, without a new version anywhere.
+    a.store.set_object_tags("data", "k", Some(&v1), tags(&[("env", "archived")]), crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(30, "tags pulled", || async { tags_of(&b, "k", Some(&v1)).await == tags(&[("env", "archived")]) }).await;
+    b.store.set_object_tags("data", "big", None, BTreeMap::new(), crate::storage::write::WriteOrigin::Client).await.unwrap();
+    eventually(30, "tags pushed", || async { tags_of(&a, "big", None).await.is_empty() }).await;
+    assert!(same_versions(&a, &b, "data", "k").await && versions_of(&a, "data", "k").await.len() == 2);
+    assert!(b.link(&link).status.last_error.is_none(), "{:?}", b.link(&link).status.last_error);
+}

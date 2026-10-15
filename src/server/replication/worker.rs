@@ -574,6 +574,22 @@ impl Worker {
             self.update(|s| s.deleted += 1);
             return Ok(());
         }
+        if let Kind::Tags(tags) = &change.kind {
+            // The version's tags, if the version is here (else they come
+            // with the version itself).
+            match self
+                .store
+                .set_object_tags(bucket, &change.key, Some(&change.version), tags.clone(), WriteOrigin::Replicated(change.stamp.clone()))
+                .await
+            {
+                Ok(_) => self.update(|s| s.metadata_only += 1),
+                Err(StorageError::NoSuchVersion { .. } | StorageError::ObjectNotFound { .. } | StorageError::VersionIsDeleteMarker { .. }) => {
+                    self.update(|s| s.skipped += 1)
+                }
+                Err(err) => return Err(err.into()),
+            }
+            return Ok(());
+        }
         if self.versioned().await? {
             // Held already (as the current state, a kept version, or a
             // removed one): nothing to fetch.
@@ -591,7 +607,7 @@ impl Worker {
             }
         }
         let result = match &change.kind {
-            Kind::RemoveVersion => unreachable!("handled above"),
+            Kind::RemoveVersion | Kind::Tags(_) => unreachable!("handled above"),
             Kind::Delete { removed } => self
                 .store
                 .delete_object_with(
@@ -660,7 +676,7 @@ impl Worker {
                     Some(&headers.user_meta),
                     headers.content_type.as_deref(),
                     headers.content_language.as_deref(),
-                    options,
+                    options.with_tags(Some(headers.tags.clone())),
                 )
                 .await
                 .map_err(PutError::Local)?;
@@ -680,6 +696,7 @@ impl Worker {
                 use futures::StreamExt;
                 let (headers, stream) = self.alive(self.peer.body(key, &change.version, &change.stamp, None)).await.map_err(PutError::Peer)?;
                 let stream = stream.inspect(|_| renew_lease(&self.heartbeat, self.lease_renew));
+                let options = options.with_tags(Some(headers.tags.clone()));
                 self.store
                     .put_object_stream_with_metadata(
                         bucket,
@@ -727,6 +744,7 @@ impl Worker {
                 headers.storage_class.as_deref(),
                 headers.content_language.as_deref(),
                 &headers.user_meta,
+                &headers.tags,
             )
             .await
             .map_err(PutError::Local)?;

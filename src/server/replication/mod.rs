@@ -1096,6 +1096,7 @@ impl ReplicationService {
                 origin: crate::storage::store::WriteOrigin::Restore(stamp.clone()),
                 precondition: Some(crate::storage::store::Precondition::IfMatch(request.lost_etag.clone())),
                 versioned: None,
+                tags: None,
             };
             match worker.restore(&change, options).await {
                 Ok(()) => {

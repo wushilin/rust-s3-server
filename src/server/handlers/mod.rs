@@ -39,6 +39,8 @@ pub(crate) mod get_object;
 pub(crate) mod get_object_attributes;
 #[path = "list_parts/lib.rs"]
 pub(crate) mod list_parts;
+#[path = "object_tagging/lib.rs"]
+pub(crate) mod object_tagging;
 #[path = "put_object/lib.rs"]
 pub(crate) mod put_object;
 #[path = "put_part/lib.rs"]

@@ -118,7 +118,7 @@ reads (§4.3) and webhooks.
 | Field | Type | Present | Meaning |
 |---|---|---|---|
 | `seq` | u64 | live events only | Position in the bucket's changelog. Strictly increasing, not contiguous. |
-| `op` | string | always | `put`, `delete`, `remove_version` (live); `exists`, `deleted` (snapshot). A reader MUST NOT guess the meaning of an op it does not know. |
+| `op` | string | always | `put`, `delete`, `remove_version`, `tags` (live); `exists`, `deleted` (snapshot). A reader MUST NOT guess the meaning of an op it does not know. |
 | `key` | string | always | The object key. |
 | `etag` | string | always | `put`/`exists`: the state's ETag (bare, no quotes). `delete`/`deleted`: the removed version's; empty when the delete removed nothing here (§3.1). |
 | `size` | u64 | always | Bytes of the state (`0` with an empty `etag`). |
@@ -130,6 +130,14 @@ reads (§4.3) and webhooks.
 | `stamp` | stamp | always (fallback for old states) | `put`/`exists`: the state's stamp. `delete`/`deleted`: the delete's own stamp. |
 | `removed_stamp` | stamp | deletes | The stamp of the version the delete removed: what it ranks by. A reader MUST use `stamp` when it is absent. |
 | `versioned` | bool | when known | `true`: the state is a real version of a versioning-enabled bucket (its stamp is its version id). `false`: the key's `null` version. Absent from events written before versioning existed; a reader treats that as unknown (§5.4). |
+
+`tags` is logged when a version's tags are replaced
+(`PutObjectTagging` / `DeleteObjectTagging`): `stamp` and `version` name
+the version, `tags` (an object of key/value strings) is its new tag set,
+`etag`, `size` and `parts` describe the version, which did not change. A
+reader applies it by identity: that version's tags become exactly the
+set (§5.4); a version the reader does not hold gets its tags when it
+fetches the version (§5.1, `x-rs3-tags`).
 
 `remove_version` is logged by `DeleteObject?versionId`: the version named
 by `stamp` (and `version`, its directory form) was permanently removed —
@@ -281,6 +289,11 @@ GET and HEAD of an object return, besides the S3 headers:
 | `x-rs3-version` | the state's version (§2.3) |
 | `x-rs3-stamp` | the state's stamp, header form (§2.2) |
 | `x-rs3-site` | the answering site's id |
+| `x-rs3-tags` | the state's object tags as named fields (§7), when it has any (S3's `x-amz-tagging-count` gives the count) |
+
+A replicator writes the tags it reads here with the copy
+(`x-amz-tagging` on PUT, CreateMultipartUpload or copy), so a replicated
+state carries its tags from the start.
 
 Request header `x-rs3-if-version: <version>` makes the read fail with
 `412 PreconditionFailed` unless the object is exactly that state, so a
@@ -397,6 +410,10 @@ site computes that the same way. On a bucket with versioning enabled:
   removal: the version goes if held, and the site remembers it as removed
   for the tombstone retention, so a copy arriving later is refused. It is
   logged as `remove_version` either way.
+- `PUT ?tagging&versionId=<stamp dir>` with `x-rs3-stamp` replaces that
+  version's tags (`404 NoSuchVersion` when the site does not hold it: the
+  tags come with the version). Unchanged tags log nothing, so a change
+  that has gone round a merge pair stops there.
 
 A replicator between two versioning-enabled buckets therefore applies
 **every** event (nothing collapses within a batch), decides by identity

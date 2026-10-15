@@ -134,6 +134,14 @@ not-applicable count is higher and the failure count lower than in earlier runs.
 
 The dated [MinIO Mint compatibility report](test_report.md) is the source of
 truth — the summary above is not a claim of complete S3 or MinIO compatibility.
+Its `versioning` suite (versions, delete markers, listings, per-version
+tagging) passes in full as of 2026-10-15; the object lock tests it also
+contains cannot run without object lock.
+
+`tests/sdk_compat.rs` additionally drives the official AWS SDK for Rust
+against freshly started servers: versioning, tagging, copies and bulk
+deletes by version id, and two replication-linked sites converging on the
+same versions, markers and tags.
 
 ### The Rust data stack (`object_store`)
 
@@ -163,7 +171,7 @@ for filtering, port overrides, and running against an existing server.
 Not implemented:
 
 - bucket policies via the S3 API (use console IAM policies instead), ACLs,
-  websites, lifecycle rules, tagging;
+  websites, lifecycle rules, bucket tagging;
 - object lock, retention/legal hold, replication, notifications, S3 Select;
 - server-side encryption and storage-tier behavior (storage class is metadata only);
 - MinIO admin APIs and Snowball archive extraction;
@@ -550,6 +558,17 @@ version. On disk every version is a directory beside the others under its
 key, so an index rebuild recovers versions and delete markers from the tree
 alone. The console's object details panel lists a key's versions with a
 download and a permanent delete for each.
+
+**Object tagging.** Up to ten key/value tags per object version, set with
+`x-amz-tagging` on PUT, copy (`x-amz-tagging-directive: COPY|REPLACE`)
+and multipart create, and read, replaced or removed with `GET`, `PUT` and
+`DELETE /{bucket}/{key}?tagging`, each with an optional `versionId`. GET
+and HEAD report `x-amz-tagging-count`. A copy source may name a version
+(`x-amz-copy-source: /bucket/key?versionId=…`). Replacing tags changes neither the
+ETag nor the version. Reading tags needs `s3:GetObject` on the object,
+changing them `s3:PutObject`. Tags travel with replicated objects and a
+tag change is a `tags` changelog event that replication applies to the
+same version on the other site.
 
 **Versions and replication.** A version is immutable and named by its
 stamp on every site, so two versioning-enabled buckets hold the same set

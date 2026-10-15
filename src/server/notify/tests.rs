@@ -2069,7 +2069,7 @@ async fn a_read_only_bucket_accepts_only_replicated_writes() {
         )
         .await
         .unwrap();
-    let upload = h.store.initiate_multipart_replicated("replica", "big", None, None, None, None, &BTreeMap::new()).await.unwrap();
+    let upload = h.store.initiate_multipart_replicated("replica", "big", None, None, None, None, &BTreeMap::new(), &BTreeMap::new()).await.unwrap();
     let part = h.store.put_multipart_part("replica", "big", &upload, 1, b"part", false).await.unwrap();
     h.store
         .complete_multipart_with(

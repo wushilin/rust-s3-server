@@ -1063,6 +1063,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: BTreeMap::new(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         cleanup.disarm();
@@ -1146,6 +1147,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: BTreeMap::new(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         cleanup.disarm();
@@ -1233,6 +1235,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: BTreeMap::new(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         cleanup.disarm();
@@ -1303,6 +1306,7 @@ impl LocalObjectStore {
                 etag: put_meta.etag.clone(),
                 last_modified_ms: now_ms(),
             }],
+            tags: put_meta.tags.clone(),
         };
         let publish_dir =
             prepare_single_publish_dir(&staging_dir, &staged_part, &object_meta).await?;
@@ -1330,10 +1334,13 @@ impl LocalObjectStore {
         mut object_meta: ObjectMeta,
         options: WriteOptions,
     ) -> Result<PutResult> {
-        let WriteOptions { origin, precondition, versioned: versioned_hint } = options;
+        let WriteOptions { origin, precondition, versioned: versioned_hint, tags } = options;
         if let Err(err) = self.check_write_allowed(bucket, &origin).await {
             let _ = tokio::fs::remove_dir_all(publish_dir).await;
             return Err(err);
+        }
+        if let Some(tags) = tags {
+            object_meta.tags = tags;
         }
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         let versioning = self.bucket_meta(bucket).await?.versioning;
@@ -1399,6 +1406,7 @@ impl LocalObjectStore {
             || object_meta.stamp.as_ref() != Some(&stamp)
             || object_meta.versioned != versioned
             || object_meta.format_version != META_FORMAT
+            || !object_meta.tags.is_empty()
         {
             object_meta.format_version = META_FORMAT;
             object_meta.last_modified_ms = last_modified_ms;
@@ -1921,7 +1929,7 @@ impl LocalObjectStore {
         options: WriteOptions,
         removed: Option<Stamp>,
     ) -> Result<DeleteResult> {
-        let WriteOptions { origin, precondition, versioned: versioned_hint } = options;
+        let WriteOptions { origin, precondition, versioned: versioned_hint, tags: _ } = options;
         self.ensure_bucket_and_key(bucket, key).await?;
         self.check_write_allowed(bucket, &origin).await?;
         let versioning = self.bucket_meta(bucket).await?.versioning;
@@ -1942,7 +1950,12 @@ impl LocalObjectStore {
             (None, _, Some(given)) => given.clone(),
             // A local delete removes exactly the version it sees.
             (None, Some(row), None) => self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms),
-            (None, None, None) => return Ok(DeleteResult::default()),
+            // A deleted key: on a versioning-enabled bucket another marker
+            // goes on top (S3); elsewhere there is nothing to do.
+            (None, None, None) => match index.get_tombstone(key).await? {
+                Some(t) if versioning == BucketVersioning::Enabled && t.blob_dir.is_some() => t.stamp.clone(),
+                _ => return Ok(DeleteResult::default()),
+            },
         };
         let current = self.current_rank(&index, key, row.as_ref()).await?;
         let versioned = self.versioned_bit(&index, key, versioning, versioned_hint).await?;
@@ -2054,6 +2067,7 @@ impl LocalObjectStore {
             versioned,
             delete_marker: true,
             removed: Some(removed.clone()),
+            tags: BTreeMap::new(),
         };
         tokio::fs::create_dir_all(&dir).await?;
         write_json_atomic(&dir.join("meta.json"), &meta).await?;
@@ -2473,6 +2487,70 @@ impl LocalObjectStore {
         Ok(Some(version.record.size))
     }
 
+    /// The tags of `key` (of the version `version_id` names, else the
+    /// current one) and that version's S3 id. A delete marker is
+    /// [`StorageError::VersionIsDeleteMarker`].
+    pub async fn object_tags(&self, bucket: &str, key: &str, version_id: Option<&str>) -> Result<(BTreeMap<String, String>, String)> {
+        let read = match version_id {
+            Some(version_id) => self.read_object_version(bucket, key, version_id).await?,
+            None => self.read_object(bucket, key).await?,
+        };
+        let version_id = match read.meta.versioned {
+            true => read.meta.stamp.as_ref().map(v3::stamp_dir).unwrap_or_else(|| "null".to_string()),
+            false => "null".to_string(),
+        };
+        Ok((read.meta.tags, version_id))
+    }
+
+    /// Replaces the tags of one version of `key` (the version `version_id`
+    /// names, else the current one) in place: neither the ETag nor the
+    /// version changes. Logged as a `tags` change, unless nothing changed.
+    /// Returns the version's S3 id.
+    pub async fn set_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: BTreeMap<String, String>,
+        origin: WriteOrigin,
+    ) -> Result<String> {
+        super::metadata::validate_tags(&tags).map_err(StorageError::InvalidObjectKey)?;
+        self.ensure_bucket_and_key(bucket, key).await?;
+        self.check_write_allowed(bucket, &origin).await?;
+        let index = self.index(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+        let version = match version_id {
+            Some(version_id) => self.find_version(bucket, key, version_id).await?,
+            None => self
+                .list_versions(bucket, key)
+                .await?
+                .into_iter()
+                .find(|v| v.is_current)
+                .ok_or_else(|| StorageError::ObjectNotFound { bucket: bucket.to_string(), key: key.to_string() })?,
+        };
+        if version.record.delete_marker {
+            return Err(StorageError::VersionIsDeleteMarker {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version.version_id(),
+            });
+        }
+        let dir = self.layout.bucket_dir(bucket)?.join(&version.record.blob_dir);
+        let mut meta: ObjectMeta = read_json(&dir.join("meta.json")).await?;
+        if meta.tags == tags {
+            return Ok(version.version_id());
+        }
+        meta.tags = tags.clone();
+        write_json_atomic(&dir.join("meta.json"), &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&dir.join("meta.json")).await?;
+            fsync_dir(&dir).await?;
+        }
+        self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+        index.log_tags(&version.record, &tags, now_ms(), origin.change_origin()).await?;
+        Ok(version.version_id())
+    }
+
     /// The bucket's versioning state.
     pub async fn bucket_versioning(&self, bucket: &str) -> Result<BucketVersioning> {
         Ok(self.bucket_meta(bucket).await?.versioning)
@@ -2565,7 +2643,7 @@ impl LocalObjectStore {
         content_language: Option<&str>,
         user_meta: &BTreeMap<String, String>,
     ) -> Result<String> {
-        self.initiate_multipart_as(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta, false)
+        self.initiate_multipart_as(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta, &BTreeMap::new(), false)
             .await
     }
 
@@ -2583,12 +2661,13 @@ impl LocalObjectStore {
         storage_class: Option<&str>,
         content_language: Option<&str>,
         user_meta: &BTreeMap<String, String>,
+        tags: &BTreeMap<String, String>,
         replicated: bool,
     ) -> Result<String> {
         if !replicated {
             self.ensure_writable(bucket).await?;
         }
-        self.initiate_multipart_replicated(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta)
+        self.initiate_multipart_replicated(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta, tags)
             .await
     }
 
@@ -2604,6 +2683,7 @@ impl LocalObjectStore {
         storage_class: Option<&str>,
         content_language: Option<&str>,
         user_meta: &BTreeMap<String, String>,
+        tags: &BTreeMap<String, String>,
     ) -> Result<String> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let upload_id = new_staging_id(now_ms());
@@ -2626,6 +2706,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: tags.clone(),
         };
         let upload_json = staging_dir.join("upload.json");
         write_json_atomic(&upload_json, &upload).await?;
@@ -3047,6 +3128,7 @@ impl LocalObjectStore {
             storage_class: upload.storage_class.clone(),
             user_meta: upload.user_meta.clone(),
             parts: object_parts,
+            tags: upload.tags.clone(),
         };
         let publish_dir = prepare_multipart_publish_dir(&staging_dir, &parts, &object_meta).await?;
         self.crash_point("complete_after_prepare");
@@ -3164,6 +3246,7 @@ impl LocalObjectStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_object_with_metadata(
         &self,
         src_bucket: &str,
@@ -3176,8 +3259,39 @@ impl LocalObjectStore {
         replacement_content_language: Option<&str>,
         options: WriteOptions,
     ) -> Result<PutResult> {
+        self.copy_object_version(
+            src_bucket,
+            src_key,
+            None,
+            dst_bucket,
+            dst_key,
+            storage_class,
+            replacement_user_meta,
+            replacement_content_type,
+            replacement_content_language,
+            options,
+        )
+        .await
+    }
+
+    /// [`Self::copy_object_with_metadata`] of one version of the source
+    /// (`src_version_id`: an S3 version id; the current state when `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_object_version(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        src_version_id: Option<&str>,
+        dst_bucket: &str,
+        dst_key: &str,
+        storage_class: Option<&str>,
+        replacement_user_meta: Option<&BTreeMap<String, String>>,
+        replacement_content_type: Option<&str>,
+        replacement_content_language: Option<&str>,
+        options: WriteOptions,
+    ) -> Result<PutResult> {
         self.ensure_bucket_and_key(dst_bucket, dst_key).await?;
-        if src_bucket == dst_bucket && src_key == dst_key {
+        if src_bucket == dst_bucket && src_key == dst_key && src_version_id.is_none() {
             // Copy onto itself = a metadata update: keep the bytes, the part
             // layout and the ETag (hardlinks, constant cost).
             if let Some(result) = self
@@ -3196,7 +3310,10 @@ impl LocalObjectStore {
             }
         }
         let _source_guard = self.locks.lock(src_bucket, src_key).await;
-        let src = self.read_object(src_bucket, src_key).await?;
+        let src = match src_version_id {
+            Some(version_id) => self.read_object_version(src_bucket, src_key, version_id).await?,
+            None => self.read_object(src_bucket, src_key).await?,
+        };
         let content_type = replacement_content_type
             .map(str::to_string)
             .unwrap_or_else(|| src.meta.content_type.clone());
@@ -3227,6 +3344,8 @@ impl LocalObjectStore {
             content_language,
             storage_class: copied_storage_class,
             user_meta,
+            // A copy keeps the source's tags unless the write replaces them.
+            tags: src.meta.tags.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         drop(_source_guard);

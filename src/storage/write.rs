@@ -103,6 +103,10 @@ pub struct WriteOptions {
     /// the state keeps that: a `null` version stays `null`. `None`: the
     /// bucket's own rule.
     pub versioned: Option<bool>,
+    /// Object tags for the new state (`x-amz-tagging`); `None` keeps what
+    /// the write would otherwise carry (a copy's source tags, an upload's
+    /// tags from its creation, else none).
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl WriteOptions {
@@ -112,7 +116,12 @@ impl WriteOptions {
 
     /// A write of `origin`, unconditional.
     pub fn from_origin(origin: WriteOrigin) -> Self {
-        Self { origin, precondition: None, versioned: None }
+        Self { origin, precondition: None, versioned: None, tags: None }
+    }
+
+    pub fn with_tags(mut self, tags: Option<std::collections::BTreeMap<String, String>>) -> Self {
+        self.tags = tags;
+        self
     }
 
     pub fn with_versioned(mut self, versioned: Option<bool>) -> Self {
@@ -131,7 +140,7 @@ impl WriteOptions {
     }
 
     pub fn precondition(precondition: Option<Precondition>) -> Self {
-        Self { origin: WriteOrigin::Client, precondition, versioned: None }
+        Self { origin: WriteOrigin::Client, precondition, versioned: None, tags: None }
     }
 
     pub fn with_precondition(mut self, precondition: Option<Precondition>) -> Self {

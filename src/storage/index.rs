@@ -1387,6 +1387,41 @@ impl ObjectIndex {
         committed
     }
 
+    /// Logs the replacement of a version's tags (the `meta.json` rewrite
+    /// is the caller's; nothing in the index changes).
+    pub async fn log_tags(&self, v: &VersionRecord, tags: &std::collections::BTreeMap<String, String>, now_ms: i64, origin: ChangeOrigin) -> Result<()> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let changes = self.changes.clone();
+        let v = v.clone();
+        let tags = tags.clone();
+        run_blocking(move || {
+            let guard = changes.begin(now_ms);
+            let change = ChangeEvent {
+                seq: guard.seq,
+                op: ChangeOp::Tags,
+                key: v.object_key.clone(),
+                etag: v.etag.clone(),
+                size: v.size,
+                last_modified_ms: v.last_modified_ms,
+                version: v.version_dir(),
+                origin,
+                ts_ms: guard.ts,
+                parts: v.parts.clone(),
+                stamp: Some(v.stamp.clone()),
+                removed_stamp: None,
+                versioned: v.versioned,
+                tags: Some(tags),
+            };
+            db.put_cf_opt(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change), &write_opts(durability))?;
+            drop(guard);
+            Ok(())
+        })
+        .await?;
+        self.notify_commit();
+        Ok(())
+    }
+
     /// Whether version `version_dir` of `key` was permanently removed (and
     /// its tombstone has not expired).
     pub async fn has_version_tombstone(&self, key: &str, version_dir: &str) -> Result<bool> {
@@ -2664,6 +2699,7 @@ fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectReco
         stamp: record.stamp.clone(),
         removed_stamp: None,
         versioned: record.versioned,
+        tags: None,
     }
 }
 
@@ -2704,6 +2740,7 @@ fn change_for_removed_version(guard: &changelog::SeqGuard<'_>, v: &VersionRecord
         stamp: Some(v.stamp.clone()),
         removed_stamp: v.removed.clone(),
         versioned: v.versioned,
+        tags: None,
     }
 }
 
@@ -2733,6 +2770,7 @@ fn change_for_tombstone(
         stamp: Some(stamp),
         removed_stamp: Some(removed),
         versioned,
+        tags: None,
     }
 }
 

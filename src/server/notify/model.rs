@@ -202,6 +202,8 @@ pub enum WireOp {
     /// One version of the key (its `stamp`) was permanently removed.
     #[serde(rename = "remove_version")]
     RemoveVersion,
+    /// The tags of one version (its `stamp`) were replaced: `tags`.
+    Tags,
     /// An operation this build does not know (a newer peer's). A reader
     /// must not guess what it means.
     #[serde(other)]
@@ -216,6 +218,7 @@ impl WireOp {
             WireOp::Exists => "exists",
             WireOp::Deleted => "deleted",
             WireOp::RemoveVersion => "remove_version",
+            WireOp::Tags => "tags",
             WireOp::Unknown => "unknown",
         }
     }
@@ -313,6 +316,9 @@ pub struct WireEvent {
     /// Absent from events written before versioning existed.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub versioned: Option<bool>,
+    /// `tags` events: the version's new tag set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl WireEvent {
@@ -333,6 +339,7 @@ impl WireEvent {
             stamp: Some(v.stamp.clone()),
             removed_stamp: v.removed.clone(),
             versioned: Some(v.versioned),
+            tags: None,
         }
     }
 
@@ -358,6 +365,7 @@ impl WireEvent {
             ),
             removed_stamp: None,
             versioned: Some(record.versioned),
+            tags: None,
         }
     }
 }
@@ -370,6 +378,7 @@ impl From<&ChangeEvent> for WireEvent {
                 ChangeOp::Put => WireOp::Put,
                 ChangeOp::Delete => WireOp::Delete,
                 ChangeOp::RemoveVersion => WireOp::RemoveVersion,
+                ChangeOp::Tags => WireOp::Tags,
             },
             key: event.key.clone(),
             etag: event.etag.clone(),
@@ -382,6 +391,7 @@ impl From<&ChangeEvent> for WireEvent {
             stamp: event.stamp.clone(),
             removed_stamp: event.removed_stamp.clone(),
             versioned: Some(event.versioned),
+            tags: event.tags.clone(),
         }
     }
 }

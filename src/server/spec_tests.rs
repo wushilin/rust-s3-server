@@ -1323,3 +1323,81 @@ async fn s5_4_a_versioned_bucket_keeps_replicated_history_by_identity() {
     assert_ne!(rest["entries"][0]["version"].as_str(), Some(now_id.as_str()));
     assert!(rest["next_after"].is_null());
 }
+
+#[tokio::test]
+async fn s5_5_object_tags_are_per_version_mutable_and_replicated_as_events() {
+    let s = Server::start().await;
+    let admin = s.admin();
+    let path = format!("/{BUCKET}/t/k");
+    // Tags on PUT, reported on HEAD, read with ?tagging.
+    let r = s.send(&admin, "PUT", &path, "", &[("x-amz-tagging", "env=prod&team=a%20b")], b"one").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let head = s.head("t/k").await;
+    assert_eq!(head.header("x-amz-tagging-count"), Some("2"));
+    assert_eq!(head.header("x-rs3-tags"), Some("env=prod;team=a%20b"), "named fields for replicators");
+    let tags = s.send(&admin, "GET", &path, "tagging", &[], b"").await;
+    assert_eq!(tags.status, StatusCode::OK);
+    assert!(tags.text().contains("<Tag><Key>env</Key><Value>prod</Value></Tag><Tag><Key>team</Key><Value>a b</Value></Tag>"), "{}", tags.text());
+    // Invalid tags are refused.
+    let bad = s.send(&admin, "PUT", &format!("/{BUCKET}/t/bad"), "", &[("x-amz-tagging", "a=1&a=2")], b"x").await;
+    assert_eq!((bad.status, bad.s3_code()), (StatusCode::BAD_REQUEST, "InvalidTag".to_string()));
+    let bad = s.send(&admin, "PUT", &path, "tagging", &[], b"<Tagging><TagSet><Tag><Key>bad*key</Key><Value>1</Value></Tag></TagSet></Tagging>").await;
+    assert_eq!((bad.status, bad.s3_code()), (StatusCode::BAD_REQUEST, "InvalidTag".to_string()));
+    // Replacing tags keeps the ETag and the version, and is a `tags` event.
+    let before = s.head("t/k").await;
+    let r = s.send(&admin, "PUT", &path, "tagging", &[], b"<Tagging><TagSet><Tag><Key>env</Key><Value>staging</Value></Tag></TagSet></Tagging>").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let after = s.head("t/k").await;
+    assert_eq!((after.header("etag"), after.header("x-rs3-version"), after.header("x-rs3-stamp")), (before.header("etag"), before.header("x-rs3-version"), before.header("x-rs3-stamp")));
+    assert_eq!(after.header("x-amz-tagging-count"), Some("1"));
+    let event = s.last_event().await;
+    assert_eq!((event["op"].as_str(), event["key"].as_str()), (Some("tags"), Some("t/k")));
+    assert_eq!(event["tags"], serde_json::json!({"env": "staging"}));
+    assert_eq!(event["version"].as_str(), after.header("x-rs3-version"));
+    assert_eq!(stamp_of(&event["stamp"]).to_header(), after.header("x-rs3-stamp").unwrap());
+    // The same tags again log nothing.
+    let seq = event["seq"].as_u64().unwrap();
+    s.send(&admin, "PUT", &path, "tagging", &[], b"<Tagging><TagSet><Tag><Key>env</Key><Value>staging</Value></Tag></TagSet></Tagging>").await;
+    assert_eq!(s.last_event().await["seq"].as_u64(), Some(seq), "unchanged tags are not an event");
+    // DELETE ?tagging clears them.
+    let r = s.send(&admin, "DELETE", &path, "tagging", &[], b"").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert!(s.head("t/k").await.header("x-amz-tagging-count").is_none());
+    assert_eq!(s.last_event().await["tags"], serde_json::json!({}));
+    // A copy keeps the source's tags by default and replaces them on
+    // request.
+    s.send(&admin, "PUT", &path, "tagging", &[], b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>").await;
+    let copied = s.send(&admin, "PUT", &format!("/{BUCKET}/t/copy"), "", &[("x-amz-copy-source", &path)], b"").await;
+    assert_eq!(copied.status, StatusCode::OK, "{}", copied.text());
+    assert_eq!(s.head("t/copy").await.header("x-rs3-tags"), Some("k=v"));
+    let replaced = s.send(&admin, "PUT", &format!("/{BUCKET}/t/copy2"), "", &[("x-amz-copy-source", &path), ("x-amz-tagging-directive", "REPLACE"), ("x-amz-tagging", "only=this")], b"").await;
+    assert_eq!(replaced.status, StatusCode::OK);
+    assert_eq!(s.head("t/copy2").await.header("x-rs3-tags"), Some("only=this"));
+    let cleared = s.send(&admin, "PUT", &format!("/{BUCKET}/t/copy3"), "", &[("x-amz-copy-source", &path), ("x-amz-tagging-directive", "REPLACE")], b"").await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert!(s.head("t/copy3").await.header("x-rs3-tags").is_none());
+
+    // Per version on a versioned bucket; a delete marker has no tags (405).
+    let r = s.send(&admin, "PUT", &format!("/{BUCKET}"), "versioning", &[], b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::OK);
+    let v1 = s.send(&admin, "PUT", &path, "", &[("x-amz-tagging", "v=1")], b"v1").await.header("x-amz-version-id").unwrap().to_string();
+    let v2 = s.send(&admin, "PUT", &path, "", &[("x-amz-tagging", "v=2")], b"v2").await.header("x-amz-version-id").unwrap().to_string();
+    let t1 = s.send(&admin, "GET", &path, &format!("tagging&versionId={v1}"), &[], b"").await;
+    assert!(t1.text().contains("<Value>1</Value>") && t1.header("x-amz-version-id") == Some(v1.as_str()), "{}", t1.text());
+    let r = s.send(&admin, "PUT", &path, &format!("tagging&versionId={v1}"), &[], b"<Tagging><TagSet><Tag><Key>v</Key><Value>one</Value></Tag></TagSet></Tagging>").await;
+    assert_eq!((r.status, r.header("x-amz-version-id")), (StatusCode::OK, Some(v1.as_str())));
+    assert!(s.send(&admin, "GET", &path, &format!("tagging&versionId={v1}"), &[], b"").await.text().contains("<Value>one</Value>"));
+    assert!(s.send(&admin, "GET", &path, "tagging", &[], b"").await.text().contains("<Value>2</Value>"), "the current version's tags are untouched");
+    let _ = v2;
+    let marker = s.send(&admin, "DELETE", &path, "", &[], b"").await.header("x-amz-version-id").unwrap().to_string();
+    let r = s.send(&admin, "GET", &path, &format!("tagging&versionId={marker}"), &[], b"").await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+    // A replicated tag change names the version by its stamp.
+    let stamp = s.send(&admin, "GET", &path, &format!("versionId={v1}"), &[], b"").await.header("x-rs3-stamp").unwrap().to_string();
+    let r = s.send(&s.replicator, "PUT", &path, &format!("tagging&versionId={v1}"), &[("x-rs3-stamp", &stamp)], b"<Tagging><TagSet><Tag><Key>from</Key><Value>peer</Value></Tag></TagSet></Tagging>").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let event = s.last_event().await;
+    assert_eq!((event["op"].as_str(), event["origin"].as_str()), (Some("tags"), Some("replication")));
+    let missing = s.send(&s.replicator, "PUT", &path, "tagging&versionId=0000000000000000001.0000000000.feedfacefeedface", &[("x-rs3-stamp", "1.0.feedfacefeedface")], b"<Tagging><TagSet></TagSet></Tagging>").await;
+    assert_eq!((missing.status, missing.s3_code()), (StatusCode::NOT_FOUND, "NoSuchVersion".to_string()));
+}

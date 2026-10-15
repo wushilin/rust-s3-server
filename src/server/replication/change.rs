@@ -19,6 +19,9 @@ pub enum Kind {
     /// The version stamped `stamp` was permanently removed
     /// (`DeleteObject?versionId`). Applied by identity, never by rank.
     RemoveVersion,
+    /// The tags of the version stamped `stamp` were replaced with these.
+    /// Applied by identity: the version's tags become exactly this set.
+    Tags(std::collections::BTreeMap<String, String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +59,7 @@ impl Change {
                 removed: event.removed_stamp.clone().unwrap_or_else(|| stamp.clone()),
             },
             WireOp::RemoveVersion => Kind::RemoveVersion,
+            WireOp::Tags => Kind::Tags(event.tags.clone().unwrap_or_default()),
             WireOp::Unknown => return Err(format!("event for {} has an unknown op (a newer peer?)", event.key)),
         };
         Ok(Self {
@@ -75,7 +79,7 @@ impl Change {
     /// delete by the version it removed.
     pub fn rank(&self) -> Rank {
         match &self.kind {
-            Kind::Put | Kind::RemoveVersion => Rank::live(self.stamp.clone()),
+            Kind::Put | Kind::RemoveVersion | Kind::Tags(_) => Rank::live(self.stamp.clone()),
             Kind::Delete { removed } => Rank::deleted(removed.clone()),
         }
     }
@@ -88,7 +92,7 @@ impl Change {
     pub fn removed(&self) -> Option<&Stamp> {
         match &self.kind {
             Kind::Delete { removed } => Some(removed),
-            Kind::Put | Kind::RemoveVersion => None,
+            Kind::Put | Kind::RemoveVersion | Kind::Tags(_) => None,
         }
     }
 
@@ -125,6 +129,7 @@ mod tests {
             stamp,
             removed_stamp: removed,
             versioned: None,
+            tags: None,
         }
     }
 

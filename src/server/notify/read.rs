@@ -413,6 +413,7 @@ pub async fn snapshot(
                     removed_stamp: t.removed.clone(),
                     versioned: Some(t.versioned),
                     stamp: Some(t.stamp),
+                    tags: None,
                 })
                 .collect(),
             next_after,

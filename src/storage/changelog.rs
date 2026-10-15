@@ -53,6 +53,9 @@ pub enum ChangeOp {
     /// a delete marker. The key's current state is whatever remains.
     #[serde(rename = "remove_version")]
     RemoveVersion,
+    /// The tags of one version (named by `stamp`) were replaced; `tags`
+    /// holds the new set. Neither the ETag nor the version changed.
+    Tags,
 }
 
 impl ChangeOp {
@@ -61,6 +64,7 @@ impl ChangeOp {
             ChangeOp::Put => "put",
             ChangeOp::Delete => "delete",
             ChangeOp::RemoveVersion => "remove_version",
+            ChangeOp::Tags => "tags",
         }
     }
 }
@@ -198,6 +202,8 @@ pub struct ChangeEvent {
     /// The state is a real version of a versioning-enabled bucket (its
     /// stamp is its version id); `false` is the key's `null` version.
     pub versioned: bool,
+    /// `tags` only: the version's new tag set.
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -227,6 +233,8 @@ struct ChangeValueV1 {
     removed_stamp: Option<super::stamp::Stamp>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     versioned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 fn default_version() -> u32 {
@@ -258,6 +266,7 @@ pub fn encode_change(event: &ChangeEvent) -> Vec<u8> {
         stamp: event.stamp.clone(),
         removed_stamp: event.removed_stamp.clone(),
         versioned: event.versioned,
+        tags: event.tags.clone(),
     })
     .expect("ChangeValueV1 serializes")
 }
@@ -284,6 +293,7 @@ pub fn decode_change(seq: u64, value: &[u8]) -> Result<ChangeEvent> {
         stamp: v.stamp,
         removed_stamp: v.removed_stamp,
         versioned: v.versioned,
+        tags: v.tags,
     })
 }
 
@@ -456,6 +466,7 @@ mod tests {
             stamp: Some(super::super::stamp::Stamp { ms: 9, c: 1, site: "s".into() }),
             removed_stamp: Some(super::super::stamp::Stamp { ms: 5, c: 0, site: "s".into() }),
             versioned: true,
+            tags: None,
         };
         assert_eq!(decode_change(7, &encode_change(&event)).unwrap(), event);
         let removal = ChangeEvent { op: ChangeOp::RemoveVersion, versioned: false, ..event };

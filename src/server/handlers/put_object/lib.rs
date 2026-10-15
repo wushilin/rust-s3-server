@@ -63,8 +63,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         None
     };
     let precondition = parse_precondition(&ctx.headers);
+    let tags = match srv::extract_tags(&ctx.headers) {
+        Ok(tags) => tags,
+        Err(message) => return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidTag", message, &resource),
+    };
     let options = match srv::write_options(&store, &ctx, &resource).await {
-        Ok(options) => options.with_precondition(precondition),
+        Ok(options) => options.with_precondition(precondition).with_tags(tags),
         Err(response) => return response,
     };
     match store

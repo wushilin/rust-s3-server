@@ -360,6 +360,13 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         // it was made with before writing to it.
         .header("x-rs3-site", store.site_id())
         .header("x-amz-request-id", "rust-s3-server");
+    // Tags: S3 reports their count; the full set travels for replication in
+    // the named-field form (§7), signed like every x-rs3 header.
+    if !object.meta.tags.is_empty() {
+        builder = builder.header("x-amz-tagging-count", object.meta.tags.len().to_string());
+        let fields: Vec<(&str, &str)> = object.meta.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        builder = builder.header("x-rs3-tags", crate::server::replication::peer::encode_fields(&fields));
+    }
     // S3 names the version only on a bucket that has (or had) versioning:
     // a real version by its id, a `null` version as `null`.
     if versioning != crate::storage::metadata::BucketVersioning::Off {
@@ -767,6 +774,7 @@ mod tests {
             versioned: false,
             delete_marker: false,
             removed: None,
+            tags: std::collections::BTreeMap::new(),
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

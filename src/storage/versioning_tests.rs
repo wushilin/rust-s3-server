@@ -276,3 +276,132 @@ async fn list_object_versions_pages_through_versions_with_both_markers() {
         }
     }
 }
+
+#[tokio::test]
+async fn tags_live_in_the_version_and_survive_a_rebuild() {
+    use std::collections::BTreeMap;
+    let (_tmp, store) = fresh().await;
+    let tags = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+    let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"one"))));
+    store
+        .put_object_stream_with_metadata(BUCKET, "k", stream, None, None, None, None, &BTreeMap::new(), false, None, None, super::store::WriteOptions::client().with_tags(Some(tags(&[("a", "1")]))))
+        .await
+        .unwrap();
+    // The null version keeps its tags when versioning is enabled over it.
+    store.set_bucket_versioning(BUCKET, BucketVersioning::Enabled).await.unwrap();
+    put(&store, "k", b"two").await.unwrap();
+    let (current, _) = store.object_tags(BUCKET, "k", None).await.unwrap();
+    assert!(current.is_empty(), "a new version starts without tags");
+    assert_eq!(store.object_tags(BUCKET, "k", Some("null")).await.unwrap().0, tags(&[("a", "1")]));
+    let before = store.read_object(BUCKET, "k").await.unwrap();
+    store.set_object_tags(BUCKET, "k", None, tags(&[("b", "2")]), WriteOrigin::Client).await.unwrap();
+    let after = store.read_object(BUCKET, "k").await.unwrap();
+    assert_eq!((before.meta.etag, before.meta.stamp, before.object_dir), (after.meta.etag, after.meta.stamp, after.object_dir), "tags change nothing else");
+    assert_eq!(after.meta.tags, tags(&[("b", "2")]));
+    assert!(matches!(store.set_object_tags(BUCKET, "k", None, tags(&[("bad key!", "x")]), WriteOrigin::Client).await, Err(StorageError::InvalidObjectKey(_))));
+    // Rebuilt from the tree: the tags are in each version's meta.json.
+    store.forget_index(BUCKET);
+    tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+    store.rebuild_index(BUCKET).await.unwrap();
+    assert_eq!(store.object_tags(BUCKET, "k", None).await.unwrap().0, tags(&[("b", "2")]));
+    assert_eq!(store.object_tags(BUCKET, "k", Some("null")).await.unwrap().0, tags(&[("a", "1")]));
+    assert!(findings(&store).await.is_empty());
+}
+
+/// The version-removal matrix: removing an earlier, a later, the current
+/// version, a marker, the last one; what becomes current each time, and
+/// what a removed version can no longer do.
+#[tokio::test]
+async fn removing_versions_promotes_the_right_one_and_keeps_them_gone() {
+    let (_tmp, store) = fresh().await;
+    let remove = |id: &str| {
+        let (store, id) = (store.clone(), id.to_string());
+        async move { store.delete_object_version(BUCKET, "k", &id, WriteOrigin::Client).await.unwrap() }
+    };
+    let current = |store: &LocalObjectStore| {
+        let store = store.clone();
+        async move { versions(&store, "k").await.into_iter().find(|v| v.1).map(|v| (v.0, v.2)) }
+    };
+    // null, then v1..v5 under versioning.
+    put(&store, "k", b"null").await;
+    store.set_bucket_versioning(BUCKET, BucketVersioning::Enabled).await.unwrap();
+    let mut ids = Vec::new();
+    for n in 1..=5 {
+        ids.push(put(&store, "k", format!("v{n}").as_bytes()).await.unwrap());
+    }
+    let (v1, v2, v3, v4, v5) = (ids[0].clone(), ids[1].clone(), ids[2].clone(), ids[3].clone(), ids[4].clone());
+    assert_eq!(versions(&store, "k").await.len(), 6);
+    assert_eq!(current(&store).await, Some((v5.clone(), false)));
+
+    // An earlier (noncurrent) version: the current one is untouched, the
+    // removed one is unreadable and listed nowhere.
+    assert_eq!(remove(&v2).await, Some(2));
+    assert_eq!(current(&store).await, Some((v5.clone(), false)));
+    assert_eq!(body_of(&store, "k", None).await, b"v5");
+    assert!(matches!(store.read_object_version(BUCKET, "k", &v2).await, Err(StorageError::NoSuchVersion { .. })));
+    assert!(versions(&store, "k").await.iter().all(|v| v.0 != v2));
+    assert_eq!(remove(&v2).await, None, "removing it again is a no-op");
+    // A later (noncurrent) version, and the oldest (null): same.
+    assert_eq!(remove(&v4).await, Some(2));
+    assert_eq!(remove("null").await, Some(4));
+    assert_eq!(versions(&store, "k").await.iter().map(|v| v.0.clone()).collect::<Vec<_>>(), [v5.clone(), v3.clone(), v1.clone()]);
+    assert_eq!(current(&store).await, Some((v5.clone(), false)));
+
+    // A removed version cannot come back: a copy arriving from a peer with
+    // that very stamp is dropped (a version tombstone remembers it).
+    let v2_stamp = crate::storage::layouts::v3::parse_stamp_dir(&v2).unwrap();
+    assert!(store.version_known(BUCKET, "k", &v2_stamp).await.unwrap());
+    let stream = futures::stream::once(futures::future::ready(Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"v2 again"))));
+    store
+        .put_object_stream_with_metadata(BUCKET, "k", stream, None, None, None, None, &std::collections::BTreeMap::new(), false, None, None, super::store::WriteOptions::replicated(v2_stamp))
+        .await
+        .unwrap();
+    assert!(versions(&store, "k").await.iter().all(|v| v.0 != v2), "still gone");
+
+    // The current version: the next newest is promoted, and so on down.
+    assert_eq!(remove(&v5).await, Some(2));
+    assert_eq!(current(&store).await, Some((v3.clone(), false)));
+    assert_eq!(body_of(&store, "k", None).await, b"v3");
+    assert!(store.key_stamp(BUCKET, "k").await.unwrap().is_some_and(|(_, deleted)| !deleted));
+    assert_eq!(store.list_objects(BUCKET, "", None, None, 10).await.unwrap().entries.len(), 1);
+
+    // A delete marker on top, and another on top of that (S3 stacks them).
+    let m1 = store.delete_object_with(BUCKET, "k", super::store::WriteOptions::client(), None).await.unwrap().version_id.unwrap();
+    let m2 = store.delete_object_with(BUCKET, "k", super::store::WriteOptions::client(), None).await.unwrap().version_id.unwrap();
+    assert!(m2 > m1);
+    assert_eq!(current(&store).await, Some((m2.clone(), true)));
+    assert_eq!(versions(&store, "k").await.iter().map(|v| v.0.clone()).collect::<Vec<_>>(), [m2.clone(), m1.clone(), v3.clone(), v1.clone()]);
+    assert!(store.list_objects(BUCKET, "", None, None, 10).await.unwrap().entries.is_empty());
+    // Removing a noncurrent version under the markers changes nothing above.
+    assert_eq!(remove(&v1).await, Some(2));
+    assert_eq!(current(&store).await, Some((m2.clone(), true)));
+    // Removing the top marker promotes the next marker: still deleted.
+    assert_eq!(remove(&m2).await, Some(0));
+    assert_eq!(current(&store).await, Some((m1.clone(), true)));
+    assert!(store.read_object(BUCKET, "k").await.is_err());
+    // Removing that marker promotes the live version: undeleted.
+    assert_eq!(remove(&m1).await, Some(0));
+    assert_eq!(current(&store).await, Some((v3.clone(), false)));
+    assert_eq!(body_of(&store, "k", None).await, b"v3");
+    // A live version removed while a marker sits below it: the marker is
+    // promoted and the key reads as deleted.
+    let m3 = store.delete_object_with(BUCKET, "k", super::store::WriteOptions::client(), None).await.unwrap().version_id.unwrap();
+    let v6 = put(&store, "k", b"v6").await.unwrap();
+    assert_eq!(versions(&store, "k").await.iter().map(|v| v.0.clone()).collect::<Vec<_>>(), [v6.clone(), m3.clone(), v3.clone()]);
+    assert_eq!(remove(&v6).await, Some(2));
+    assert_eq!(current(&store).await, Some((m3.clone(), true)));
+    assert!(store.read_object(BUCKET, "k").await.is_err());
+    // The last two go: nothing is left, not even a tombstone.
+    assert_eq!(remove(&m3).await, Some(0));
+    assert_eq!(body_of(&store, "k", None).await, b"v3");
+    assert_eq!(remove(&v3).await, Some(2));
+    assert!(versions(&store, "k").await.is_empty());
+    assert!(store.key_stamp(BUCKET, "k").await.unwrap().is_none());
+    assert!(store.list_objects(BUCKET, "", None, None, 10).await.unwrap().entries.is_empty());
+    assert!(findings(&store).await.is_empty());
+    // And a rebuild from the tree agrees: nothing.
+    store.forget_index(BUCKET);
+    tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+    assert_eq!(store.rebuild_index(BUCKET).await.unwrap(), 0);
+    assert!(versions(&store, "k").await.is_empty());
+}
