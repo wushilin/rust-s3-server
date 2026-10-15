@@ -40,6 +40,12 @@ pub enum StorageError {
     /// newer build wrote it) or a migration step this build cannot run.
     /// The server refuses to start.
     UnsupportedLayout { bucket: String, message: String },
+    /// No version of the key has the given version id. Maps to HTTP 404
+    /// `NoSuchVersion`.
+    NoSuchVersion { bucket: String, key: String, version_id: String },
+    /// The version named is a delete marker: it has no content to read.
+    /// Maps to HTTP 405 `MethodNotAllowed` with `x-amz-delete-marker`.
+    VersionIsDeleteMarker { bucket: String, key: String, version_id: String },
 }
 
 impl fmt::Display for StorageError {
@@ -86,6 +92,12 @@ impl fmt::Display for StorageError {
                 f,
                 "{bucket}/{key} already has a state at least as new (stamp {current}); nothing changed"
             ),
+            StorageError::NoSuchVersion { bucket, key, version_id } => {
+                write!(f, "no version {version_id} of {bucket}/{key}")
+            }
+            StorageError::VersionIsDeleteMarker { bucket, key, version_id } => {
+                write!(f, "version {version_id} of {bucket}/{key} is a delete marker")
+            }
             StorageError::UnsupportedLayout { bucket, message } => {
                 write!(f, "bucket {bucket}: unsupported storage layout: {message}")
             }

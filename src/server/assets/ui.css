@@ -396,6 +396,14 @@
   .detail-row dt { color:var(--muted); }
   .detail-row dd { margin:0; word-break:break-word; }
   .details-actions { display:flex; gap:8px; margin-top:22px; }
+  .details-versions { margin-top:22px; }
+  .details-versions-head { display:flex; align-items:baseline; gap:10px; margin-bottom:4px; }
+  .details-versions-head h4 { margin:0; font-size:12.5px; }
+  .version-row { display:grid; grid-template-columns:1fr auto; gap:4px 8px; padding:9px 0; border-bottom:1px solid var(--line); font-size:12px; }
+  .version-row .version-main { display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
+  .version-row code { font-size:10.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:170px; display:inline-block; vertical-align:bottom; }
+  .version-row .version-actions { display:flex; gap:2px; }
+  .version-row .version-sub { grid-column:1 / -1; color:var(--muted); font-size:11px; }
 
   @media (max-width:950px) {
     #loginView { grid-template-columns:1fr; } .login-art { display:none; }

@@ -1130,3 +1130,101 @@ async fn w4_a_failed_delivery_is_sent_again_with_a_new_delivery_id() {
     assert_ne!(got[0].headers["x-rs3-delivery"], got[1].headers["x-rs3-delivery"]);
     assert_eq!(*rx.fail_first.lock().unwrap(), 0);
 }
+
+// ── object versioning (S3 semantics over the wire) ──────────────────────────
+
+#[tokio::test]
+async fn s9_versioning_enabled_suspended_and_version_scoped_requests() {
+    let s = Server::start().await;
+    let admin = s.admin();
+    async fn versioning(s: &Server, body: &str) -> Reply {
+        s.send(&s.admin(), "PUT", &format!("/{BUCKET}"), "versioning", &[], body.as_bytes()).await
+    }
+    async fn get_versioning(s: &Server) -> String {
+        s.send(&s.admin(), "GET", &format!("/{BUCKET}"), "versioning", &[], b"").await.text()
+    }
+    async fn get(s: &Server, query: &str) -> Reply {
+        s.send(&s.admin(), "GET", &format!("/{BUCKET}/v/k"), query, &[], b"").await
+    }
+
+    // Never enabled: no version ids anywhere, no Status in the config.
+    let r = s.put("v/k", b"null").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.header("x-amz-version-id").is_none(), "no version id before versioning");
+    assert!(!get_versioning(&s).await.contains("<Status>"));
+    assert!(get(&s, "").await.header("x-amz-version-id").is_none());
+    let r = versioning(&s, "<VersioningConfiguration><Status>Bogus</Status></VersioningConfiguration>").await;
+    assert_eq!((r.status, r.s3_code()), (StatusCode::BAD_REQUEST, "MalformedXML".to_string()));
+
+    // Enabled: every write is a version, named in the response.
+    let r = versioning(&s, "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(get_versioning(&s).await.contains("<Status>Enabled</Status>"));
+    let v1 = s.put("v/k", b"one").await.header("x-amz-version-id").expect("a version id").to_string();
+    let v2 = s.put("v/k", b"two").await.header("x-amz-version-id").expect("a version id").to_string();
+    assert!(v1 < v2 && v1 != "null");
+    let r = get(&s, "").await;
+    assert_eq!((r.status, r.body.as_slice(), r.header("x-amz-version-id")), (StatusCode::OK, &b"two"[..], Some(v2.as_str())));
+    let r = get(&s, &format!("versionId={v1}")).await;
+    assert_eq!((r.status, r.body.as_slice(), r.header("x-amz-version-id")), (StatusCode::OK, &b"one"[..], Some(v1.as_str())));
+    let r = get(&s, "versionId=null").await;
+    assert_eq!((r.status, r.body.as_slice(), r.header("x-amz-version-id")), (StatusCode::OK, &b"null"[..], Some("null")));
+    let r = get(&s, "versionId=0000000000000000001.0000000000.0123456789abcdef").await;
+    assert_eq!((r.status, r.s3_code()), (StatusCode::NOT_FOUND, "NoSuchVersion".to_string()));
+    let r = get(&s, "versionId=bogus").await;
+    assert_eq!((r.status, r.s3_code()), (StatusCode::NOT_FOUND, "NoSuchVersion".to_string()));
+
+    // A delete leaves a marker; the versions stay readable by id.
+    let r = s.send(&admin, "DELETE", &format!("/{BUCKET}/v/k"), "", &[], b"").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(r.header("x-amz-delete-marker"), Some("true"));
+    let marker = r.header("x-amz-version-id").expect("the marker's id").to_string();
+    assert!(marker > v2);
+    let r = get(&s, "").await;
+    assert_eq!((r.status, r.header("x-amz-delete-marker"), r.header("x-amz-version-id")), (StatusCode::NOT_FOUND, Some("true"), Some(marker.as_str())));
+    let r = get(&s, &format!("versionId={marker}")).await;
+    assert_eq!((r.status, r.header("x-amz-delete-marker")), (StatusCode::METHOD_NOT_ALLOWED, Some("true")));
+    let r = get(&s, &format!("versionId={v2}")).await;
+    assert_eq!((r.status, r.body.as_slice()), (StatusCode::OK, &b"two"[..]));
+    let listing = s.send(&admin, "GET", &format!("/{BUCKET}"), "versions&prefix=v/", &[], b"").await.text();
+    assert!(listing.contains(&format!("<DeleteMarker><Key>v/k</Key><VersionId>{marker}</VersionId><IsLatest>true</IsLatest>")), "{listing}");
+    assert_eq!(listing.matches("<Version>").count(), 3, "{listing}");
+    assert!(listing.contains(&format!("<VersionId>{v2}</VersionId><IsLatest>false</IsLatest>")), "{listing}");
+    assert!(listing.contains("<VersionId>null</VersionId><IsLatest>false</IsLatest>"), "{listing}");
+    assert!(listing.contains("<IsTruncated>false</IsTruncated>"));
+
+    // Removing the marker by its id undeletes the key.
+    let r = s.send(&admin, "DELETE", &format!("/{BUCKET}/v/k"), &format!("versionId={marker}"), &[], b"").await;
+    assert_eq!((r.status, r.header("x-amz-version-id")), (StatusCode::NO_CONTENT, Some(marker.as_str())));
+    let r = get(&s, "").await;
+    assert_eq!((r.status, r.body.as_slice(), r.header("x-amz-version-id")), (StatusCode::OK, &b"two"[..], Some(v2.as_str())));
+    // Pages of one: every version is reachable through the markers.
+    let mut seen = Vec::new();
+    let mut query = String::from("versions&prefix=v/&max-keys=1");
+    for _ in 0..5 {
+        let page = s.send(&admin, "GET", &format!("/{BUCKET}"), &query, &[], b"").await.text();
+        let id = page.split("<VersionId>").nth(1).map(|rest| rest.split('<').next().unwrap().to_string()).expect("one version");
+        seen.push(id.clone());
+        if page.contains("<IsTruncated>false</IsTruncated>") {
+            break;
+        }
+        let key_marker = page.split("<NextKeyMarker>").nth(1).unwrap().split('<').next().unwrap().to_string();
+        let version_marker = page.split("<NextVersionIdMarker>").nth(1).unwrap().split('<').next().unwrap().to_string();
+        query = format!("versions&prefix=v/&max-keys=1&key-marker={key_marker}&version-id-marker={version_marker}");
+    }
+    assert_eq!(seen, vec![v2.clone(), v1.clone(), "null".to_string()]);
+
+    // Suspended: a write is the null version and replaces only the null one.
+    let r = versioning(&s, "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(get_versioning(&s).await.contains("<Status>Suspended</Status>"));
+    assert_eq!(s.put("v/k", b"three").await.header("x-amz-version-id"), Some("null"));
+    let listing = s.send(&admin, "GET", &format!("/{BUCKET}"), "versions&prefix=v/", &[], b"").await.text();
+    assert!(listing.contains("<VersionId>null</VersionId><IsLatest>true</IsLatest>"), "{listing}");
+    assert_eq!(listing.matches("<Version>").count(), 3, "null, v2, v1: {listing}");
+    assert_eq!(get(&s, "").await.body, b"three");
+    assert_eq!(get(&s, &format!("versionId={v1}")).await.body, b"one");
+    // Off is not a state a bucket can return to.
+    let r = versioning(&s, "<VersioningConfiguration></VersioningConfiguration>").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}

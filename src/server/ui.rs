@@ -100,6 +100,8 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/{name}/cors", get(get_bucket_cors).put(set_bucket_cors))
         .route("/api/buckets/{name}/read-only", put(set_bucket_read_only))
         .route("/api/buckets/{name}/upgrade-layout", post(upgrade_bucket_layout))
+        .route("/api/buckets/{name}/versioning", put(set_bucket_versioning))
+        .route("/api/object/versions", get(list_object_versions))
         // Changelog subscriptions: webhooks and replication tokens (admin only).
         .route("/api/subscriptions", get(list_subscriptions).post(create_subscription))
         .route(
@@ -686,9 +688,10 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 
 fn storage_error(err: StorageError) -> Response {
     let status = match err {
-        StorageError::ObjectNotFound { .. } | StorageError::BucketNotFound(_) => {
+        StorageError::ObjectNotFound { .. } | StorageError::BucketNotFound(_) | StorageError::NoSuchVersion { .. } => {
             StatusCode::NOT_FOUND
         }
+        StorageError::VersionIsDeleteMarker { .. } => StatusCode::METHOD_NOT_ALLOWED,
         StorageError::BucketRebuilding(_) => StatusCode::SERVICE_UNAVAILABLE,
         StorageError::InvalidMultipartUpload(_) | StorageError::BucketInUse(_) => StatusCode::CONFLICT,
         StorageError::StaleStamp { .. } => StatusCode::PRECONDITION_FAILED,
@@ -1573,6 +1576,7 @@ async fn list_buckets(
                     "layout": layout,
                     "layout_current": CURRENT_LAYOUT,
                     "layout_upgrade": LocalObjectStore::layout_upgrade_available(layout),
+                    "versioning": meta.versioning,
                 }));
             }
             Json(json!({ "buckets": visible })).into_response()
@@ -2078,6 +2082,55 @@ async fn list_objects(
 struct ObjectQuery {
     bucket: String,
     key: String,
+    /// A version of the object (`null`, or a version id from the versions
+    /// listing); the current one when absent.
+    #[serde(default)]
+    version_id: Option<String>,
+}
+
+/// `GET /api/object/versions?bucket=&key=`: every version of the key, newest
+/// first, with which one is current (a delete marker when the key is
+/// deleted).
+async fn list_object_versions(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Query(q): Query<ObjectQuery>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "LIST",
+        format!("/{}/{} versions", q.bucket, q.key),
+        &[Requirement::object("s3:GetObject", &q.bucket, &q.key)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let versioning = state.store.bucket_versioning(&q.bucket).await.unwrap_or_default();
+    match state.store.list_versions(&q.bucket, &q.key).await {
+        Ok(versions) => Json(json!({
+            "versioning": versioning,
+            "versions": versions.iter().map(|v| json!({
+                "version_id": v.version_id(),
+                "is_current": v.is_current,
+                "delete_marker": v.record.delete_marker,
+                "versioned": v.record.versioned,
+                "size": v.record.size,
+                "etag": v.record.etag,
+                "last_modified_ms": v.record.last_modified_ms,
+                "stamp": v.record.stamp.to_header(),
+                "removed_stamp": v.record.removed.as_ref().map(|s| s.to_header()),
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(err) => storage_error(err),
+    }
 }
 
 async fn download_object(
@@ -2101,11 +2154,24 @@ async fn download_object(
         Ok(g) => g,
         Err(resp) => return resp,
     };
-    let read = match state.store.read_object(&q.bucket, &q.key).await {
+    let read = match &q.version_id {
+        Some(version_id) => state.store.read_object_version(&q.bucket, &q.key, version_id).await,
+        None => state.store.read_object(&q.bucket, &q.key).await,
+    };
+    let read = match read {
         Ok(read) => read,
         Err(err) => return storage_error(err),
     };
-    audit(&state, &rid.0, &session.username, "download", format!("/{}/{}", q.bucket, q.key));
+    audit(
+        &state,
+        &rid.0,
+        &session.username,
+        "download",
+        match &q.version_id {
+            Some(version_id) => format!("/{}/{} (version {version_id})", q.bucket, q.key),
+            None => format!("/{}/{}", q.bucket, q.key),
+        },
+    );
     // Open every part before responding: open FDs survive a concurrent
     // overwrite retiring the dir mid-download.
     let mut files = Vec::with_capacity(read.meta.parts.len());
@@ -2238,6 +2304,20 @@ async fn delete_object(
         Ok(g) => g,
         Err(resp) => return resp,
     };
+    if let Some(version_id) = &q.version_id {
+        // A permanent delete of one version (no marker is left).
+        return match state
+            .store
+            .delete_object_version(&q.bucket, &q.key, version_id, crate::storage::write::WriteOrigin::Client)
+            .await
+        {
+            Ok(_) => {
+                audit(&state, &rid.0, &session.username, "delete_object_version", format!("/{}/{} (version {version_id})", q.bucket, q.key));
+                Json(json!({"ok": true})).into_response()
+            }
+            Err(err) => storage_error(err),
+        };
+    }
     match state.store.delete_object(&q.bucket, &q.key).await {
         Ok(()) => {
             audit(&state, &rid.0, &session.username, "delete_object", format!("/{}/{}", q.bucket, q.key));
@@ -3869,6 +3949,37 @@ async fn upgrade_bucket_layout(
                 std::time::Duration::from_secs(state.config.sweeper.interval_secs.max(1)),
             );
             (StatusCode::ACCEPTED, Json(json!({ "ok": true, "layout": layout }))).into_response()
+        }
+        Err(StorageError::BucketInUse(message)) => error_response(StatusCode::CONFLICT, message),
+        Err(err) => storage_error(err),
+    }
+}
+
+// ── bucket versioning (admin only) ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct VersioningRequest {
+    state: crate::storage::metadata::BucketVersioning,
+}
+
+/// Enables or suspends object versioning. Enabling needs the bucket on the
+/// current storage layout (409 with the reason otherwise); a bucket that
+/// was ever enabled can only be suspended.
+async fn set_bucket_versioning(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+    Json(request): Json<VersioningRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.set_bucket_versioning(&name, request.state).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "set_bucket_versioning", format!("/{name} ({})", request.state.as_str()));
+            Json(json!({ "ok": true, "versioning": request.state })).into_response()
         }
         Err(StorageError::BucketInUse(message)) => error_response(StatusCode::CONFLICT, message),
         Err(err) => storage_error(err),

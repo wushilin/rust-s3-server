@@ -611,11 +611,8 @@ impl NotifyService {
         };
         let mut total = 0;
         for (bucket, _) in buckets {
-            let Ok(index) = self.inner.store.index(&bucket).await else {
-                continue;
-            };
             loop {
-                match index.purge_tombstones(cutoff_ms, TRIM_BATCH).await {
+                match self.inner.store.purge_tombstones(&bucket, cutoff_ms, TRIM_BATCH).await {
                     Ok(0) => break,
                     Ok(n) => total += n,
                     Err(err) => {

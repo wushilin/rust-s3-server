@@ -106,6 +106,9 @@ mod tests {
         let legacy_dir = bucket_dir.join(&legacy_rel);
         tokio::fs::create_dir_all(legacy_dir.parent().unwrap()).await.unwrap();
         tokio::fs::rename(bucket_dir.join(&row.blob_dir), &legacy_dir).await.unwrap();
+        // The now-empty key dir of the current layout goes too: a legacy
+        // tree never had one.
+        let _ = tokio::fs::remove_dir(bucket_dir.join(&row.blob_dir).parent().unwrap()).await;
         index.update_blob_dir(key, &row.blob_dir, &legacy_rel).await.unwrap();
         legacy_dir
     }
@@ -183,7 +186,7 @@ mod tests {
         assert_eq!(store.bucket_layout("bucket").await.unwrap(), BucketLayout::current());
         let objects = store.layout().bucket_dir("bucket").unwrap().join("objects");
         assert_eq!(single_level_leaves(&objects).len(), 2);
-        assert!(!store.has_legacy_layout_dirs("bucket").await.unwrap());
+        assert_eq!(store.detect_layout("bucket").await.unwrap(), CURRENT_LAYOUT);
         assert_eq!(store.read_object("bucket", "a").await.unwrap().meta.size, 4);
         // A later start finds nothing to resume.
         assert!(store.check_layouts().await.unwrap().is_empty());
@@ -200,7 +203,7 @@ mod tests {
         make_legacy_object(&store, "b-good").await;
         make_legacy_object(&store, "c-done").await;
         // The previous run moved one object and stopped.
-        assert!(store.migrate_object_layout("bucket", "c-done").await.unwrap());
+        assert!(store.relocate_object("bucket", "c-done").await.unwrap());
         let migrating = BucketLayout::Migrating { from: 1, to: CURRENT_LAYOUT };
         store.set_bucket_layout("bucket", migrating).await.unwrap();
 

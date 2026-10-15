@@ -45,10 +45,53 @@ pub struct ObjectMeta {
     #[serde(default)]
     pub user_meta: BTreeMap<String, String>,
     pub parts: Vec<PartMeta>,
-    /// Version stamp (see `storage::stamp`); `None` on objects written
-    /// before stamps existed.
+    /// Version stamp (see `storage::stamp`); `None` only on format-1
+    /// objects written before stamps existed (format 2 always carries one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stamp: Option<super::stamp::Stamp>,
+    /// Written while the bucket's versioning was enabled: a real version
+    /// with its stamp as the version id. `false` is S3's `null` version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub versioned: bool,
+    /// A delete marker: the key was deleted at `stamp`, removing the version
+    /// stamped `removed`. Holds no parts (`size` 0, empty `etag`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delete_marker: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<super::stamp::Stamp>,
+}
+
+/// The `meta.json` format this build writes. Format 1 (`stamp` optional,
+/// no `versioned` / `delete_marker`) is still read; a layout upgrade
+/// rewrites every blob to the current format.
+pub const META_FORMAT: u32 = 2;
+
+/// A bucket's versioning state, as S3 defines it: never enabled, enabled,
+/// or suspended (once enabled a bucket can only be suspended, never
+/// returned to never-enabled).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BucketVersioning {
+    #[default]
+    Off,
+    Enabled,
+    Suspended,
+}
+
+impl BucketVersioning {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BucketVersioning::Off => "off",
+            BucketVersioning::Enabled => "enabled",
+            BucketVersioning::Suspended => "suspended",
+        }
+    }
+
+    /// Whether a write made now gets a real version id (`true`) or is the
+    /// key's `null` version.
+    pub fn writes_versions(self) -> bool {
+        self == BucketVersioning::Enabled
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,10 +130,9 @@ pub struct UploadMeta {
     pub user_meta: BTreeMap<String, String>,
 }
 
-/// The blob layout this build writes and serves: single-level fanout
-/// (`objects/<4hex>/<leaf>`). Layout 1 was the 4-level fanout
-/// (`objects/aa/bb/cc/dd/<leaf>`).
-pub const CURRENT_LAYOUT: u32 = 2;
+/// The blob layout this build writes. See [`super::layouts`] for every
+/// layout this build reads and the steps between them.
+pub const CURRENT_LAYOUT: u32 = super::layouts::CURRENT;
 
 /// Where a bucket stands with respect to the on-disk layout, recorded in
 /// its `bucket.json`. A bucket serves only while `stable` on the current
@@ -147,6 +189,13 @@ pub struct BucketMeta {
     /// other write is refused. For replica buckets.
     #[serde(default)]
     pub read_only: bool,
+    /// Object versioning (requires the bucket to be stable on layout 3).
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub versioning: BucketVersioning,
+}
+
+fn is_off(v: &BucketVersioning) -> bool {
+    *v == BucketVersioning::Off
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,8 +302,8 @@ mod tests {
         // A bucket.json from before layouts were recorded still parses, with no layout.
         let old: BucketMeta = serde_json::from_str(r#"{"created_at_ms":1,"storage_version":"v2"}"#).unwrap();
         assert_eq!(old.layout, None);
-        let written = serde_json::to_string(&BucketMeta { created_at_ms: 1, storage_version: String::new(), layout: Some(BucketLayout::current()), cors: vec![], read_only: false }).unwrap();
-        assert!(written.contains(r#""layout":{"state":"stable","version":2}"#) && !written.contains("storage_version"), "{written}");
+        let written = serde_json::to_string(&BucketMeta { created_at_ms: 1, storage_version: String::new(), layout: Some(BucketLayout::current()), cors: vec![], read_only: false, versioning: BucketVersioning::Off }).unwrap();
+        assert!(written.contains(r#""layout":{"state":"stable","version":3}"#) && !written.contains("storage_version") && !written.contains("versioning"), "{written}");
     }
 
     use super::*;
@@ -297,6 +346,9 @@ mod tests {
     fn object_meta_serializes_storage_as_lowercase() {
         let meta = ObjectMeta {
             stamp: None,
+            versioned: false,
+            delete_marker: false,
+            removed: None,
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

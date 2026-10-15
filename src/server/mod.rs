@@ -815,6 +815,9 @@ fn operation_and_target(
     }
     if key.is_none() || key == Some("") {
         if *method == Method::PUT {
+            if query.contains_key("versioning") {
+                return ("PUT_BUCKET_VERSIONING", format!("/{bucket}"));
+            }
             return ("CREATE_BUCKET", format!("/{bucket}"));
         }
         if *method == Method::DELETE {
@@ -841,6 +844,9 @@ fn operation_and_target(
             }
             if query.contains_key("location") {
                 return ("GET_BUCKET_LOCATION", format!("/{bucket}"));
+            }
+            if query.contains_key("versioning") {
+                return ("GET_BUCKET_VERSIONING", format!("/{bucket}"));
             }
             // A reader of the bucket's changelog — often a replication link
             // long-polling, so it is in flight most of the time.
@@ -1563,6 +1569,8 @@ async fn bucket_route(
         Method::GET if ctx.query.contains_key(replication::peer::QUERY_ACCESS) => access_s3(store, ctx).await,
         Method::GET if ctx.query.contains_key("cors") => get_bucket_cors_s3(store, ctx).await,
         Method::PUT if ctx.query.contains_key("cors") => put_bucket_cors_s3(store, ctx, body).await,
+        Method::GET if ctx.query.contains_key("versioning") => get_bucket_versioning_s3(store, ctx).await,
+        Method::PUT if ctx.query.contains_key("versioning") => put_bucket_versioning_s3(store, ctx, body).await,
         Method::DELETE if ctx.query.contains_key("cors") => delete_bucket_cors_s3(store, ctx).await,
         // A sub-resource we do not implement must never fall through to
         // CreateBucket/DeleteBucket: `PUT /{bucket}?versioning` would be
@@ -2328,7 +2336,6 @@ fn expected_payload_sha256(headers: &HeaderMap, aws_chunked: bool) -> Option<Str
 
 fn known_unimplemented_bucket_query(query: &HashMap<String, String>) -> bool {
     [
-        "versioning",
         "cors",
         "website",
         "lifecycle",
@@ -2365,11 +2372,69 @@ fn unimplemented_bucket_subresource(query: &HashMap<String, String>) -> bool {
         "replication",
         "requestPayment",
         "tagging",
-        "versioning",
         "website",
     ]
     .iter()
     .any(|k| query.contains_key(*k))
+}
+
+/// Adds `x-amz-version-id` to a write's response when the store reported
+/// one (the bucket has versioning enabled or suspended).
+pub(crate) fn with_version_id(mut response: Response, version_id: Option<&str>) -> Response {
+    if let Some(value) = version_id.and_then(|v| axum::http::HeaderValue::from_str(v).ok()) {
+        response.headers_mut().insert("x-amz-version-id", value);
+    }
+    response
+}
+
+/// `GET /{bucket}?versioning`: the bucket's versioning state. S3 omits
+/// `Status` for a bucket that was never enabled.
+async fn get_bucket_versioning_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    match store.bucket_versioning(&ctx.bucket).await {
+        Ok(state) => {
+            let status = match state {
+                crate::storage::metadata::BucketVersioning::Off => String::new(),
+                crate::storage::metadata::BucketVersioning::Enabled => "<Status>Enabled</Status>".to_string(),
+                crate::storage::metadata::BucketVersioning::Suspended => "<Status>Suspended</Status>".to_string(),
+            };
+            xml_response(
+                StatusCode::OK,
+                format!(r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{status}</VersioningConfiguration>"#),
+            )
+        }
+        Err(err) => storage_error_response(err, &ctx.resource()),
+    }
+}
+
+/// `PUT /{bucket}?versioning`: enable or suspend versioning. Enabling needs
+/// the bucket on the current storage layout (409 otherwise).
+async fn put_bucket_versioning_s3(store: LocalObjectStore, ctx: handlers::BucketCtx, body: Body) -> Response {
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return s3_error(StatusCode::BAD_REQUEST, "MalformedXML", "Invalid versioning document", &ctx.resource()),
+    };
+    let xml_body = String::from_utf8_lossy(&bytes);
+    let status = Regex::new(r#"(?s)<Status>\s*(.*?)\s*</Status>"#)
+        .unwrap()
+        .captures(&xml_body)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+    let state = match status.as_deref() {
+        Some("Enabled") => crate::storage::metadata::BucketVersioning::Enabled,
+        Some("Suspended") => crate::storage::metadata::BucketVersioning::Suspended,
+        _ => {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                "The versioning document must set Status to Enabled or Suspended",
+                &ctx.resource(),
+            )
+        }
+    };
+    match store.set_bucket_versioning(&ctx.bucket, state).await {
+        Ok(()) => empty_response(StatusCode::OK),
+        Err(StorageError::BucketInUse(message)) => s3_error(StatusCode::CONFLICT, "InvalidBucketState", message, &ctx.resource()),
+        Err(err) => storage_error_response(err, &ctx.resource()),
+    }
 }
 
 fn storage_error_response(err: StorageError, resource: &str) -> Response {
@@ -2462,6 +2527,25 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
             err.to_string(),
             resource,
         ),
+        StorageError::NoSuchVersion { .. } => s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchVersion",
+            "The specified version does not exist.".to_string(),
+            resource,
+        ),
+        StorageError::VersionIsDeleteMarker { ref version_id, .. } => {
+            let mut response = s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.".to_string(),
+                resource,
+            );
+            response.headers_mut().insert("x-amz-delete-marker", axum::http::HeaderValue::from_static("true"));
+            if let Ok(value) = axum::http::HeaderValue::from_str(version_id) {
+                response.headers_mut().insert("x-amz-version-id", value);
+            }
+            response
+        }
         StorageError::StaleStamp { ref current, .. } => {
             let mut response = s3_error(
                 StatusCode::PRECONDITION_FAILED,

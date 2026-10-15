@@ -59,8 +59,18 @@ other state of that key on every site.
 A **version** names an exact stored state: an opaque string that changes
 on every publish of the key, even when the ETag does not. It is reported
 as `x-rs3-version` on GET/HEAD and as `version` in events, and is what a
-replicator pins a read to (§5.1). It is site-local: the same bytes on two
-sites have different versions but the same ETag and stamp.
+replicator pins a read to (§5.1). A replicator MUST treat it as opaque.
+(On the current storage layout it is the stamp in its zero-padded directory
+form, `<ms:019>.<c:010>.<site>`, and so identical on every site holding the
+version; a site on an older layout reports a site-local name.)
+
+A bucket with S3 versioning enabled keeps the displaced states as
+noncurrent versions. Replication is unaffected: the changelog describes the
+key's *current* state, a replicated write into a versioned bucket is kept
+as a version of that bucket under the origin's stamp, and a delete leaves a
+delete marker there. A version-scoped delete (`DeleteObject?versionId`) of
+a noncurrent version is logged as a `delete` of that version and ranks
+below the current state, so peers ignore it.
 
 ### 2.4 Rank: last-writer-wins with version-scoped deletes
 
@@ -87,6 +97,9 @@ A delete leaves a **tombstone** holding the delete's stamp and the removed
 stamp, kept for the tombstone retention (14 days by default). A delete of
 a key that is absent still records one when it names a version. A site
 offline longer than the retention MUST re-snapshot rather than resume.
+On the current storage layout the tombstone is also a delete-marker
+directory beside the key's versions, so an index rebuilt from the tree
+alone still knows the delete.
 
 ## 3. The event
 

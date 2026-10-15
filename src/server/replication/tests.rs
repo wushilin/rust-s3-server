@@ -1774,3 +1774,33 @@ async fn the_error_clears_promptly_even_with_a_long_poll() {
     a.put("data", "after", b"v").await;
     eventually(30, "replicating", || same(&a, &b, "data")).await;
 }
+
+#[tokio::test]
+async fn a_versioned_target_keeps_every_replicated_version_and_marker() {
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    b.store.set_bucket_versioning("data", crate::storage::metadata::BucketVersioning::Enabled).await.unwrap();
+    b.pull_from(&a, "data", Mode::Mirror).await;
+    a.put("data", "k", b"one").await;
+    a.put("data", "k", b"two").await;
+    eventually(30, "mirrored", || same(&a, &b, "data")).await;
+    eventually(30, "two versions on b", || async { b.store.list_versions("data", "k").await.unwrap().len() == 2 }).await;
+    let versions = b.store.list_versions("data", "k").await.unwrap();
+    let a_stamp = a.store.key_stamp("data", "k").await.unwrap().unwrap().0;
+    assert!(versions[0].is_current && versions[0].record.stamp == a_stamp, "the current version carries the origin's stamp");
+    assert!(versions.iter().all(|v| v.record.versioned), "replicated writes are versions of the target");
+    assert!(versions[1].record.stamp < versions[0].record.stamp);
+    assert_eq!(versions[0].version_id(), crate::storage::layouts::v3::stamp_dir(&a_stamp), "the version id is the stamp");
+
+    // A delete on the source leaves a marker on the versioned target, the
+    // versions behind it.
+    a.store.delete_object("data", "k").await.unwrap();
+    eventually(30, "deleted on b", || async { b.store.read_object("data", "k").await.is_err() }).await;
+    let versions = b.store.list_versions("data", "k").await.unwrap();
+    assert_eq!(versions.len(), 3);
+    assert!(versions[0].is_current && versions[0].record.delete_marker && versions[0].record.versioned);
+    assert!(versions[1..].iter().all(|v| !v.is_current && !v.record.delete_marker));
+}

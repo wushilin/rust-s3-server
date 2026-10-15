@@ -89,6 +89,13 @@ const CF_INTENTS: &str = "intents";
 const CF_COUNTERS: &str = "counters";
 const CF_META: &str = "meta";
 const CF_TOMBSTONES: &str = "tombstones";
+/// Noncurrent versions of versioned keys: `<key>\0<stamp dir>` → the
+/// version (see [`VersionRecord`]). Empty unless the bucket has (or had)
+/// versioning enabled.
+const CF_VERSIONS: &str = "versions";
+/// Separator between the object key and the version dir in `versions`
+/// keys; object keys never contain it (`validate_object_key`).
+const VERSION_KEY_SEP: u8 = 0;
 
 const KEY_OBJECT_COUNT: &[u8] = b"objects";
 /// `meta` keys `repl_ckpt/<link id>`: a replication link's checkpoint (its
@@ -109,6 +116,9 @@ pub struct ObjectRecord {
     pub parts: Option<PartLayout>,
     /// Version stamp; `None` on rows indexed before stamps existed.
     pub stamp: Option<Stamp>,
+    /// Written while the bucket's versioning was enabled (a real version);
+    /// `false` is the key's `null` version.
+    pub versioned: bool,
 }
 
 /// A deleted key's last state: the delete's stamp, and what it removed.
@@ -131,6 +141,175 @@ pub struct Tombstone {
     pub etag: String,
     #[serde(default)]
     pub size: u64,
+    /// The delete was made while versioning was enabled: a real delete
+    /// marker with its stamp as its version id (else a `null` marker).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub versioned: bool,
+    /// The delete marker's directory on disk (layout 3), relative to the
+    /// bucket dir; absent on tombstones from before markers were written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_dir: Option<String>,
+}
+
+/// One version of a key: a live state or a delete marker, current or not.
+/// The `versions` family stores the noncurrent ones; the current one is the
+/// `objects` row or the `tombstones` entry, from which [`Self::from_row`] /
+/// [`Self::from_tombstone`] build the same view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRecord {
+    pub object_key: String,
+    /// The version's (effective) stamp: its directory name and version id.
+    pub stamp: Stamp,
+    pub blob_dir: String,
+    pub size: u64,
+    pub etag: String,
+    pub last_modified_ms: i64,
+    pub parts: Option<PartLayout>,
+    pub versioned: bool,
+    pub delete_marker: bool,
+    /// For a delete marker: the stamp of the version it removed.
+    pub removed: Option<Stamp>,
+}
+
+impl VersionRecord {
+    /// The version directory name: how the `versions` family keys it.
+    pub fn version_dir(&self) -> String {
+        super::layouts::v3::stamp_dir(&self.stamp)
+    }
+
+    /// The version id as S3 clients see it: the stamp dir for a real
+    /// version, `null` otherwise.
+    pub fn version_id(&self) -> String {
+        if self.versioned {
+            self.version_dir()
+        } else {
+            "null".to_string()
+        }
+    }
+
+    /// Where this version ranks (see [`super::stamp::Rank`]).
+    pub fn rank(&self) -> super::stamp::Rank {
+        if self.delete_marker {
+            super::stamp::Rank::deleted(self.removed.clone().unwrap_or_else(|| self.stamp.clone()))
+        } else {
+            super::stamp::Rank::live(self.stamp.clone())
+        }
+    }
+
+    pub fn from_row(row: &ObjectRecord, stamp: Stamp) -> Self {
+        Self {
+            object_key: row.object_key.clone(),
+            stamp,
+            blob_dir: row.blob_dir.clone(),
+            size: row.size,
+            etag: row.etag.clone(),
+            last_modified_ms: row.last_modified_ms,
+            parts: row.parts.clone(),
+            versioned: row.versioned,
+            delete_marker: false,
+            removed: None,
+        }
+    }
+
+    /// `None` for a tombstone with no marker on disk (nothing to keep as a
+    /// version).
+    pub fn from_tombstone(t: &Tombstone) -> Option<Self> {
+        Some(Self {
+            object_key: t.object_key.clone(),
+            stamp: t.stamp.clone(),
+            blob_dir: t.blob_dir.clone()?,
+            size: 0,
+            etag: String::new(),
+            last_modified_ms: t.stamp.ms,
+            parts: None,
+            versioned: t.versioned,
+            delete_marker: true,
+            removed: t.removed.clone(),
+        })
+    }
+
+    pub fn into_row(self) -> ObjectRecord {
+        ObjectRecord {
+            object_key: self.object_key,
+            blob_dir: self.blob_dir,
+            size: self.size,
+            etag: self.etag,
+            last_modified_ms: self.last_modified_ms,
+            parts: self.parts,
+            stamp: Some(self.stamp),
+            versioned: self.versioned,
+        }
+    }
+
+    pub fn into_tombstone(self, deleted_at_ms: i64) -> Tombstone {
+        Tombstone {
+            object_key: self.object_key,
+            stamp: self.stamp,
+            removed: self.removed,
+            deleted_at_ms,
+            version: String::new(),
+            etag: String::new(),
+            size: 0,
+            versioned: self.versioned,
+            blob_dir: Some(self.blob_dir),
+        }
+    }
+}
+
+/// What a commit does with the states it displaces: blob dirs to retire
+/// (a `retire` intent each) and versions to keep in the `versions` family.
+#[derive(Debug, Clone, Default)]
+pub struct Displaced {
+    pub retire: Vec<String>,
+    pub keep: Vec<VersionRecord>,
+    /// Noncurrent versions (by version dir) to drop from the `versions`
+    /// family: a `null` version a new `null` state replaces (their dirs are
+    /// in `retire`).
+    pub drop_versions: Vec<String>,
+}
+
+impl Displaced {
+    pub fn retire(dir: &str) -> Self {
+        Self { retire: vec![dir.to_string()], keep: Vec::new(), drop_versions: Vec::new() }
+    }
+}
+
+/// Which version of a key a version-scoped delete removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionTarget {
+    /// The current row.
+    Current,
+    /// The current delete marker (the `tombstones` entry).
+    Marker,
+    /// A noncurrent version, by its version dir.
+    Noncurrent(String),
+}
+
+/// A page of [`VersionRecord`]s in key order, newest version first per key.
+#[derive(Debug, Clone, Default)]
+pub struct VersionsPage {
+    pub entries: Vec<(VersionRecord, bool)>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_version_marker: Option<String>,
+}
+
+fn versions_key(key: &str, version_dir: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() + 1 + version_dir.len());
+    out.extend_from_slice(key.as_bytes());
+    out.push(VERSION_KEY_SEP);
+    out.extend_from_slice(version_dir.as_bytes());
+    out
+}
+
+fn split_versions_key(raw: &[u8]) -> (String, String) {
+    match raw.iter().position(|b| *b == VERSION_KEY_SEP) {
+        Some(i) => (
+            String::from_utf8_lossy(&raw[..i]).into_owned(),
+            String::from_utf8_lossy(&raw[i + 1..]).into_owned(),
+        ),
+        None => (String::from_utf8_lossy(raw).into_owned(), String::new()),
+    }
 }
 
 impl Tombstone {
@@ -211,6 +390,67 @@ struct ObjectValueV1 {
     parts: Option<PartLayout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stamp: Option<Stamp>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    versioned: bool,
+}
+
+/// The `versions` family value. The key (`<object key>\0<version dir>`)
+/// carries the object key and the stamp.
+#[derive(Debug, Serialize, Deserialize)]
+struct VersionValueV1 {
+    #[serde(default = "default_version")]
+    v: u32,
+    #[serde(default)]
+    blob_dir: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    etag: String,
+    #[serde(default)]
+    last_modified_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parts: Option<PartLayout>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    versioned: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    delete_marker: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removed: Option<Stamp>,
+}
+
+fn encode_version(record: &VersionRecord) -> Vec<u8> {
+    serde_json::to_vec(&VersionValueV1 {
+        v: ENTITY_VERSION,
+        blob_dir: record.blob_dir.clone(),
+        size: record.size,
+        etag: record.etag.clone(),
+        last_modified_ms: record.last_modified_ms,
+        parts: record.parts.clone(),
+        versioned: record.versioned,
+        delete_marker: record.delete_marker,
+        removed: record.removed.clone(),
+    })
+    .expect("VersionValueV1 serializes")
+}
+
+fn decode_version(raw_key: &[u8], value: &[u8]) -> Result<VersionRecord> {
+    let v: VersionValueV1 = serde_json::from_slice(value)?;
+    reject_newer(v.v, "version")?;
+    let (object_key, version_dir) = split_versions_key(raw_key);
+    let stamp = super::layouts::v3::parse_stamp_dir(&version_dir)
+        .ok_or_else(|| StorageError::Db(format!("versions key for {object_key} has a bad version dir {version_dir}")))?;
+    Ok(VersionRecord {
+        object_key,
+        stamp,
+        blob_dir: v.blob_dir,
+        size: v.size,
+        etag: v.etag,
+        last_modified_ms: v.last_modified_ms,
+        parts: v.parts,
+        versioned: v.versioned,
+        delete_marker: v.delete_marker,
+        removed: v.removed,
+    })
 }
 
 /// The `intents` family value. The id is the RocksDB key.
@@ -250,6 +490,7 @@ fn encode_object(record: &ObjectRecord) -> Vec<u8> {
         last_modified_ms: record.last_modified_ms,
         parts: record.parts.clone(),
         stamp: record.stamp.clone(),
+        versioned: record.versioned,
     })
     .expect("ObjectValueV1 serializes")
 }
@@ -265,6 +506,7 @@ fn decode_object(key: &[u8], value: &[u8]) -> Result<ObjectRecord> {
         last_modified_ms: v.last_modified_ms,
         parts: v.parts,
         stamp: v.stamp,
+        versioned: v.versioned,
     })
 }
 
@@ -377,6 +619,7 @@ fn column_families() -> Vec<ColumnFamilyDescriptor> {
         ColumnFamilyDescriptor::new(CF_META, Options::default()),
         ColumnFamilyDescriptor::new(CF_CHANGELOG, Options::default()),
         ColumnFamilyDescriptor::new(CF_TOMBSTONES, Options::default()),
+        ColumnFamilyDescriptor::new(CF_VERSIONS, Options::default()),
     ]
 }
 
@@ -605,7 +848,7 @@ impl ObjectIndex {
         let db = self.db.clone();
         let _ = run_blocking(move || {
             let _ = db.flush();
-            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META, CF_CHANGELOG, CF_TOMBSTONES] {
+            for name in [CF_OBJECTS, CF_INTENTS, CF_COUNTERS, CF_META, CF_CHANGELOG, CF_TOMBSTONES, CF_VERSIONS] {
                 if let Ok(handle) = cf(&db, name) {
                     let _ = db.flush_cf(&handle);
                 }
@@ -734,38 +977,6 @@ impl ObjectIndex {
         updated
     }
 
-    /// Up to `limit` keys still on the legacy 4-level fanout layout
-    /// (`objects/xx/xx/xx/xx/…`). Empty once migration is complete. Only
-    /// consulted after the cheap root-dir check finds legacy structure, so it
-    /// never scans a clean bucket. Resumes strictly after `after`, so a caller
-    /// can walk past keys whose migration keeps failing.
-    pub async fn legacy_layout_keys(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
-        let db = self.db.clone();
-        let after = after.map(str::to_string);
-        run_blocking(move || {
-            let objects = cf(&db, CF_OBJECTS)?;
-            let mut keys = Vec::new();
-            let mode = match &after {
-                Some(after) => IteratorMode::From(after.as_bytes(), Direction::Forward),
-                None => IteratorMode::Start,
-            };
-            for item in db.iterator_cf(&objects, mode) {
-                let (key, value) = item?;
-                if after.as_deref().is_some_and(|after| key.as_ref() == after.as_bytes()) {
-                    continue; // `after` is exclusive
-                }
-                let record = decode_object(&key, &value)?;
-                if is_legacy_layout(&record.blob_dir) {
-                    keys.push(record.object_key);
-                    if keys.len() >= limit {
-                        break;
-                    }
-                }
-            }
-            Ok(keys)
-        })
-        .await
-    }
 
     pub async fn is_empty(&self) -> Result<bool> {
         let db = self.db.clone();
@@ -831,25 +1042,32 @@ impl ObjectIndex {
         displaced_blob_dir: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<i64>> {
-        self.commit_publish_from(record, publish_intent_id, displaced_blob_dir, now_ms, ChangeOrigin::Client)
-            .await
+        let displaced = displaced_blob_dir.map(Displaced::retire).unwrap_or_default();
+        let ids = self
+            .commit_publish_from(record, publish_intent_id, displaced, now_ms, ChangeOrigin::Client)
+            .await?;
+        Ok(ids.first().copied())
     }
 
     /// [`Self::commit_publish`] recording who caused the change in the
-    /// changelog entry it appends to the same batch.
+    /// changelog entry it appends to the same batch, and doing with the
+    /// states it displaces what `displaced` says: a `retire` intent per dir
+    /// to retire, a `versions` row per version to keep. The key's tombstone
+    /// (if any) is removed: it was either kept as a version or its marker
+    /// dir listed for retirement by the caller. Returns the retire intent
+    /// ids, in `displaced.retire` order.
     pub async fn commit_publish_from(
         &self,
         record: &ObjectRecord,
         publish_intent_id: i64,
-        displaced_blob_dir: Option<&str>,
+        displaced: Displaced,
         now_ms: i64,
         origin: ChangeOrigin,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Vec<i64>> {
         let db = self.db.clone();
         let durability = self.durability;
         let record = record.clone();
-        let displaced = displaced_blob_dir.map(str::to_string);
-        let retire_id = displaced.as_ref().map(|_| self.next_intent_id());
+        let retire_ids: Vec<i64> = displaced.retire.iter().map(|_| self.next_intent_id()).collect();
         let changes = self.changes.clone();
         let committed = run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
@@ -857,15 +1075,22 @@ impl ObjectIndex {
             let counters = cf(&db, CF_COUNTERS)?;
             let log = cf(&db, CF_CHANGELOG)?;
             let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let versions = cf(&db, CF_VERSIONS)?;
             let existed = db.get_cf(&objects, record.object_key.as_bytes())?.is_some();
 
             let mut batch = WriteBatch::default();
             batch.put_cf(&objects, record.object_key.as_bytes(), encode_object(&record));
             batch.delete_cf(&tombstones, record.object_key.as_bytes());
             batch.delete_cf(&intents, id_key(publish_intent_id));
-            if let (Some(old_dir), Some(id)) = (&displaced, retire_id) {
+            for (old_dir, id) in displaced.retire.iter().zip(&retire_ids) {
                 let value = encode_intent(INTENT_RETIRE, &record.object_key, old_dir, now_ms, 0);
-                batch.put_cf(&intents, id_key(id), value);
+                batch.put_cf(&intents, id_key(*id), value);
+            }
+            for kept in &displaced.keep {
+                batch.put_cf(&versions, versions_key(&kept.object_key, &kept.version_dir()), encode_version(kept));
+            }
+            for dir in &displaced.drop_versions {
+                batch.delete_cf(&versions, versions_key(&record.object_key, dir));
             }
             if !existed {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, 1i64.to_le_bytes());
@@ -874,7 +1099,7 @@ impl ObjectIndex {
             let change = change_for(&guard, ChangeOp::Put, &record, origin);
             batch.put_cf(&log, changelog::seq_key(guard.seq), changelog::encode_change(&change));
             db.write_opt(batch, &write_opts(durability))?;
-            Ok(retire_id)
+            Ok(retire_ids)
         })
         .await;
         if committed.is_ok() {
@@ -886,32 +1111,43 @@ impl ObjectIndex {
     /// The atomic commit point of a DELETE: removes the object and records a
     /// `retire` intent for its blob dir in one write batch.
     pub async fn commit_delete(&self, key: &str, blob_dir: &str, now_ms: i64) -> Result<i64> {
-        self.commit_delete_from(key, blob_dir, now_ms, ChangeOrigin::Client, None, None).await
+        let ids = self
+            .commit_delete_from(key, Displaced::retire(blob_dir), now_ms, ChangeOrigin::Client, None, None, None, false)
+            .await?;
+        Ok(ids[0])
     }
 
     /// [`Self::commit_delete`] recording who caused the change and the
-    /// delete's own version stamp. A changelog entry is appended only when a
-    /// row was actually removed.
+    /// delete's own version stamp, and doing with the displaced states what
+    /// `displaced` says (retire dirs, keep versions). With a `stamp`, the
+    /// key's tombstone is (re)written: it names the removed row, and — when
+    /// the delete wrote a marker dir (`marker_dir`) — where that marker is
+    /// and whether it is a real (`versioned`) delete marker. A changelog
+    /// entry is appended only when a row was actually removed. Returns the
+    /// retire intent ids, in `displaced.retire` order.
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit_delete_from(
         &self,
         key: &str,
-        blob_dir: &str,
+        displaced: Displaced,
         now_ms: i64,
         origin: ChangeOrigin,
         stamp: Option<Stamp>,
         removed: Option<Stamp>,
-    ) -> Result<i64> {
+        marker_dir: Option<String>,
+        versioned: bool,
+    ) -> Result<Vec<i64>> {
         let db = self.db.clone();
         let durability = self.durability;
-        let id = self.next_intent_id();
+        let retire_ids: Vec<i64> = displaced.retire.iter().map(|_| self.next_intent_id()).collect();
         let key = key.to_string();
-        let blob_dir = blob_dir.to_string();
         let changes = self.changes.clone();
         let committed = run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
             let intents = cf(&db, CF_INTENTS)?;
             let counters = cf(&db, CF_COUNTERS)?;
             let log = cf(&db, CF_CHANGELOG)?;
+            let versions = cf(&db, CF_VERSIONS)?;
             let existing = db
                 .get_cf(&objects, key.as_bytes())?
                 .map(|v| decode_object(key.as_bytes(), &v))
@@ -919,8 +1155,16 @@ impl ObjectIndex {
 
             let mut batch = WriteBatch::default();
             batch.delete_cf(&objects, key.as_bytes());
-            let value = encode_intent(INTENT_RETIRE, &key, &blob_dir, now_ms, 0);
-            batch.put_cf(&intents, id_key(id), value);
+            for (dir, id) in displaced.retire.iter().zip(&retire_ids) {
+                let value = encode_intent(INTENT_RETIRE, &key, dir, now_ms, 0);
+                batch.put_cf(&intents, id_key(*id), value);
+            }
+            for kept in &displaced.keep {
+                batch.put_cf(&versions, versions_key(&kept.object_key, &kept.version_dir()), encode_version(kept));
+            }
+            for dir in &displaced.drop_versions {
+                batch.delete_cf(&versions, versions_key(&key, dir));
+            }
             let mut guard = None;
             if let Some(existing) = &existing {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, (-1i64).to_le_bytes());
@@ -935,6 +1179,8 @@ impl ObjectIndex {
                         version: changelog::version_of(&existing.blob_dir),
                         etag: existing.etag.clone(),
                         size: existing.size,
+                        versioned,
+                        blob_dir: marker_dir.clone(),
                     };
                     batch.put_cf(&cf(&db, CF_TOMBSTONES)?, key.as_bytes(), encode_tombstone(&tombstone));
                 }
@@ -943,18 +1189,403 @@ impl ObjectIndex {
             }
             db.write_opt(batch, &write_opts(durability))?;
             drop(guard);
-            Ok((id, existing.is_some()))
+            Ok((retire_ids, existing.is_some()))
         })
         .await;
         match committed {
-            Ok((id, logged)) => {
+            Ok((ids, logged)) => {
                 if logged {
                     self.notify_commit();
                 }
-                Ok(id)
+                Ok(ids)
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Permanently removes one version of `key` (`DeleteObject?versionId`):
+    /// the current row, the current delete marker, or a noncurrent version.
+    /// When the current state goes, `promote` (the newest remaining version,
+    /// found by the caller) becomes current: a live version is put back as
+    /// the row, a marker as the tombstone. Everything is one write batch.
+    /// Logged as a `delete` of the removed version (and a `put` of a
+    /// promoted live version). Returns the retire intent for the removed
+    /// blob dir, or `None` when there was nothing to remove.
+    pub async fn commit_remove_version(
+        &self,
+        key: &str,
+        target: VersionTarget,
+        promote: Option<VersionRecord>,
+        now_ms: i64,
+        origin: ChangeOrigin,
+        stamp: Stamp,
+    ) -> Result<Option<(i64, String)>> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let id = self.next_intent_id();
+        let key = key.to_string();
+        let changes = self.changes.clone();
+        let committed = run_blocking(move || {
+            let objects = cf(&db, CF_OBJECTS)?;
+            let intents = cf(&db, CF_INTENTS)?;
+            let counters = cf(&db, CF_COUNTERS)?;
+            let log = cf(&db, CF_CHANGELOG)?;
+            let versions = cf(&db, CF_VERSIONS)?;
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let mut batch = WriteBatch::default();
+            let mut delta = 0i64;
+            let mut guards = Vec::new();
+            let removed_dir: Option<String> = match &target {
+                VersionTarget::Current => {
+                    let Some(existing) = db.get_cf(&objects, key.as_bytes())?.map(|v| decode_object(key.as_bytes(), &v)).transpose()? else {
+                        return Ok(None);
+                    };
+                    batch.delete_cf(&objects, key.as_bytes());
+                    delta -= 1;
+                    let g = changes.begin(now_ms);
+                    let change = change_for_delete(&g, &existing, origin, Some(stamp.clone()), existing.stamp.clone());
+                    batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
+                    guards.push(g);
+                    Some(existing.blob_dir)
+                }
+                VersionTarget::Marker => {
+                    let Some(t) = db.get_cf(&tombstones, key.as_bytes())?.map(|v| decode_tombstone(key.as_bytes(), &v)).transpose()? else {
+                        return Ok(None);
+                    };
+                    batch.delete_cf(&tombstones, key.as_bytes());
+                    t.blob_dir
+                }
+                VersionTarget::Noncurrent(dir) => {
+                    let raw = versions_key(&key, dir);
+                    let Some(v) = db.get_cf(&versions, &raw)?.map(|v| decode_version(&raw, &v)).transpose()? else {
+                        return Ok(None);
+                    };
+                    batch.delete_cf(&versions, &raw);
+                    if !v.delete_marker {
+                        let g = changes.begin(now_ms);
+                        let change = change_for_delete(&g, &v.clone().into_row(), origin, Some(stamp.clone()), Some(v.stamp.clone()));
+                        batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
+                        guards.push(g);
+                    }
+                    Some(v.blob_dir)
+                }
+            };
+            if !matches!(target, VersionTarget::Noncurrent(_)) {
+                if let Some(next) = promote {
+                    batch.delete_cf(&versions, versions_key(&next.object_key, &next.version_dir()));
+                    if next.delete_marker {
+                        batch.put_cf(&tombstones, key.as_bytes(), encode_tombstone(&next.into_tombstone(now_ms)));
+                    } else {
+                        let row = next.into_row();
+                        batch.put_cf(&objects, key.as_bytes(), encode_object(&row));
+                        delta += 1;
+                        let g = changes.begin(now_ms);
+                        let change = change_for(&g, ChangeOp::Put, &row, origin);
+                        batch.put_cf(&log, changelog::seq_key(g.seq), changelog::encode_change(&change));
+                        guards.push(g);
+                    }
+                }
+            }
+            let Some(dir) = removed_dir else {
+                db.write_opt(batch, &write_opts(durability))?;
+                drop(guards);
+                return Ok(None);
+            };
+            batch.put_cf(&intents, id_key(id), encode_intent(INTENT_RETIRE, &key, &dir, now_ms, 0));
+            if delta != 0 {
+                batch.merge_cf(&counters, KEY_OBJECT_COUNT, delta.to_le_bytes());
+            }
+            db.write_opt(batch, &write_opts(durability))?;
+            drop(guards);
+            Ok(Some((id, dir)))
+        })
+        .await;
+        if committed.is_ok() {
+            self.notify_commit();
+        }
+        committed
+    }
+
+    // ── versions ────────────────────────────────────────────────────────────
+
+    /// A noncurrent version of `key` by its version dir.
+    pub async fn get_version(&self, key: &str, version_dir: &str) -> Result<Option<VersionRecord>> {
+        let db = self.db.clone();
+        let raw = versions_key(key, version_dir);
+        run_blocking(move || {
+            let versions = cf(&db, CF_VERSIONS)?;
+            match db.get_cf(&versions, &raw)? {
+                Some(value) => Ok(Some(decode_version(&raw, &value)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// The noncurrent versions of `key`, newest first.
+    pub async fn versions_of(&self, key: &str) -> Result<Vec<VersionRecord>> {
+        let db = self.db.clone();
+        let prefix = versions_key(key, "");
+        run_blocking(move || {
+            let versions = cf(&db, CF_VERSIONS)?;
+            let mut out = Vec::new();
+            for item in db.iterator_cf(&versions, IteratorMode::From(&prefix, Direction::Forward)) {
+                let (k, v) = item?;
+                if !k.starts_with(&prefix) {
+                    break;
+                }
+                out.push(decode_version(&k, &v)?);
+            }
+            out.reverse();
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Up to `limit` noncurrent versions in `versions`-key order, strictly
+    /// after the raw key `after` (the scan's cursor over the whole family).
+    pub async fn all_versions_after(&self, after: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, VersionRecord)>> {
+        let db = self.db.clone();
+        let after = after.map(|a| a.to_vec());
+        run_blocking(move || {
+            let versions = cf(&db, CF_VERSIONS)?;
+            let mode = match &after {
+                Some(after) => IteratorMode::From(after, Direction::Forward),
+                None => IteratorMode::Start,
+            };
+            let mut out = Vec::new();
+            for item in db.iterator_cf(&versions, mode) {
+                let (k, v) = item?;
+                if after.as_deref().is_some_and(|a| a == k.as_ref()) {
+                    continue;
+                }
+                out.push((k.to_vec(), decode_version(&k, &v)?));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Every version of every key under `prefix` in key order, newest first
+    /// per key, with whether each is the key's current state. Starts after
+    /// `key_marker` (and, for that key, after `version_marker`); a key's
+    /// versions may be split across pages. Rows without a stamp (from before
+    /// stamps) get the fallback stamp for `site`. `null` delete markers are
+    /// listed only when `null_markers` (a suspended bucket's deletes).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_versions_page(
+        &self,
+        prefix: &str,
+        key_marker: Option<&str>,
+        version_marker: Option<&str>,
+        max: usize,
+        site: &str,
+        null_markers: bool,
+    ) -> Result<VersionsPage> {
+        let db = self.db.clone();
+        let prefix = prefix.to_string();
+        let key_marker = key_marker.map(str::to_string);
+        let version_marker = version_marker.map(str::to_string);
+        let site = site.to_string();
+        run_blocking(move || {
+            let objects = cf(&db, CF_OBJECTS)?;
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let versions = cf(&db, CF_VERSIONS)?;
+            let start = match &key_marker {
+                Some(m) if m.as_str() > prefix.as_str() => m.clone(),
+                _ => prefix.clone(),
+            };
+            let mut rows = db.raw_iterator_cf(&objects);
+            rows.seek(start.as_bytes());
+            let mut tombs = db.raw_iterator_cf(&tombstones);
+            tombs.seek(start.as_bytes());
+            let mut page = VersionsPage::default();
+            loop {
+                rows.status()?;
+                tombs.status()?;
+                let row_key = rows.key().map(|k| k.to_vec());
+                let tomb_key = tombs.key().map(|k| k.to_vec());
+                let key = match (&row_key, &tomb_key) {
+                    (None, None) => break,
+                    (Some(a), Some(b)) => a.min(b).clone(),
+                    (Some(a), None) => a.clone(),
+                    (None, Some(b)) => b.clone(),
+                };
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                let key_str = String::from_utf8_lossy(&key).into_owned();
+                // The key's current state, then its noncurrent versions.
+                let mut current: Vec<VersionRecord> = Vec::new();
+                if row_key.as_deref() == Some(key.as_slice()) {
+                    let row = decode_object(&key, rows.value().unwrap_or_default())?;
+                    let stamp = row.stamp.clone().unwrap_or_else(|| Stamp::fallback(row.last_modified_ms, &site));
+                    current.push(VersionRecord::from_row(&row, stamp));
+                    rows.next();
+                }
+                if tomb_key.as_deref() == Some(key.as_slice()) {
+                    let t = decode_tombstone(&key, tombs.value().unwrap_or_default())?;
+                    if t.versioned || null_markers {
+                        if let Some(v) = VersionRecord::from_tombstone(&t) {
+                            current.push(v);
+                        }
+                    }
+                    tombs.next();
+                }
+                current.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+                let after_marker = key_marker.as_deref() == Some(key_str.as_str());
+                if after_marker && version_marker.is_none() {
+                    continue; // the whole key was listed on the previous page
+                }
+                let vprefix = versions_key(&key_str, "");
+                let mut noncurrent = Vec::new();
+                for item in db.iterator_cf(&versions, IteratorMode::From(&vprefix, Direction::Forward)) {
+                    let (k, v) = item?;
+                    if !k.starts_with(&vprefix) {
+                        break;
+                    }
+                    noncurrent.push(decode_version(&k, &v)?);
+                }
+                noncurrent.reverse();
+                let n = current.len();
+                for (i, v) in current.into_iter().chain(noncurrent).enumerate() {
+                    if v.delete_marker && !v.versioned && !null_markers {
+                        continue;
+                    }
+                    let vdir = v.version_dir();
+                    if after_marker && version_marker.as_deref().is_some_and(|m| vdir.as_str() >= m) {
+                        continue;
+                    }
+                    if page.entries.len() >= max {
+                        page.is_truncated = true;
+                        return Ok(page);
+                    }
+                    page.next_key_marker = Some(key_str.clone());
+                    page.next_version_marker = Some(vdir);
+                    page.entries.push((v, i == 0 && n > 0));
+                }
+            }
+            Ok(page)
+        })
+        .await
+    }
+
+    /// Repoints a row at its relocated blob dir and records the stamp the
+    /// relocation materialised — the atomic pivot of a layout upgrade
+    /// (hardlink → **flip** → unlink). The `expected` guard makes it a no-op
+    /// if the row moved under us (a concurrent overwrite), so it can never
+    /// clobber a newer version. Returns whether a row was updated. Called
+    /// under the per-key write lock.
+    pub async fn relocate_row(&self, key: &str, expected: &str, new_blob_dir: &str, stamp: &Stamp) -> Result<bool> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let key = key.to_string();
+        let expected = expected.to_string();
+        let new_blob_dir = new_blob_dir.to_string();
+        let stamp = stamp.clone();
+        run_blocking(move || {
+            let objects = cf(&db, CF_OBJECTS)?;
+            let Some(value) = db.get_cf(&objects, key.as_bytes())? else {
+                return Ok(false);
+            };
+            let mut record = decode_object(key.as_bytes(), &value)?;
+            if record.blob_dir != expected {
+                return Ok(false);
+            }
+            record.blob_dir = new_blob_dir;
+            record.stamp = Some(stamp);
+            db.put_cf_opt(&objects, key.as_bytes(), encode_object(&record), &write_opts(durability))?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Up to `limit` keys whose row is not on the current layout, or has no
+    /// stamp, strictly after `after`: what a layout upgrade still has to
+    /// relocate. Empty once the upgrade is complete.
+    pub async fn rows_off_layout(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        let db = self.db.clone();
+        let after = after.map(str::to_string);
+        run_blocking(move || {
+            let objects = cf(&db, CF_OBJECTS)?;
+            let mut keys = Vec::new();
+            let mode = match &after {
+                Some(after) => IteratorMode::From(after.as_bytes(), Direction::Forward),
+                None => IteratorMode::Start,
+            };
+            for item in db.iterator_cf(&objects, mode) {
+                let (key, value) = item?;
+                if after.as_deref().is_some_and(|after| key.as_ref() == after.as_bytes()) {
+                    continue; // `after` is exclusive
+                }
+                let record = decode_object(&key, &value)?;
+                if !super::layouts::is_current(&record.blob_dir) || record.stamp.is_none() {
+                    keys.push(record.object_key);
+                    if keys.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Ok(keys)
+        })
+        .await
+    }
+
+    /// Up to `limit` tombstones with no delete-marker dir on disk, strictly
+    /// after `after`: what a layout upgrade still has to materialise.
+    pub async fn tombstones_without_marker(&self, after: Option<&str>, limit: usize) -> Result<Vec<Tombstone>> {
+        let db = self.db.clone();
+        let after = after.map(str::to_string);
+        run_blocking(move || {
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let mut out = Vec::new();
+            let mode = match &after {
+                Some(after) => IteratorMode::From(after.as_bytes(), Direction::Forward),
+                None => IteratorMode::Start,
+            };
+            for item in db.iterator_cf(&tombstones, mode) {
+                let (key, value) = item?;
+                if after.as_deref().is_some_and(|after| key.as_ref() == after.as_bytes()) {
+                    continue;
+                }
+                let t = decode_tombstone(&key, &value)?;
+                if t.blob_dir.is_none() {
+                    out.push(t);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Records where a tombstone's marker dir was written, if the tombstone
+    /// is still the one given (same stamp). Returns whether it was updated.
+    pub async fn set_tombstone_marker(&self, key: &str, stamp: &Stamp, blob_dir: &str) -> Result<bool> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let key = key.to_string();
+        let stamp = stamp.clone();
+        let blob_dir = blob_dir.to_string();
+        run_blocking(move || {
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let Some(value) = db.get_cf(&tombstones, key.as_bytes())? else {
+                return Ok(false);
+            };
+            let mut t = decode_tombstone(key.as_bytes(), &value)?;
+            if t.stamp != stamp {
+                return Ok(false);
+            }
+            t.blob_dir = Some(blob_dir);
+            db.put_cf_opt(&tombstones, key.as_bytes(), encode_tombstone(&t), &write_opts(durability))?;
+            Ok(true)
+        })
+        .await
     }
 
     // ── replication checkpoints ─────────────────────────────────────────────
@@ -1002,81 +1633,86 @@ impl ObjectIndex {
     }
 
     /// Records a delete of a key that has no object here (a replicated
-    /// delete arriving first), unless a newer tombstone exists. Returns
-    /// whether it was recorded. Logged as a `delete` (no ETag, size 0) in the
-    /// same batch: nothing visible changed here, but the delete must still
-    /// reach every other site and reader — a site that has the removed
-    /// version (or an older one) would otherwise keep it while this one
-    /// refuses it forever. Called under the key lock.
+    /// delete arriving first, or a delete on top of a delete marker), unless
+    /// a tombstone that ranks at least as high exists. The displaced
+    /// tombstone's marker is retired or kept as a version per `displaced`.
+    /// Returns the retire intent ids when recorded, `None` when not. Logged as a `delete` (no ETag, size
+    /// 0) in the same batch: nothing visible changed here, but the delete
+    /// must still reach every other site and reader — a site that has the
+    /// removed version (or an older one) would otherwise keep it while this
+    /// one refuses it forever. Called under the key lock.
     pub async fn record_tombstone(
         &self,
-        key: &str,
-        stamp: &Stamp,
-        removed: &Stamp,
-        now_ms: i64,
+        tombstone: Tombstone,
+        displaced: Displaced,
         origin: ChangeOrigin,
-    ) -> Result<bool> {
+    ) -> Result<Option<Vec<i64>>> {
         let db = self.db.clone();
         let durability = self.durability;
-        let key = key.to_string();
-        let stamp = stamp.clone();
-        let removed = removed.clone();
+        let retire_ids: Vec<i64> = displaced.retire.iter().map(|_| self.next_intent_id()).collect();
         let changes = self.changes.clone();
         let recorded = run_blocking(move || {
             let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let intents = cf(&db, CF_INTENTS)?;
+            let versions = cf(&db, CF_VERSIONS)?;
+            let key = tombstone.object_key.clone();
+            let removed = tombstone.removed.clone().unwrap_or_else(|| tombstone.stamp.clone());
             if let Some(existing) = db.get_cf(&tombstones, key.as_bytes())? {
                 if decode_tombstone(key.as_bytes(), &existing)?.rank() >= super::stamp::Rank::deleted(removed.clone()) {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
-            let tombstone = Tombstone {
-                object_key: key.clone(),
-                stamp: stamp.clone(),
-                removed: Some(removed.clone()),
-                deleted_at_ms: now_ms,
-                version: String::new(),
-                etag: String::new(),
-                size: 0,
-            };
+            let now_ms = tombstone.deleted_at_ms;
             let mut batch = WriteBatch::default();
             batch.put_cf(&tombstones, key.as_bytes(), encode_tombstone(&tombstone));
+            for (dir, id) in displaced.retire.iter().zip(&retire_ids) {
+                batch.put_cf(&intents, id_key(*id), encode_intent(INTENT_RETIRE, &key, dir, now_ms, 0));
+            }
+            for kept in &displaced.keep {
+                batch.put_cf(&versions, versions_key(&kept.object_key, &kept.version_dir()), encode_version(kept));
+            }
+            for dir in &displaced.drop_versions {
+                batch.delete_cf(&versions, versions_key(&key, dir));
+            }
             let guard = changes.begin(now_ms);
-            let change = change_for_tombstone(&guard, &key, origin, stamp, removed);
+            let change = change_for_tombstone(&guard, &key, origin, tombstone.stamp.clone(), removed);
             batch.put_cf(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change));
             db.write_opt(batch, &write_opts(durability))?;
             drop(guard);
-            Ok(true)
+            Ok(Some(retire_ids))
         })
         .await?;
-        if recorded {
+        if recorded.is_some() {
             self.notify_commit();
         }
         Ok(recorded)
     }
 
     /// Removes tombstones of deletes made before `cutoff_ms`, at most
-    /// `max_entries` per call. Returns how many were removed.
-    pub async fn purge_tombstones(&self, cutoff_ms: i64, max_entries: usize) -> Result<usize> {
+    /// `max_entries` per call. Returns the removed tombstones, so the caller
+    /// can trash their marker dirs.
+    pub async fn purge_tombstones(&self, cutoff_ms: i64, max_entries: usize) -> Result<Vec<Tombstone>> {
         let db = self.db.clone();
         let durability = self.durability;
         run_blocking(move || {
             let tombstones = cf(&db, CF_TOMBSTONES)?;
             let mut batch = WriteBatch::default();
-            let mut removed = 0usize;
+            let mut removed = Vec::new();
             for item in db.iterator_cf(&tombstones, IteratorMode::Start) {
                 let (key, value) = item?;
-                let expired = decode_tombstone(&key, &value)
-                    .map(|t| t.deleted_at_ms < cutoff_ms)
-                    .unwrap_or(true);
+                let t = decode_tombstone(&key, &value);
+                let expired = t.as_ref().map(|t| t.deleted_at_ms < cutoff_ms).unwrap_or(true);
                 if expired {
                     batch.delete_cf(&tombstones, &key);
-                    removed += 1;
-                    if removed >= max_entries {
+                    if let Ok(t) = t {
+                        removed.push(t);
+                    }
+                    if batch.len() >= max_entries {
                         break;
                     }
                 }
             }
-            if removed > 0 {
+            if !batch.is_empty() {
                 db.write_opt(batch, &write_opts(durability))?;
             }
             Ok(removed)
@@ -1240,55 +1876,118 @@ impl ObjectIndex {
 
     // ── rebuild ─────────────────────────────────────────────────────────────
 
-    /// Bulk newer-wins insert used by the rebuild pipeline. Per key, the entry
-    /// with the highest `last_modified_ms` wins (path as tie-break for
-    /// determinism); every displaced blob dir is reported so the caller can
-    /// trash it. Maintains the object counter as it goes.
-    pub async fn insert_rebuild_batch(&self, entries: &[ObjectRecord]) -> Result<RebuildBatchOutcome> {
+    /// Bulk insert used by the rebuild pipeline. Every entry is a version
+    /// found on disk. Per key: every real (`versioned`) version is kept; of
+    /// the `null` versions (and `null` delete markers) only the newest
+    /// survives — a key has at most one `null` state, so older ones are
+    /// leftovers of a crash (a blob the row flip displaced but never
+    /// retired) and are reported for trashing. The newest surviving version
+    /// is the key's current state (the row, or the tombstone for a marker);
+    /// the rest go to the `versions` family. Entries already current from an
+    /// earlier batch take part in the same adjudication. Maintains the
+    /// object counter as it goes.
+    pub async fn insert_rebuild_batch(&self, entries: &[VersionRecord]) -> Result<RebuildBatchOutcome> {
         let db = self.db.clone();
         let durability = self.durability;
         let entries = entries.to_vec();
         run_blocking(move || {
             let objects = cf(&db, CF_OBJECTS)?;
+            let tombstones = cf(&db, CF_TOMBSTONES)?;
+            let versions = cf(&db, CF_VERSIONS)?;
             let counters = cf(&db, CF_COUNTERS)?;
             let mut outcome = RebuildBatchOutcome::default();
-
-            // Adjudicate duplicates within the batch first so the DB sees at
-            // most one candidate per key.
-            let mut best: std::collections::HashMap<&str, &ObjectRecord> = std::collections::HashMap::new();
+            let mut by_key: std::collections::BTreeMap<&str, Vec<VersionRecord>> = std::collections::BTreeMap::new();
             for entry in &entries {
-                match best.get(entry.object_key.as_str()) {
-                    Some(current) if !newer_wins(entry, current) => {
-                        outcome.loser_blob_dirs.push(entry.blob_dir.clone());
-                    }
-                    Some(current) => {
-                        outcome.loser_blob_dirs.push(current.blob_dir.clone());
-                        best.insert(&entry.object_key, entry);
-                    }
-                    None => {
-                        best.insert(&entry.object_key, entry);
-                    }
-                }
+                by_key.entry(entry.object_key.as_str()).or_default().push(entry.clone());
             }
-
             let mut batch = WriteBatch::default();
             let mut delta: i64 = 0;
-            for entry in best.values() {
-                let existing = db
-                    .get_cf(&objects, entry.object_key.as_bytes())?
-                    .map(|v| decode_object(entry.object_key.as_bytes(), &v))
-                    .transpose()?;
-                if let Some(existing) = existing {
-                    if !newer_wins(entry, &existing) {
-                        outcome.loser_blob_dirs.push(entry.blob_dir.clone());
+            for (key, mut candidates) in by_key {
+                // The current state from an earlier batch joins the contest.
+                let existing_row = db.get_cf(&objects, key.as_bytes())?.map(|v| decode_object(key.as_bytes(), &v)).transpose()?;
+                let existing_tomb = db.get_cf(&tombstones, key.as_bytes())?.map(|v| decode_tombstone(key.as_bytes(), &v)).transpose()?;
+                let mut had_live = false;
+                if let Some(row) = &existing_row {
+                    had_live = true;
+                    if let Some(stamp) = &row.stamp {
+                        candidates.push(VersionRecord::from_row(row, stamp.clone()));
+                    }
+                }
+                // A carried tombstone without a marker cannot be a version; it
+                // stays only while nothing newer arrives.
+                let mut carried_tombstone = None;
+                if let Some(t) = &existing_tomb {
+                    match VersionRecord::from_tombstone(t) {
+                        Some(v) => candidates.push(v),
+                        None => carried_tombstone = Some(t.clone()),
+                    }
+                }
+                // The noncurrent versions already kept join too (an older
+                // `null` state arriving later must lose to the one kept), and
+                // are rewritten with the survivors.
+                let vprefix = versions_key(key, "");
+                for item in db.iterator_cf(&versions, IteratorMode::From(&vprefix, Direction::Forward)) {
+                    let (k, v) = item?;
+                    if !k.starts_with(&vprefix) {
+                        break;
+                    }
+                    candidates.push(decode_version(&k, &v)?);
+                    batch.delete_cf(&versions, &k);
+                }
+                // Newest first; equal stamps tie-break on path for determinism.
+                candidates.sort_by(|a, b| b.stamp.cmp(&a.stamp).then_with(|| b.blob_dir.cmp(&a.blob_dir)));
+                candidates.dedup_by(|a, b| a.blob_dir == b.blob_dir);
+                let mut survivors = Vec::new();
+                let mut seen_null = false;
+                for v in candidates {
+                    if v.versioned {
+                        survivors.push(v);
+                    } else if seen_null {
+                        outcome.loser_blob_dirs.push(v.blob_dir);
+                    } else {
+                        seen_null = true;
+                        survivors.push(v);
+                    }
+                }
+                let mut survivors = survivors.into_iter();
+                let Some(newest) = survivors.next() else {
+                    continue;
+                };
+                if let Some(t) = &carried_tombstone {
+                    if t.rank() >= newest.rank() {
+                        // The carried tombstone outranks everything on disk.
+                        for v in std::iter::once(newest).chain(survivors) {
+                            batch.put_cf(&versions, versions_key(key, &v.version_dir()), encode_version(&v));
+                        }
+                        if had_live {
+                            batch.delete_cf(&objects, key.as_bytes());
+                            delta -= 1;
+                        }
                         continue;
                     }
-                    outcome.loser_blob_dirs.push(existing.blob_dir);
-                } else {
-                    delta += 1;
+                    batch.delete_cf(&tombstones, key.as_bytes());
                 }
-                batch.put_cf(&objects, entry.object_key.as_bytes(), encode_object(entry));
+                // Clear whichever current state is being replaced; the
+                // newest survivor becomes current.
+                if newest.delete_marker {
+                    if had_live {
+                        batch.delete_cf(&objects, key.as_bytes());
+                        delta -= 1;
+                    }
+                    batch.put_cf(&tombstones, key.as_bytes(), encode_tombstone(&newest.clone().into_tombstone(newest.stamp.ms)));
+                } else {
+                    batch.delete_cf(&tombstones, key.as_bytes());
+                    if !had_live {
+                        delta += 1;
+                    }
+                    batch.put_cf(&objects, key.as_bytes(), encode_object(&newest.clone().into_row()));
+                }
+                batch.delete_cf(&versions, versions_key(key, &newest.version_dir()));
                 outcome.inserted += 1;
+                for v in survivors {
+                    batch.put_cf(&versions, versions_key(key, &v.version_dir()), encode_version(&v));
+                    outcome.inserted += 1;
+                }
             }
             if delta != 0 {
                 batch.merge_cf(&counters, KEY_OBJECT_COUNT, delta.to_le_bytes());
@@ -1497,7 +2196,7 @@ impl ObjectIndex {
     pub async fn copy_changelog_into(&self, dst: &ObjectIndex) -> Result<usize> {
         let src = self.db.clone();
         let dst_db = dst.db.clone();
-        let copied = run_blocking(move || {
+        run_blocking(move || {
             let src_log = cf(&src, CF_CHANGELOG)?;
             let dst_log = cf(&dst_db, CF_CHANGELOG)?;
             let dst_meta = cf(&dst_db, CF_META)?;
@@ -1512,12 +2211,34 @@ impl ObjectIndex {
                     dst_db.write(std::mem::take(&mut batch))?;
                 }
             }
-            // Tombstones too: they are what keeps a delete from being undone.
+            for key in [KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH, KEY_TRIMMED_TS] {
+                if let Some(value) = src.get_cf(&src_meta, key)? {
+                    batch.put_cf(&dst_meta, key, value);
+                }
+            }
+            dst_db.write(batch)?;
+            Ok(copied)
+        })
+        .await
+    }
+
+    /// Copies this index's tombstones (what keeps a delete from being
+    /// undone; those with a marker on disk are re-found by the walk anyway)
+    /// and replication checkpoints into `dst`.
+    pub async fn copy_tombstones_into(&self, dst: &ObjectIndex) -> Result<usize> {
+        let src = self.db.clone();
+        let dst_db = dst.db.clone();
+        run_blocking(move || {
+            let dst_meta = cf(&dst_db, CF_META)?;
+            let src_meta = cf(&src, CF_META)?;
             let src_tomb = cf(&src, CF_TOMBSTONES)?;
             let dst_tomb = cf(&dst_db, CF_TOMBSTONES)?;
+            let mut copied = 0usize;
+            let mut batch = WriteBatch::default();
             for item in src.iterator_cf(&src_tomb, IteratorMode::Start) {
                 let (key, value) = item?;
                 batch.put_cf(&dst_tomb, key, value);
+                copied += 1;
                 if batch.len() >= 10_000 {
                     dst_db.write(std::mem::take(&mut batch))?;
                 }
@@ -1532,16 +2253,10 @@ impl ObjectIndex {
                 }
                 batch.put_cf(&dst_meta, key, value);
             }
-            for key in [KEY_CHANGELOG_ID, KEY_TRIMMED_THROUGH, KEY_TRIMMED_TS] {
-                if let Some(value) = src.get_cf(&src_meta, key)? {
-                    batch.put_cf(&dst_meta, key, value);
-                }
-            }
             dst_db.write(batch)?;
             Ok(copied)
         })
-        .await?;
-        Ok(copied)
+        .await
     }
 
     // ── listing ───────────────────────────────────────────────────────────────
@@ -1814,39 +2529,7 @@ fn change_for_tombstone(
     }
 }
 
-/// Matches the legacy 4-level fanout layout `objects/xx/xx/xx/xx/…` (four
-/// exactly-two-char levels, then at least a trailing slash). Equivalent to the
-/// old `blob_dir LIKE 'objects/__/__/__/__/%'`.
-fn is_legacy_layout(blob_dir: &str) -> bool {
-    let Some(rest) = blob_dir.strip_prefix("objects/") else {
-        return false;
-    };
-    let mut parts = rest.split('/');
-    for _ in 0..4 {
-        match parts.next() {
-            Some(level) if level.len() == 2 => {}
-            _ => return false,
-        }
-    }
-    // The `%` follows a fifth `/`, so there must be a fifth segment (possibly
-    // empty, for a trailing slash).
-    parts.next().is_some()
-}
 
-/// Newer-wins adjudication: highest `last_modified_ms`, blob path as a
-/// deterministic tie-break.
-fn newer_wins(candidate: &ObjectRecord, incumbent: &ObjectRecord) -> bool {
-    // Version stamps order states exactly (a replicated state's
-    // Last-Modified is its origin's time, which a local clamp may not
-    // exceed); Last-Modified decides only when a side has no stamp.
-    match (&candidate.stamp, &incumbent.stamp) {
-        (Some(a), Some(b)) if a != b => a > b,
-        _ => {
-            (candidate.last_modified_ms, candidate.blob_dir.as_str())
-                > (incumbent.last_modified_ms, incumbent.blob_dir.as_str())
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1855,6 +2538,7 @@ mod tests {
     fn record(key: &str, blob_dir: &str, lm: i64) -> ObjectRecord {
         ObjectRecord {
             stamp: None,
+            versioned: false,
             object_key: key.to_string(),
             blob_dir: blob_dir.to_string(),
             size: 1,
@@ -1964,19 +2648,64 @@ mod tests {
         assert_eq!((status.head, status.trimmed_through), (2, 1));
     }
 
-    #[test]
-    fn rebuild_prefers_the_higher_stamp_over_last_modified() {
-        use crate::storage::stamp::Stamp;
-        let stamped = |lm: i64, ms: i64, site: &str| ObjectRecord {
-            stamp: Some(Stamp { ms, c: 0, site: site.into() }),
-            ..record("k", &format!("objects/x/V1{ms}{site}"), lm)
-        };
-        // A replicated state shows its origin's (older) time but carries the
-        // newer stamp; the stamp decides.
-        assert!(newer_wins(&stamped(100, 500, "b"), &stamped(200, 400, "a")));
-        assert!(!newer_wins(&stamped(200, 400, "a"), &stamped(100, 500, "b")));
-        // Without a stamp on one side, Last-Modified decides as before.
-        assert!(newer_wins(&record("k", "objects/x/V1z", 300), &stamped(200, 900, "a")));
+    /// A version found on disk, as the rebuild hands it to the batch insert.
+    fn version(key: &str, blob_dir: &str, ms: i64, site: &str, versioned: bool, delete_marker: bool) -> VersionRecord {
+        VersionRecord {
+            object_key: key.to_string(),
+            stamp: Stamp { ms, c: 0, site: site.into() },
+            blob_dir: blob_dir.to_string(),
+            size: if delete_marker { 0 } else { 1 },
+            etag: if delete_marker { String::new() } else { "e".to_string() },
+            last_modified_ms: ms,
+            parts: None,
+            versioned,
+            delete_marker,
+            removed: delete_marker.then(|| Stamp { ms: ms - 1, c: 0, site: site.into() }),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_batch_keeps_real_versions_and_only_the_newest_null_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = open_tmp(&tmp).await;
+        // Two null states (a crash leftover and the live one), two real
+        // versions, and a real delete marker newest of all.
+        let outcome = index
+            .insert_rebuild_batch(&[
+                version("k", "objects/null-old", 100, "a", false, false),
+                version("k", "objects/null-new", 200, "a", false, false),
+                version("k", "objects/v1", 300, "a", true, false),
+                version("k", "objects/v2", 400, "b", true, false),
+                version("k", "objects/marker", 500, "a", true, true),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(outcome.loser_blob_dirs, vec!["objects/null-old".to_string()]);
+        assert_eq!(outcome.inserted, 4);
+        assert!(index.get("k").await.unwrap().is_none(), "the marker is current: no row");
+        let t = index.get_tombstone("k").await.unwrap().unwrap();
+        assert_eq!((t.blob_dir.as_deref(), t.versioned), (Some("objects/marker"), true));
+        assert_eq!(index.object_count().await.unwrap(), 0);
+        let versions: Vec<_> = index.versions_of("k").await.unwrap().into_iter().map(|v| v.blob_dir).collect();
+        assert_eq!(versions, ["objects/v2", "objects/v1", "objects/null-new"], "newest first");
+
+        // A later batch brings a newer live version: it becomes current and
+        // the marker joins the noncurrent versions.
+        let outcome = index
+            .insert_rebuild_batch(&[version("k", "objects/v3", 600, "a", true, false)])
+            .await
+            .unwrap();
+        assert!(outcome.loser_blob_dirs.is_empty());
+        assert_eq!(index.get("k").await.unwrap().unwrap().blob_dir, "objects/v3");
+        assert!(index.get_tombstone("k").await.unwrap().is_none());
+        assert_eq!(index.object_count().await.unwrap(), 1);
+        assert_eq!(index.versions_of("k").await.unwrap().len(), 4);
+        // An older null state arriving later loses to the one already kept.
+        let outcome = index
+            .insert_rebuild_batch(&[version("k", "objects/null-older", 50, "a", false, false)])
+            .await
+            .unwrap();
+        assert_eq!(outcome.loser_blob_dirs, vec!["objects/null-older".to_string()]);
     }
 
     #[tokio::test]
@@ -2069,36 +2798,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_layout_keys_matches_four_level_fanout_only() {
+    async fn rows_off_layout_lists_old_layouts_and_unstamped_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let index = open_tmp(&tmp).await;
-        put(&index, "legacy", "objects/aa/bb/cc/dd/V1_9F00", 1).await;
-        put(&index, "modern", "objects/aabb/V1_9F00", 1).await;
-        let keys = index.legacy_layout_keys(None, 100).await.unwrap();
-        assert_eq!(keys, vec!["legacy".to_string()]);
+        put(&index, "legacy", "objects/aa/bb/cc/dd/V1ABCDEF_9F00", 1).await;
+        put(&index, "modern", "objects/aabb/V1ABCDEF_9F00", 1).await;
+        let stamp = Stamp { ms: 5, c: 0, site: "0123456789abcdef".into() };
+        let current = crate::storage::layouts::v3::blob_rel("bucket", "current", &stamp);
+        put(&index, "current-unstamped", &current, 1).await;
+        let intent = index.insert_publish_intent("current", &current, 1).await.unwrap();
+        index
+            .commit_publish(&ObjectRecord { stamp: Some(stamp), ..record("current", &current, 1) }, intent, None, 1)
+            .await
+            .unwrap();
+        let keys = index.rows_off_layout(None, 100).await.unwrap();
+        assert_eq!(keys, vec!["current-unstamped".to_string(), "legacy".to_string(), "modern".to_string()]);
     }
 
-    #[tokio::test]
-    async fn rebuild_batch_newer_wins_reports_losers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let index = open_tmp(&tmp).await;
-        let outcome = index
-            .insert_rebuild_batch(&[record("k", "objects/old", 5), record("k", "objects/new", 9)])
-            .await
-            .unwrap();
-        assert_eq!(outcome.inserted, 1);
-        assert_eq!(outcome.loser_blob_dirs, vec!["objects/old".to_string()]);
-        assert_eq!(index.object_count().await.unwrap(), 1);
-        // A later, older duplicate arriving in a separate batch also loses.
-        let outcome = index
-            .insert_rebuild_batch(&[record("k", "objects/older", 1)])
-            .await
-            .unwrap();
-        assert_eq!(outcome.inserted, 0);
-        assert_eq!(outcome.loser_blob_dirs, vec!["objects/older".to_string()]);
-        assert_eq!(index.get("k").await.unwrap().unwrap().blob_dir, "objects/new");
-        assert_eq!(index.object_count().await.unwrap(), 1);
-    }
 
     #[tokio::test]
     async fn outdated_schema_is_rejected_and_survives_reopen() {
@@ -2372,15 +3088,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_layout_keys_resumes_after_cursor() {
+    async fn rows_off_layout_resumes_after_cursor() {
         let tmp = tempfile::tempdir().unwrap();
         let index = open_tmp(&tmp).await;
         for key in ["a", "b", "c"] {
             put(&index, key, &format!("objects/aa/bb/cc/dd/{key}"), 1).await;
         }
-        assert_eq!(index.legacy_layout_keys(Some("a"), 10).await.unwrap(), vec!["b", "c"]);
-        assert_eq!(index.legacy_layout_keys(Some("b"), 1).await.unwrap(), vec!["c"]);
-        assert!(index.legacy_layout_keys(Some("c"), 10).await.unwrap().is_empty());
+        assert_eq!(index.rows_off_layout(Some("a"), 10).await.unwrap(), vec!["b", "c"]);
+        assert_eq!(index.rows_off_layout(Some("b"), 1).await.unwrap(), vec!["c"]);
+        assert!(index.rows_off_layout(Some("c"), 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

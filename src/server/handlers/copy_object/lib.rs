@@ -101,9 +101,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         .await
     {
         Ok(result) => srv::with_measure(
-            srv::xml_response(
-                StatusCode::OK,
-                copy_object_xml(&result.etag, result.last_modified_ms),
+            srv::with_version_id(
+                srv::xml_response(
+                    StatusCode::OK,
+                    copy_object_xml(&result.etag, result.last_modified_ms),
+                ),
+                result.version_id.as_deref(),
             ),
             srv::OperationMeasure::Bytes(result.size),
         ),

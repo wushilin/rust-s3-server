@@ -15,8 +15,8 @@ virtual-hosted-style addressing — is verified continuously against the MinIO
 Mint suite and real AWS SDKs.
 
 Good fit for local development, integration tests, CI, and small trusted
-production deployments. Features that only make sense at AWS scale (versioning,
-ACLs, replication, S3 Select) are [deliberately out of scope](#intentional-limits).
+production deployments. Features that only make sense at AWS scale (ACLs,
+S3 Select, object lock) are [deliberately out of scope](#intentional-limits).
 
 ## Quick start
 
@@ -162,7 +162,6 @@ for filtering, port overrides, and running against an existing server.
 
 Not implemented:
 
-- bucket versioning and delete markers;
 - bucket policies via the S3 API (use console IAM policies instead), ACLs,
   websites, lifecycle rules, tagging;
 - object lock, retention/legal hold, replication, notifications, S3 Select;
@@ -170,11 +169,11 @@ Not implemented:
 - MinIO admin APIs and Snowball archive extraction;
 - **TLS termination** — put rusts3 behind a reverse proxy (see below).
 
-`GET /{bucket}?versions` is a compatibility view that reports the current object
-of each key as its single `null` version, exactly as S3 answers for an
-unversioned bucket. Overwritten and deleted blobs are retained in trash for the
-retention window, but they are an operator recovery buffer, not versions: there
-is no `?versionId` API to fetch or delete one, so they are not listed.
+On a bucket that never had versioning, `GET /{bucket}?versions` reports the
+current object of each key as its single `null` version, exactly as S3 does.
+Overwritten and deleted blobs of such a bucket are retained in trash for the
+retention window as an operator recovery buffer, not as versions. See
+[Object versioning](#object-versioning) for buckets that keep versions.
 
 ## Configuration
 
@@ -267,20 +266,51 @@ HMAC key.
 throughput but can lose the last acknowledged writes after power loss. A normal
 process crash preserves committed writes in either mode.
 
+**Filesystem.** Put the data directory on a checksumming filesystem:
+**Btrfs** or **ZFS**. Both detect a flipped bit on read (and repair it from
+a mirror or parity copy), scale to the directory counts a large bucket
+produces, and compress transparently, which matters for text-heavy buckets.
+ext4 and XFS work but neither verifies data integrity, so a silent disk error
+reaches the client as a wrong byte with a matching ETag; the health scan
+catches size and metadata drift, not bit flips. The server never relies on
+filesystem features beyond rename, hardlink and fsync, so any POSIX
+filesystem is supported — the recommendation is about what the disk can do
+to your data.
+
 **Storage layout versions.** Each bucket records its on-disk layout in its
-`bucket.json`: `"layout": {"state": "stable", "version": 2}`, or while an
-upgrade runs `{"state": "migrating", "from": 1, "to": 2}`. This build writes
-layout 2 (single-level fanout) and still serves layout 1 (the older 4-level
-fanout). At startup the server records the layout of buckets that never had
-one, refuses to start on a layout written by a newer build, and resumes any
-upgrade that was started and interrupted. An upgrade is started by an admin
+`bucket.json`: `"layout": {"state": "stable", "version": 3}`, or while an
+upgrade runs `{"state": "migrating", "from": 2, "to": 3}`. This build writes
+layout 3 and still serves layouts 1 and 2:
+
+| Layout | Shape | Written by |
+|---:|---|---|
+| 1 | `objects/aa/bb/cc/dd/<leaf>`, 4-level fanout, `meta.json` format 1 | the first releases |
+| 2 | `objects/<4hex>/<leaf>`, single-level fanout, `meta.json` format 1 | releases before versioning |
+| 3 | `objects/<4hex>/<sha1(key)>/<stamp>/`, one dir per key, one per version, `meta.json` format 2 (every blob carries its stamp; delete markers on disk) | this build |
+
+Every layout lives in its own sealed file under `src/storage/layouts/` with
+a registry of what is supported; a change in shape is a new layout, never an
+edit of an old one, and a test builds a bucket in every supported layout and
+proves this build reads and upgrades it. At startup the server records the
+layout of buckets that never had one, refuses to start on a layout written by
+a newer build, and resumes any upgrade that was started and interrupted. An upgrade is started by an admin
 (bucket settings → **Storage layout** → **Upgrade now**, or
 `POST /api/buckets/{name}/upgrade-layout`); the console flags buckets that
 can be upgraded. While it runs the bucket answers `503` to every data request
 and shows in the tasks panel; a bucket is never served on a half-migrated
 layout, and a step that fails is retried every `sweeper.interval_secs` with
 the bucket still unavailable. Moving an object is a hardlink and an index
-update, so no data is copied.
+update, so no data is copied. The step to layout 3 also materialises a stamp
+for objects from before stamps existed and writes the delete marker of every
+tombstone, so afterwards a rebuild from the tree alone recovers every object,
+every version and every delete.
+
+**Index rebuilds and the changelog.** A rebuild walks the tree and rewrites
+the index. Its changelog (what webhooks and replication links read) is
+carried across only when the rebuilt catalog is the same catalog; if the tree
+disagreed with the prior index, or the index was lost, the log starts over
+under a new id and consumers detect the switch and resnapshot rather than
+miss a change.
 
 ### Authentication and IAM
 
@@ -490,6 +520,40 @@ password to bootstrap administration. The console supports:
 
 Share links carry the creator's current authority — deleting the user or
 narrowing their policy revokes or narrows existing links.
+
+## Object versioning
+
+Buckets can keep every version of every object, with S3's semantics:
+
+- **Enable** it in the bucket settings (or `PUT /{bucket}?versioning` with
+  `<Status>Enabled</Status>`). The bucket must be on the current storage
+  layout; the console says so and offers the upgrade. Objects that exist at
+  that point are the key's `null` version.
+- **Enabled:** every PUT, copy and multipart completion is a new version,
+  reported as `x-amz-version-id`; the previous version stays. A DELETE
+  inserts a delete marker (the key answers 404 with `x-amz-delete-marker`)
+  and keeps every version. `GET`/`HEAD ?versionId=` read a version;
+  `DELETE ?versionId=` removes exactly that version or marker, permanently —
+  removing the current one makes the next newest current, removing a marker
+  undeletes the key.
+- **Suspended:** existing versions stay; a write becomes the key's `null`
+  version and replaces only the previous `null` one; a delete replaces it
+  with a `null` delete marker. A bucket that was enabled can be suspended,
+  never returned to never-enabled.
+- `GET /{bucket}?versions` lists everything, newest first per key, with
+  `DeleteMarker` entries and `IsLatest`, paginated by `key-marker` and
+  `version-id-marker`.
+
+A version id is the version's stamp (`§2.2` of the replication spec) in a
+zero-padded, sortable form, so it is the same on every site that holds the
+version. On disk every version is a directory beside the others under its
+key, so an index rebuild recovers versions and delete markers from the tree
+alone. The console's object details panel lists a key's versions with a
+download and a permanent delete for each. Replication writes into a
+versioned bucket like any other write, so a versioned replica keeps the
+history of an unversioned source. Not yet: lifecycle expiry of noncurrent
+versions, and replication of version-scoped deletes (a replica drops only
+what the source's current state drops).
 
 ## Changelog, webhooks and replication
 
@@ -903,7 +967,8 @@ request/byte totals and rates are in the periodic logs and the console task view
 | `GET` | `/{bucket}?location` | Get bucket location. |
 | `GET` | `/{bucket}?uploads` | List multipart uploads. |
 | `GET/PUT/DELETE` | `/{bucket}?cors` | Read, replace, or remove bucket CORS rules. |
-| `GET` | `/{bucket}?versions` | Compatibility listing: one `null` version per live key, paginated by `key-marker`; not S3 versioning. |
+| `GET` | `/{bucket}?versions` | ListObjectVersions: every version and delete marker, newest first per key, paginated by `key-marker` / `version-id-marker`. |
+| `GET` / `PUT` | `/{bucket}?versioning` | Read or set the bucket's versioning state (`Enabled` / `Suspended`; enabling needs the current storage layout). |
 | `POST` | `/{bucket}?delete` | Multi-object delete, including quiet mode. |
 | `POST` | `/{bucket}?rebuildIndex` | Start an index rebuild (`202`; `409` if already running). |
 | `POST` | `/{bucket}` | SigV4 browser form upload with policy validation. |

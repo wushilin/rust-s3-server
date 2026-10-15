@@ -85,7 +85,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         .await
     {
         Ok(result) => srv::with_measure(
-            srv::empty_response_with_etag(StatusCode::OK, &result.etag),
+            srv::with_version_id(srv::empty_response_with_etag(StatusCode::OK, &result.etag), result.version_id.as_deref()),
             srv::OperationMeasure::Bytes(result.size),
         ),
         Err(err) => srv::storage_error_response(err, &resource),

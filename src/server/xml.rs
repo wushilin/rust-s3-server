@@ -217,42 +217,52 @@ pub fn list_object_versions_xml(
     versions: &[ObjectVersionEntry],
     max_keys: usize,
     key_marker: &str,
+    version_id_marker: &str,
     is_truncated: bool,
     next_key_marker: Option<&str>,
+    next_version_id_marker: Option<&str>,
 ) -> String {
     let encode_keys = encoding_type == Some("url");
     let mut body = String::new();
     for version in versions {
-        body.push_str(&format!(
-            "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>{}</StorageClass><Owner><ID>rust-s3-server</ID></Owner></Version>",
-            escape_xml(&encode_list_value(&version.meta.object_key, encode_keys)),
-            // This server is non-versioned; S3 reports the version id as the literal
-            // "null" for objects in unversioned buckets. The internal storage
-            // directory name on `version.version_id` is never exposed to clients.
-            "null",
-            version.is_latest,
-            iso_utc_ms(version.meta.last_modified_ms),
-            escape_xml(&quote_etag(&version.meta.etag)),
-            version.meta.size,
-            escape_xml(&version.meta.storage_class),
-        ));
+        if version.delete_marker {
+            body.push_str(&format!(
+                "<DeleteMarker><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><Owner><ID>rust-s3-server</ID></Owner></DeleteMarker>",
+                escape_xml(&encode_list_value(&version.key, encode_keys)),
+                escape_xml(&version.version_id),
+                version.is_latest,
+                iso_utc_ms(version.last_modified_ms),
+            ));
+        } else {
+            body.push_str(&format!(
+                "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass><Owner><ID>rust-s3-server</ID></Owner></Version>",
+                escape_xml(&encode_list_value(&version.key, encode_keys)),
+                escape_xml(&version.version_id),
+                version.is_latest,
+                iso_utc_ms(version.last_modified_ms),
+                escape_xml(&quote_etag(&version.etag)),
+                version.size,
+            ));
+        }
     }
     let encoding_xml = encoding_type
         .map(|v| format!("<EncodingType>{}</EncodingType>", escape_xml(v)))
         .unwrap_or_default();
     let next_markers_xml = if is_truncated {
         format!(
-            "<NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>",
+            "<NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>{}</NextVersionIdMarker>",
             escape_xml(&encode_list_value(next_key_marker.unwrap_or(""), encode_keys)),
+            escape_xml(next_version_id_marker.unwrap_or("null")),
         )
     } else {
         String::new()
     };
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix>{encoding_xml}<KeyMarker>{}</KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{is_truncated}</IsTruncated>{next_markers_xml}{body}</ListVersionsResult>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix>{encoding_xml}<KeyMarker>{}</KeyMarker><VersionIdMarker>{}</VersionIdMarker><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{is_truncated}</IsTruncated>{next_markers_xml}{body}</ListVersionsResult>"#,
         escape_xml(bucket),
         escape_xml(&encode_list_value(prefix, encode_keys)),
         escape_xml(&encode_list_value(key_marker, encode_keys)),
+        escape_xml(version_id_marker),
     )
 }
 
@@ -580,7 +590,6 @@ fn encode_list_value(value: &str, encode: bool) -> String {
 mod tests {
     use super::*;
     use crate::storage::index::ObjectRecord;
-    use crate::storage::metadata::ObjectMeta;
 
     #[test]
     fn escape_xml_writes_controls_as_character_references() {
@@ -605,6 +614,7 @@ mod tests {
             &ListPage {
                 entries: vec![ObjectRecord {
                     stamp: None,
+                    versioned: false,
                     object_key: "a/file".to_string(),
                     blob_dir: "objects/aa/bb/cc/dd/V1ABCDEF_0001".to_string(),
                     size: 3,
@@ -638,6 +648,7 @@ mod tests {
             &ListPage {
                 entries: vec![ObjectRecord {
                     stamp: None,
+                    versioned: false,
                     object_key: "a+b c".to_string(),
                     blob_dir: "objects/aa/bb/cc/dd/V1ABCDEF_0002".to_string(),
                     size: 3,
@@ -663,34 +674,34 @@ mod tests {
     }
 
     #[test]
-    fn list_object_versions_reports_null_version_id() {
-        let meta = ObjectMeta {
-            stamp: None,
-            format_version: 1,
-            bucket: "bucket".to_string(),
-            object_key: "my-prefix/datafile".to_string(),
-            storage: crate::storage::metadata::ObjectStorageKind::Single,
-            size: 5,
-            etag: "abc".to_string(),
-            last_modified_ms: 0,
-            content_type: "text/plain".to_string(),
-            content_encoding: None,
-            content_language: None,
-            storage_class: "STANDARD".to_string(),
-            user_meta: std::collections::BTreeMap::new(),
-            parts: vec![],
-        };
-        let versions = vec![ObjectVersionEntry {
-            meta,
-            // Internal on-disk storage directory name; must never leak to clients.
-            version_id: "V1ED6836".to_string(),
-            is_latest: true,
-        }];
-        let xml =
-            list_object_versions_xml("bucket", "my-prefix", None, &versions, 1000, "", false, None);
-        assert!(xml.contains("<VersionId>null</VersionId>"));
-        assert!(!xml.contains("V1ED6836"));
-        assert!(xml.contains("<IsLatest>true</IsLatest>"));
+    fn list_object_versions_lists_versions_and_delete_markers() {
+        let stamp = crate::storage::stamp::Stamp { ms: 1_700_000_000_000, c: 0, site: "0123456789abcdef".into() };
+        let versions = vec![
+            ObjectVersionEntry {
+                key: "my-prefix/datafile".to_string(),
+                version_id: "null".to_string(),
+                is_latest: false,
+                last_modified_ms: 0,
+                etag: "abc".to_string(),
+                size: 5,
+                delete_marker: false,
+                stamp: stamp.clone(),
+            },
+            ObjectVersionEntry {
+                key: "my-prefix/datafile".to_string(),
+                version_id: crate::storage::layouts::v3::stamp_dir(&stamp),
+                is_latest: true,
+                last_modified_ms: 1_700_000_000_000,
+                etag: String::new(),
+                size: 0,
+                delete_marker: true,
+                stamp,
+            },
+        ];
+        let xml = list_object_versions_xml("bucket", "my-prefix", None, &versions, 1000, "", "", true, Some("my-prefix/datafile"), Some("null"));
+        assert!(xml.contains("<Version><Key>my-prefix/datafile</Key><VersionId>null</VersionId><IsLatest>false</IsLatest>"), "{xml}");
+        assert!(xml.contains("<DeleteMarker><Key>my-prefix/datafile</Key><VersionId>0000001700000000000.0000000000.0123456789abcdef</VersionId><IsLatest>true</IsLatest>"), "{xml}");
+        assert!(xml.contains("<NextKeyMarker>my-prefix/datafile</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>"), "{xml}");
     }
 
     #[test]

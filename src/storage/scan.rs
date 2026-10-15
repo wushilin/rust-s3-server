@@ -542,6 +542,38 @@ impl LocalObjectStore {
             after = batch.last().map(|r| r.object_key.clone());
             yield_now().await;
         }
+        // Noncurrent versions and delete markers are blob dirs too: the walk
+        // must find them referenced, or it would report (and a repair would
+        // trash) every version a versioned bucket keeps.
+        let mut after_version: Option<Vec<u8>> = None;
+        loop {
+            check_cancelled(cancel, &self.shutdown_token())?;
+            let batch = index.all_versions_after(after_version.as_deref(), INDEX_BATCH as usize).await?;
+            if batch.is_empty() {
+                break;
+            }
+            for (_, v) in &batch {
+                report.logical_bytes += v.size;
+                rows.insert(hash64(&v.blob_dir), attr_fingerprint(v.size, &v.etag, v.last_modified_ms));
+            }
+            after_version = batch.last().map(|(k, _)| k.clone());
+            yield_now().await;
+        }
+        let mut after_tombstone: Option<String> = None;
+        loop {
+            check_cancelled(cancel, &self.shutdown_token())?;
+            let (batch, more) = index.list_tombstones("", after_tombstone.as_deref(), INDEX_BATCH as usize).await?;
+            for t in &batch {
+                if let Some(dir) = &t.blob_dir {
+                    rows.insert(hash64(dir), attr_fingerprint(0, "", t.stamp.ms));
+                }
+            }
+            if !more {
+                break;
+            }
+            after_tombstone = batch.last().map(|t| t.object_key.clone());
+            yield_now().await;
+        }
         // The counter is maintained by merge operator and can drift from the
         // rows actually present; the sweep just counted them, so trust that.
         report.objects_indexed = rows.len() as u64;
@@ -1249,18 +1281,22 @@ impl LocalObjectStore {
     /// either already gone or handled by the caller.
     async fn delete_row(&self, bucket: &str, key: &str, row: &ObjectRecord) -> Result<()> {
         let index = self.index(bucket).await?;
-        let retire_id = index
+        let retire_ids = index
             .commit_delete_from(
                 key,
-                &row.blob_dir,
+                crate::storage::index::Displaced::retire(&row.blob_dir),
                 now_ms(),
                 ChangeOrigin::Repair,
                 Some(self.next_stamp()),
                 Some(self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms)),
+                None,
+                false,
             )
             .await?;
         self.forget_cached_meta(bucket, key);
-        let _ = index.delete_intent(retire_id).await;
+        for retire_id in retire_ids {
+            let _ = index.delete_intent(retire_id).await;
+        }
         Ok(())
     }
 }

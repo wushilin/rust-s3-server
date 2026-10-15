@@ -781,7 +781,7 @@ async fn repair_changes_are_marked_as_such() {
     let index = h.store.index("bkt").await.unwrap();
     let row = index.get("k").await.unwrap().unwrap();
     index
-        .commit_delete_from("k", &row.blob_dir, now_ms(), ChangeOrigin::Repair, None, None)
+        .commit_delete_from("k", crate::storage::index::Displaced::retire(&row.blob_dir), now_ms(), ChangeOrigin::Repair, None, None, None, false)
         .await
         .unwrap();
     wait_until(10, "two events", || rx.live_keys().len() == 2).await;

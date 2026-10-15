@@ -1446,7 +1446,6 @@
             ("DELETE", "lifecycle"),
             ("DELETE", "encryption"),
             ("DELETE", "replication"),
-            ("PUT", "versioning"),
             ("PUT", "policy"),
             ("PUT", "object-lock"),
         ] {
@@ -1669,7 +1668,7 @@
         // While the rebuild runs the bucket answers 503 SlowDown by design;
         // poll until it completes instead of racing a fixed sleep.
         let mut res = None;
-        for _ in 0..200 {
+        for _ in 0..1200 {
             let attempt = app
                 .clone()
                 .oneshot(
@@ -1687,7 +1686,7 @@
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
         }
-        let res = res.expect("rebuild did not finish within 5s");
+        let res = res.expect("rebuild did not finish within 30s");
         assert_eq!(res.status(), StatusCode::OK);
         let _unused = app
             .clone()

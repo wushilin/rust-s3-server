@@ -30,7 +30,14 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         ..
     } = ctx;
 
-    let object = match store.read_object(&bucket, &key).await {
+    let versioning = store.bucket_versioning(&bucket).await.unwrap_or_default();
+    // `?versionId=`: one version of the key, current or not.
+    let version_id = query.get("versionId").filter(|v| !v.is_empty()).cloned();
+    let read = match &version_id {
+        Some(version_id) => store.read_object_version(&bucket, &key, version_id).await,
+        None => store.read_object(&bucket, &key).await,
+    };
+    let object = match read {
         Ok(object) => object,
         Err(err) => {
             let not_found = matches!(err, crate::storage::errors::StorageError::ObjectNotFound { .. });
@@ -47,6 +54,17 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
                         response
                             .headers_mut()
                             .insert("x-rs3-deleted", axum::http::HeaderValue::from_static("true"));
+                    }
+                    // S3: a key whose current state is a delete marker.
+                    if versioning != crate::storage::metadata::BucketVersioning::Off {
+                        response
+                            .headers_mut()
+                            .insert("x-amz-delete-marker", axum::http::HeaderValue::from_static("true"));
+                        if let Ok(Some(marker)) = store.list_versions(&bucket, &key).await.map(|v| v.into_iter().next()) {
+                            if let Ok(value) = axum::http::HeaderValue::from_str(&marker.version_id()) {
+                                response.headers_mut().insert("x-amz-version-id", value);
+                            }
+                        }
                     }
                     // What the tombstone ranks by: the version it removed.
                     if let Ok(Some(rank)) = store.key_rank(&bucket, &key).await {
@@ -336,6 +354,14 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         // it was made with before writing to it.
         .header("x-rs3-site", store.site_id())
         .header("x-amz-request-id", "rust-s3-server");
+    // S3 names the version only on a bucket that has (or had) versioning:
+    // a real version by its id, a `null` version as `null`.
+    if versioning != crate::storage::metadata::BucketVersioning::Off {
+        builder = builder.header(
+            "x-amz-version-id",
+            if object.meta.versioned { crate::storage::layouts::v3::stamp_dir(&stamp) } else { "null".to_string() },
+        );
+    }
     // AWS sends this header only for a non-default class; a STANDARD object
     // carries no `x-amz-storage-class` at all.
     if storage_class != "STANDARD" {
@@ -732,6 +758,9 @@ mod tests {
     fn multipart_meta(sizes: &[u64]) -> ObjectMeta {
         ObjectMeta {
             stamp: None,
+            versioned: false,
+            delete_marker: false,
+            removed: None,
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

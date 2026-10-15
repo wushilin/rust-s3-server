@@ -49,9 +49,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
                 .unwrap_or("127.0.0.1");
             let location = format!("http://{host}/{}/{}", ctx.bucket, ctx.key);
             srv::with_measure(
-                srv::xml_response(
-                    StatusCode::OK,
-                    complete_multipart_xml(&location, &ctx.bucket, &ctx.key, &result.etag),
+                srv::with_version_id(
+                    srv::xml_response(
+                        StatusCode::OK,
+                        complete_multipart_xml(&location, &ctx.bucket, &ctx.key, &result.etag),
+                    ),
+                    result.version_id.as_deref(),
                 ),
                 srv::OperationMeasure::Bytes(result.size),
             )
