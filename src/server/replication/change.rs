@@ -22,6 +22,9 @@ pub enum Kind {
     /// The tags of the version stamped `stamp` were replaced with these.
     /// Applied by identity: the version's tags become exactly this set.
     Tags(std::collections::BTreeMap<String, String>),
+    /// A bucket setting changed: the bucket's settings after it, adopted
+    /// where newer (`LocalObjectStore::adopt_bucket_settings`).
+    Bucket(crate::storage::metadata::BucketSettings),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +63,7 @@ impl Change {
             },
             WireOp::RemoveVersion => Kind::RemoveVersion,
             WireOp::Tags => Kind::Tags(event.tags.clone().unwrap_or_default()),
+            WireOp::Bucket => Kind::Bucket(event.settings.clone().unwrap_or_default()),
             WireOp::Unknown => return Err(format!("event for {} has an unknown op (a newer peer?)", event.key)),
         };
         Ok(Self {
@@ -79,7 +83,7 @@ impl Change {
     /// delete by the version it removed.
     pub fn rank(&self) -> Rank {
         match &self.kind {
-            Kind::Put | Kind::RemoveVersion | Kind::Tags(_) => Rank::live(self.stamp.clone()),
+            Kind::Put | Kind::RemoveVersion | Kind::Tags(_) | Kind::Bucket(_) => Rank::live(self.stamp.clone()),
             Kind::Delete { removed } => Rank::deleted(removed.clone()),
         }
     }
@@ -92,7 +96,7 @@ impl Change {
     pub fn removed(&self) -> Option<&Stamp> {
         match &self.kind {
             Kind::Delete { removed } => Some(removed),
-            Kind::Put | Kind::RemoveVersion | Kind::Tags(_) => None,
+            Kind::Put | Kind::RemoveVersion | Kind::Tags(_) | Kind::Bucket(_) => None,
         }
     }
 
@@ -130,6 +134,7 @@ mod tests {
             removed_stamp: removed,
             versioned: None,
             tags: None,
+            settings: None,
         }
     }
 

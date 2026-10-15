@@ -204,6 +204,8 @@ pub enum WireOp {
     RemoveVersion,
     /// The tags of one version (its `stamp`) were replaced: `tags`.
     Tags,
+    /// A bucket setting changed: `settings`.
+    Bucket,
     /// An operation this build does not know (a newer peer's). A reader
     /// must not guess what it means.
     #[serde(other)]
@@ -219,6 +221,7 @@ impl WireOp {
             WireOp::Deleted => "deleted",
             WireOp::RemoveVersion => "remove_version",
             WireOp::Tags => "tags",
+            WireOp::Bucket => "bucket",
             WireOp::Unknown => "unknown",
         }
     }
@@ -319,6 +322,9 @@ pub struct WireEvent {
     /// `tags` events: the version's new tag set.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tags: Option<std::collections::BTreeMap<String, String>>,
+    /// `bucket` events: the bucket's settings after the change.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub settings: Option<crate::storage::metadata::BucketSettings>,
 }
 
 impl WireEvent {
@@ -340,6 +346,7 @@ impl WireEvent {
             removed_stamp: v.removed.clone(),
             versioned: Some(v.versioned),
             tags: None,
+            settings: None,
         }
     }
 
@@ -366,6 +373,7 @@ impl WireEvent {
             removed_stamp: None,
             versioned: Some(record.versioned),
             tags: None,
+            settings: None,
         }
     }
 }
@@ -379,6 +387,7 @@ impl From<&ChangeEvent> for WireEvent {
                 ChangeOp::Delete => WireOp::Delete,
                 ChangeOp::RemoveVersion => WireOp::RemoveVersion,
                 ChangeOp::Tags => WireOp::Tags,
+                ChangeOp::Bucket => WireOp::Bucket,
             },
             key: event.key.clone(),
             etag: event.etag.clone(),
@@ -392,6 +401,7 @@ impl From<&ChangeEvent> for WireEvent {
             removed_stamp: event.removed_stamp.clone(),
             versioned: Some(event.versioned),
             tags: event.tags.clone(),
+            settings: event.settings.clone(),
         }
     }
 }

@@ -285,7 +285,7 @@ async fn s3_a_put_is_logged_with_every_field_and_matches_the_object_headers() {
     let page = page.json();
     assert_eq!(
         keys_of(&page),
-        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events", "versioning"])
+        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events", "versioning", "settings"])
     );
     assert_eq!(page["bucket"], BUCKET);
     assert_eq!(page["site_id"], SITE);
@@ -527,7 +527,7 @@ async fn s4_2_snapshot_pages_objects_then_tombstones() {
     let first = s.snapshot("limit=2").await;
     assert_eq!(first.status, StatusCode::OK);
     let first = first.json();
-    assert_eq!(keys_of(&first), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after", "versioning"]));
+    assert_eq!(keys_of(&first), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after", "versioning", "settings"]));
     assert_eq!(first["next_after"], "b");
     let head = first["head"].as_u64().unwrap();
     let entry = &first["entries"][0];
@@ -607,7 +607,7 @@ async fn s4_3_a_replication_token_reads_the_same_shapes() {
     let page: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         keys_of(&page),
-        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events", "versioning"])
+        set(&["bucket", "site_id", "site_name", "log_id", "head", "trimmed_through", "next", "more", "events", "versioning", "settings"])
     );
     assert_eq!(page["events"].as_array().unwrap().len(), 1, "the token's filter is its scope");
     assert_eq!(page["events"][0]["key"], "in/a");
@@ -628,7 +628,7 @@ async fn s4_3_a_replication_token_reads_the_same_shapes() {
         .unwrap();
     assert_eq!(snapshot.status(), StatusCode::OK);
     let snapshot: Value = serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(keys_of(&snapshot), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after", "versioning"]));
+    assert_eq!(keys_of(&snapshot), set(&["bucket", "site_id", "site_name", "log_id", "head", "entries", "next_after", "versioning", "settings"]));
     assert_eq!(snapshot["entries"][0]["op"], "exists");
     for bad in ["", "rs3cl_wrong"] {
         let response = s.app.clone().oneshot(bearer(bad)).await.unwrap();

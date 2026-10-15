@@ -236,6 +236,42 @@ pub struct BucketMeta {
     /// Object versioning (requires the bucket to be stable on layout 3).
     #[serde(default, skip_serializing_if = "is_off")]
     pub versioning: BucketVersioning,
+    /// When (and where) `versioning` was last set: replication adopts the
+    /// newer setting of two sites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning_stamp: Option<super::stamp::Stamp>,
+    /// When `cors` was last set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_stamp: Option<super::stamp::Stamp>,
+    /// Keep this bucket's CORS rules as they are: never adopt a peer's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cors_local: bool,
+}
+
+/// A bucket's replicated settings, as the changelog pages, snapshot pages
+/// and `bucket` events carry them: each with the stamp of its last change,
+/// so two sites agree on the newer one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BucketSettings {
+    #[serde(default)]
+    pub versioning: BucketVersioning,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning_stamp: Option<super::stamp::Stamp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cors: Vec<CorsRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_stamp: Option<super::stamp::Stamp>,
+}
+
+impl BucketSettings {
+    pub fn of(meta: &BucketMeta) -> Self {
+        Self {
+            versioning: meta.versioning,
+            versioning_stamp: meta.versioning_stamp.clone(),
+            cors: meta.cors.clone(),
+            cors_stamp: meta.cors_stamp.clone(),
+        }
+    }
 }
 
 fn is_off(v: &BucketVersioning) -> bool {
@@ -346,7 +382,7 @@ mod tests {
         // A bucket.json from before layouts were recorded still parses, with no layout.
         let old: BucketMeta = serde_json::from_str(r#"{"created_at_ms":1,"storage_version":"v2"}"#).unwrap();
         assert_eq!(old.layout, None);
-        let written = serde_json::to_string(&BucketMeta { created_at_ms: 1, storage_version: String::new(), layout: Some(BucketLayout::current()), cors: vec![], read_only: false, versioning: BucketVersioning::Off }).unwrap();
+        let written = serde_json::to_string(&BucketMeta { created_at_ms: 1, storage_version: String::new(), layout: Some(BucketLayout::current()), cors: vec![], read_only: false, versioning: BucketVersioning::Off, versioning_stamp: None, cors_stamp: None, cors_local: false }).unwrap();
         assert!(written.contains(r#""layout":{"state":"stable","version":3}"#) && !written.contains("storage_version") && !written.contains("versioning"), "{written}");
     }
 

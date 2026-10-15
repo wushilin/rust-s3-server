@@ -250,21 +250,45 @@ impl Worker {
         }
     }
 
-    /// The local bucket's versioning state.
-    async fn local_versioning(&self) -> Result<String, StepError> {
-        Ok(self.store.bucket_versioning(&self.link.local_bucket).await?.as_str().to_string())
+
+    /// Bucket settings travel with every page: the newer side's are
+    /// adopted (`LocalObjectStore::adopt_bucket_settings`). A link needs
+    /// the same versioning on both buckets; what cannot be adopted (a
+    /// mirror whose source has no versioning while this replica has, or a
+    /// bucket still on an old layout) stops the link at once. Nothing is
+    /// checkpointed until a batch is applied, so once the settings match
+    /// the link continues from its position. A merge link whose own side
+    /// is the newer one continues: its push carries the change over.
+    async fn adopt_settings(&self, peer: &crate::storage::metadata::BucketSettings) -> Result<bool, StepError> {
+        let bucket = &self.link.local_bucket;
+        let before = self.store.bucket_versioning(bucket).await?;
+        let local = match self.store.adopt_bucket_settings(bucket, peer).await {
+            Ok(local) => local,
+            Err(StorageError::BucketInUse(message)) => {
+                return Err(StepError::Fatal(format!("cannot adopt the peer's versioning: {message}")))
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if local != peer.versioning && self.link.mode == Mode::Mirror {
+            return Err(StepError::Fatal(format!(
+                "versioning differs: bucket {bucket} here is {}, the source's is {}; a mirror cannot change its \
+                 source, so the link resumes once both buckets have the same setting",
+                local.as_str(),
+                peer.versioning.as_str()
+            )));
+        }
+        Ok(local != before)
     }
 
-    /// A link needs the same versioning setting on both buckets: a mismatch
-    /// (a setting changed on one side) stops it at once. Nothing is
-    /// checkpointed until a batch is applied, so once the settings match
-    /// again the link continues from its position.
-    async fn check_versioning(&self, peer: &str) -> Result<(), StepError> {
-        let local = self.local_versioning().await?;
-        if peer != local {
-            return Err(StepError::Fatal(format!(
-                "versioning differs: bucket {} here is {local}, the peer's is {peer}; the link resumes once both                  buckets have the same setting",
-                self.link.local_bucket
+    /// A snapshot walks current states or every version, depending on the
+    /// local versioning: adopting a change to it mid-walk starts the walk
+    /// over under the new setting.
+    async fn adopt_settings_snapshotting(&self, peer: &crate::storage::metadata::BucketSettings) -> Result<(), StepError> {
+        if self.adopt_settings(peer).await? {
+            return Err(StepError::Resnapshot(format!(
+                "bucket {} adopted the peer's versioning ({}): snapshotting again under it",
+                self.link.local_bucket,
+                peer.versioning.as_str()
             )));
         }
         Ok(())
@@ -353,7 +377,7 @@ impl Worker {
             let page = self.peer.snapshot(None, SNAPSHOT_PAGE, "", false, versions).await?;
             self.peer_answered();
             self.check_site(&page.site_id)?;
-            self.check_versioning(&page.versioning).await?;
+            self.adopt_settings_snapshotting(&page.settings).await?;
             self.peer_named(&page.site_name);
             let mut checkpoint = Checkpoint {
                 v: RECORD_VERSION,
@@ -383,7 +407,7 @@ impl Worker {
                 self.update(|s| s.state = "snapshot".to_string());
                 let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", false, versions).await?;
                 self.peer_answered();
-                self.check_versioning(&page.versioning).await?;
+                self.adopt_settings_snapshotting(&page.settings).await?;
                 if page.log_id != checkpoint.peer_log_id {
                     return Err(StepError::Resnapshot("the peer's changelog changed mid-snapshot".to_string()));
                 }
@@ -395,7 +419,7 @@ impl Worker {
                 // there does not survive here.
                 let page = self.peer.snapshot(cursor.as_deref(), SNAPSHOT_PAGE, "", true, false).await?;
                 self.peer_answered();
-                self.check_versioning(&page.versioning).await?;
+                self.adopt_settings(&page.settings).await?;
                 self.apply_all(&page.entries, &checkpoint.peer_site).await?;
                 checkpoint.phase = match page.next_after {
                     Some(next) => Phase::Snapshot { through, cursor: Some(next), tombstones: true },
@@ -420,7 +444,7 @@ impl Worker {
                 };
                 self.peer_answered();
                 self.check_site(&page.site_id)?;
-                self.check_versioning(&page.versioning).await?;
+                self.adopt_settings(&page.settings).await?;
                 self.peer_named(&page.site_name);
                 self.apply_all(&page.events, &checkpoint.peer_site).await?;
                 checkpoint.phase = Phase::Live { after: page.next };
@@ -574,6 +598,14 @@ impl Worker {
             self.update(|s| s.deleted += 1);
             return Ok(());
         }
+        if let Kind::Bucket(settings) = &change.kind {
+            // (Live: a changed versioning needs no new snapshot — nothing
+            // was checkpointed under the old one that the new one would
+            // read differently.)
+            self.adopt_settings(settings).await?;
+            self.update(|s| s.metadata_only += 1);
+            return Ok(());
+        }
         if let Kind::Tags(tags) = &change.kind {
             // The version's tags, if the version is here (else they come
             // with the version itself).
@@ -607,7 +639,7 @@ impl Worker {
             }
         }
         let result = match &change.kind {
-            Kind::RemoveVersion | Kind::Tags(_) => unreachable!("handled above"),
+            Kind::RemoveVersion | Kind::Tags(_) | Kind::Bucket(_) => unreachable!("handled above"),
             Kind::Delete { removed } => self
                 .store
                 .delete_object_with(

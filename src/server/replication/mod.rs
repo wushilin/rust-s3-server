@@ -747,12 +747,34 @@ impl ReplicationService {
                 missing.join(", ")
             )));
         }
-        let local_versioning = self.inner.store.bucket_versioning(&link.local_bucket).await?.as_str().to_string();
-        if report.versioning != local_versioning {
-            return Err(LinkError::BadRequest(format!(
-                "versioning differs: bucket {} here is {local_versioning}, {at} is {}; a link needs the same setting                  on both buckets (both off, or both enabled, so that both hold the same versions)",
-                link.local_bucket, report.versioning
-            )));
+        // Versioning: the link needs the same setting on both buckets. The
+        // newer side's is adopted once it runs; refused here only when it
+        // cannot be: a mirror whose source has no versioning while this
+        // replica has (a mirror cannot change its source), or this bucket
+        // on a layout that cannot take versioning.
+        let local = self.inner.store.bucket_settings(&link.local_bucket).await?;
+        let off = crate::storage::metadata::BucketVersioning::Off;
+        if report.versioning != local.versioning.as_str() {
+            if link.mode == Mode::Mirror && local.versioning != off && report.versioning == "off" {
+                return Err(LinkError::BadRequest(format!(
+                    "versioning differs: bucket {} here is {}, {at} has none; a mirror takes its source's setting \
+                     and cannot give it one",
+                    link.local_bucket,
+                    local.versioning.as_str()
+                )));
+            }
+            if local.versioning == off && report.versioning != "off" {
+                let layout = self.inner.store.bucket_layout(&link.local_bucket).await?;
+                if !layout.is_stable_current() {
+                    return Err(LinkError::BadRequest(format!(
+                        "{at} has versioning {}, which bucket {} here would adopt, but it is on storage layout {}: upgrade it \
+                         first",
+                        report.versioning,
+                        link.local_bucket,
+                        layout.target()
+                    )));
+                }
+            }
         }
         if link.mode == Mode::Merge && report.read_only {
             return Err(LinkError::BadRequest(format!(

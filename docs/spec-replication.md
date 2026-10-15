@@ -118,7 +118,7 @@ reads (§4.3) and webhooks.
 | Field | Type | Present | Meaning |
 |---|---|---|---|
 | `seq` | u64 | live events only | Position in the bucket's changelog. Strictly increasing, not contiguous. |
-| `op` | string | always | `put`, `delete`, `remove_version`, `tags` (live); `exists`, `deleted` (snapshot). A reader MUST NOT guess the meaning of an op it does not know. |
+| `op` | string | always | `put`, `delete`, `remove_version`, `tags`, `bucket` (live); `exists`, `deleted` (snapshot). A reader MUST NOT guess the meaning of an op it does not know. |
 | `key` | string | always | The object key. |
 | `etag` | string | always | `put`/`exists`: the state's ETag (bare, no quotes). `delete`/`deleted`: the removed version's; empty when the delete removed nothing here (§3.1). |
 | `size` | u64 | always | Bytes of the state (`0` with an empty `etag`). |
@@ -138,6 +138,12 @@ the version, `tags` (an object of key/value strings) is its new tag set,
 reader applies it by identity: that version's tags become exactly the
 set (§5.4); a version the reader does not hold gets its tags when it
 fetches the version (§5.1, `x-rs3-tags`).
+
+`bucket` is logged when a bucket setting changes (`key` is empty):
+`settings` holds the bucket's replicated settings after the change —
+`versioning` with `versioning_stamp`, `cors` with `cors_stamp` — and
+`stamp` is the change's. A reader adopts what is newer than its own
+(§5.5).
 
 `remove_version` is logged by `DeleteObject?versionId`: the version named
 by `stamp` (and `version`, its directory form) was permanently removed —
@@ -426,13 +432,37 @@ the reader skips.
 **A link requires the same versioning setting on both buckets** (both
 `off`, both `enabled`, or both `suspended`): what is replicated — every
 version, or the current states — must be the same thing on both sides.
-The access report (§6.1), every changelog page (§4.1) and every snapshot
-page (§4.2) carry the answering bucket's `versioning`; a link is refused
-at creation when the settings differ, and a running link stops at once
-when it sees a page from a bucket whose setting differs from its own. A
-link checkpoints only after a batch is applied, so once both settings
-match again it continues from its position; no re-snapshot is needed as
-long as the position is within the peer's retention.
+Settings replicate (§5.5) so that this holds without the operator: the
+access report (§6.1), every changelog page (§4.1) and every snapshot
+page (§4.2) carry the answering bucket's `settings`, and a reader adopts
+the newer. What cannot be adopted stops the link at once: a mirror whose
+replica has versioning while its source has none (a mirror cannot change
+its source), or a bucket on a storage layout that cannot take versioning.
+A link checkpoints only after a batch is applied, so once the settings
+match it continues from its position; no re-snapshot is needed as long as
+the position is within the peer's retention. A link is refused at
+creation in those two cases only.
+
+### 5.5 Bucket settings
+
+Versioning and CORS rules replicate; the storage layout and the read-only
+flag are local to a site. Each setting carries the stamp of its last
+change (`BucketSettings` in pages and `bucket` events). Two sites agree
+on the result by these rules, evaluated the same way on both:
+
+- Versioning: `enabled` or `suspended` always beats `off` (a bucket never
+  returns to `off`); between `enabled` and `suspended` the newer stamp
+  wins. Adopting needs the current storage layout.
+- CORS: the newer stamp wins, unless the bucket keeps its rules local
+  (`cors_local`), in which case it adopts nothing and still sends its own.
+
+A reader adopts from every page it reads and from `bucket` events; a
+pusher sends `PUT /{bucket}?versioning&x-rs3-stamp=<stamp>` and
+`PUT /{bucket}?cors&x-rs3-stamp=<stamp>` — replicated settings writes,
+authorised by `s3:ReplicateWrite` on the bucket, applied under the same
+rules. Adopting a versioning change during a snapshot walk starts the
+walk over under the new setting; during live replay it needs no
+re-snapshot.
 
 ## 7. Named header fields
 

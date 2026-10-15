@@ -148,15 +148,23 @@ impl Pusher {
         Ok(self.store.bucket_versioning(&self.link.local_bucket).await?.as_str().to_string())
     }
 
-    /// A link needs the same versioning setting on both buckets (see the
-    /// pull worker): a mismatch stops the push at once.
-    async fn check_versioning(&self, peer: &str) -> Result<(), StepError> {
-        let local = self.local_versioning().await?;
-        if peer != local {
-            return Err(StepError::Fatal(format!(
-                "versioning differs: bucket {} here is {local}, the peer's is {peer}; the link resumes once both                  buckets have the same setting",
-                self.link.local_bucket
-            )));
+    /// The peer's settings seen on a probe: adopt what is newer; what is
+    /// newer here is pushed (`PeerClient::put_settings`). A versioning that
+    /// still differs afterwards (the peer cannot take ours: an old layout
+    /// there) fails the batch, retried later.
+    async fn reconcile_settings(&self, peer: &crate::storage::metadata::BucketSettings) -> Result<(), StepError> {
+        let bucket = &self.link.local_bucket;
+        let local = match self.store.adopt_bucket_settings(bucket, peer).await {
+            Ok(local) => local,
+            Err(StorageError::BucketInUse(message)) => {
+                return Err(StepError::Fatal(format!("cannot adopt the peer's versioning: {message}")))
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if local != peer.versioning || peer.cors != self.store.bucket_settings(bucket).await?.cors {
+            let ours = self.store.bucket_settings(bucket).await?;
+            self.alive(self.peer.put_settings(&ours)).await?;
+            self.peer_site_check()?;
         }
         Ok(())
     }
@@ -217,7 +225,7 @@ impl Pusher {
                     probe.site_id
                 )));
             }
-            self.check_versioning(&probe.versioning).await?;
+            self.reconcile_settings(&probe.settings).await?;
             let checkpoint = PushCheckpoint {
                 v: RECORD_VERSION,
                 local_log_id: log_id,
@@ -326,9 +334,9 @@ impl Pusher {
         // The same setting on both sides (checked on every batch), and a
         // versioning-enabled peer keeps every state it is sent, so nothing
         // is collapsed on the way there.
-        let peer_versioning = self.alive(self.peer.versioning()).await?;
-        self.check_versioning(&peer_versioning).await?;
-        let peer_versioned = peer_versioning == "enabled";
+        let probe = self.alive(self.peer.snapshot(None, 1, "", false, false)).await?;
+        self.reconcile_settings(&probe.settings).await?;
+        let peer_versioned = self.store.bucket_versioning(&self.link.local_bucket).await? == crate::storage::metadata::BucketVersioning::Enabled;
         let (batch, collapsed) = if peer_versioned { (events.to_vec(), 0) } else { latest_per_key(events) };
         if collapsed > 0 {
             self.update(|s| s.collapsed += collapsed as u64);
@@ -353,7 +361,7 @@ impl Pusher {
         // change names the version's stamp, not its author's, so for those
         // the origin tells: applied here by replication means pulled.
         let echo = match &change.kind {
-            Kind::RemoveVersion | Kind::Tags(_) => change.origin == WireOrigin::Replication,
+            Kind::RemoveVersion | Kind::Tags(_) | Kind::Bucket(_) => change.origin == WireOrigin::Replication,
             Kind::Put | Kind::Delete { .. } => change.stamp.site == peer_site,
         };
         if live && echo {
@@ -371,6 +379,12 @@ impl Pusher {
             self.alive(self.peer.delete_version(&change.key, &change.stamp)).await?;
             self.peer_site_check()?;
             self.update(|s| s.deleted += 1);
+            return Ok(());
+        }
+        if let Kind::Bucket(settings) = &change.kind {
+            self.alive(self.peer.put_settings(settings)).await?;
+            self.peer_site_check()?;
+            self.update(|s| s.metadata_only += 1);
             return Ok(());
         }
         if let Kind::Tags(tags) = &change.kind {
@@ -393,7 +407,7 @@ impl Pusher {
             return Ok(());
         }
         let result = match &change.kind {
-            Kind::RemoveVersion | Kind::Tags(_) => unreachable!("handled above"),
+            Kind::RemoveVersion | Kind::Tags(_) | Kind::Bucket(_) => unreachable!("handled above"),
             Kind::Delete { removed } => self
                 .alive(self.peer.delete(&change.key, &change.stamp, removed, change.versioned))
                 .await

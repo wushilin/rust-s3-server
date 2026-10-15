@@ -424,16 +424,20 @@ async fn replication_keeps_versions_and_tags_in_sync_through_the_aws_sdk() {
     assert_eq!(status["state"], "live", "{status}");
     assert!(status["last_error"].is_null(), "{status}");
 
-    // A link needs the same versioning setting: refused across a mismatch.
+    // Bucket settings travel: a merge link to an unversioned bucket turns
+    // versioning on there, as the SDK sees it.
     for s3 in [&sa, &sb] {
-        s3.create_bucket().bucket("sdk-mismatch").send().await.unwrap();
+        s3.create_bucket().bucket("sdk-settings").send().await.unwrap();
     }
     sa.put_bucket_versioning()
-        .bucket("sdk-mismatch")
+        .bucket("sdk-settings")
         .versioning_configuration(VersioningConfiguration::builder().status(BucketVersioningStatus::Enabled).build())
         .send()
         .await
         .unwrap();
-    let refused = b.link(&a, "sdk-mismatch", "merge").await.unwrap_err();
-    assert!(refused.contains("versioning differs"), "{refused}");
+    b.link(&a, "sdk-settings", "merge").await.expect("link");
+    eventually(60, "versioning adopted on b", || async {
+        sb.get_bucket_versioning().bucket("sdk-settings").send().await.unwrap().status() == Some(&BucketVersioningStatus::Enabled)
+    })
+    .await;
 }

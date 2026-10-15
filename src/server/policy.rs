@@ -777,9 +777,16 @@ pub fn requirements_for_request(
     let reqs = match (method, &decoded_key) {
         // ── bucket level ──
         ("GET", None) if has("cors") => vec![Requirement::bucket("s3:GetBucketCORS", bucket)],
+        // A replicated settings write (a peer's change, stamped in the
+        // query) is replication's permission, not the operator's.
+        ("PUT", None) if (has("cors") || has("versioning")) && has("x-rs3-stamp") => {
+            vec![Requirement::bucket("s3:ReplicateWrite", bucket)]
+        }
         ("PUT" | "DELETE", None) if has("cors") => {
             vec![Requirement::bucket("s3:PutBucketCORS", bucket)]
         }
+        ("GET", None) if has("versioning") => vec![Requirement::bucket("s3:GetBucketVersioning", bucket)],
+        ("PUT", None) if has("versioning") => vec![Requirement::bucket("s3:PutBucketVersioning", bucket)],
         ("PUT", None) => vec![Requirement::bucket("s3:CreateBucket", bucket)],
         ("DELETE", None) => vec![Requirement::bucket("s3:DeleteBucket", bucket)],
         ("HEAD", None) => vec![Requirement::bucket("s3:ListBucket", bucket)],

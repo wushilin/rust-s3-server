@@ -1897,77 +1897,7 @@ async fn a_merge_link_pushes_every_version_and_removal_to_a_versioned_peer() {
     assert!(b.link(&link).status.last_error.is_none());
 }
 
-#[tokio::test]
-async fn a_link_needs_the_same_versioning_on_both_buckets() {
-    use crate::storage::metadata::BucketVersioning;
-    let a = Site::start("site-a").await;
-    let b = Site::start("site-b").await;
-    for site in [&a, &b] {
-        site.store.create_bucket("data").await.unwrap();
-    }
-    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
-    // Refused at creation, with the reason.
-    let err = b.link_with(&a, "data", Mode::Mirror, AK, SK, true).await.unwrap_err();
-    assert!(err.to_string().contains("versioning differs"), "{err}");
-    // An unchecked link (made while the peer was unreachable, say) stops at
-    // its first page instead of replicating.
-    let link = b.link_with(&a, "data", Mode::Mirror, AK, SK, false).await.unwrap();
-    a.put("data", "k", b"x").await;
-    eventually(30, "stopped", || async { b.link(&link).status.state == "stopped" }).await;
-    assert!(b.link(&link).status.last_error.as_deref().is_some_and(|e| e.contains("versioning differs")), "{:?}", b.link(&link).status.last_error);
-    assert!(b.store.read_object("data", "k").await.is_err(), "nothing replicated");
-    // The same setting on both sides: the link resumes on its own.
-    b.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
-    eventually(30, "mirrored", || same(&a, &b, "data")).await;
-    eventually(30, "live", || async { b.link(&link).status.state == "live" }).await;
-}
 
-#[tokio::test]
-async fn a_versioning_change_stops_a_merge_link_both_ways_until_both_match_then_it_continues() {
-    use crate::storage::metadata::BucketVersioning;
-    let a = Site::start("site-a").await;
-    let b = Site::start("site-b").await;
-    for site in [&a, &b] {
-        site.store.create_bucket("data").await.unwrap();
-    }
-    a.put("data", "from-a", b"a").await;
-    b.put("data", "from-b", b"b").await;
-    let link = b.pull_from(&a, "data", Mode::Merge).await;
-    eventually(30, "merged", || same(&a, &b, "data")).await;
-
-    // Versioning turned on at a only: pull and push both stop at once,
-    // and nothing crosses meanwhile.
-    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
-    a.put("data", "while-apart-a", b"a2").await;
-    b.put("data", "while-apart-b", b"b2").await;
-    // The pull side sees the peer's setting on its next page and stops the
-    // link; the push side checks on its next batch and backs off. Nothing
-    // crosses either way meanwhile.
-    eventually(30, "the link stopped", || async { b.link(&link).status.state == "stopped" }).await;
-    assert!(b.link(&link).status.last_error.as_deref().is_some_and(|e| e.contains("versioning differs")), "{:?}", b.link(&link).status.last_error);
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(b.store.read_object("data", "while-apart-a").await.is_err(), "nothing pulled while apart");
-    assert!(a.store.read_object("data", "while-apart-b").await.is_err(), "nothing pushed while apart");
-
-    // Both enabled: nothing was checkpointed while apart, so both
-    // directions continue from their positions (no re-snapshot) and
-    // everything written apart crosses, as versions on both sides.
-    let position_before = b.link(&link).status.position;
-    b.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
-    eventually(60, "converged", || same(&a, &b, "data")).await;
-    assert!(b.link(&link).status.position >= position_before, "continued from the position, not from a snapshot");
-    assert!(b.link(&link).status.snapshot_cursor.is_none());
-    for key in ["from-a", "from-b", "while-apart-a", "while-apart-b"] {
-        assert!(same_versions(&a, &b, "data", key).await, "{key}");
-    }
-    assert_eq!(b.link(&link).status.state, "live");
-    a.put("data", "from-a", b"a3").await;
-    b.put("data", "from-b", b"b3").await;
-    eventually(30, "versions on both", || async {
-        same_versions(&a, &b, "data", "from-a").await && same_versions(&a, &b, "data", "from-b").await && versions_of(&a, "data", "from-a").await.len() == 2
-    })
-    .await;
-}
 
 #[tokio::test]
 async fn object_tags_travel_with_objects_and_tag_changes_replicate_both_ways() {
@@ -2015,4 +1945,102 @@ async fn object_tags_travel_with_objects_and_tag_changes_replicate_both_ways() {
     eventually(30, "tags pushed", || async { tags_of(&a, "big", None).await.is_empty() }).await;
     assert!(same_versions(&a, &b, "data", "k").await && versions_of(&a, "data", "k").await.len() == 2);
     assert!(b.link(&link).status.last_error.is_none(), "{:?}", b.link(&link).status.last_error);
+}
+
+// ── bucket settings replicate ───────────────────────────────────────────────
+
+async fn versioning_of(site: &Site, bucket: &str) -> crate::storage::metadata::BucketVersioning {
+    site.store.bucket_versioning(bucket).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_mirror_adopts_its_sources_versioning_and_cannot_give_it_one() {
+    use crate::storage::metadata::{BucketLayout, BucketVersioning};
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    for n in 0..3 {
+        a.put("data", "k", format!("v{n}").as_bytes()).await;
+    }
+    // The replica is off: the link is allowed and adopts enabled at its
+    // first page, then holds every version.
+    let link = b.pull_from(&a, "data", Mode::Mirror).await;
+    eventually(30, "adopted", || async { versioning_of(&b, "data").await == BucketVersioning::Enabled }).await;
+    eventually(30, "every version", || same_versions(&a, &b, "data", "k")).await;
+    assert_eq!(versions_of(&b, "data", "k").await.len(), 3);
+    assert!(b.link(&link).status.last_error.is_none(), "{:?}", b.link(&link).status.last_error);
+    // Suspended on the source: adopted on the replica.
+    a.store.set_bucket_versioning("data", BucketVersioning::Suspended).await.unwrap();
+    eventually(30, "suspended adopted", || async { versioning_of(&b, "data").await == BucketVersioning::Suspended }).await;
+
+    // A replica ahead of an unversioned source is refused, and an unchecked
+    // one stops: a mirror cannot change its source.
+    let c = Site::start("site-c").await;
+    c.store.create_bucket("data").await.unwrap();
+    c.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    let d = Site::start("site-d").await;
+    d.store.create_bucket("data").await.unwrap();
+    let err = c.link_with(&d, "data", Mode::Mirror, AK, SK, true).await.unwrap_err();
+    assert!(err.to_string().contains("versioning differs"), "{err}");
+    let link = c.link_with(&d, "data", Mode::Mirror, AK, SK, false).await.unwrap();
+    eventually(30, "stopped", || async { c.link(&link).status.state == "stopped" }).await;
+    assert!(c.link(&link).status.last_error.as_deref().is_some_and(|e| e.contains("versioning differs")));
+    // The source gets versioning: the link resumes on the ticker.
+    d.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    d.put("data", "k", b"x").await;
+    eventually(30, "resumed", || async { c.link(&link).status.state == "live" && same(&c, &d, "data").await }).await;
+
+    // A replica on an old layout cannot adopt: refused with the reason.
+    let e = Site::start("site-e").await;
+    e.store.create_bucket("data").await.unwrap();
+    e.store.set_bucket_layout("data", BucketLayout::Stable { version: 2 }).await.unwrap();
+    let err = e.link_with(&a, "data", Mode::Mirror, AK, SK, true).await.unwrap_err();
+    assert!(err.to_string().contains("upgrade it first"), "{err}");
+}
+
+#[tokio::test]
+async fn a_merge_link_carries_settings_both_ways_and_the_newer_change_wins() {
+    use crate::storage::metadata::{BucketVersioning, CorsRule};
+    let a = Site::start("site-a").await;
+    let b = Site::start("site-b").await;
+    for site in [&a, &b] {
+        site.store.create_bucket("data").await.unwrap();
+    }
+    a.put("data", "from-a", b"a").await;
+    b.put("data", "from-b", b"b").await;
+    let link = b.pull_from(&a, "data", Mode::Merge).await;
+    eventually(30, "merged", || same(&a, &b, "data")).await;
+
+    // Enabled on a: b adopts it (pull), and keeps replicating meanwhile.
+    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    a.put("data", "from-a", b"a2").await;
+    eventually(30, "b enabled", || async { versioning_of(&b, "data").await == BucketVersioning::Enabled }).await;
+    eventually(30, "versions on b", || async { same_versions(&a, &b, "data", "from-a").await && versions_of(&b, "data", "from-a").await.len() == 2 }).await;
+    // Suspended on b: a adopts it (push).
+    b.store.set_bucket_versioning("data", BucketVersioning::Suspended).await.unwrap();
+    eventually(30, "a suspended", || async { versioning_of(&a, "data").await == BucketVersioning::Suspended }).await;
+    // Both change at once: the newer stamp wins on both sides.
+    a.store.set_bucket_versioning("data", BucketVersioning::Enabled).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    b.store.set_bucket_versioning("data", BucketVersioning::Suspended).await.unwrap();
+    eventually(30, "agreed on the newer", || async {
+        versioning_of(&a, "data").await == BucketVersioning::Suspended && versioning_of(&b, "data").await == BucketVersioning::Suspended
+    })
+    .await;
+    assert!(b.link(&link).status.last_error.is_none(), "{:?}", b.link(&link).status.last_error);
+
+    // CORS rules travel too, unless a bucket keeps its own.
+    let rule = |origin: &str| CorsRule { allowed_origins: vec![origin.to_string()], allowed_methods: vec!["GET".into()], allowed_headers: vec![], expose_headers: vec![], max_age_seconds: Some(60) };
+    a.store.set_bucket_cors("data", vec![rule("https://a.example")]).await.unwrap();
+    eventually(30, "cors on b", || async { b.store.bucket_meta("data").await.unwrap().cors == vec![rule("https://a.example")] }).await;
+    b.store.set_bucket_cors("data", vec![rule("https://b.example")]).await.unwrap();
+    eventually(30, "cors on a", || async { a.store.bucket_meta("data").await.unwrap().cors == vec![rule("https://b.example")] }).await;
+    a.store.set_bucket_cors_local("data", true).await.unwrap();
+    b.store.set_bucket_cors("data", vec![rule("https://b2.example")]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(a.store.bucket_meta("data").await.unwrap().cors, vec![rule("https://b.example")], "a keeps its own");
+    assert!(same(&a, &b, "data").await);
 }

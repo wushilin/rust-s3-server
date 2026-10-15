@@ -93,10 +93,13 @@ pub struct ReadResponse {
     /// More changes are already available after `next`.
     pub more: bool,
     pub events: Vec<WireEvent>,
-    /// The bucket's versioning state (`off`, `enabled`, `suspended`); a
-    /// link stops when its two buckets differ.
+    /// The bucket's versioning state (`off`, `enabled`, `suspended`).
     #[serde(default = "default_versioning")]
     pub versioning: String,
+    /// The bucket's replicated settings with their change stamps: a link
+    /// adopts the newer side's.
+    #[serde(default)]
+    pub settings: crate::storage::metadata::BucketSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +124,9 @@ pub struct SnapshotResponse {
     /// pusher sends every version to a bucket that keeps them.
     #[serde(default = "default_versioning")]
     pub versioning: String,
+    /// See `ReadResponse::settings`.
+    #[serde(default)]
+    pub settings: crate::storage::metadata::BucketSettings,
 }
 
 fn default_versioning() -> String {
@@ -372,6 +378,7 @@ async fn read_once(store: &LocalObjectStore, bucket: &str, params: &ReadParams) 
         more,
         events,
         versioning: store.bucket_versioning(bucket).await?.as_str().to_string(),
+        settings: store.bucket_settings(bucket).await?,
     })
 }
 
@@ -383,7 +390,8 @@ pub async fn snapshot(
     params: &SnapshotParams,
 ) -> Result<SnapshotResponse, ReadError> {
     let index = store.index(bucket).await?;
-    let versioning = store.bucket_versioning(bucket).await?.as_str().to_string();
+    let settings = store.bucket_settings(bucket).await?;
+    let versioning = settings.versioning.as_str().to_string();
     if params.deleted {
         let head = index.changelog_head();
         let (tombstones, more) = index
@@ -414,11 +422,13 @@ pub async fn snapshot(
                     versioned: Some(t.versioned),
                     stamp: Some(t.stamp),
                     tags: None,
+                    settings: None,
                 })
                 .collect(),
             next_after,
             next_after_version: None,
             versioning: versioning.clone(),
+            settings: settings.clone(),
         });
     }
     if params.versions {
@@ -449,6 +459,7 @@ pub async fn snapshot(
             next_after: if page.is_truncated { page.next_key_marker } else { None },
             next_after_version: if page.is_truncated { page.next_version_marker } else { None },
             versioning: versioning.clone(),
+            settings: settings.clone(),
         });
     }
     if !params.filter.wants_puts() {
@@ -463,6 +474,7 @@ pub async fn snapshot(
             next_after: None,
             next_after_version: None,
             versioning: versioning.clone(),
+            settings: settings.clone(),
         });
     }
     // Head first: everything committed after it is replayed live.
@@ -488,5 +500,6 @@ pub async fn snapshot(
         next_after: if page.is_truncated { page.next_after } else { None },
         next_after_version: None,
         versioning,
+        settings,
     })
 }

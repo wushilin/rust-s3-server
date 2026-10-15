@@ -46,7 +46,7 @@ use super::index::{
 };
 use super::layout::StorageLayout;
 use super::locks::ObjectLockTable;
-use super::metadata::{BucketLayout, BucketVersioning, CURRENT_LAYOUT, META_FORMAT, 
+use super::metadata::{BucketLayout, BucketSettings, BucketVersioning, CURRENT_LAYOUT, META_FORMAT, 
     content_encoding_or_none, content_language_or_none, content_type_or_default,
     storage_class_or_default, unquote_etag, BucketMeta, CorsRule, ObjectMeta, ObjectStorageKind, PartMeta,
     PutMeta, UploadMeta,
@@ -617,6 +617,9 @@ impl LocalObjectStore {
                 cors: Vec::new(),
                 read_only: false,
                 versioning: BucketVersioning::Off,
+                versioning_stamp: None,
+                cors_stamp: None,
+                cors_local: false,
             };
             write_json_atomic(&bucket_meta_path, &meta).await?;
             self.bucket_meta_cache.insert(bucket.to_string(), meta);
@@ -655,22 +658,9 @@ impl LocalObjectStore {
         Ok(meta)
     }
 
+    /// Replaces the bucket's CORS rules: a client's change, stamped now.
     pub async fn set_bucket_cors(&self, bucket: &str, cors: Vec<CorsRule>) -> Result<()> {
-        validate_bucket_name(bucket)?;
-        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
-        let path = self.layout.bucket_meta_path(bucket)?;
-        if !path.exists() {
-            return Err(StorageError::BucketNotFound(bucket.to_string()));
-        }
-        let mut meta: BucketMeta = read_json(&path).await?;
-        meta.cors = cors;
-        write_json_atomic(&path, &meta).await?;
-        if self.durability == Durability::Full {
-            fsync_file(&path).await?;
-            fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
-        }
-        self.bucket_meta_cache.insert(bucket.to_string(), meta);
-        Ok(())
+        self.apply_bucket_cors(bucket, cors, None, &WriteOrigin::Client).await.map(|_| ())
     }
 
     /// Marks a bucket read-only (only replicated writes accepted) or
@@ -2556,11 +2546,32 @@ impl LocalObjectStore {
         Ok(self.bucket_meta(bucket).await?.versioning)
     }
 
-    /// Sets the bucket's versioning state (`PutBucketVersioning`). Enabling
-    /// requires the bucket to be stable on the current layout (every object
-    /// has a materialised stamp, so every version has an id); a bucket that
-    /// was ever enabled can only be suspended, not turned off.
+    /// Sets the bucket's versioning state (`PutBucketVersioning`): a
+    /// client's change, stamped now.
     pub async fn set_bucket_versioning(&self, bucket: &str, versioning: BucketVersioning) -> Result<()> {
+        self.apply_bucket_versioning(bucket, versioning, None, &WriteOrigin::Client).await.map(|_| ())
+    }
+
+    /// The bucket's replicated settings with their change stamps.
+    pub async fn bucket_settings(&self, bucket: &str) -> Result<BucketSettings> {
+        Ok(BucketSettings::of(&self.bucket_meta(bucket).await?))
+    }
+
+    /// Applies a versioning state, a client's (no `stamp`: a fresh one) or
+    /// a peer's (its change's `stamp`). Enabling requires the bucket to be
+    /// stable on the current layout (every object has a materialised stamp,
+    /// so every version has an id); a bucket that was ever enabled can only
+    /// be suspended, not turned off. Two sites agree on the result: enabled
+    /// or suspended always beats off, and between those the newer stamp
+    /// wins. Logged as a `bucket` change when applied. Returns whether the
+    /// state changed.
+    pub async fn apply_bucket_versioning(
+        &self,
+        bucket: &str,
+        versioning: BucketVersioning,
+        stamp: Option<Stamp>,
+        origin: &WriteOrigin,
+    ) -> Result<bool> {
         validate_bucket_name(bucket)?;
         let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
         let path = self.layout.bucket_meta_path(bucket)?;
@@ -2568,13 +2579,37 @@ impl LocalObjectStore {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
         let mut meta: BucketMeta = read_json(&path).await?;
-        if meta.versioning == versioning {
-            return Ok(());
-        }
         if versioning == BucketVersioning::Off {
+            if meta.versioning == BucketVersioning::Off {
+                return Ok(false);
+            }
+            if stamp.is_some() {
+                return Ok(false); // a peer still off: it will adopt ours
+            }
             return Err(StorageError::BucketInUse(format!(
                 "bucket {bucket}: versioning cannot be turned off once enabled, only suspended"
             )));
+        }
+        let stamp = match stamp {
+            Some(stamp) => {
+                self.clock().observe(&stamp);
+                stamp
+            }
+            None => self.clock().next(),
+        };
+        if meta.versioning == versioning {
+            if meta.versioning_stamp.as_ref().is_some_and(|have| *have >= stamp) {
+                return Ok(false);
+            }
+            // Same state, newer stamp: remember it, nothing to log.
+            meta.versioning_stamp = Some(stamp);
+            write_json_atomic(&path, &meta).await?;
+            self.bucket_meta_cache.insert(bucket.to_string(), meta);
+            return Ok(false);
+        }
+        // Enabled vs suspended: the newer change wins (off never does).
+        if meta.versioning != BucketVersioning::Off && meta.versioning_stamp.as_ref().is_some_and(|have| *have >= stamp) {
+            return Ok(false);
         }
         let layout = meta.layout.unwrap_or(BucketLayout::Stable { version: 1 });
         if !layout.is_stable_current() {
@@ -2584,14 +2619,94 @@ impl LocalObjectStore {
             )));
         }
         meta.versioning = versioning;
+        meta.versioning_stamp = Some(stamp.clone());
         write_json_atomic(&path, &meta).await?;
         if self.durability == Durability::Full {
             fsync_file(&path).await?;
             fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
         }
+        let settings = BucketSettings::of(&meta);
         self.bucket_meta_cache.insert(bucket.to_string(), meta);
-        log::info!("bucket {bucket} versioning is now {}", versioning.as_str());
+        log::info!("bucket {bucket} versioning is now {} (by {:?})", versioning.as_str(), origin.change_origin());
+        self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin()).await?;
+        Ok(true)
+    }
+
+    /// Applies CORS rules, a client's (no `stamp`) or a peer's (its
+    /// change's `stamp`, adopted only when newer and the bucket does not
+    /// keep its CORS local). Logged as a `bucket` change when applied.
+    pub async fn apply_bucket_cors(&self, bucket: &str, cors: Vec<CorsRule>, stamp: Option<Stamp>, origin: &WriteOrigin) -> Result<bool> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        let stamp = match stamp {
+            Some(stamp) => {
+                if meta.cors_local || meta.cors_stamp.as_ref().is_some_and(|have| *have >= stamp) {
+                    return Ok(false);
+                }
+                self.clock().observe(&stamp);
+                stamp
+            }
+            None => self.clock().next(),
+        };
+        let changed = meta.cors != cors;
+        meta.cors = cors;
+        meta.cors_stamp = Some(stamp.clone());
+        write_json_atomic(&path, &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&path).await?;
+            fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
+        }
+        let settings = BucketSettings::of(&meta);
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        if changed {
+            self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin()).await?;
+        }
+        Ok(changed)
+    }
+
+    /// Whether this bucket keeps its CORS rules local (never adopts a
+    /// peer's).
+    pub async fn set_bucket_cors_local(&self, bucket: &str, local: bool) -> Result<()> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        meta.cors_local = local;
+        write_json_atomic(&path, &meta).await?;
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
         Ok(())
+    }
+
+    /// Adopts a peer's settings where they are newer (versioning: enabled
+    /// or suspended over off, else the newer stamp; CORS: the newer stamp,
+    /// unless kept local). Returns the local versioning afterwards.
+    pub async fn adopt_bucket_settings(&self, bucket: &str, peer: &BucketSettings) -> Result<BucketVersioning> {
+        let local = self.bucket_settings(bucket).await?;
+        if peer.versioning != local.versioning && peer.versioning != BucketVersioning::Off {
+            let adopt = local.versioning == BucketVersioning::Off
+                || match (&peer.versioning_stamp, &local.versioning_stamp) {
+                    (Some(theirs), Some(ours)) => theirs > ours,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+            if adopt {
+                self.apply_bucket_versioning(bucket, peer.versioning, peer.versioning_stamp.clone(), &WriteOrigin::Mirror).await?;
+            }
+        }
+        if let Some(stamp) = &peer.cors_stamp {
+            if peer.cors != local.cors {
+                self.apply_bucket_cors(bucket, peer.cors.clone(), Some(stamp.clone()), &WriteOrigin::Mirror).await?;
+            }
+        }
+        self.bucket_versioning(bucket).await
     }
 
     /// Removes tombstones of deletes made before `cutoff_ms` (at most

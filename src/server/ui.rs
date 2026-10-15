@@ -101,6 +101,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/{name}/read-only", put(set_bucket_read_only))
         .route("/api/buckets/{name}/upgrade-layout", post(upgrade_bucket_layout))
         .route("/api/buckets/{name}/versioning", put(set_bucket_versioning))
+        .route("/api/buckets/{name}/cors-local", put(set_bucket_cors_local))
         .route("/api/object/versions", get(list_object_versions))
         // Changelog subscriptions: webhooks and replication tokens (admin only).
         .route("/api/subscriptions", get(list_subscriptions).post(create_subscription))
@@ -1577,6 +1578,7 @@ async fn list_buckets(
                     "layout_current": CURRENT_LAYOUT,
                     "layout_upgrade": LocalObjectStore::layout_upgrade_available(layout),
                     "versioning": meta.versioning,
+                    "cors_local": meta.cors_local,
                 }));
             }
             Json(json!({ "buckets": visible })).into_response()
@@ -3982,6 +3984,33 @@ async fn set_bucket_versioning(
             Json(json!({ "ok": true, "versioning": request.state })).into_response()
         }
         Err(StorageError::BucketInUse(message)) => error_response(StatusCode::CONFLICT, message),
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct CorsLocalRequest {
+    cors_local: bool,
+}
+
+/// Whether the bucket keeps its CORS rules local (a replication peer's
+/// rules are not adopted).
+async fn set_bucket_cors_local(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+    Json(request): Json<CorsLocalRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.set_bucket_cors_local(&name, request.cors_local).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "set_bucket_cors_local", format!("/{name} ({})", request.cors_local));
+            Json(json!({ "ok": true, "cors_local": request.cors_local })).into_response()
+        }
         Err(err) => storage_error(err),
     }
 }

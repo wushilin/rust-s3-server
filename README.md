@@ -580,10 +580,17 @@ version instead of refusing it, and forwards version removals
 (`DeleteObject ?versionId`, logged as `remove_version`) so a removed
 version, or a removed delete marker, goes on every site and cannot come
 back from a late copy. A link requires the same versioning setting on both
-buckets, so that both replicate the same thing: it is refused at creation
-otherwise, and a running link stops at once when a setting changes on one
-side (the console shows the reason) and continues from its position once
-both match again. Not yet: lifecycle expiry of noncurrent versions.
+buckets, so that both replicate the same thing, and **bucket settings
+replicate** so that this holds by itself: versioning (enabled or suspended
+beats off, between those the newer change wins) and CORS rules (the newer
+change wins, unless the bucket keeps its CORS local in its settings)
+travel with every page and as `bucket` changelog events. A merge link
+carries them both ways, a mirror takes its source's. The two cases that
+cannot be adopted stop the link with the reason shown in the console, and
+it resumes on its own from its position once fixed: a mirror replica that
+has versioning while its source has none, and a bucket still on an old
+storage layout. The storage layout and the read-only flag never
+replicate. Not yet: lifecycle expiry of noncurrent versions.
 
 ## Changelog, webhooks and replication
 

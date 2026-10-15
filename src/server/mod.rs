@@ -1699,8 +1699,12 @@ async fn put_bucket_cors_s3(
     if rules.is_empty() || rules.len() > 100 {
         return s3_error(StatusCode::BAD_REQUEST, "MalformedXML", "CORSConfiguration must contain 1 to 100 rules", &ctx.resource());
     }
-    match store.set_bucket_cors(&ctx.bucket, rules).await {
-        Ok(()) => empty_response(StatusCode::OK),
+    let (stamp, origin) = match settings_stamp(&ctx.query) {
+        Ok(stamp) => (stamp.clone(), stamp.map(crate::storage::store::WriteOrigin::Replicated).unwrap_or_default()),
+        Err(message) => return s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &ctx.resource()),
+    };
+    match store.apply_bucket_cors(&ctx.bucket, rules, stamp, &origin).await {
+        Ok(_) => empty_response(StatusCode::OK),
         Err(err) => storage_error_response(err, &ctx.resource()),
     }
 }
@@ -2464,10 +2468,22 @@ async fn put_bucket_versioning_s3(store: LocalObjectStore, ctx: handlers::Bucket
             )
         }
     };
-    match store.set_bucket_versioning(&ctx.bucket, state).await {
-        Ok(()) => empty_response(StatusCode::OK),
+    let (stamp, origin) = match settings_stamp(&ctx.query) {
+        Ok(stamp) => (stamp.clone(), stamp.map(crate::storage::store::WriteOrigin::Replicated).unwrap_or_default()),
+        Err(message) => return s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &ctx.resource()),
+    };
+    match store.apply_bucket_versioning(&ctx.bucket, state, stamp, &origin).await {
+        Ok(_) => empty_response(StatusCode::OK),
         Err(StorageError::BucketInUse(message)) => s3_error(StatusCode::CONFLICT, "InvalidBucketState", message, &ctx.resource()),
         Err(err) => storage_error_response(err, &ctx.resource()),
+    }
+}
+
+/// `x-rs3-stamp=` in a settings write's query: a peer's change, replicated.
+fn settings_stamp(query: &HashMap<String, String>) -> Result<Option<crate::storage::stamp::Stamp>, String> {
+    match query.get("x-rs3-stamp") {
+        None => Ok(None),
+        Some(value) => crate::storage::stamp::Stamp::parse_header(value).map(Some),
     }
 }
 

@@ -676,6 +676,46 @@ impl PeerClient {
         self.send_write(builder, &format!("PUT {key}?tagging")).await.map(|_| ())
     }
 
+    /// Sends this bucket's settings to the peer (replicated writes of
+    /// `?versioning` and `?cors`, stamped with each setting's change): the
+    /// peer adopts what is newer than its own.
+    pub async fn put_settings(&self, settings: &crate::storage::metadata::BucketSettings) -> Result<(), PeerError> {
+        let path = format!("/{}", self.config.bucket);
+        if let Some(stamp) = &settings.versioning_stamp {
+            if settings.versioning != crate::storage::metadata::BucketVersioning::Off {
+                let status = if settings.versioning == crate::storage::metadata::BucketVersioning::Enabled { "Enabled" } else { "Suspended" };
+                let body = format!("<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>");
+                let query = format!("versioning&x-rs3-stamp={}", urlencoding::encode(&stamp.to_header()));
+                let builder = self.signed(Method::PUT, &path, &query, &[]).header("content-length", body.len()).body(body);
+                self.send_write(builder, "PUT ?versioning").await?;
+            }
+        }
+        if let Some(stamp) = &settings.cors_stamp {
+            let rules = settings
+                .cors
+                .iter()
+                .map(|rule| {
+                    let tag = |name: &str, values: &[String]| {
+                        values.iter().map(|v| format!("<{name}>{}</{name}>", crate::server::xml::escape_xml(v))).collect::<String>()
+                    };
+                    let max_age = rule.max_age_seconds.map(|v| format!("<MaxAgeSeconds>{v}</MaxAgeSeconds>")).unwrap_or_default();
+                    format!(
+                        "<CORSRule>{}{}{}{}{max_age}</CORSRule>",
+                        tag("AllowedOrigin", &rule.allowed_origins),
+                        tag("AllowedMethod", &rule.allowed_methods),
+                        tag("AllowedHeader", &rule.allowed_headers),
+                        tag("ExposeHeader", &rule.expose_headers)
+                    )
+                })
+                .collect::<String>();
+            let body = format!("<CORSConfiguration>{rules}</CORSConfiguration>");
+            let query = format!("cors&x-rs3-stamp={}", urlencoding::encode(&stamp.to_header()));
+            let builder = self.signed(Method::PUT, &path, &query, &[]).header("content-length", body.len()).body(body);
+            self.send_write(builder, "PUT ?cors").await?;
+        }
+        Ok(())
+    }
+
     /// Permanently removes version `stamp` of `key` on the peer
     /// (`DELETE ?versionId`, a replicated write).
     pub async fn delete_version(&self, key: &str, stamp: &Stamp) -> Result<(), PeerError> {

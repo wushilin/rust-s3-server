@@ -1412,6 +1412,43 @@ impl ObjectIndex {
                 removed_stamp: None,
                 versioned: v.versioned,
                 tags: Some(tags),
+                settings: None,
+            };
+            db.put_cf_opt(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change), &write_opts(durability))?;
+            drop(guard);
+            Ok(())
+        })
+        .await?;
+        self.notify_commit();
+        Ok(())
+    }
+
+    /// Logs a bucket setting change (`bucket`): the settings after it, and
+    /// the change's stamp.
+    pub async fn log_bucket(&self, settings: &super::metadata::BucketSettings, stamp: &Stamp, now_ms: i64, origin: ChangeOrigin) -> Result<()> {
+        let db = self.db.clone();
+        let durability = self.durability;
+        let changes = self.changes.clone();
+        let settings = settings.clone();
+        let stamp = stamp.clone();
+        run_blocking(move || {
+            let guard = changes.begin(now_ms);
+            let change = ChangeEvent {
+                seq: guard.seq,
+                op: ChangeOp::Bucket,
+                key: String::new(),
+                etag: String::new(),
+                size: 0,
+                last_modified_ms: stamp.ms,
+                version: String::new(),
+                origin,
+                ts_ms: guard.ts,
+                parts: None,
+                stamp: Some(stamp),
+                removed_stamp: None,
+                versioned: false,
+                tags: None,
+                settings: Some(settings),
             };
             db.put_cf_opt(&cf(&db, CF_CHANGELOG)?, changelog::seq_key(guard.seq), changelog::encode_change(&change), &write_opts(durability))?;
             drop(guard);
@@ -2700,6 +2737,7 @@ fn change_for(guard: &changelog::SeqGuard<'_>, op: ChangeOp, record: &ObjectReco
         removed_stamp: None,
         versioned: record.versioned,
         tags: None,
+        settings: None,
     }
 }
 
@@ -2741,6 +2779,7 @@ fn change_for_removed_version(guard: &changelog::SeqGuard<'_>, v: &VersionRecord
         removed_stamp: v.removed.clone(),
         versioned: v.versioned,
         tags: None,
+        settings: None,
     }
 }
 
@@ -2771,6 +2810,7 @@ fn change_for_tombstone(
         removed_stamp: Some(removed),
         versioned,
         tags: None,
+        settings: None,
     }
 }
 
