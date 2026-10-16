@@ -1,4 +1,4 @@
-# rusts3 — single-node S3-compatible server
+# rusts3 — S3-compatible object storage with multi-site replication
 
 Why not RustFS? RustFS uses a lot of CPU for useless stuff. I used ZFS with integrity check 
 yet RustFS spends huge amount of CPU time when idling. 
@@ -8,15 +8,27 @@ Rust-S3-Server uses 0% CPU when you are not using it. It does zero background ma
 It does FSYNC when you upload objects (you mean realize the upload of many objects might look slower), 
 it prioritizes integrity over naive speed.
 
-A lightweight, single-node S3-compatible server in Rust, with a built-in
-management console. The core AWS S3 API — authentication, bucket/object CRUD,
-listings, multipart, copy, presigning, browser POST, and both path-style and
-virtual-hosted-style addressing — is verified continuously against the MinIO
-Mint suite and real AWS SDKs.
+A lightweight S3-compatible server in Rust with a built-in management
+console. The AWS S3 API — authentication, bucket/object CRUD, listings,
+multipart, copy, presigning, browser POST, path-style and virtual-hosted-style
+addressing, **object versioning** and **object tagging** — is verified against
+the MinIO Mint suite, the official AWS SDK for Rust and a recorded session
+against Amazon S3. Several sites keep buckets in sync through
+**changelog-driven replication** (one-way mirrors or two-way merges, every
+version, marker, tag and bucket setting included).
 
-Good fit for local development, integration tests, CI, and small trusted
-production deployments. Features that only make sense at AWS scale (versioning,
-ACLs, replication, S3 Select) are [deliberately out of scope](#intentional-limits).
+**Positioning.** Each site is one node: one process, one data directory,
+one filesystem. There is no clustering, sharding or erasure coding, and
+there will not be; durability within a site comes from the filesystem
+(Btrfs or ZFS are recommended, see [Storage](#storage)) and from fsync on
+every write. Across sites, buckets replicate asynchronously through
+mirror or merge links, so several single-node sites can hold the same
+data for disaster recovery, geographic proximity or read scaling. Good
+fit for local development, integration tests, CI, and small to medium
+trusted production deployments where a site fits on one machine.
+Features that only make sense at AWS scale (ACLs, S3 Select, object lock)
+are [deliberately out of scope](#intentional-limits). See
+[Status](#status) for what is in, what is not, and how it is tested.
 
 ## Quick start
 
@@ -77,9 +89,20 @@ vice versa. Each surface can be firewalled or proxied independently.
   folder drag-and-drop upload, transparent multipart for large files (to the
   5 TiB S3 ceiling), in-flight multipart visibility with one-click abort, IAM
   administration, share links, and a live task monitor.
+- **Object versioning** with S3's semantics: enabled, suspended, `null`
+  versions, delete markers, version-scoped reads and deletes,
+  `ListObjectVersions`; every version is a directory on disk, so a rebuild
+  recovers history. The console lists a key's versions with download and
+  delete per version.
+- **Object tagging**, per version, mutable without a new version.
+- **Replication between sites**: changelog-driven mirror and merge links
+  with last-writer-wins by version stamp, every version and marker on
+  versioning-enabled buckets, tags, and bucket settings (versioning, CORS)
+  adopted by the newer change; webhooks on the same changelog.
 - **Crash-safe storage**: RocksDB-primary indexes over immutable blob
   directories, write-ahead intents, atomic publication, automatic index
-  rebuilds, and configurable durability.
+  rebuilds, versioned on-disk layouts with explicit gated upgrades, a
+  health scan with repair actions, and configurable durability.
 - Request/auth/authz/operation audit logs, live throughput, and
   MinIO-compatible health and metrics paths.
 
@@ -112,6 +135,55 @@ vice versa. Each surface can be firewalled or proxied independently.
 
 </details>
 
+## Status
+
+As of 2026-10-15, on the `feat/replication-foundation` branch.
+
+**Implemented**
+
+| Area | State |
+|---|---|
+| Core S3 API | Buckets, objects, listings v1/v2, multipart, copy, conditional reads and writes (`If-Match`, `If-None-Match`), presigned URLs, browser POST, path and virtual-hosted style, SigV4/SigV2, `aws-chunked`. |
+| Object versioning | `PutBucketVersioning` (enabled/suspended), version ids on writes, `GET`/`HEAD`/`DELETE ?versionId`, delete markers, `ListObjectVersions` with delimiter and both markers, `DeleteObjects` by version id, `CopyObject` from a version. S3's suspended-mode and marker-stacking rules. |
+| Object tagging | `x-amz-tagging` on PUT, copy (`x-amz-tagging-directive`) and multipart create; `GET`/`PUT`/`DELETE ?tagging` per version; `x-amz-tagging-count`. |
+| Bucket CORS | Rules via `?cors` and the console; enforced on preflight and actual requests. |
+| IAM | Users, groups, API keys, AWS-style policies with conditions, a policy builder; actions for every operation above, including `s3:ReplicateWrite` for replicated writes. |
+| Changelog and webhooks | Per-bucket ordered changelog (`put`, `delete`, `remove_version`, `tags`, `bucket`), long-poll reads, snapshots, signed webhook deliveries with retries and mute, replication tokens. |
+| Replication | Mirror (one-way, read-only replica) and merge (two-way) links between sites; last-writer-wins by stamp; every version, marker, removal and tag change on versioning-enabled buckets; bucket settings (versioning, CORS) adopted by the newer change; chains of sites; restore of lost objects from a peer. |
+| Storage | Layouts 1, 2 and 3 read, 3 written; explicit, gated, resumable upgrades started from the console; index rebuild from the tree alone (versions, markers and tags included); health scan with repair; `full` and `relaxed` durability. |
+| Console | Object browser, uploads, versions panel, bucket settings (versioning, CORS, keep-CORS-local, read-only, layout upgrade), IAM, webhooks, replication links with live status, tasks, stats, health scan. |
+| `rs3` client | mc-compatible command line: aliases, ls, cp, mirror, find, share, and `rs3 watch` to follow a bucket's changelog. |
+
+**Not implemented**
+
+- Object lock, retention and legal hold; MFA delete.
+- Lifecycle rules, including expiry of noncurrent versions: versions
+  accumulate until deleted.
+- Bucket policies via the S3 API (console IAM policies instead), ACLs,
+  bucket tagging, website hosting, S3 event notifications (the changelog and
+  webhooks take their place), S3 Select, server-side encryption, storage
+  tiers (storage class is metadata only).
+- `UploadPartCopy` from a specific version of the source (the current
+  version is copied).
+- Replication of the storage layout and the read-only flag: both are local
+  to a site by design.
+- MinIO admin APIs, Snowball archive extraction, TLS termination (use a
+  reverse proxy).
+
+**How it is tested** (`cargo test`, with a built `rusts3` for the two
+integration suites)
+
+| Suite | What it checks | Last result |
+|---|---|---|
+| Unit and integration tests (in-process) | Storage commit paths and crash points, layout upgrades from every supported layout (interrupted and resumed), versioning and tagging semantics, the version-removal matrix, IAM, webhooks, replication between two and three sites | 604 pass, 1 ignored |
+| Protocol conformance (`src/server/spec_tests.rs`) | Every header, parameter and event field of [the replication spec](docs/spec-replication.md) and [the webhook spec](docs/spec-webhooks.md), over SigV4 | all pass |
+| AWS golden replay (`tests/aws_compat.rs`) | 39 operations compared with a recording of what Amazon S3 returned | pass, with the listed accepted divergences |
+| AWS SDK for Rust (`tests/sdk_compat.rs`) | Versioning, tagging, copies and bulk deletes by version id, and two linked sites converging, as the official SDK sees them | 2 pass |
+| MinIO Mint `versioning` suite (built natively, see `test_report.md`) | 13 versioning and tagging tests | 13 pass; the object lock tests cannot run |
+
+One in-process test, the webhook offset replay, is sensitive to machine
+load and can fail under the full suite while passing alone.
+
 ## Compatibility
 
 ### MinIO Mint
@@ -134,6 +206,16 @@ not-applicable count is higher and the failure count lower than in earlier runs.
 
 The dated [MinIO Mint compatibility report](test_report.md) is the source of
 truth — the summary above is not a claim of complete S3 or MinIO compatibility.
+Its `versioning` suite (versions, delete markers, listings, per-version
+tagging) passes in full as of 2026-10-15; the object lock tests it also
+contains cannot run without object lock.
+
+`tests/sdk_compat.rs` additionally drives the official AWS SDK for Rust
+against freshly started servers: versioning, tagging, copies and bulk
+deletes by version id, and two replication-linked sites converging on the
+same versions, markers and tags. The replication tests also run a chain of
+three merge-linked sites and a chain of two mirrors, so a change made at
+either end reaches the other, including removals, tag and setting changes.
 
 ### The Rust data stack (`object_store`)
 
@@ -160,21 +242,21 @@ for filtering, port overrides, and running against an existing server.
 
 ## Intentional limits
 
-Not implemented:
+Not implemented (see [Status](#status) for the full list):
 
-- bucket versioning and delete markers;
 - bucket policies via the S3 API (use console IAM policies instead), ACLs,
-  websites, lifecycle rules, tagging;
-- object lock, retention/legal hold, replication, notifications, S3 Select;
+  websites, lifecycle rules, bucket tagging;
+- object lock, retention/legal hold, S3 event notifications (the changelog
+  and webhooks take their place), S3 Select;
 - server-side encryption and storage-tier behavior (storage class is metadata only);
 - MinIO admin APIs and Snowball archive extraction;
 - **TLS termination** — put rusts3 behind a reverse proxy (see below).
 
-`GET /{bucket}?versions` is a compatibility view that reports the current object
-of each key as its single `null` version, exactly as S3 answers for an
-unversioned bucket. Overwritten and deleted blobs are retained in trash for the
-retention window, but they are an operator recovery buffer, not versions: there
-is no `?versionId` API to fetch or delete one, so they are not listed.
+On a bucket that never had versioning, `GET /{bucket}?versions` reports the
+current object of each key as its single `null` version, exactly as S3 does.
+Overwritten and deleted blobs of such a bucket are retained in trash for the
+retention window as an operator recovery buffer, not as versions. See
+[Object versioning](#object-versioning) for buckets that keep versions.
 
 ## Configuration
 
@@ -245,6 +327,7 @@ HMAC key.
 | `server.bind_address` | `0.0.0.0` | S3 API listen address. |
 | `server.bind_port` | `8002` | S3 API listen port. |
 | `server.base_dir` | `./rusts3-data` | Object, index, and IAM data root. |
+| `server.site_name` | unset | This site's readable name, shown in the console and to replication peers. Only a label. Without this setting, a two-word name (like `quiet-falcon`) is generated on first start and an admin can change it any time in the console ("Change", bottom of the sidebar), effective at once; with it, the configured name is applied at every start and the console cannot change it. (The **site id** itself is not configurable: it is generated on first start, kept in `<base_dir>/site.json`, and never changes — it is in every version stamp the site writes and is how replication peers know it. A config that still sets `server.site_id` is refused at start.) |
 | `server.proxy_protocol` | `auto` | PROXY protocol v1/v2 on both listeners. `auto` detects it per connection — a header from a loopback/private peer names the real client, a connection without one is plain HTTP; a header from a public peer is dropped. `off` never looks for one. |
 | `ui.enabled` | `true` | Enable the management console. |
 | `ui.bind_address` | S3 bind address | Optional separate console listen address. |
@@ -265,6 +348,52 @@ HMAC key.
 `full` is the safe default for power-loss durability. `relaxed` improves write
 throughput but can lose the last acknowledged writes after power loss. A normal
 process crash preserves committed writes in either mode.
+
+**Filesystem.** Put the data directory on a checksumming filesystem:
+**Btrfs** or **ZFS**. Both detect a flipped bit on read (and repair it from
+a mirror or parity copy), scale to the directory counts a large bucket
+produces, and compress transparently, which matters for text-heavy buckets.
+ext4 and XFS work but neither verifies data integrity, so a silent disk error
+reaches the client as a wrong byte with a matching ETag; the health scan
+catches size and metadata drift, not bit flips. The server never relies on
+filesystem features beyond rename, hardlink and fsync, so any POSIX
+filesystem is supported — the recommendation is about what the disk can do
+to your data.
+
+**Storage layout versions.** Each bucket records its on-disk layout in its
+`bucket.json`: `"layout": {"state": "stable", "version": 3}`, or while an
+upgrade runs `{"state": "migrating", "from": 2, "to": 3}`. This build writes
+layout 3 and still serves layouts 1 and 2:
+
+| Layout | Shape | Written by |
+|---:|---|---|
+| 1 | `objects/aa/bb/cc/dd/<leaf>`, 4-level fanout, `meta.json` format 1 | the first releases |
+| 2 | `objects/<4hex>/<leaf>`, single-level fanout, `meta.json` format 1 | releases before versioning |
+| 3 | `objects/<4hex>/<sha1(key)>/<stamp>/`, one dir per key, one per version, `meta.json` format 2 (every blob carries its stamp; delete markers on disk) | this build |
+
+Every layout lives in its own sealed file under `src/storage/layouts/` with
+a registry of what is supported; a change in shape is a new layout, never an
+edit of an old one, and a test builds a bucket in every supported layout and
+proves this build reads and upgrades it. At startup the server records the
+layout of buckets that never had one, refuses to start on a layout written by
+a newer build, and resumes any upgrade that was started and interrupted. An upgrade is started by an admin
+(bucket settings → **Storage layout** → **Upgrade now**, or
+`POST /api/buckets/{name}/upgrade-layout`); the console flags buckets that
+can be upgraded. While it runs the bucket answers `503` to every data request
+and shows in the tasks panel; a bucket is never served on a half-migrated
+layout, and a step that fails is retried every `sweeper.interval_secs` with
+the bucket still unavailable. Moving an object is a hardlink and an index
+update, so no data is copied. The step to layout 3 also materialises a stamp
+for objects from before stamps existed and writes the delete marker of every
+tombstone, so afterwards a rebuild from the tree alone recovers every object,
+every version and every delete.
+
+**Index rebuilds and the changelog.** A rebuild walks the tree and rewrites
+the index. Its changelog (what webhooks and replication links read) is
+carried across only when the rebuilt catalog is the same catalog; if the tree
+disagreed with the prior index, or the index was lost, the log starts over
+under a new id and consumers detect the switch and resnapshot rather than
+miss a change.
 
 ### Authentication and IAM
 
@@ -298,7 +427,7 @@ a private reverse proxy's `X-Forwarded-For`/`X-Real-IP`, otherwise the TCP peer.
 
 | Field | Default | Description |
 |---|---:|---|
-| `sweeper.interval_secs` | `300` | Schedule interval for intent resolution, staging/trash cleanup, and legacy-layout migration. |
+| `sweeper.interval_secs` | `300` | Schedule interval for intent resolution and staging/trash cleanup; also the retry interval of a failed storage layout upgrade. |
 | `sweeper.intent_batch_size` | `100` | Stale intents processed per batch; a run drains all eligible batches. |
 | `sweeper.intent_grace_period_secs` | `3600` | Minimum intent age during normal operation. Startup recovery bypasses the grace period. |
 | `sweeper.staging_expiry_secs` | `86400` | Idle age before abandoned single-PUT staging is removed. |
@@ -317,7 +446,11 @@ batch/grace settings.
 | Field | Default | Description |
 |---|---:|---|
 | `changelog.retention_days` | `14` | Changelog entries older than this are trimmed, whether or not every subscription has read them. |
-| `changelog.trim_interval_secs` | `600` | How often the trim runs. |
+| `changelog.trim_interval_secs` | `600` | How often the trim and the tombstone purge run. |
+| `replication.check_interval_secs` | `5` | Supervisor tick: an enabled replication link without a live worker gets one within this. |
+| `replication.worker_stale_secs` | `600` | A link worker silent for this long is replaced. A worker renews its lease while it makes progress (every chunk of a transfer counts, renewed at most every 5s), so a slow transfer of a large object is never mistaken for a hang. |
+| `replication.parallelism` | `8` | Changes a link applies concurrently within one batch. |
+| `changelog.tombstone_days` | `14` | How long a delete's tombstone (its stamp) is kept, so an older replicated write cannot bring the object back. |
 | `webhooks.check_interval_secs` | `5` | Checker tick: muted webhooks whose mute has passed resume on the next tick. |
 | `webhooks.mute_secs` | `30` | Mute after any unsuccessful delivery (per-webhook override). A longer `Retry-After` wins. |
 | `webhooks.max_mute_secs` | `900` | Cap on a receiver's `Retry-After`. |
@@ -471,7 +604,83 @@ password to bootstrap administration. The console supports:
 Share links carry the creator's current authority — deleting the user or
 narrowing their policy revokes or narrows existing links.
 
+## Object versioning
+
+Buckets can keep every version of every object, with S3's semantics:
+
+- **Enable** it in the bucket settings (or `PUT /{bucket}?versioning` with
+  `<Status>Enabled</Status>`). The bucket must be on the current storage
+  layout; the console says so and offers the upgrade. Objects that exist at
+  that point are the key's `null` version.
+- **Enabled:** every PUT, copy and multipart completion is a new version,
+  reported as `x-amz-version-id`; the previous version stays. A DELETE
+  inserts a delete marker (the key answers 404 with `x-amz-delete-marker`)
+  and keeps every version. `GET`/`HEAD ?versionId=` read a version;
+  `DELETE ?versionId=` removes exactly that version or marker, permanently —
+  removing the current one makes the next newest current, removing a marker
+  undeletes the key.
+- **Suspended:** existing versions stay; a write becomes the key's `null`
+  version and replaces only the previous `null` one; a delete replaces it
+  with a `null` delete marker. A bucket that was enabled can be suspended,
+  never returned to never-enabled.
+- `GET /{bucket}?versions` lists everything, newest first per key, with
+  `DeleteMarker` entries and `IsLatest`, paginated by `key-marker` and
+  `version-id-marker`.
+
+A version id is the version's stamp (`§2.2` of the replication spec) in a
+zero-padded, sortable form, so it is the same on every site that holds the
+version. On disk every version is a directory beside the others under its
+key, so an index rebuild recovers versions and delete markers from the tree
+alone. The console's object details panel lists a key's versions with a
+download and a permanent delete for each.
+
+**Object tagging.** Up to ten key/value tags per object version, set with
+`x-amz-tagging` on PUT, copy (`x-amz-tagging-directive: COPY|REPLACE`)
+and multipart create, and read, replaced or removed with `GET`, `PUT` and
+`DELETE /{bucket}/{key}?tagging`, each with an optional `versionId`. GET
+and HEAD report `x-amz-tagging-count`. A copy source may name a version
+(`x-amz-copy-source: /bucket/key?versionId=…`). Replacing tags changes neither the
+ETag nor the version. Reading tags needs `s3:GetObject` on the object,
+changing them `s3:PutObject`. Tags travel with replicated objects and a
+tag change is a `tags` changelog event that replication applies to the
+same version on the other site.
+
+**Versions and replication.** A version is immutable and named by its
+stamp on every site, so two versioning-enabled buckets hold the same set
+of versions: history is a union, and last-writer-wins only decides which
+version is current. A link into a versioning-enabled bucket applies every
+event (nothing is collapsed within a batch), fetches each state by its
+version id, keeps a state older than the current one as a noncurrent
+version instead of refusing it, and forwards version removals
+(`DeleteObject ?versionId`, logged as `remove_version`) so a removed
+version, or a removed delete marker, goes on every site and cannot come
+back from a late copy. A link requires the same versioning setting on both
+buckets, so that both replicate the same thing, and **bucket settings
+replicate** so that this holds by itself: versioning (enabled or suspended
+beats off, between those the newer change wins) and CORS rules (the newer
+change wins, unless the bucket keeps its CORS local in its settings)
+travel with every page and as `bucket` changelog events. A merge link
+carries them both ways, a mirror takes its source's. The two cases that
+cannot be adopted stop the link with the reason shown in the console, and
+it resumes on its own from its position once fixed: a mirror replica that
+has versioning while its source has none, and a bucket still on an old
+storage layout. The storage layout and the read-only flag never
+replicate. Not yet: lifecycle expiry of noncurrent versions.
+
 ## Changelog, webhooks and replication
+
+Three kinds of subscriber read a bucket's changelog: webhooks (pushed
+batches), replication links (other sites), and `rs3 watch
+ALIAS/BUCKET[/PREFIX]` from the command line, which prints every change as
+it commits (`--json` for the raw events, `--from-start` to replay,
+`--snapshot --versions` to list every version first). It needs
+`s3:GetBucketChangelog` on the bucket.
+
+The wire protocol is specified in [docs/spec-replication.md](docs/spec-replication.md)
+(changelog reads, events, stamps, replicated writes, peer checks) and
+[docs/spec-webhooks.md](docs/spec-webhooks.md) (webhook requests and
+batches); `src/server/spec_tests.rs` checks the server against both. What
+follows is the guide.
 
 Every bucket keeps a **changelog**: each committed PUT, copy, multipart
 completion and delete is recorded, in the same atomic write as the change
@@ -479,19 +688,21 @@ itself, with a per-bucket sequence number (`seq`). Sequence numbers increase
 strictly but are not contiguous. Entries are kept for
 `changelog.retention_days` (14 by default).
 
-Admins subscribe to a bucket's changelog in the console (**Webhooks &
-Replication**), in one of two ways:
+There are two ways to consume it:
 
-- **Webhook**: the server POSTs batches to a URL.
-- **Replication token**: a replicator pulls batches from the S3 port.
+- **Read it** (pull). Any credential granted `s3:GetBucketChangelog` can read
+  a bucket's changelog over the S3 API, and so can a replication token. No
+  setup is needed on the server. The reader keeps its own position.
+- **Webhooks** (push). An admin configures them in the console (**Webhooks &
+  Replication**). The server tracks each webhook's position and POSTs batches
+  to it.
 
-Each subscription keeps its own position, can filter by key prefix, key suffix
-and operation, and can optionally start with a **snapshot** of the objects
-already in the bucket before switching to live changes.
+Both can filter by key prefix, key suffix and operation.
 
 ### Batch format
 
-Webhooks receive this as the POST body. Pull responses add an `ack` field.
+Webhooks receive this as the POST body. Reads return the same `events` (see
+below).
 
 ```json
 {
@@ -501,7 +712,8 @@ Webhooks receive this as the POST body. Pull responses add an `ack` field.
   "events": [
     {"seq": 117, "op": "put", "key": "2026/a.jpg", "etag": "9b2c…", "size": 482113,
      "last_modified_ms": 1791800000123, "version": "V1A9F3K2_7Q1M",
-     "origin": "client", "ts_ms": 1791800000130}
+     "origin": "client", "ts_ms": 1791800000130,
+     "parts": {"multipart": true, "count": 3, "size": 8388608, "last": 1048576}}
   ]
 }
 ```
@@ -512,9 +724,32 @@ Webhooks receive this as the POST body. Pull responses add an `ack` field.
   - Sending `x-rs3-if-version: <version>` on a GET makes it fail with `412` if
     the object has changed since. A replicator can therefore fetch exactly the
     state an event names.
-- `origin` is `client` or `repair`. A `repair` delete means the health scan
-  removed an index row whose data was lost. It does not mean a client deleted
-  the object.
+- Delete events also carry `removed_stamp`, the stamp of the version they
+  removed.
+- `stamp` is the version stamp `{"ms", "c", "site"}`: when the state was
+  written (epoch ms), a counter for writes within the same millisecond
+  (almost always 0), and the id of the site that wrote it.
+  - For a delete, it is the delete's own stamp.
+  - Stamps compare by `ms`, then `c`, then `site`, identically on every site,
+    so two sites holding different states of a key agree which one is newer.
+  - A site's stamps only ever increase, including across restarts and backwards
+    clock steps, and a local write always outranks any stamp the site has seen.
+  - GET and HEAD return it as `x-rs3-stamp: <ms>.<c>.<site>`.
+  - Objects written before stamps existed report `<last-modified>.0.<this
+    site>`.
+- `parts` is how the object was uploaded. Upload the same bytes the same way
+  and the other side computes the identical ETag:
+  - `{"count": 1}`: a single PUT (ETag = MD5 of the content).
+  - `"multipart": true`: a multipart upload with `count` parts. Every part is
+    `size` except the `last`, or the parts are listed in `sizes` when they are
+    irregular. Even a one-part multipart upload differs from a single PUT (its
+    ETag ends in `-1`).
+  - Absent for objects stored before layouts were recorded; use
+    GetObjectAttributes for those.
+- `origin` is `client` (a client of that site wrote it), `replication`
+  (replication applied it there; the stamp's `site` says where it was made)
+  or `repair`. A `repair` delete means the health scan removed an index row
+  whose data was lost. It does not mean a client deleted the object.
 - A snapshot arrives as `phase: "snapshot"` batches of `op: "exists"` entries,
   which have no `seq`:
   - The first batch has `snapshot_begin`; the last has `snapshot_end`.
@@ -551,30 +786,276 @@ Delivery and failure handling:
 - Webhook URLs must be `https://` and must not resolve to internal addresses.
   Both rules can be relaxed in the config. Redirects are not followed.
 
-### Pulling with a replication token
+### Reading the changelog
 
-All requests go to the S3 port with `Authorization: Bearer rs3cl_…`. The token
-only works for these two endpoints. Use path-style addressing: a bucket name
-can't start with `_`, so `/_rs3/` never clashes with a bucket. On a
-virtual-hosted request (`<bucket>.<public_hostname>/_rs3/changelog`), the path
-is an ordinary object key and goes to S3.
+Reads are **stateless**: the server stores nothing per reader. A reader asks
+for the changes after the `seq` it has applied and saves the returned `next`
+itself. Saving it next to the data it applied is best, so that if that data is
+rolled back, the position rolls back with it. Re-reading is always safe.
+
+With SigV4 credentials that have `s3:GetBucketChangelog` (read-only; the admin
+group's `s3:*` includes it):
 
 ```text
-GET  /_rs3/changelog[?wait=<secs>]          next batch (long-polls up to 60s when idle)
-POST /_rs3/changelog/ack  {"ack": "<ack>"}  acknowledge it once applied
+GET /{bucket}?x-rs3-changelog&after=<seq>[&limit=N][&min=N][&wait=secs|&wait_ms=N][&prefix=][&suffix=][&ops=put,delete][&log_id=]
+GET /{bucket}?x-rs3-changelog-snapshot[&after=<key>][&limit=N][&prefix=][&suffix=]
 ```
+
+- **Changes:** returns `{bucket, log_id, head, trimmed_through, next, more,
+  events}`. `next` moves past filtered-out changes too.
+- **Batching, Kafka-style:** a response holds up to `limit` changes (default
+  500, max 10,000), like `max.poll.records`. The request waits until at least
+  `min` matching changes are available (default 1, like `fetch.min.bytes`) or
+  until the wait passes (`wait` in seconds or `wait_ms`; default 20s, max 60s,
+  like `fetch.max.wait.ms`), then returns what it has. A full page returns
+  immediately. Pass `wait=0` for an immediate answer.
+- **Snapshot listing:** pages through the current objects as `op: "exists"`
+  entries. Save the **first** page's `head`, page through to the end
+  (`next_after` is null), then read changes with `after=<that head>`. That
+  replays anything that changed during the listing.
+- **Errors:**
+  - `410 Gone`: `after` is older than what retention kept. The response names
+    the oldest available position. Re-snapshot, or accept the loss and
+    continue from there.
+  - `409 Conflict`: the position doesn't belong to this log, either because it
+    is beyond the head, or because `log_id` doesn't match after a rebuild
+    replaced the log.
+
+Instead of `after`, pass `since=<epoch ms>` to start at the first change
+committed at or after that time; `next` is a seq as usual. Commit times never
+decrease in seq order, so the server finds the position with a binary search.
+If changes from that time may already have been removed by retention, the
+response is `410`. Responses also carry the server's `site_id`.
+
+**Metadata updates keep the bytes.** A CopyObject onto the same key (S3's way
+of changing metadata) doesn't copy any data. The new version hardlinks the
+existing part files, so the update costs the same regardless of object size and
+keeps the part layout and the ETag, including a multipart `-N` ETag. If the
+filesystem can't hardlink, it falls back to a byte copy. A copy to a different
+key is still a full copy, stored as a single part.
+
+**Replicated writes.** A PUT, CompleteMultipartUpload, CopyObject or DELETE
+that sends `x-rs3-stamp: <ms>.<c>.<site>` keeps that stamp instead of getting a
+new local one. For a write, `Last-Modified` becomes the stamp's time. This is
+how a replica keeps the origin's stamp. A CreateMultipartUpload sent with
+`x-rs3-replicate: true` (also needing `s3:ReplicateWrite`) starts a replicated
+upload, which a read-only bucket accepts; the stamp the object keeps is the
+one sent with the completion.
+
+- **Last-writer-wins, with version-scoped deletes.** Every state of a key has a
+  rank, computed identically on every site.
+  - A live object ranks by its stamp.
+  - A delete ranks by the stamp of the version it **removed**, just above that
+    version. It does not rank by when the delete happened.
+  - A stamped change applies only if it outranks the key's current state.
+    Otherwise the server answers `412` with the current stamp in
+    `x-rs3-stamp-current`, and nothing is written or logged. Replays and echoes
+    are therefore no-ops, and every site keeps the same winner whatever order
+    changes arrive in.
+  - So a delete only removes what its author saw. A version written
+    concurrently on another site, even slightly earlier in wall-clock time,
+    survives a delete of an older version.
+  - A replicated DELETE sends the removed version's stamp in
+    `x-rs3-removed-stamp`. Without it, the delete's own stamp is used.
+- **Tombstones.** A delete leaves a tombstone holding its stamp, kept for
+  `changelog.tombstone_days` (14). It stops an older write from bringing the
+  object back. A stamped delete of a key that doesn't exist still records one.
+  - HEAD or GET of a deleted key answers `404` with `x-rs3-stamp` and
+    `x-rs3-deleted: true`.
+  - `?x-rs3-changelog-snapshot&deleted=1` lists the tombstones.
+  - A site offline for longer than the tombstone retention must re-snapshot
+    rather than resume.
+- **Permission.** Setting a stamp decides conflicts, so it requires the custom
+  IAM action `s3:ReplicateWrite` on the object, in addition to the write or
+  delete permission. Stamps more than 10 minutes in the future are refused.
+  Like every `x-amz-*` header, an `x-rs3-*` header must be covered by the
+  request's signature (`403` otherwise): a stamp decides which version wins,
+  so it is never taken from an unsigned header.
+- Local (unstamped) writes and deletes are never conditional, and always
+  outrank every state the site has seen.
+
+**Replication tokens** (created by an admin in the console) give the same reads
+without S3 credentials. They are scoped to one bucket and the token's filter:
+
+```text
+GET /_rs3/changelog?after=<seq>[&limit=N][&min=N][&wait=secs|&wait_ms=N][&log_id=]
+GET /_rs3/changelog/snapshot[?after=<key>][&limit=N]
+```
+
+Send `Authorization: Bearer rs3cl_…` on the S3 port, using path-style
+addressing. A bucket name can't start with `_`, so `/_rs3/` never clashes with
+a bucket. On a virtual-hosted request (`<bucket>.<public_hostname>/_rs3/…`) the
+path is an ordinary object key and goes to S3. Pausing a token in the console
+disables it (`403`).
+
+### Replication links
+
+A replication link replicates a whole bucket with a bucket on another rusts3
+site (the peer). It is configured in the console (**Webhooks & Replication →
+Replication links**) on one site, and that site's server runs it: it is the
+actor for both directions. There are no prefix filters on links (webhooks can
+filter by prefix).
+
+- **Mirror** (this ⟵ peer: one way, remote wins): the local bucket becomes an
+  exact copy of the peer's. Its initial snapshot also deletes local objects the
+  peer doesn't have. The bucket is made **read-only** so only replication
+  writes it; that's what keeps "remote wins" true.
+- **Merge** (this ⟷ peer: both ways, newer wins): the link pulls the peer's
+  changes in and pushes the local bucket's changes out. Both buckets end up as
+  the union of their objects, every key at its highest-stamped state; deletes
+  win or lose by stamp too, via tombstones. Nothing is configured on the peer:
+  its console lists the link under **Managed on other sites** (links seen
+  reading its changelogs in the last 5 minutes).
+
+**Site ids and names.** Each server has a site id, generated on its first
+start (16 hex characters, kept in `<base_dir>/site.json`) and never changed:
+every version stamp carries the id of the site that wrote it, and peers know a
+site's changelog by it. The site name is a free label shown beside it
+(generated as two words, changeable in the console or set by
+`server.site_name`). A
+copy of a data directory carries `site.json` along and is the same site;
+links refuse to run between two servers reporting one id. To set up a new
+site, start it from an empty data directory and let a link fill it.
+
+**Two keys, both explicit.** A link carries everything it is allowed to do:
+
+| | Key | Mirror needs | Merge needs |
+|---|---|---|---|
+| On this site | **local access key**: an access key of this site, named only (no secret: the server acts *as* it) | `s3:PutObject`, `s3:DeleteObject`, `s3:ReplicateWrite` | the same, plus `s3:GetObject`, `s3:GetBucketChangelog` |
+| On the peer | **peer access key and secret** (SigV4) | `s3:GetObject`, `s3:GetBucketChangelog` | the same, plus `s3:PutObject`, `s3:DeleteObject`, `s3:ReplicateWrite` |
+
+Each action is needed on the whole bucket (every key). `s3:ReplicateWrite` is
+the permission to write with a change's original stamp: replicated writes keep
+the stamp of the site that made them, which is what decides conflicts, so
+setting it is a privilege of its own. Admin keys (`s3:*`) have everything.
+In the console's policy editor, the rule builder's **Replication** access
+level grants exactly these on a whole bucket (bucket `*` for every bucket),
+and the JSON presets **Replicate all buckets** (`ReplicateAllBuckets`) and
+**Replicate one bucket** (`ReplicateOneBucket`) do the same. Both cover
+either key of either mode; `s3:AbortMultipartUpload` is included so a failed
+pushed multipart copy can clean up.
+
+- **Checked when the link is created** (and when its peer or keys change): the
+  peer must answer, not be this server, have the bucket, and its key must have
+  every permission above (the peer reports them for the calling key:
+  `GET /{bucket}?x-rs3-access`); the local key must exist and have its
+  permissions too. A merge into a read-only peer bucket is refused. So is a
+  merge link for a pair the peer already serves with its own merge link.
+- **Bound to two site ids.** A link records this site's id and the peer's
+  when it is created (the peer's from the check; a link created without the
+  check records it on first contact). If another site answers later (the
+  endpoint now reaches a different or rebuilt server), the link stops with an
+  error naming the change, and nothing moves in either direction: the push also confirms the peer's id (`x-rs3-site`, on
+  object reads) before every write. **Accept site ids** (console, or action
+  `accept_site_ids`) re-checks the peer, records the ids both sides report
+  now, and starts again from a fresh snapshot.
+- **Checked while it runs:** the local key's permissions every step (delete
+  the key or narrow its policy and the link stops with an error saying what
+  is missing); the peer enforces its key on every request.
+- **Rules the server enforces:**
+  - A mirror link needs a read-only target. The console makes the bucket
+    read-only when it creates the link.
+  - A mirror is its bucket's only link.
+  - A mirrored bucket can't be switched back to read-write while its mirror
+    link exists, even if the link is paused. Deleting the link leaves the bucket
+    read-only; making it writable again is a separate, explicit step.
+  - One link per bucket pair on a site. If both sites end up with a merge link
+    for the same pair anyway (one was created while the other site was down),
+    the one on the site with the higher site id stops with an error saying so,
+    and the other keeps syncing both ways. Delete one of them.
+
+How it works:
+
+- The link first walks the peer's snapshot, then follows its changelog. A
+  merge link's push does the same with the local bucket: it walks the local
+  objects and tombstones, then follows the local changelog (read in-process,
+  the same code that serves the changelog API), writing to the peer with
+  stamped S3 requests.
+- Every change is applied with its original stamp, under last-writer-wins.
+  - A change whose stamp is not newer than the receiving side's state is
+    skipped without fetching or sending anything (the push asks the peer with
+    a HEAD first). Changes the push would send back to the site they came from
+    are skipped too, which is how echoes stop.
+  - Identical content with a newer stamp becomes a metadata-only update; no
+    bytes move.
+  - Object data is read pinned to the change's version (`x-rs3-if-version`),
+    so changes the peer has since superseded are skipped.
+- Multipart objects are re-uploaded with the peer's part layout, so ETags
+  match.
+- **Parallelism:** each batch is collapsed to the latest change per key, then
+  applied up to `replication.parallelism` (8) at a time. Batches run one after
+  another, and the link checkpoints only after every change in a batch has
+  succeeded. One failure holds the checkpoint, and the batch is retried; the
+  changes that already succeeded are cheap no-ops on replay. Concurrent applies
+  are safe because the last-writer-wins check and the commit are atomic under
+  each key's lock.
+- Deletes caused by a health-scan repair (`origin: repair`) are never
+  replicated. The other side's copy is kept.
+- **A change that moved on vs. lost data.** If the object a change names was
+  overwritten or deleted since, the change is skipped: a later change in the
+  log carries the object's current state. If the index still names the
+  object but its bytes are gone (a disk lost them), nothing is skipped: the
+  link stops at that object and reports it (for example `corrupt object: row
+  for photos/a.jpg references unreadable blob`) until it is resolved (restore
+  from peer, or delete the key).
+- **Restore from peer.** When the storage scan finds an object whose bytes are
+  missing or corrupt in a bucket that a link pulls into, the recommended repair
+  is **Restore from replication peer**. It fetches the object back with its
+  original stamp, layout and metadata. Deleting the row is the last resort.
+  - It only restores the lost version or a newer one.
+  - If the peer has only an older version, the repair fails and explains why.
+    **Restore older version from peer** accepts the rollback explicitly.
+
+Operation:
+
+- **Position:** each link's position (and a merge link's push position in the
+  local changelog) is stored in the local bucket's own index, next to the data
+  it describes, and is carried across index rebuilds.
+- **Re-snapshot triggers:** a link re-snapshots on its own when the peer's
+  changelog no longer has its position (`410`), when the peer's log was
+  replaced, or when its checkpoint is older than the tombstone retention
+  while it is behind (a caught-up link refreshes its checkpoint as it idles,
+  so a quiet bucket is never re-walked for nothing).
+- **Supervision:** a supervisor checks every `replication.check_interval_secs`
+  (5s) and starts a worker for every enabled link that lacks one, for example
+  after a crash or a restart. It replaces a worker that has been silent for
+  `replication.worker_stale_secs` (600s), and never runs two workers for one
+  link. A worker renews its lease while it makes progress (every chunk of a
+  transfer) and while a request to the peer is pending (such a wait is
+  bounded by the client's timeouts), so only a worker stuck where no timeout
+  applies is ever replaced.
+- **Safety:**
+  - A link whose peer reports this server's own site id (a copied data
+    directory) stops with an error.
+  - A bucket that is the target of a link can't be deleted until the link is
+    removed.
+
+### Read-only buckets
+
+An admin can mark a bucket **read-only** (console: bucket settings, or `PUT
+/api/buckets/{name}/read-only {"read_only": true}`). A read-only bucket accepts
+only replicated writes: writes carrying a version stamp, which come from
+replication links (including the mirror sweep and restore from peer) or from
+`s3:ReplicateWrite` clients sending `x-rs3-stamp`.
+
+Every other write is refused with `403`: PUT, copy (including metadata
+updates), multipart upload, DELETE, multi-delete, browser POST, and console
+uploads and deletes. Uploads are refused before any bytes are sent. Reads are
+unaffected. This is meant for replica buckets.
 
 ### Falling behind retention
 
-If a subscription's position falls behind what retention has kept, the events
-it missed are gone, so it **pauses** instead of skipping them silently:
+A reader that falls behind retention gets `410 Gone` and decides for itself
+what to do.
+
+If a webhook's position falls behind what retention has kept, the events it
+missed are gone, so it **pauses** instead of skipping them silently:
 
 - **Resume** is refused with an explanation.
-- A paused replication token answers `410 Gone`.
 - The admin chooses one of: **resume from oldest retained**, **re-snapshot**,
   **skip to head**, or **set offset**.
 
-The console warns when a subscription's oldest pending change is close to
+The console warns when a webhook's oldest pending change is close to
 expiring. A bucket cannot be deleted while it has subscriptions. An index
 rebuild carries the changelog over, so positions stay valid.
 
@@ -605,7 +1086,8 @@ request/byte totals and rates are in the periodic logs and the console task view
 | `GET` | `/{bucket}?location` | Get bucket location. |
 | `GET` | `/{bucket}?uploads` | List multipart uploads. |
 | `GET/PUT/DELETE` | `/{bucket}?cors` | Read, replace, or remove bucket CORS rules. |
-| `GET` | `/{bucket}?versions` | Compatibility listing: one `null` version per live key, paginated by `key-marker`; not S3 versioning. |
+| `GET` | `/{bucket}?versions` | ListObjectVersions: every version and delete marker, newest first per key, paginated by `key-marker` / `version-id-marker`. |
+| `GET` / `PUT` | `/{bucket}?versioning` | Read or set the bucket's versioning state (`Enabled` / `Suspended`; enabling needs the current storage layout). |
 | `POST` | `/{bucket}?delete` | Multi-object delete, including quiet mode. |
 | `POST` | `/{bucket}?rebuildIndex` | Start an index rebuild (`202`; `409` if already running). |
 | `POST` | `/{bucket}` | SigV4 browser form upload with policy validation. |
@@ -616,8 +1098,10 @@ request/byte totals and rates are in the periodic logs and the console task view
 |---|---|---|
 | `PUT` | `/{bucket}/{key}` | Streaming upload, including `aws-chunked`, content hashes, metadata, and storage class. |
 | `GET` / `HEAD` | `/{bucket}/{key}` | Streaming read, single byte ranges, conditional reads, response-header overrides, and metadata. |
-| `DELETE` | `/{bucket}/{key}` | Idempotent delete. `forceDelete=true` / `x-minio-force-delete` deletes a prefix for MinIO compatibility. |
-| `PUT` | object + `x-amz-copy-source` | Server-side copy with metadata directive and source preconditions. |
+| `DELETE` | `/{bucket}/{key}` | Idempotent delete; a delete marker on a versioned bucket. `forceDelete=true` / `x-minio-force-delete` deletes a prefix for MinIO compatibility. |
+| `GET` / `HEAD` / `DELETE` | object + `?versionId` | Read, inspect or permanently remove one version (`null` for the null version). |
+| `GET` / `PUT` / `DELETE` | object + `?tagging[&versionId]` | Read, replace or remove a version's tags. |
+| `PUT` | object + `x-amz-copy-source` | Server-side copy with metadata and tagging directives and source preconditions; the source may name a version. |
 | `POST` | object + `?uploads` | Initiate multipart upload. |
 | `PUT` | object + `uploadId`, `partNumber` | Upload a part, or copy a source/range into a part. |
 | `GET` | object + `uploadId` | List uploaded parts. |

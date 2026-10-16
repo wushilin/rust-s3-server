@@ -45,6 +45,93 @@ pub struct ObjectMeta {
     #[serde(default)]
     pub user_meta: BTreeMap<String, String>,
     pub parts: Vec<PartMeta>,
+    /// Version stamp (see `storage::stamp`); `None` only on format-1
+    /// objects written before stamps existed (format 2 always carries one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<super::stamp::Stamp>,
+    /// Written while the bucket's versioning was enabled: a real version
+    /// with its stamp as the version id. `false` is S3's `null` version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub versioned: bool,
+    /// A delete marker: the key was deleted at `stamp`, removing the version
+    /// stamped `removed`. Holds no parts (`size` 0, empty `etag`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delete_marker: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<super::stamp::Stamp>,
+    /// Object tags (S3 object tagging): up to 10 key/value pairs, the one
+    /// mutable part of a version — replacing them changes neither the
+    /// ETag nor the version.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Object tags as S3 limits them: at most 10, keys 1–128 and values 0–256
+/// characters, from letters, digits, space and `+ - = . _ : / @`, keys
+/// unique. Returns the reason when not.
+pub fn validate_tags(tags: &BTreeMap<String, String>) -> std::result::Result<(), String> {
+    if tags.len() > 10 {
+        return Err("Object tags cannot be greater than 10".to_string());
+    }
+    let ok = |s: &str| s.chars().all(|c| c.is_alphanumeric() || " +-=._:/@".contains(c));
+    for (key, value) in tags {
+        if key.is_empty() || key.chars().count() > 128 || !ok(key) {
+            return Err("The TagKey you have provided is invalid".to_string());
+        }
+        if value.chars().count() > 256 || !ok(value) {
+            return Err("The TagValue you have provided is invalid".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Parses the `x-amz-tagging` header / `Tagging` query form:
+/// `key=value&key2=value2`, URL-encoded. A repeated key is an error.
+pub fn parse_tagging_header(value: &str) -> std::result::Result<BTreeMap<String, String>, String> {
+    let mut tags = BTreeMap::new();
+    for part in value.split('&').filter(|p| !p.is_empty()) {
+        let (key, val) = part.split_once('=').unwrap_or((part, ""));
+        let decode = |s: &str| urlencoding::decode(&s.replace('+', " ")).map(|c| c.into_owned()).map_err(|_| "The TagKey you have provided is invalid".to_string());
+        let (key, val) = (decode(key)?, decode(val)?);
+        if tags.insert(key, val).is_some() {
+            return Err("Cannot provide multiple Tags with the same key".to_string());
+        }
+    }
+    validate_tags(&tags)?;
+    Ok(tags)
+}
+
+/// The `meta.json` format this build writes. Format 1 (`stamp` optional,
+/// no `versioned` / `delete_marker`) is still read; a layout upgrade
+/// rewrites every blob to the current format.
+pub const META_FORMAT: u32 = 2;
+
+/// A bucket's versioning state, as S3 defines it: never enabled, enabled,
+/// or suspended (once enabled a bucket can only be suspended, never
+/// returned to never-enabled).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BucketVersioning {
+    #[default]
+    Off,
+    Enabled,
+    Suspended,
+}
+
+impl BucketVersioning {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BucketVersioning::Off => "off",
+            BucketVersioning::Enabled => "enabled",
+            BucketVersioning::Suspended => "suspended",
+        }
+    }
+
+    /// Whether a write made now gets a real version id (`true`) or is the
+    /// key's `null` version.
+    pub fn writes_versions(self) -> bool {
+        self == BucketVersioning::Enabled
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +151,8 @@ pub struct PutMeta {
     pub storage_class: String,
     #[serde(default)]
     pub user_meta: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,18 +170,112 @@ pub struct UploadMeta {
     pub storage_class: String,
     #[serde(default)]
     pub user_meta: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+}
+
+/// The blob layout this build writes. See [`super::layouts`] for every
+/// layout this build reads and the steps between them.
+pub const CURRENT_LAYOUT: u32 = super::layouts::CURRENT;
+
+/// Where a bucket stands with respect to the on-disk layout, recorded in
+/// its `bucket.json`. A bucket serves only while `stable` on the current
+/// layout: at startup the server marks every bucket on an older layout
+/// `migrating` and migrates it behind the 503 gate; a bucket found
+/// `migrating` (the previous run stopped half way) resumes the same step
+/// before it serves. A layout newer than the build knows refuses to start.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum BucketLayout {
+    /// The bucket is entirely on layout `version`.
+    Stable { version: u32 },
+    /// An upgrade from layout `from` to layout `to` was started and has
+    /// not finished: objects may be on either.
+    Migrating { from: u32, to: u32 },
+}
+
+impl BucketLayout {
+    pub fn current() -> Self {
+        BucketLayout::Stable { version: CURRENT_LAYOUT }
+    }
+
+    /// The layout version the bucket is (ending up) on.
+    pub fn target(self) -> u32 {
+        match self {
+            BucketLayout::Stable { version } => version,
+            BucketLayout::Migrating { to, .. } => to,
+        }
+    }
+
+    pub fn is_stable_current(self) -> bool {
+        self == Self::current()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketMeta {
     pub created_at_ms: i64,
-    /// On-disk storage layout version. Current unreleased format is "v1".
-    #[serde(default)]
+    /// Superseded by `layout`; older files carry `"v1"` or `"v2"`, read by
+    /// nothing. Kept so they still parse.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub storage_version: String,
+    /// The bucket's on-disk layout and whether an upgrade is in progress.
+    /// Absent in files written before layouts were recorded: the startup
+    /// check detects the layout from the tree and records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<BucketLayout>,
     /// User-managed bucket CORS rules. The management console's own origin is
     /// an implicit server rule and is deliberately not persisted here.
     #[serde(default)]
     pub cors: Vec<CorsRule>,
+    /// A read-only bucket accepts only replicated writes (carrying a version
+    /// stamp — replication links, or `s3:ReplicateWrite` clients); every
+    /// other write is refused. For replica buckets.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Object versioning (requires the bucket to be stable on layout 3).
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub versioning: BucketVersioning,
+    /// When (and where) `versioning` was last set: replication adopts the
+    /// newer setting of two sites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning_stamp: Option<super::stamp::Stamp>,
+    /// When `cors` was last set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_stamp: Option<super::stamp::Stamp>,
+    /// Keep this bucket's CORS rules as they are: never adopt a peer's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cors_local: bool,
+}
+
+/// A bucket's replicated settings, as the changelog pages, snapshot pages
+/// and `bucket` events carry them: each with the stamp of its last change,
+/// so two sites agree on the newer one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BucketSettings {
+    #[serde(default)]
+    pub versioning: BucketVersioning,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning_stamp: Option<super::stamp::Stamp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cors: Vec<CorsRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_stamp: Option<super::stamp::Stamp>,
+}
+
+impl BucketSettings {
+    pub fn of(meta: &BucketMeta) -> Self {
+        Self {
+            versioning: meta.versioning,
+            versioning_stamp: meta.versioning_stamp.clone(),
+            cors: meta.cors.clone(),
+            cors_stamp: meta.cors_stamp.clone(),
+        }
+    }
+}
+
+fn is_off(v: &BucketVersioning) -> bool {
+    *v == BucketVersioning::Off
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +370,22 @@ pub fn unquote_etag(etag: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bucket_layout_is_recorded_as_a_tagged_state() {
+        let stable = serde_json::to_value(BucketLayout::current()).unwrap();
+        assert_eq!(stable, serde_json::json!({"state": "stable", "version": CURRENT_LAYOUT}));
+        let migrating = serde_json::to_value(BucketLayout::Migrating { from: 1, to: 2 }).unwrap();
+        assert_eq!(migrating, serde_json::json!({"state": "migrating", "from": 1, "to": 2}));
+        let back: BucketLayout = serde_json::from_value(migrating).unwrap();
+        assert_eq!(back, BucketLayout::Migrating { from: 1, to: 2 });
+        assert_eq!(back.target(), 2);
+        // A bucket.json from before layouts were recorded still parses, with no layout.
+        let old: BucketMeta = serde_json::from_str(r#"{"created_at_ms":1,"storage_version":"v2"}"#).unwrap();
+        assert_eq!(old.layout, None);
+        let written = serde_json::to_string(&BucketMeta { created_at_ms: 1, storage_version: String::new(), layout: Some(BucketLayout::current()), cors: vec![], read_only: false, versioning: BucketVersioning::Off, versioning_stamp: None, cors_stamp: None, cors_local: false }).unwrap();
+        assert!(written.contains(r#""layout":{"state":"stable","version":3}"#) && !written.contains("storage_version") && !written.contains("versioning"), "{written}");
+    }
+
     use super::*;
 
     #[test]
@@ -226,6 +425,11 @@ mod tests {
     #[test]
     fn object_meta_serializes_storage_as_lowercase() {
         let meta = ObjectMeta {
+            stamp: None,
+            versioned: false,
+            delete_marker: false,
+            removed: None,
+            tags: std::collections::BTreeMap::new(),
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

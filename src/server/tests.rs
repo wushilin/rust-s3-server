@@ -162,7 +162,7 @@
             "<Delete><Object><Key>&amp;lt;</Key></Object></Delete>",
         )
         .unwrap();
-        assert_eq!(keys, vec!["&lt;"]);
+        assert_eq!(keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["&lt;"]);
     }
 
     #[test]
@@ -181,7 +181,7 @@
         .unwrap();
         assert!(quiet);
         assert_eq!(
-            keys,
+            keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
             vec!["report ", " a\nbAB", "x</Key>&amp;", "&unknown; & &#xZZ;"]
         );
     }

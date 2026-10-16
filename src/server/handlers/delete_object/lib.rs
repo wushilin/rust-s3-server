@@ -14,11 +14,47 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     if force_delete_enabled(&ctx) {
         return force_delete_prefix(store, ctx).await;
     }
-    match store.delete_object_with_size(&ctx.bucket, &ctx.key).await {
-        Ok(size) => srv::with_measure(
-            srv::empty_response(StatusCode::NO_CONTENT),
-            srv::OperationMeasure::Bytes(size.unwrap_or(0)),
-        ),
+    // A replicated delete carries the origin's stamp (s3:ReplicateWrite) and
+    // the stamp of the version it removed (what it ranks by).
+    let options = match srv::write_options(&store, &ctx, &resource).await {
+        Ok(options) => options,
+        Err(response) => return response,
+    };
+    let removed = match srv::removed_stamp(&ctx.headers, &options.origin) {
+        Ok(removed) => removed,
+        Err(message) => return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &resource),
+    };
+    // `?versionId=`: a permanent delete of one version (S3 semantics: the
+    // version goes, the next newest becomes current; a `null` id names the
+    // key's null version).
+    if let Some(version_id) = ctx.query.get("versionId").filter(|v| !v.is_empty()) {
+        let author = srv::replicated_author(&ctx.query, &options.origin);
+        return match store.delete_object_version_by(&ctx.bucket, &ctx.key, version_id, options.origin, author.as_deref()).await {
+            Ok(size) => {
+                let mut response = srv::empty_response(StatusCode::NO_CONTENT);
+                if let Ok(value) = axum::http::HeaderValue::from_str(version_id) {
+                    response.headers_mut().insert("x-amz-version-id", value);
+                }
+                srv::with_measure(response, srv::OperationMeasure::Bytes(size.unwrap_or(0)))
+            }
+            Err(err) => srv::storage_error_response(err, &resource),
+        };
+    }
+    match store.delete_object_with(&ctx.bucket, &ctx.key, options, removed).await {
+        Ok(result) => {
+            let mut response = srv::empty_response(StatusCode::NO_CONTENT);
+            if let Some(version_id) = &result.version_id {
+                if let Ok(value) = axum::http::HeaderValue::from_str(version_id) {
+                    response.headers_mut().insert("x-amz-version-id", value);
+                }
+                if result.delete_marker {
+                    response
+                        .headers_mut()
+                        .insert("x-amz-delete-marker", axum::http::HeaderValue::from_static("true"));
+                }
+            }
+            srv::with_measure(response, srv::OperationMeasure::Bytes(result.size.unwrap_or(0)))
+        }
         Err(err) => srv::storage_error_response(err, &resource),
     }
 }

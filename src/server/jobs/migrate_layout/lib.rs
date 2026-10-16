@@ -1,104 +1,98 @@
-//! Background job: migrate objects from the legacy 4-level fanout layout
-//! (`objects/aa/bb/cc/dd/…`) to the current single-level layout
-//! (`objects/<4hex>/…`).
+//! Job: migrate a bucket to the current on-disk layout, at startup, behind
+//! the 503 gate.
 //!
-//! New writes already use the single-level layout, so this only relocates
-//! pre-existing objects and then finds nothing to do. Per object it does
-//! **hardlink → atomic index flip → unlink** (see
-//! [`LocalObjectStore::migrate_object_layout`]) — metadata-only, fast, and
-//! idempotent. A read concurrent with an object's migration may transiently
-//! fail (the old path can vanish mid-read) but never returns wrong content.
+//! A bucket serves only while its `bucket.json` says it is stable on the
+//! layout this build writes. The startup check
+//! ([`LocalObjectStore::plan_layout_migrations`]) marks every bucket on an
+//! older layout `migrating` and raises its gate; this job runs the step
+//! ([`LocalObjectStore::migrate_bucket_layout`]) and lowers the gate once the
+//! bucket is stable. A run that stops half way leaves the bucket `migrating`
+//! and the next start resumes it; a step that fails (an object that cannot
+//! be moved) is retried every `retry` while the bucket keeps answering 503,
+//! so a bucket is never served on a mixed layout.
 //!
-//! Detection is a cheap `read_dir` of each bucket's `objects/` root (a legacy
-//! fanout dir has a 2-char name; the current layout uses 4-char names), so a
-//! fully-migrated bucket is skipped without ever scanning the index.
+//! The only step today is layout 1 → 2 (the 4-level fanout to the
+//! single-level one): per object **hardlink → atomic index flip → unlink**
+//! (see [`LocalObjectStore::migrate_object_layout`]), metadata-only and
+//! idempotent.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use std::sync::Arc;
-
 use crate::server::registry::{TaskKind, TaskRegistry};
+use crate::storage::errors::StorageError;
+use crate::storage::metadata::BucketLayout;
 use crate::storage::store::LocalObjectStore;
 
 pub(crate) const JOB: &str = "migrate_layout";
 
-/// Keys relocated per index query.
-const BATCH: usize = 500;
-
-/// Migrates every legacy-layout object across all buckets, then returns the
-/// count migrated. Registers a cancellable task (indeterminate progress — total
-/// is unknown; the panel shows "migrated N objects" + uptime) only when there is
-/// actually work, so it's invisible once migration is complete.
-pub(crate) async fn run_once(
-    store: &LocalObjectStore,
-    cancel: &CancellationToken,
-    tasks: &Arc<TaskRegistry>,
-    run_id: &str,
-) -> u64 {
-    let buckets = match store.list_buckets().await {
-        Ok(buckets) => buckets,
-        Err(err) => {
-            log::warn!("[{run_id}] {JOB} failed to list buckets error={err}");
-            return 0;
+/// Migrates `bucket` (whose gate the startup check raised) to the current
+/// layout, retrying a failed step every `retry`, then lowers the gate.
+pub(crate) fn spawn(
+    store: LocalObjectStore,
+    bucket: String,
+    layout: BucketLayout,
+    tasks: Arc<TaskRegistry>,
+    cancel: CancellationToken,
+    retry: Duration,
+) {
+    let run_id = crate::server::new_request_id();
+    tokio::spawn(async move {
+        let guard = tasks.register(&run_id, TaskKind::Job, JOB, format!("/{bucket}"));
+        log::warn!("[{run_id}] {JOB} started bucket={bucket} layout={layout:?}: the bucket answers 503 until it is done");
+        // The gate stays up until the bucket is stable, whatever happens to
+        // this task — except at shutdown, when the process ends anyway.
+        struct GateGuard {
+            store: LocalObjectStore,
+            bucket: String,
         }
-    };
-
-    // Cheap gate: which buckets still carry legacy structure? No index scan.
-    let mut legacy_buckets = Vec::new();
-    for (bucket, _) in &buckets {
-        if store.has_legacy_layout_dirs(bucket).await.unwrap_or(false) {
-            legacy_buckets.push(bucket.clone());
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.store.end_rebuild(&self.bucket);
+            }
         }
-    }
-    if legacy_buckets.is_empty() {
-        return 0; // nothing to migrate — no task, no work
-    }
-
-    let guard = tasks.register(run_id, TaskKind::Job, JOB, "all-buckets");
-    let mut migrated = 0u64;
-    'buckets: for bucket in &legacy_buckets {
-        // Key cursor: each batch resumes after the previous one, so a key whose
-        // migration fails every time is skipped for the rest of this run (and
-        // retried next run) instead of being refetched forever.
-        let mut after: Option<String> = None;
+        let gate = GateGuard { store: store.clone(), bucket: bucket.clone() };
         loop {
-            if cancel.is_cancelled() || guard.is_cancelled() {
-                break 'buckets;
-            }
-            let keys = match store.legacy_layout_keys(bucket, after.as_deref(), BATCH).await {
-                Ok(keys) => keys,
+            match store.migrate_bucket_layout(&bucket, &cancel).await {
+                Ok(moved) => {
+                    log::info!("[{run_id}] {JOB} complete bucket={bucket} moved={moved}");
+                    break;
+                }
+                Err(err) if cancel.is_cancelled() || guard.is_cancelled() => {
+                    log::info!("[{run_id}] {JOB} stopped bucket={bucket}: {err}; resumes at the next start");
+                    // Keep the gate up: nothing may serve a half-migrated bucket.
+                    std::mem::forget(gate);
+                    return;
+                }
+                Err(err @ StorageError::UnsupportedLayout { .. }) => {
+                    log::error!("[{run_id}] {JOB} cannot run bucket={bucket}: {err}; the bucket stays unavailable");
+                    guard.progress().set_note(err.to_string());
+                    std::mem::forget(gate);
+                    return;
+                }
                 Err(err) => {
-                    log::warn!("[{run_id}] {JOB} bucket={bucket} error={err}");
-                    break; // next bucket
-                }
-            };
-            if keys.is_empty() {
-                break; // bucket fully migrated (or only failures remain behind the cursor)
-            }
-            after = keys.last().cloned();
-            for key in keys {
-                if cancel.is_cancelled() || guard.is_cancelled() {
-                    break 'buckets;
-                }
-                match store.migrate_object_layout(bucket, &key).await {
-                    Ok(true) => migrated += 1,
-                    Ok(false) => {}
-                    Err(err) => log::warn!("[{run_id}] {JOB} bucket={bucket} key={key} error={err}"),
+                    log::error!("[{run_id}] {JOB} failed bucket={bucket}: {err}; retrying in {}s", retry.as_secs());
+                    guard.progress().set_note(format!("{err}; retrying"));
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            std::mem::forget(gate);
+                            return;
+                        }
+                        _ = tokio::time::sleep(retry) => {}
+                    }
                 }
             }
-            guard.progress().set_note(format!("migrated {migrated} objects"));
         }
-    }
-
-    if migrated > 0 {
-        log::info!("[{run_id}] {JOB} complete migrated={migrated}");
-    }
-    migrated
+        drop(gate);
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::metadata::CURRENT_LAYOUT;
 
     /// Writes an object, then moves it to a legacy 4-level path and repoints
     /// the index — a pre-migration object.
@@ -112,6 +106,9 @@ mod tests {
         let legacy_dir = bucket_dir.join(&legacy_rel);
         tokio::fs::create_dir_all(legacy_dir.parent().unwrap()).await.unwrap();
         tokio::fs::rename(bucket_dir.join(&row.blob_dir), &legacy_dir).await.unwrap();
+        // The now-empty key dir of the current layout goes too: a legacy
+        // tree never had one.
+        let _ = tokio::fs::remove_dir(bucket_dir.join(&row.blob_dir).parent().unwrap()).await;
         index.update_blob_dir(key, &row.blob_dir, &legacy_rel).await.unwrap();
         legacy_dir
     }
@@ -131,8 +128,72 @@ mod tests {
         leaves
     }
 
+    /// Strips the layout marker, as a bucket.json from before layouts were
+    /// recorded has none.
+    async fn forget_layout(store: &LocalObjectStore) {
+        let path = store.layout().bucket_meta_path("bucket").unwrap();
+        let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        meta.as_object_mut().unwrap().remove("layout");
+        std::fs::write(&path, meta.to_string()).unwrap();
+        store.forget_bucket_meta("bucket");
+    }
+
+    async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !check() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
-    async fn a_key_that_always_fails_neither_spins_nor_leaks_dirs() {
+    async fn a_legacy_bucket_is_gated_migrated_and_then_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bucket").await.unwrap();
+        store.create_bucket("fresh").await.unwrap();
+        assert_eq!(store.bucket_layout("fresh").await.unwrap(), BucketLayout::current());
+        make_legacy_object(&store, "a").await;
+        make_legacy_object(&store, "b").await;
+        forget_layout(&store).await;
+        assert_eq!(store.bucket_layout("bucket").await.unwrap(), BucketLayout::Stable { version: 1 }, "detected from the tree");
+
+        // Startup: the layout is recorded; a bucket on an older layout keeps
+        // serving until an operator upgrades it.
+        assert!(store.check_layouts().await.unwrap().is_empty(), "nothing to resume");
+        assert_eq!(store.bucket_layout("bucket").await.unwrap(), BucketLayout::Stable { version: 1 });
+        assert!(store.index("bucket").await.is_ok(), "an old layout still serves");
+        assert_eq!(store.read_object("bucket", "a").await.unwrap().meta.size, 4);
+        assert!(LocalObjectStore::layout_upgrade_available(store.bucket_layout("bucket").await.unwrap()));
+        assert!(!LocalObjectStore::layout_upgrade_available(store.bucket_layout("fresh").await.unwrap()));
+
+        // The operator starts the upgrade: the bucket is marked migrating
+        // and gated; the fresh one is left alone.
+        let migrating = BucketLayout::Migrating { from: 1, to: CURRENT_LAYOUT };
+        assert_eq!(store.start_layout_upgrade("bucket").await.unwrap(), migrating);
+        assert_eq!(store.bucket_layout("bucket").await.unwrap(), migrating);
+        assert!(matches!(store.index("bucket").await, Err(StorageError::BucketRebuilding(_))), "nothing serves it");
+        assert!(store.index("fresh").await.is_ok());
+        assert!(matches!(store.start_layout_upgrade("bucket").await, Err(StorageError::BucketInUse(_))), "already in progress");
+        assert!(matches!(store.start_layout_upgrade("fresh").await, Err(StorageError::BucketInUse(_))), "already current");
+
+        let tasks = TaskRegistry::new();
+        spawn(store.clone(), "bucket".into(), migrating, tasks, CancellationToken::new(), Duration::from_millis(100));
+        wait_until("the bucket is stable", || {
+            futures::executor::block_on(async { store.index("bucket").await.is_ok() })
+        })
+        .await;
+        assert_eq!(store.bucket_layout("bucket").await.unwrap(), BucketLayout::current());
+        let objects = store.layout().bucket_dir("bucket").unwrap().join("objects");
+        assert_eq!(single_level_leaves(&objects).len(), 2);
+        assert_eq!(store.detect_layout("bucket").await.unwrap(), CURRENT_LAYOUT);
+        assert_eq!(store.read_object("bucket", "a").await.unwrap().meta.size, 4);
+        // A later start finds nothing to resume.
+        assert!(store.check_layouts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_migration_resumes_and_a_stuck_one_keeps_the_gate_up() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalObjectStore::new(tmp.path());
         store.create_bucket("bucket").await.unwrap();
@@ -140,22 +201,48 @@ mod tests {
         let broken = make_legacy_object(&store, "a-broken").await;
         std::fs::remove_dir_all(&broken).unwrap();
         make_legacy_object(&store, "b-good").await;
-        let objects = store.layout().bucket_dir("bucket").unwrap().join("objects");
+        make_legacy_object(&store, "c-done").await;
+        // The previous run moved one object and stopped.
+        assert!(store.relocate_object("bucket", "c-done").await.unwrap());
+        let migrating = BucketLayout::Migrating { from: 1, to: CURRENT_LAYOUT };
+        store.set_bucket_layout("bucket", migrating).await.unwrap();
 
-        assert!(store.migrate_object_layout("bucket", "a-broken").await.is_err());
-        assert!(single_level_leaves(&objects).is_empty(), "failed attempt removed its new dir");
-
-        let tasks = TaskRegistry::new();
+        let resume = store.check_layouts().await.unwrap();
+        assert_eq!(resume, vec![("bucket".to_string(), migrating)], "resumes the recorded step, gated");
+        assert!(matches!(store.index("bucket").await, Err(StorageError::BucketRebuilding(_))));
         let cancel = CancellationToken::new();
-        let migrated = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            run_once(&store, &cancel, &tasks, "test"),
-        )
-        .await
-        .expect("the run must end despite a permanently failing key");
-        assert_eq!(migrated, 1, "the good key behind the failing one migrates");
-        let leaves = single_level_leaves(&objects);
-        assert_eq!(leaves.len(), 1, "only the migrated object's dir: {leaves:?}");
-        assert!(std::fs::read_dir(&leaves[0]).unwrap().next().is_some());
+        let tasks = TaskRegistry::new();
+        spawn(store.clone(), "bucket".into(), migrating, tasks.clone(), cancel.clone(), Duration::from_millis(200));
+        // The good key moves; the broken one keeps the bucket migrating and gated.
+        wait_until("b-good moved", || {
+            futures::executor::block_on(async {
+                !store.index_unchecked("bucket").await.unwrap().get("b-good").await.unwrap().unwrap().blob_dir.starts_with("objects/aa/")
+            })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(store.bucket_layout("bucket").await.unwrap(), migrating, "not stable while a key cannot move");
+        assert!(matches!(store.index("bucket").await, Err(StorageError::BucketRebuilding(_))), "still gated");
+        let objects = store.layout().bucket_dir("bucket").unwrap().join("objects");
+        assert_eq!(single_level_leaves(&objects).len(), 2, "no dir leaked per failed attempt");
+        // The operator removes the dead row (an index rebuild does the same);
+        // the next retry completes.
+        store.index_unchecked("bucket").await.unwrap().commit_delete("a-broken", "objects/aa/bb/cc/dd/x", 0).await.unwrap();
+        wait_until("the bucket is stable", || futures::executor::block_on(async { store.index("bucket").await.is_ok() })).await;
+        assert_eq!(store.bucket_layout("bucket").await.unwrap(), BucketLayout::current());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_layout_from_a_newer_build_refuses_to_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        store.create_bucket("bucket").await.unwrap();
+        store.set_bucket_layout("bucket", BucketLayout::Stable { version: CURRENT_LAYOUT + 1 }).await.unwrap();
+        let err = store.check_layouts().await.unwrap_err();
+        assert!(matches!(err, StorageError::UnsupportedLayout { .. }), "{err}");
+        assert!(err.to_string().contains("newer build"), "{err}");
+        store.set_bucket_layout("bucket", BucketLayout::Migrating { from: CURRENT_LAYOUT, to: CURRENT_LAYOUT + 1 }).await.unwrap();
+        assert!(matches!(store.check_layouts().await, Err(StorageError::UnsupportedLayout { .. })));
     }
 }

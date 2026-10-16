@@ -29,6 +29,8 @@ const actionLabels={
   delete_row:'Delete index row',
   quarantine:'Quarantine (trash bytes + delete row)',
   resync_row:'Resync row from meta.json',
+  restore_from_peer:'Restore from replication peer',
+  restore_older_from_peer:'Restore older version from peer',
   reclaim_empty_dirs:'Reclaim empty directories',
 };
 // A repaired finding stays in its report rather than vanishing — the report is

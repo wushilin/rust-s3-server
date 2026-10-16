@@ -380,6 +380,7 @@ impl IamStore {
             let cfs = [CF_USERS, CF_GROUPS, CF_ACCESS_KEYS, CF_WEB_KEYS, CF_USER_GROUPS]
                 .into_iter()
                 .chain(super::notify::ADMIN_DB_FAMILIES)
+                .chain(super::replication::ADMIN_DB_FAMILIES)
                 .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
             let db = Db::open_cf_descriptors(&opts, &db_path, cfs)?;
             // Seed the built-in admin group if absent. Scoped so the CF handle

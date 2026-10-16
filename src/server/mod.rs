@@ -11,6 +11,7 @@ pub mod iam;
 pub(crate) mod jobs;
 pub mod identity;
 pub mod notify;
+pub mod replication;
 pub mod key_usage;
 pub mod logging;
 pub(crate) mod pipeline;
@@ -814,6 +815,9 @@ fn operation_and_target(
     }
     if key.is_none() || key == Some("") {
         if *method == Method::PUT {
+            if query.contains_key("versioning") {
+                return ("PUT_BUCKET_VERSIONING", format!("/{bucket}"));
+            }
             return ("CREATE_BUCKET", format!("/{bucket}"));
         }
         if *method == Method::DELETE {
@@ -840,6 +844,20 @@ fn operation_and_target(
             }
             if query.contains_key("location") {
                 return ("GET_BUCKET_LOCATION", format!("/{bucket}"));
+            }
+            if query.contains_key("versioning") {
+                return ("GET_BUCKET_VERSIONING", format!("/{bucket}"));
+            }
+            // A reader of the bucket's changelog — often a replication link
+            // long-polling, so it is in flight most of the time.
+            if query.contains_key(notify::read::QUERY_SNAPSHOT) {
+                return ("CHANGELOG", format!("/{bucket}/ changelog snapshot"));
+            }
+            if query.contains_key(notify::read::QUERY_CHANGELOG) {
+                return ("CHANGELOG", format!("/{bucket}/ changelog"));
+            }
+            if query.contains_key(replication::peer::QUERY_ACCESS) {
+                return ("ACCESS_CHECK", format!("/{bucket}"));
             }
             return ("LIST", target);
         }
@@ -1035,6 +1053,8 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     let _process_lock = acquire_process_lock(FsPath::new(&config.root))?;
 
     let store = LocalObjectStore::from_storage_config(&config.root, &config.app_config.storage);
+    // Site identity and version-stamp clock, before anything can write.
+    store.init_site(config.app_config.server.site_name.as_deref())?;
     let shutdown = store.shutdown_token();
     let metrics = Arc::new(TrafficMetrics::default());
     // One registry of in-flight work, shared by the HTTP handlers and the
@@ -1054,6 +1074,21 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             }
         }
         Err(err) => log::warn!("startup rebuild scan failed error={err}"),
+    }
+
+    // Storage layouts: refuse to start on a layout a newer build wrote; a
+    // bucket whose upgrade was started and interrupted resumes it now,
+    // behind its 503 gate (it serves nothing until it is stable). Buckets on
+    // an older layout keep serving until an operator upgrades them.
+    for (bucket, layout) in store.check_layouts().await? {
+        jobs::migrate_layout::spawn(
+            store.clone(),
+            bucket,
+            layout,
+            tasks.clone(),
+            shutdown.child_token(),
+            std::time::Duration::from_secs(config.app_config.sweeper.interval_secs.max(1)),
+        );
     }
 
     // Startup intent drain: resolve every crash-leftover intent before
@@ -1178,6 +1213,28 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?;
+    // Replication links: workers pulling peers' buckets into local ones.
+    let replication = replication::ReplicationService::start(
+        store.clone(),
+        replication::db::LinkDb::new(iam.admin_db()),
+        {
+            // A link acts here as its local access key.
+            let auth = AuthState { config: config.app_config.clone(), iam: Some(iam.clone()), usage: None };
+            replication::LocalAuth(Arc::new(move |access_key| auth.identity_of_key(access_key)))
+        },
+        replication::Timing {
+            check_interval: std::time::Duration::from_secs(config.app_config.replication.check_interval_secs.max(1)),
+            stale_after: std::time::Duration::from_secs(config.app_config.replication.worker_stale_secs.max(30)),
+            max_checkpoint_age: std::time::Duration::from_secs(config.app_config.changelog.tombstone_days.max(1) * 86_400),
+            long_poll: std::time::Duration::from_secs(20),
+            parallelism: config.app_config.replication.parallelism.clamp(1, 256),
+            lease_renew: std::time::Duration::from_secs(5),
+            fatal_pause: std::time::Duration::from_secs(30),
+        },
+        shutdown.clone(),
+    )
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
     let key_usage = key_usage::KeyUsageStore::open(FsPath::new(&config.root)).await?;
     key_usage.spawn_flusher(shutdown.clone());
     let auth_state = AuthState {
@@ -1221,6 +1278,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
             scans,
             stats,
             notify: Some(notify.clone()),
+            replication: Some(replication.clone()),
         };
         let ui_bind = format!(
             "{}:{}",
@@ -1369,38 +1427,6 @@ fn spawn_maintenance_jobs(
     spawn_job!("delete_staging", jobs::delete_staging::run_once);
     spawn_job!("delete_trash", jobs::delete_trash::run_once);
 
-    // Layout migration: relocate legacy 4-level objects to the single-level
-    // layout. Its own loop (starts immediately); each run drains all remaining
-    // legacy objects, then idles. Once nothing is left it finds no work.
-    {
-        let store = store.clone();
-        let cancel = shutdown.child_token();
-        let tasks = tasks.clone();
-        let idle_secs = cfg.interval_secs.max(1);
-        tokio::spawn(async move {
-            log::info!(
-                "job scheduler started job=migrate_layout interval_secs={idle_secs} (starts immediately)"
-            );
-            loop {
-                if cancel.is_cancelled() {
-                    log::info!("job scheduler stopping job=migrate_layout");
-                    break;
-                }
-                let run_id = new_request_id();
-                let fut = jobs::migrate_layout::run_once(&store, &cancel, &tasks, &run_id);
-                if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await.is_err() {
-                    log::error!("job migrate_layout panicked run_id={run_id}; scheduler continues");
-                }
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        log::info!("job scheduler stopping job=migrate_layout");
-                        break;
-                    }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(idle_secs)) => {}
-                }
-            }
-        });
-    }
 
     // Empty-directory reclaimer: its own self-paced loop rather than the fixed
     // scheduler above. It starts immediately, runs a full drain (which itself
@@ -1524,8 +1550,28 @@ async fn bucket_route(
     );
     match method {
         Method::HEAD => handlers::head_bucket::handle(store, ctx, body).await,
+        // rusts3 extension: the bucket's changelog (stateless reads; the
+        // caller keeps its own position). Authorized as s3:GetBucketChangelog.
+        // Read-only: any other verb is refused rather than falling through to
+        // CreateBucket / DeleteBucket.
+        _ if ctx.query.contains_key(notify::read::QUERY_CHANGELOG)
+            || ctx.query.contains_key(notify::read::QUERY_SNAPSHOT) =>
+        {
+            if method != Method::GET {
+                return s3_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "The changelog is read-only",
+                    &ctx.bucket,
+                );
+            }
+            changelog_s3(store, ctx).await
+        }
+        Method::GET if ctx.query.contains_key(replication::peer::QUERY_ACCESS) => access_s3(store, ctx).await,
         Method::GET if ctx.query.contains_key("cors") => get_bucket_cors_s3(store, ctx).await,
         Method::PUT if ctx.query.contains_key("cors") => put_bucket_cors_s3(store, ctx, body).await,
+        Method::GET if ctx.query.contains_key("versioning") => get_bucket_versioning_s3(store, ctx).await,
+        Method::PUT if ctx.query.contains_key("versioning") => put_bucket_versioning_s3(store, ctx, body).await,
         Method::DELETE if ctx.query.contains_key("cors") => delete_bucket_cors_s3(store, ctx).await,
         // A sub-resource we do not implement must never fall through to
         // CreateBucket/DeleteBucket: `PUT /{bucket}?versioning` would be
@@ -1653,10 +1699,85 @@ async fn put_bucket_cors_s3(
     if rules.is_empty() || rules.len() > 100 {
         return s3_error(StatusCode::BAD_REQUEST, "MalformedXML", "CORSConfiguration must contain 1 to 100 rules", &ctx.resource());
     }
-    match store.set_bucket_cors(&ctx.bucket, rules).await {
-        Ok(()) => empty_response(StatusCode::OK),
+    let (stamp, origin) = match settings_stamp(&ctx.query) {
+        Ok(stamp) => (stamp.clone(), stamp.map(crate::storage::store::WriteOrigin::Replicated).unwrap_or_default()),
+        Err(message) => return s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &ctx.resource()),
+    };
+    match store.apply_bucket_cors(&ctx.bucket, rules, stamp, &origin).await {
+        Ok(_) => empty_response(StatusCode::OK),
         Err(err) => storage_error_response(err, &ctx.resource()),
     }
+}
+
+async fn changelog_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    use axum::response::IntoResponse;
+    // A replication link names itself: the console lists who replicates
+    // this bucket, and a merge link here pairing the bucket with the
+    // reader's site is reported back (one merge link per pair suffices).
+    let merge_back = ctx
+        .headers
+        .get(replication::peer::HEADER_REPLICATOR)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|replicator| store.replica_read(&ctx.bucket, replicator, true));
+    let mut response = if ctx.query.contains_key(notify::read::QUERY_SNAPSHOT) {
+        let result = match notify::read::snapshot_params(&ctx.query) {
+            Ok(params) => notify::read::snapshot(&store, &ctx.bucket, &params).await,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(page) => axum::Json(page).into_response(),
+            Err(err) => err.into_response(),
+        }
+    } else {
+        let result = match notify::read::read_params(&ctx.query) {
+            Ok(params) => notify::read::read(&store, &ctx.bucket, &params).await,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(page) => axum::Json(page).into_response(),
+            Err(err) => err.into_response(),
+        }
+    };
+    if let Some(value) = merge_back.and_then(|m| HeaderValue::from_str(&m).ok()) {
+        response.headers_mut().insert(replication::peer::HEADER_MERGE_BACK, value);
+    }
+    response
+}
+
+/// rusts3 extension: what the caller may do on this bucket — the check a
+/// replication link runs against its peer before it is created.
+async fn access_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    use axum::response::IntoResponse;
+    use replication::peer::{AccessReport, READ_ACTIONS, WRITE_ACTIONS};
+    let meta = match store.bucket_meta(&ctx.bucket).await {
+        Ok(meta) => meta,
+        Err(err) => return storage_error_response(err, &ctx.resource()),
+    };
+    let allowed = |action: &'static str| match &ctx.identity {
+        // Auth disabled: everything is allowed.
+        None => true,
+        Some(identity) => replication::allowed_on_bucket(identity, action, &ctx.bucket),
+    };
+    let actions = READ_ACTIONS
+        .iter()
+        .chain(WRITE_ACTIONS.iter())
+        .map(|action| (action.to_string(), allowed(action)))
+        .collect();
+    let merge_back = ctx
+        .headers
+        .get(replication::peer::HEADER_REPLICATOR)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|replicator| store.replica_read(&ctx.bucket, replicator, false));
+    axum::Json(AccessReport {
+        site_id: store.site_id(),
+        site_name: store.site_name(),
+        bucket: ctx.bucket.clone(),
+        read_only: meta.read_only,
+        actions,
+        merge_back,
+        versioning: meta.versioning.as_str().to_string(),
+    })
+    .into_response()
 }
 
 async fn delete_bucket_cors_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
@@ -1714,6 +1835,11 @@ async fn object_route(
             "partNumber requires an uploadId",
             &ctx.resource(),
         ),
+        // Object tagging, on the current version or the one `versionId`
+        // names.
+        Method::GET | Method::PUT | Method::DELETE if ctx.query.contains_key("tagging") => {
+            handlers::object_tagging::handle(store, ctx, body).await
+        }
         Method::PUT if is_copy => handlers::copy_object::handle(store, ctx, body).await,
         Method::PUT => handlers::put_object::handle(store, ctx, body).await,
         Method::GET if has_upload_id => handlers::list_parts::handle(store, ctx, body).await,
@@ -1809,7 +1935,7 @@ const MAX_DELETE_OBJECTS_KEYS: usize = 1000;
 /// byte-for-byte (`"report "` must not become `"report"`), entities --
 /// named, decimal and hex -- are decoded exactly once, and CDATA is honoured.
 /// The error is the message of a `MalformedXML` reply.
-fn parse_delete_objects_xml(xml: &str) -> Result<(Vec<String>, bool), &'static str> {
+fn parse_delete_objects_xml(xml: &str) -> Result<(Vec<(String, Option<String>)>, bool), &'static str> {
     let root = parse_xml_tree(xml)?;
     if root.name != "Delete" {
         return Err("The XML you provided was not well-formed or did not validate against our published schema");
@@ -1827,7 +1953,13 @@ fn parse_delete_objects_xml(xml: &str) -> Result<(Vec<String>, bool), &'static s
             .iter()
             .find(|child| child.name == "Key")
             .ok_or("The XML you provided was not well-formed or did not validate against our published schema")?;
-        keys.push(key.text.clone());
+        let version_id = object
+            .children
+            .iter()
+            .find(|child| child.name == "VersionId")
+            .map(|v| v.text.trim().to_string())
+            .filter(|v| !v.is_empty());
+        keys.push((key.text.clone(), version_id));
         if keys.len() > MAX_DELETE_OBJECTS_KEYS {
             return Err("The XML you provided was not well-formed or did not validate against our published schema");
         }
@@ -1948,7 +2080,7 @@ fn parse_xml_tree(xml: &str) -> Result<XmlNode, &'static str> {
 /// Decodes XML character data exactly once: the five predefined entities plus
 /// decimal (`&#10;`) and hex (`&#x1F600;`) character references. Anything that
 /// is not a recognisable reference is kept literally.
-fn unescape_xml(value: &str) -> String {
+pub(crate) fn unescape_xml(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(amp) = rest.find('&') {
@@ -1993,10 +2125,19 @@ fn unescape_xml(value: &str) -> String {
     out
 }
 
+/// The `?versionId=` of an `x-amz-copy-source`, when it names one.
+pub(crate) fn parse_copy_source_version(raw: &str) -> Option<String> {
+    let query = raw.split_once('?')?.1;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("versionId="))
+        .map(|v| percent_decode(v))
+        .filter(|v| !v.is_empty())
+}
+
 pub(crate) fn parse_copy_source(raw: &str) -> Option<(String, String)> {
-    // An `x-amz-copy-source` may carry a `?versionId=…` suffix; strip it so it
-    // never becomes part of the source key. This server addresses only the
-    // current version, so the version id is simply ignored.
+    // An `x-amz-copy-source` may carry a `?versionId=…` suffix (see
+    // `parse_copy_source_version`); it is not part of the key.
     let raw = raw.split('?').next().unwrap_or(raw);
     let path = percent_decode(raw.trim_start_matches('/'));
     let slash = path.find('/')?;
@@ -2221,7 +2362,6 @@ fn expected_payload_sha256(headers: &HeaderMap, aws_chunked: bool) -> Option<Str
 
 fn known_unimplemented_bucket_query(query: &HashMap<String, String>) -> bool {
     [
-        "versioning",
         "cors",
         "website",
         "lifecycle",
@@ -2258,11 +2398,103 @@ fn unimplemented_bucket_subresource(query: &HashMap<String, String>) -> bool {
         "replication",
         "requestPayment",
         "tagging",
-        "versioning",
         "website",
     ]
     .iter()
     .any(|k| query.contains_key(*k))
+}
+
+/// The `x-amz-tagging` request header of a write: the new object's tags.
+/// `Ok(None)` when absent; a malformed value is the S3 message.
+pub(crate) fn extract_tags(headers: &HeaderMap) -> Result<Option<BTreeMap<String, String>>, String> {
+    match headers.get("x-amz-tagging") {
+        None => Ok(None),
+        Some(value) => {
+            let value = value.to_str().map_err(|_| "The TagKey you have provided is invalid".to_string())?;
+            crate::storage::metadata::parse_tagging_header(value).map(Some)
+        }
+    }
+}
+
+/// Adds `x-amz-version-id` to a write's response when the store reported
+/// one (the bucket has versioning enabled or suspended).
+pub(crate) fn with_version_id(mut response: Response, version_id: Option<&str>) -> Response {
+    if let Some(value) = version_id.and_then(|v| axum::http::HeaderValue::from_str(v).ok()) {
+        response.headers_mut().insert("x-amz-version-id", value);
+    }
+    response
+}
+
+/// `GET /{bucket}?versioning`: the bucket's versioning state. S3 omits
+/// `Status` for a bucket that was never enabled.
+async fn get_bucket_versioning_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Response {
+    match store.bucket_versioning(&ctx.bucket).await {
+        Ok(state) => {
+            let status = match state {
+                crate::storage::metadata::BucketVersioning::Off => String::new(),
+                crate::storage::metadata::BucketVersioning::Enabled => "<Status>Enabled</Status>".to_string(),
+                crate::storage::metadata::BucketVersioning::Suspended => "<Status>Suspended</Status>".to_string(),
+            };
+            xml_response(
+                StatusCode::OK,
+                format!(r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{status}</VersioningConfiguration>"#),
+            )
+        }
+        Err(err) => storage_error_response(err, &ctx.resource()),
+    }
+}
+
+/// `PUT /{bucket}?versioning`: enable or suspend versioning. Enabling needs
+/// the bucket on the current storage layout (409 otherwise).
+async fn put_bucket_versioning_s3(store: LocalObjectStore, ctx: handlers::BucketCtx, body: Body) -> Response {
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return s3_error(StatusCode::BAD_REQUEST, "MalformedXML", "Invalid versioning document", &ctx.resource()),
+    };
+    let xml_body = String::from_utf8_lossy(&bytes);
+    let status = Regex::new(r#"(?s)<Status>\s*(.*?)\s*</Status>"#)
+        .unwrap()
+        .captures(&xml_body)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+    let state = match status.as_deref() {
+        Some("Enabled") => crate::storage::metadata::BucketVersioning::Enabled,
+        Some("Suspended") => crate::storage::metadata::BucketVersioning::Suspended,
+        _ => {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                "The versioning document must set Status to Enabled or Suspended",
+                &ctx.resource(),
+            )
+        }
+    };
+    let (stamp, origin) = match settings_stamp(&ctx.query) {
+        Ok(stamp) => (stamp.clone(), stamp.map(crate::storage::store::WriteOrigin::Replicated).unwrap_or_default()),
+        Err(message) => return s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &ctx.resource()),
+    };
+    match store.apply_bucket_versioning(&ctx.bucket, state, stamp, &origin).await {
+        Ok(_) => empty_response(StatusCode::OK),
+        Err(StorageError::BucketInUse(message)) => s3_error(StatusCode::CONFLICT, "InvalidBucketState", message, &ctx.resource()),
+        Err(err) => storage_error_response(err, &ctx.resource()),
+    }
+}
+
+/// `x-rs3-author=` in a replicated write's query: the site where a client
+/// made the change (only with a replicated origin; ignored otherwise).
+pub(crate) fn replicated_author(query: &HashMap<String, String>, origin: &crate::storage::write::WriteOrigin) -> Option<String> {
+    origin.given_stamp()?;
+    query
+        .get("x-rs3-author")
+        .filter(|site| crate::storage::stamp::validate_site_id(site).is_ok())
+        .cloned()
+}
+
+/// `x-rs3-stamp=` in a settings write's query: a peer's change, replicated.
+fn settings_stamp(query: &HashMap<String, String>) -> Result<Option<crate::storage::stamp::Stamp>, String> {
+    match query.get("x-rs3-stamp") {
+        None => Ok(None),
+        Some(value) => crate::storage::stamp::Stamp::parse_header(value).map(Some),
+    }
 }
 
 fn storage_error_response(err: StorageError, resource: &str) -> Response {
@@ -2341,12 +2573,49 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
             let mut response = s3_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SlowDown",
-                "Bucket index rebuild in progress; retry shortly",
+                "Bucket index rebuild or storage layout upgrade in progress; retry shortly",
                 resource,
             );
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            response
+        }
+        StorageError::BucketReadOnly(_) => s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            err.to_string(),
+            resource,
+        ),
+        StorageError::NoSuchVersion { .. } => s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchVersion",
+            "The specified version does not exist.".to_string(),
+            resource,
+        ),
+        StorageError::VersionIsDeleteMarker { ref version_id, .. } => {
+            let mut response = s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.".to_string(),
+                resource,
+            );
+            response.headers_mut().insert("x-amz-delete-marker", axum::http::HeaderValue::from_static("true"));
+            if let Ok(value) = axum::http::HeaderValue::from_str(version_id) {
+                response.headers_mut().insert("x-amz-version-id", value);
+            }
+            response
+        }
+        StorageError::StaleStamp { ref current, .. } => {
+            let mut response = s3_error(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                err.to_string(),
+                resource,
+            );
+            if let Ok(value) = HeaderValue::from_str(&current) {
+                response.headers_mut().insert("x-rs3-stamp-current", value);
+            }
             response
         }
         StorageError::BucketInUse(message) => s3_error(
@@ -2369,6 +2638,137 @@ fn storage_error_response(err: StorageError, resource: &str) -> Response {
         ),
     }
 }
+
+/// The write model of an object request: who the write is from
+/// ([`WriteOrigin`](crate::storage::write::WriteOrigin)), decided by its
+/// `x-rs3-stamp` header (a replicated write keeps that stamp; it needs
+/// `s3:ReplicateWrite`), and checked against a read-only bucket up front —
+/// before any body is uploaded — so the refusal is cheap and the same for
+/// PUT, copy, multipart completion and DELETE.
+pub(crate) async fn write_options(
+    store: &LocalObjectStore,
+    ctx: &handlers::ObjectCtx,
+    resource: &str,
+) -> Result<crate::storage::store::WriteOptions, Response> {
+    let stamp = replicated_stamp(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, resource)?;
+    // `x-rs3-versioned`: whether the replicated state is a real version on
+    // its site (kept as such on a versioning-enabled bucket).
+    let versioned = match ctx.headers.get("x-rs3-versioned").map(|v| v.to_str().unwrap_or("")) {
+        None => None,
+        Some(_) if stamp.is_none() => {
+            return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "x-rs3-versioned needs x-rs3-stamp", resource))
+        }
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "x-rs3-versioned must be true or false", resource)),
+    };
+    let options = crate::storage::store::WriteOptions::stamped(stamp).with_versioned(versioned);
+    store
+        .check_write_allowed(&ctx.bucket, &options.origin)
+        .await
+        .map_err(|err| storage_error_response(err, resource))?;
+    Ok(options)
+}
+
+/// The `x-rs3-removed-stamp` header of a replicated DELETE: the stamp of
+/// the version the delete removed, which it ranks by. Only with a stamped
+/// (replicated) delete.
+pub(crate) fn removed_stamp(
+    headers: &HeaderMap,
+    origin: &crate::storage::write::WriteOrigin,
+) -> Result<Option<crate::storage::stamp::Stamp>, String> {
+    match headers.get("x-rs3-removed-stamp").map(|v| v.to_str().map(crate::storage::stamp::Stamp::parse_header)) {
+        None => Ok(None),
+        Some(Ok(Ok(removed))) if origin.given_stamp().is_some() => Ok(Some(removed)),
+        Some(_) => Err("x-rs3-removed-stamp must be <ms>.<counter>.<site> and needs x-rs3-stamp".to_string()),
+    }
+}
+
+/// The `x-rs3-stamp` request header of a replicated write: the version
+/// stamp the object keeps instead of a fresh local one. Setting it means
+/// backdating (or forward-dating) the object, which decides last-writer-wins
+/// conflicts, so it needs `s3:ReplicateWrite` on the object as well as the
+/// write permission itself. `Ok(None)` when absent.
+pub(crate) fn replicated_stamp(
+    identity: Option<&Identity>,
+    headers: &HeaderMap,
+    bucket: &str,
+    key: &str,
+    resource: &str,
+) -> Result<Option<crate::storage::stamp::Stamp>, Response> {
+    let Some(value) = headers.get("x-rs3-stamp") else {
+        return Ok(None);
+    };
+    let stamp = value
+        .to_str()
+        .map_err(|_| "x-rs3-stamp is not valid text".to_string())
+        .and_then(crate::storage::stamp::Stamp::parse_header)
+        .map_err(|message| s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, resource))?;
+    if stamp.ms > crate::storage::time::now_ms() + crate::storage::stamp::MAX_FUTURE_MS {
+        return Err(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-rs3-stamp is too far in the future (check the source site's clock)",
+            resource,
+        ));
+    }
+    require_replicate_write(identity, bucket, key, resource, "x-rs3-stamp")?;
+    Ok(Some(stamp))
+}
+
+/// `s3:ReplicateWrite` on the object, or `403` naming the header that
+/// needs it.
+fn require_replicate_write(
+    identity: Option<&Identity>,
+    bucket: &str,
+    key: &str,
+    resource: &str,
+    header: &str,
+) -> Result<(), Response> {
+    if let Some(identity) = identity {
+        let needed = [self::policy::Requirement::object("s3:ReplicateWrite", bucket, key)];
+        if !identity.authorize(&needed) {
+            return Err(s3_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                format!("{header} requires s3:ReplicateWrite"),
+                resource,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `x-rs3-replicate: true` header of a CreateMultipartUpload: the
+/// upload is replication's (its completion carries the stamp the object
+/// keeps), so a read-only bucket accepts it. Needs `s3:ReplicateWrite`
+/// like a stamp does. A stamp is never sent here: no state exists yet for
+/// it to name.
+pub(crate) fn replicated_upload(
+    identity: Option<&Identity>,
+    headers: &HeaderMap,
+    bucket: &str,
+    key: &str,
+    resource: &str,
+) -> Result<bool, Response> {
+    let Some(value) = headers.get(REPLICATE_HEADER) else {
+        return Ok(false);
+    };
+    let value = value.to_str().unwrap_or("").trim();
+    if !(value.eq_ignore_ascii_case("true") || value == "1") {
+        return Err(s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            format!("{REPLICATE_HEADER} must be true"),
+            resource,
+        ));
+    }
+    require_replicate_write(identity, bucket, key, resource, REPLICATE_HEADER)?;
+    Ok(true)
+}
+
+/// Marks a CreateMultipartUpload as replication's (see [`replicated_upload`]).
+pub(crate) const REPLICATE_HEADER: &str = "x-rs3-replicate";
 
 fn s3_error(
     status: StatusCode,
@@ -2454,5 +2854,7 @@ mod auth_regression_tests;
 mod iam_e2e_tests;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod spec_tests;
 #[cfg(test)]
 mod tests;

@@ -30,9 +30,54 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         ..
     } = ctx;
 
-    let object = match store.read_object(&bucket, &key).await {
+    let versioning = store.bucket_versioning(&bucket).await.unwrap_or_default();
+    // `?versionId=`: one version of the key, current or not.
+    let version_id = query.get("versionId").filter(|v| !v.is_empty()).cloned();
+    let read = match &version_id {
+        Some(version_id) => store.read_object_version(&bucket, &key, version_id).await,
+        None => store.read_object(&bucket, &key).await,
+    };
+    let object = match read {
         Ok(object) => object,
-        Err(err) => return srv::storage_error_response(err, &format!("/{bucket}/{key}")),
+        Err(err) => {
+            let not_found = matches!(err, crate::storage::errors::StorageError::ObjectNotFound { .. });
+            let mut response = srv::storage_error_response(err, &format!("/{bucket}/{key}"));
+            if let Ok(value) = axum::http::HeaderValue::from_str(&store.site_id()) {
+                response.headers_mut().insert("x-rs3-site", value);
+            }
+            // A deleted key still has a state for replication: its
+            // tombstone's stamp.
+            if not_found {
+                if let Ok(Some((stamp, true))) = store.key_stamp(&bucket, &key).await {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&stamp.to_header()) {
+                        response.headers_mut().insert("x-rs3-stamp", value);
+                        response
+                            .headers_mut()
+                            .insert("x-rs3-deleted", axum::http::HeaderValue::from_static("true"));
+                    }
+                    // S3: a key whose current state is a delete marker.
+                    if versioning != crate::storage::metadata::BucketVersioning::Off {
+                        response
+                            .headers_mut()
+                            .insert("x-amz-delete-marker", axum::http::HeaderValue::from_static("true"));
+                        if let Ok(Some(marker)) = store.list_versions(&bucket, &key).await.map(|v| v.into_iter().next()) {
+                            if let Ok(value) = axum::http::HeaderValue::from_str(&marker.version_id()) {
+                                response.headers_mut().insert("x-amz-version-id", value);
+                            }
+                        }
+                    }
+                    // What the tombstone ranks by: the version it removed.
+                    if let Ok(Some(rank)) = store.key_rank(&bucket, &key).await {
+                        if rank.deleted {
+                            if let Ok(value) = axum::http::HeaderValue::from_str(&rank.stamp.to_header()) {
+                                response.headers_mut().insert("x-rs3-removed-stamp", value);
+                            }
+                        }
+                    }
+                }
+            }
+            return response;
+        }
     };
 
     // Conditional request checks. Per RFC 7232 the precedence is:
@@ -45,12 +90,20 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     let server_etag = object.meta.etag.trim_matches('"');
     // The exact object state, as named by changelog events (`version`).
     let version = crate::storage::changelog::version_of(&object.object_dir.to_string_lossy());
+    // Its version stamp (the fallback for objects written before stamps).
+    let stamp = store.effective_stamp(object.meta.stamp.as_ref(), object.meta.last_modified_ms);
 
     // 0. x-rs3-if-version: a replicator pins the exact state a changelog
     // event named. Anything else (overwritten since, even with the same
     // ETag) is a 412, so it never tags newer data with an older version.
+    // `x-rs3-if-stamp` pins the same state by its stamp: a storage layout
+    // upgrade renames versions, never stamps, so a pin by both survives it.
+    let stamp_pinned = headers
+        .get("x-rs3-if-stamp")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|want| want.trim() == stamp.to_header());
     if let Some(want) = headers.get("x-rs3-if-version").and_then(|v| v.to_str().ok()) {
-        if want.trim() != version {
+        if want.trim() != version && !stamp_pinned {
             return srv::s3_error_detailed(
                 StatusCode::PRECONDITION_FAILED,
                 "PreconditionFailed",
@@ -302,7 +355,26 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::LAST_MODIFIED, last_modified)
         .header("x-rs3-version", version)
+        .header("x-rs3-stamp", stamp.to_header())
+        // Which site answers: a replication link confirms it is still the one
+        // it was made with before writing to it.
+        .header("x-rs3-site", store.site_id())
         .header("x-amz-request-id", "rust-s3-server");
+    // Tags: S3 reports their count; the full set travels for replication in
+    // the named-field form (§7), signed like every x-rs3 header.
+    if !object.meta.tags.is_empty() {
+        builder = builder.header("x-amz-tagging-count", object.meta.tags.len().to_string());
+        let fields: Vec<(&str, &str)> = object.meta.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        builder = builder.header("x-rs3-tags", crate::server::replication::peer::encode_fields(&fields));
+    }
+    // S3 names the version only on a bucket that has (or had) versioning:
+    // a real version by its id, a `null` version as `null`.
+    if versioning != crate::storage::metadata::BucketVersioning::Off {
+        builder = builder.header(
+            "x-amz-version-id",
+            if object.meta.versioned { crate::storage::layouts::v3::stamp_dir(&stamp) } else { "null".to_string() },
+        );
+    }
     // AWS sends this header only for a non-default class; a STANDARD object
     // carries no `x-amz-storage-class` at all.
     if storage_class != "STANDARD" {
@@ -517,7 +589,7 @@ struct PartReadSegment {
 /// files without loading the full content into memory. Single-part objects are
 /// seeked and wrapped directly; multi-part objects are piped through an
 /// in-process duplex channel into one contiguous stream.
-async fn stream_object_range(
+pub(crate) async fn stream_object_range(
     meta: &ObjectMeta,
     part_offsets: &[u64],
     object_dir: &FsPath,
@@ -698,6 +770,11 @@ mod tests {
 
     fn multipart_meta(sizes: &[u64]) -> ObjectMeta {
         ObjectMeta {
+            stamp: None,
+            versioned: false,
+            delete_marker: false,
+            removed: None,
+            tags: std::collections::BTreeMap::new(),
             format_version: 1,
             bucket: "bucket".to_string(),
             object_key: "key".to_string(),

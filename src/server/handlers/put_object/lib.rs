@@ -63,6 +63,14 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
         None
     };
     let precondition = parse_precondition(&ctx.headers);
+    let tags = match srv::extract_tags(&ctx.headers) {
+        Ok(tags) => tags,
+        Err(message) => return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidTag", message, &resource),
+    };
+    let options = match srv::write_options(&store, &ctx, &resource).await {
+        Ok(options) => options.with_precondition(precondition).with_tags(tags),
+        Err(response) => return response,
+    };
     match store
         .put_object_stream_with_metadata(
             &ctx.bucket,
@@ -76,12 +84,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             aws_chunked,
             expected_sha256.as_deref(),
             expected_decoded_len,
-            precondition,
+            options,
         )
         .await
     {
         Ok(result) => srv::with_measure(
-            srv::empty_response_with_etag(StatusCode::OK, &result.etag),
+            srv::with_version_id(srv::empty_response_with_etag(StatusCode::OK, &result.etag), result.version_id.as_deref()),
             srv::OperationMeasure::Bytes(result.size),
         ),
         Err(err) => srv::storage_error_response(err, &resource),

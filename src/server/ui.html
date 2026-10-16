@@ -67,7 +67,7 @@
     <div class="nav-label">Open Source</div>
     <a class="nav-item nav-link" href="https://github.com/wushilin/rust-s3-server" target="_blank" rel="noopener"><span data-icon="database"></span> Source Code<span class="nav-ext" data-icon="external"></span></a>
     <a class="nav-item nav-link" href="https://github.com/wushilin/rust-s3-server/blob/main/LICENSE" target="_blank" rel="noopener"><span data-icon="shield"></span> Apache-2.0 License<span class="nav-ext" data-icon="external"></span></a>
-    <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span></div></div></div>
+    <div class="sidebar-foot"><div class="server-state" id="serverState"><span class="state-dot"></span><div class="server-state-copy"><span id="serverStateText">Connecting…</span><span class="server-version" id="serverVersion">RustS3</span><span class="server-version" id="serverSite"></span></div><button type="button" class="site-change hidden" id="siteChangeBtn" data-admin-only onclick="openSiteDialog()" title="Change this site's name">Change</button></div></div>
   </aside>
 
   <div class="app-main">
@@ -186,6 +186,15 @@
           <div class="table-wrap"><table><thead><tr><th>Subscription</th><th>Bucket / filter</th><th>Status</th><th>Position</th><th>Last delivery</th><th style="width:150px"></th></tr></thead><tbody id="subRows"></tbody></table></div>
           <div id="subEmpty" class="empty hidden"></div>
         </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="panel-title"><div><h3>Replication links</h3><p>Replicate a whole bucket with another rusts3 site. <b>Mirror</b> (this ⟵ peer) copies the peer's bucket into a read-only one here, remote wins. <b>Merge</b> (this ⟷ peer) syncs both ways, newer wins; one link, on either site, serves the pair. This site: <code id="siteId"></code></p></div><span class="spacer"></span><button class="btn primary" onclick="openLinkDialog()"><span data-icon="plus"></span> New link</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Link</th><th>Direction</th><th>Status</th><th>Progress</th><th>Last error</th><th style="width:150px"></th></tr></thead><tbody id="linkRows"></tbody></table></div>
+          <div id="linkEmpty" class="empty hidden"></div>
+          <div id="incomingWrap" class="hidden">
+            <div class="panel-title" style="border-top:1px solid var(--line)"><div><h3>Managed on other sites</h3><p>Links configured on a peer that replicate this site's buckets (seen in the last 5 minutes). Change them on that site.</p></div></div>
+            <div class="table-wrap"><table><thead><tr><th>Link</th><th>Direction</th><th>Last seen</th></tr></thead><tbody id="incomingRows"></tbody></table></div>
+          </div>
+        </div>
       </section>
 
       <section id="tab_perf" class="page hidden">
@@ -260,6 +269,7 @@
   <div class="details-preview"><span data-icon="file"></span></div>
   <dl id="detailList"></dl>
   <div class="details-actions"><a class="btn primary" id="detailDownload"><span data-icon="download"></span> Download</a><button class="btn" onclick="openShareFromDetails()"><span data-icon="share"></span> Share</button></div>
+  <div class="details-versions"><div class="details-versions-head"><h4>Versions</h4><span class="muted" id="detailVersionsHint"></span></div><div id="detailVersions"></div></div>
 </aside>
 
 <dialog id="reportDlg" class="report-dlg">
@@ -299,7 +309,11 @@
 <dialog id="bucketSettingsDlg">
   <div class="dialog-head"><div><h3>Bucket settings — <span id="bucketSettingsName"></span></h3><p>Configure browser origins allowed to access this bucket.</p></div><button type="button" class="dialog-close" onclick="bucketSettingsDlg.close()"><span data-icon="x"></span></button></div>
   <div class="dialog-body">
+    <div class="field" data-admin-only id="bucketLayoutRow"><label>Storage layout</label><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span id="bucketLayoutText" class="muted" style="font-size:12px"></span><button type="button" class="btn small primary hidden" id="bucketLayoutUpgrade" onclick="upgradeBucketLayout()">Upgrade now</button></div></div>
+    <div class="field" data-admin-only><label for="bucketVersioning">Object versioning</label><select class="input" id="bucketVersioning"><option value="off">Off — an overwrite or delete replaces the object</option><option value="enabled">Enabled — every overwrite and delete keeps the previous version</option><option value="suspended">Suspended — existing versions are kept; new writes replace the null version</option></select><span class="muted" style="font-size:11.5px" id="bucketVersioningHint"></span></div>
+    <label class="field" data-admin-only style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="bucketReadOnly"> <span><b>Read-only</b> — accept only replicated writes (replication links, or s3:ReplicateWrite clients). Uploads, copies and deletes from clients and this console are refused.</span></label>
     <div class="field"><label>Console origin (implicitly allowed)</label><input class="input" id="bucketConsoleOrigin" readonly></div>
+    <label class="field" data-admin-only style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="bucketCorsLocal"> <span><b>Keep CORS local</b> — do not adopt a replication peer's CORS rules (this bucket's rules still replicate to peers that accept them).</span></label>
     <div class="field"><label for="bucketCorsJson">CORS rules (JSON) <button type="button" class="btn small" onclick="openCorsSample()">View sample</button></label><textarea class="input code-area" id="bucketCorsJson" rows="15" spellcheck="false"></textarea><span class="muted" style="font-size:11.5px">Each rule uses allowed_origins, allowed_methods, allowed_headers, expose_headers, and optional max_age_seconds. The faded example is not saved unless you paste or type it. The console rule is applied automatically.</span></div>
     <div id="bucketSettingsError" class="inline-error"></div>
   </div>
@@ -400,8 +414,8 @@
   <div class="dialog-head"><div><h3>Policy for <span id="pd_target"></span></h3><p>Build common S3 rules visually or edit the exact policy JSON.</p></div><button class="dialog-close" onclick="policyDlg.close()"><span data-icon="x"></span></button></div>
   <div class="dialog-body">
     <div class="editor-tabs"><button class="editor-tab active" id="rulesTab" onclick="setPolicyMode('rules')">Rule builder</button><button class="editor-tab" id="jsonTab" onclick="setPolicyMode('json')">JSON</button></div>
-    <div id="rulesEditor"><div id="ruleList" class="rule-list"></div><button class="btn small" style="margin-top:11px" onclick="addPolicyRule()"><span data-icon="plus"></span> Add rule</button><p class="rule-note">Prefix scopes object operations and object/version listings. AWS multipart-upload listing remains bucket-scoped. Batch deletes authorize every object independently. An explicit Deny always overrides every Allow.</p></div>
-    <div id="jsonEditor" class="hidden"><div class="preset-row"><button class="btn small" onclick="preset('full-all')">Full access</button><button class="btn small" onclick="preset('ro-all')">Read-only</button><button class="btn small" onclick="preset('full-bucket')">Bucket full access</button><button class="btn small" onclick="preset('ro-bucket')">Bucket read-only</button><button class="btn small" onclick="preset('wo-bucket')">Bucket ingest</button></div><textarea class="input" id="pd_text" spellcheck="false" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px"></textarea></div>
+    <div id="rulesEditor"><div id="ruleList" class="rule-list"></div><button class="btn small" style="margin-top:11px" onclick="addPolicyRule()"><span data-icon="plus"></span> Add rule</button><p class="rule-note"><b>Replication</b> grants what a replication link's key needs on the whole bucket (use bucket <code>*</code> for every bucket): reading it and its changelog, and writing it with original stamps. Prefix scopes object operations and object/version listings. AWS multipart-upload listing remains bucket-scoped. Batch deletes authorize every object independently. An explicit Deny always overrides every Allow.</p></div>
+    <div id="jsonEditor" class="hidden"><div class="preset-row"><button class="btn small" onclick="preset('full-all')">Full access</button><button class="btn small" onclick="preset('ro-all')">Read-only</button><button class="btn small" onclick="preset('full-bucket')">Bucket full access</button><button class="btn small" onclick="preset('ro-bucket')">Bucket read-only</button><button class="btn small" onclick="preset('wo-bucket')">Bucket ingest</button><button class="btn small" title="What a replication link's key needs on every bucket: s3:GetBucketChangelog, s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ReplicateWrite, s3:AbortMultipartUpload" onclick="preset('repl-all')">Replicate all buckets</button><button class="btn small" title="The same, on the bucket selected in the Object Browser" onclick="preset('repl-bucket')">Replicate one bucket</button></div><textarea class="input" id="pd_text" spellcheck="false" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px"></textarea></div>
     <datalist id="policyBuckets"></datalist><div id="policyError" class="inline-error"></div>
   </div>
   <div class="dialog-actions"><button class="btn danger" onclick="savePolicy(null)">Detach policy</button><span class="spacer"></span><button class="btn" onclick="policyDlg.close()">Cancel</button><button class="btn primary" onclick="savePolicy()">Save policy</button></div>
@@ -429,10 +443,46 @@
       <div class="field"><label for="sub_ops">Changes</label><select class="input" id="sub_ops"><option value="">Puts and deletes</option><option value="put">Puts only</option><option value="delete">Deletes only</option></select></div>
       <div class="field"><label for="sub_batch">Max events per batch</label><input class="input" id="sub_batch" type="number" min="1" max="10000" placeholder="server default"></div>
       <div class="field sub-webhook"><label for="sub_mute">Mute after a failed delivery (seconds)</label><input class="input" id="sub_mute" type="number" min="1" placeholder="server default"></div>
-      <label class="field sub-create" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="sub_snapshot"> Start with a snapshot of the objects already in the bucket</label>
+      <label class="field sub-create sub-webhook" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="sub_snapshot"> Start with a snapshot of the objects already in the bucket</label>
       <div id="subError" class="inline-error"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="btn" onclick="subDlg.close()">Cancel</button><button class="btn primary" type="submit" id="sub_submit">Create</button></div>
+  </form>
+</dialog>
+
+<dialog id="siteDlg">
+  <form onsubmit="saveSiteName(event)">
+    <div class="dialog-head"><div><h3>Site name</h3><p>A readable label for this server, shown here and to replication peers. Changing it changes nothing else.</p></div><button type="button" class="dialog-close" onclick="siteDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body">
+      <div class="field"><label for="site_name_input">Name</label><input class="input" id="site_name_input" maxlength="64" autocomplete="off"></div>
+      <div class="muted" style="font-size:11.5px">Site id <code id="site_id_text"></code> stays as it is: it is generated once and never changes (it is in every version stamp, and is how peers know this site).</div>
+      <div id="siteError" class="inline-error"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="siteDlg.close()">Cancel</button><button class="btn primary" type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="linkDlg">
+  <form onsubmit="saveLink(event)">
+    <div class="dialog-head"><div><h3>New replication link</h3><p>This site runs the link; nothing is configured on the peer. It acts as two keys: a key on this site for what it does here, and a key on the peer for what it does there.</p></div><button type="button" class="dialog-close" onclick="linkDlg.close()"><span data-icon="x"></span></button></div>
+    <div class="dialog-body">
+      <div class="field"><label>Mode</label>
+        <div class="mode-cards">
+          <label class="mode-card"><input type="radio" name="ln_mode" value="mirror" onchange="linkModeChanged()"><strong>Mirror</strong><div class="rflow"><div class="rend here"><small>this site</small><code>bucket</code></div><div class="rarrow">⟵</div><div class="rend"><small>peer</small><code>bucket</code></div></div><span>One way. This bucket becomes a read-only copy of the peer's (remote wins).</span></label>
+          <label class="mode-card"><input type="radio" name="ln_mode" value="merge" onchange="linkModeChanged()"><strong>Merge</strong><div class="rflow"><div class="rend here"><small>this site</small><code>bucket</code></div><div class="rarrow">⟷</div><div class="rend"><small>peer</small><code>bucket</code></div></div><span>Both ways, newer wins. This site pulls the peer's changes and pushes its own.</span></label>
+        </div>
+      </div>
+      <div class="field"><label for="ln_name">Name</label><input class="input" id="ln_name" placeholder="e.g. sg-jp-photos" autocomplete="off"></div>
+      <div class="field"><label for="ln_bucket">This site's bucket</label><select class="input" id="ln_bucket"></select></div>
+      <div class="field"><label for="ln_local_key">This site's key</label><select class="input" id="ln_local_key"></select><span class="muted" style="font-size:11.5px">The link acts as this key here: its policy decides what the link may do to the bucket. No secret is needed.</span></div>
+      <div class="field"><label for="ln_endpoint">Peer S3 endpoint</label><input class="input" id="ln_endpoint" placeholder="https://s3.other-site.example.com" autocomplete="off"></div>
+      <div class="field"><label for="ln_peer_bucket">Peer bucket</label><input class="input" id="ln_peer_bucket" autocomplete="off"></div>
+      <div class="field"><label for="ln_ak">Peer access key</label><input class="input" id="ln_ak" autocomplete="off"></div>
+      <div class="field"><label for="ln_sk">Peer secret key</label><input class="input" id="ln_sk" type="password" autocomplete="new-password"></div>
+      <div class="perm-box" id="ln_perms"></div>
+      <div id="linkError" class="inline-error"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" onclick="linkDlg.close()">Cancel</button><button class="btn primary" type="submit" id="ln_submit">Check and create</button></div>
   </form>
 </dialog>
 
@@ -447,16 +497,16 @@
   <div class="dialog-body">
     <div class="danger-callout hidden" id="sa_pause"></div>
     <div class="secret-box" id="sa_detail" style="white-space:pre-wrap"></div>
-    <div class="field" style="margin-top:12px"><label for="sa_offset">Set offset (replay or skip to a seq)</label><div style="display:flex;gap:8px"><input class="input" id="sa_offset" type="number" min="0"><button class="btn" onclick="subAction('set_offset')">Set</button></div></div>
+    <div class="field sa-webhook" style="margin-top:12px"><label for="sa_offset">Set offset (replay or skip to a seq)</label><div style="display:flex;gap:8px"><input class="input" id="sa_offset" type="number" min="0"><button class="btn" onclick="subAction('set_offset')">Set</button></div></div>
     <div id="saError" class="inline-error"></div>
   </div>
   <div class="dialog-actions" style="flex-wrap:wrap">
     <button class="btn" onclick="subAction('pause')">Pause</button>
     <button class="btn primary" onclick="subAction('resume')">Resume</button>
-    <button class="btn" onclick="subAction('unmute')">Unmute now</button>
-    <button class="btn" onclick="subAction('resume_from_oldest')">Resume from oldest retained</button>
-    <button class="btn" onclick="subAction('resnapshot')">Re-snapshot</button>
-    <button class="btn" onclick="subAction('skip_to_head')">Skip to head</button>
+    <button class="btn sa-webhook" onclick="subAction('unmute')">Unmute now</button>
+    <button class="btn sa-webhook" onclick="subAction('resume_from_oldest')">Resume from oldest retained</button>
+    <button class="btn sa-webhook" onclick="subAction('resnapshot')">Re-snapshot</button>
+    <button class="btn sa-webhook" onclick="subAction('skip_to_head')">Skip to head</button>
     <button class="btn" id="sa_rotate" onclick="subRotate()">Rotate secret</button>
   </div>
 </dialog>
