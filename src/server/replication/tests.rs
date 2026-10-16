@@ -143,10 +143,18 @@ impl Site {
         // As the real server does: the store's token is the process one, and
         // it ends long polls so the shutdown is not held up.
         self.store.shutdown_token().cancel();
-        tokio::time::sleep(Duration::from_millis(300)).await;
         let Site { tmp, name, store, iam, notify, replication, endpoint, .. } = self;
-        drop((store, iam, notify, replication));
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop((notify, replication));
+        // Every task of the site lets go of the store and the admin database
+        // before the directory can be opened again: RocksDB holds a lock
+        // file per database, and a handle still open in a worker winding
+        // down (seconds, on a loaded Windows runner) makes the reopen fail.
+        let admin = iam.admin_db();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while (store.handle_count() > 1 || Arc::strong_count(&admin) > 2) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop((admin, iam, store));
         Stopped { tmp, name, endpoint }
     }
 
@@ -162,12 +170,7 @@ impl Site {
     /// Stops this site and starts a different, empty one (site id `name`)
     /// at the same address: the endpoint now reaches another site.
     async fn replace_with_fresh(self, name: &str) -> Self {
-        self.shutdown.cancel();
-        self.store.shutdown_token().cancel();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let Site { store, iam, notify, replication, endpoint, .. } = self;
-        drop((store, iam, notify, replication));
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let Stopped { endpoint, .. } = self.stop().await;
         let bind = endpoint.trim_start_matches("http://").to_string();
         Self::open(tempfile::tempdir().unwrap(), name, fast_timing(), &bind).await
     }

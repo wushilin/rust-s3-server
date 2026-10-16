@@ -586,6 +586,14 @@ impl LocalObjectStore {
         self.crash_points.lock().unwrap().insert(name.to_string());
     }
 
+    /// How many handles to this store's shared state exist, clones of
+    /// `self` included. Tests use it to wait for a stopped site's tasks to
+    /// let go before the same data directory is opened again.
+    #[cfg(test)]
+    pub(crate) fn handle_count(&self) -> usize {
+        Arc::strong_count(&self.index_cache)
+    }
+
     #[cfg(test)]
     pub fn disarm_crash_point(&self, name: &str) {
         self.crash_points.lock().unwrap().remove(name);
