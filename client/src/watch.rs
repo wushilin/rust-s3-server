@@ -122,15 +122,15 @@ fn human(event: &serde_json::Value, prefix: &str) -> String {
 
 fn emit(event: &serde_json::Value, prefix: &str) {
     if out().json {
-        println!("{}", render_json(event, JsonStyle::AlwaysCompact, false));
+        crate::progress::ui_println!("{}", render_json(event, JsonStyle::AlwaysCompact, false));
     } else {
-        println!("{}", human(event, prefix));
+        crate::progress::ui_println!("{}", human(event, prefix));
     }
 }
 
 fn note(message: &str) {
     if !out().quiet {
-        eprintln!("{message}");
+        crate::progress::ui_eprintln!("{message}");
     }
 }
 
