@@ -271,6 +271,42 @@ where
     tokio::spawn(f()).await.is_err()
 }
 
+/// The one window the index-driven resume cannot see: the row already
+/// names the new dir, the old leaf is still on disk. Resuming must reap it
+/// — otherwise the bucket is declared current while its tree still holds
+/// the old layout, and the next rebuild has two copies of the key to pick
+/// from.
+#[tokio::test]
+async fn a_crash_between_the_flip_and_the_unlink_leaves_no_old_leaf_after_resume() {
+    for layout in [1, 2] {
+        let (_tmp, store) = fresh().await;
+        let fixture = build_in_layout(&store, layout).await;
+        store.start_layout_upgrade(BUCKET).await.unwrap();
+
+        store.arm_crash_point("migrate_after_flip");
+        let s = store.clone();
+        assert!(crashing(move || async move {
+            s.migrate_bucket_layout(BUCKET, &CancellationToken::new()).await.unwrap();
+        })
+        .await);
+        store.disarm_crash_point("migrate_after_flip");
+        // At least one row was flipped with its old leaf left behind.
+        assert_ne!(store.detect_layout(BUCKET).await.unwrap(), CURRENT_LAYOUT, "layout {layout}: old leaf still on disk");
+        let index = store.index_unchecked(BUCKET).await.unwrap();
+        let flipped = index.all_entries_after(None, 100).await.unwrap().into_iter().filter(|r| layouts::is_current(&r.blob_dir)).count();
+        assert!(flipped >= 1, "layout {layout}");
+        store.end_rebuild(BUCKET);
+        assert_fixture_intact(&store, &fixture).await;
+        store.try_begin_rebuild(BUCKET);
+
+        store.migrate_bucket_layout(BUCKET, &CancellationToken::new()).await.unwrap();
+        store.end_rebuild(BUCKET);
+        assert_on_current_layout(&store).await;
+        assert_fixture_intact(&store, &fixture).await;
+        assert!(store.check_layouts().await.unwrap().is_empty(), "layout {layout}: nothing left to resume");
+    }
+}
+
 #[tokio::test]
 async fn an_upgrade_interrupted_at_every_step_resumes_without_loss() {
     let (_tmp, store) = fresh().await;

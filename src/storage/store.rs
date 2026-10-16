@@ -3727,23 +3727,74 @@ impl LocalObjectStore {
             }
         }
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+        self.crash_point("migrate_after_flip");
 
         // 3. Clean up the old leaf. Its files are hardlinks, so unlinking just
-        //    drops the extra link — the inodes live on under new_dir.
-        let _ = tokio::fs::remove_dir_all(&old_dir).await;
-        // Reclaim the now-empty old fanout chain bottom-up. Race-free: new
-        // writes only ever create current-layout dirs, so nothing recreates
-        // these old paths; a sibling object still under the chain just makes
-        // `remove_dir` fail (`DirectoryNotEmpty`) and we stop.
+        //    drops the extra link — the inodes live on under new_dir. A crash
+        //    before this point leaves the old leaf behind with its row already
+        //    flipped; `reap_relocated_leaves` finishes the job on resume.
+        remove_old_leaf(&bucket_dir.join("objects"), &old_dir).await;
+        Ok(true)
+    }
+
+    /// Old-layout leaves whose object already lives on the current layout:
+    /// the leftover of a crash between an index flip and the old leaf's
+    /// unlink. The index-driven pass never revisits them (their rows are
+    /// current), so the resumed upgrade walks the tree for them. A leaf is
+    /// reaped only when its row names a current-layout dir holding the same
+    /// content (same ETag); a leaf the index still names is the index-driven
+    /// pass's job, and one it does not name at all is an orphan left for a
+    /// rebuild to trash. Returns how many were reaped.
+    async fn reap_relocated_leaves(&self, bucket: &str, cancel: &CancellationToken) -> Result<u64> {
+        let bucket_dir = self.layout.bucket_dir(bucket)?;
         let objects_root = bucket_dir.join("objects");
-        let mut parent = old_dir.parent().map(|p| p.to_path_buf());
-        while let Some(dir) = parent {
-            if dir == objects_root || tokio::fs::remove_dir(&dir).await.is_err() {
+        let index = self.index_unchecked(bucket).await?;
+        let mut reaped = 0u64;
+        let mut stack = vec![objects_root.clone()];
+        while let Some(dir) = stack.pop() {
+            if cancel.is_cancelled() {
                 break;
             }
-            parent = dir.parent().map(|p| p.to_path_buf());
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            let mut is_leaf = false;
+            let mut subdirs = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_name() == "meta.json" {
+                    is_leaf = true;
+                } else if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    subdirs.push(entry.path());
+                }
+            }
+            drop(entries);
+            if !is_leaf {
+                stack.extend(subdirs);
+                continue;
+            }
+            let Ok(rel) = dir.strip_prefix(&bucket_dir) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if layouts::is_current(&rel) {
+                continue;
+            }
+            let Ok(meta) = read_json::<ObjectMeta>(&dir.join("meta.json")).await else {
+                continue;
+            };
+            let key = meta.object_key;
+            let _guard = self.locks.lock(bucket, &key).await;
+            let Some(row) = index.get(&key).await? else {
+                continue;
+            };
+            if row.blob_dir == rel || !layouts::is_current(&row.blob_dir) || row.etag != meta.etag {
+                continue;
+            }
+            log::info!("bucket {bucket}: reaping old-layout leaf {rel} of {key}, already moved to {}", row.blob_dir);
+            remove_old_leaf(&objects_root, &dir).await;
+            reaped += 1;
         }
-        Ok(true)
+        Ok(reaped)
     }
 
     /// Writes the marker dir of a tombstone that has none (from before
@@ -3965,6 +4016,13 @@ impl LocalObjectStore {
             1 | 2 => self.relocate_to_current_layout(bucket, cancel).await?,
             other => return Err(unsupported(format!("no migration step from layout {other} to {to}"))),
         };
+        if cancel.is_cancelled() {
+            return Err(StorageError::Io(format!("layout migration of bucket {bucket} cancelled")));
+        }
+        let reaped = self.reap_relocated_leaves(bucket, cancel).await?;
+        if reaped > 0 {
+            log::info!("bucket {bucket}: {reaped} old-layout leaves of already-moved objects reaped");
+        }
         if cancel.is_cancelled() {
             return Err(StorageError::Io(format!("layout migration of bucket {bucket} cancelled")));
         }
@@ -4918,6 +4976,22 @@ async fn prepare_multipart_publish_dir(
 /// Removes every empty directory under `dir` (bottom-up, `remove_dir` only,
 /// so a dir holding anything is never touched) and returns whether `dir`
 /// itself ended up removed. `depth` 0 is the `objects/` root, which stays.
+/// Unlinks an old-layout leaf dir and reclaims its now-empty fanout chain
+/// bottom-up, stopping at `objects_root`. Race-free: new writes only ever
+/// create current-layout dirs, so nothing recreates these old paths; a
+/// sibling object still under the chain just makes `remove_dir` fail
+/// (`DirectoryNotEmpty`) and the climb stops.
+async fn remove_old_leaf(objects_root: &Path, old_dir: &Path) {
+    let _ = tokio::fs::remove_dir_all(old_dir).await;
+    let mut parent = old_dir.parent().map(|p| p.to_path_buf());
+    while let Some(dir) = parent {
+        if dir == objects_root || tokio::fs::remove_dir(&dir).await.is_err() {
+            break;
+        }
+        parent = dir.parent().map(|p| p.to_path_buf());
+    }
+}
+
 async fn prune_empty_dirs(dir: &Path, depth: usize) -> bool {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return false;
