@@ -29,17 +29,18 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// `RUSTS3_BIN` if set, else a release build if there is one (the suite
+/// is faster against it), else the debug binary cargo built for this test
+/// (`rusts3.exe` on Windows).
 fn rusts3_binary() -> PathBuf {
     if let Ok(path) = std::env::var("RUSTS3_BIN") {
         return PathBuf::from(path);
     }
-    for profile in ["release", "debug"] {
-        let candidate = repo_root().join("target").join(profile).join("rusts3");
-        if candidate.exists() {
-            return candidate;
-        }
+    let release = repo_root().join("target").join("release").join(format!("rusts3{}", std::env::consts::EXE_SUFFIX));
+    if release.exists() {
+        return release;
     }
-    panic!("no rusts3 binary: build one (cargo build --release) or set RUSTS3_BIN");
+    PathBuf::from(env!("CARGO_BIN_EXE_rusts3"))
 }
 
 struct Server {

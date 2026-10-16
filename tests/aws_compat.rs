@@ -118,26 +118,19 @@ impl Server {
     }
 }
 
-/// Builds `rusts3` if it is not already built. The test drives the real binary
-/// over a socket, so an in-process router is not a substitute.
+/// The test drives the real binary over a socket, so an in-process router
+/// is not a substitute: `RUSTS3_BIN` if set, else a release build if there
+/// is one, else the debug binary cargo built for this test (`rusts3.exe`
+/// on Windows).
 fn rusts3_binary() -> PathBuf {
     if let Ok(path) = std::env::var("RUSTS3_BIN") {
         return PathBuf::from(path);
     }
-    let root = repo_root();
-    for profile in ["release", "debug"] {
-        let candidate = root.join("target").join(profile).join("rusts3");
-        if candidate.exists() {
-            return candidate;
-        }
+    let release = repo_root().join("target").join("release").join(format!("rusts3{}", std::env::consts::EXE_SUFFIX));
+    if release.exists() {
+        return release;
     }
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "rusts3"])
-        .current_dir(&root)
-        .status()
-        .expect("cargo build");
-    assert!(status.success(), "building rusts3 failed");
-    root.join("target/debug/rusts3")
+    PathBuf::from(env!("CARGO_BIN_EXE_rusts3"))
 }
 
 fn probe(args: &[&str]) -> std::process::Output {

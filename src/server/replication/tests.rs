@@ -1759,13 +1759,18 @@ async fn the_error_clears_promptly_even_with_a_long_poll() {
         async move { view.status.state == "live" }
     })
     .await;
-    // The peer goes away (its long poll is cut) and comes back.
-    let a = a.restart().await;
+    // The peer goes away (its long poll is cut). It stays away until the
+    // outage is on record: how soon the worker's next poll lands depends on
+    // the machine, and a restart that outruns it would show no outage at
+    // all (seen on a loaded Windows runner).
+    let stopped = a.stop().await;
     eventually(30, "the outage is reported", || {
         let view = b.link(&id);
         async move { view.status.last_error.is_some() }
     })
     .await;
+    // And comes back.
+    let a = stopped.start().await;
     let back = Instant::now();
     eventually(15, "cleared once the peer answers", || {
         let view = b.link(&id);
