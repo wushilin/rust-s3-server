@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use self::db::LinkDb;
 use self::model::{Link, LinkStatus, Mode, RECORD_VERSION};
@@ -61,6 +62,17 @@ pub fn allowed_on_bucket(identity: &crate::server::identity::Identity, action: &
         crate::server::policy::Requirement::object(action, bucket, "*")
     };
     identity.authorize(&[requirement])
+}
+
+/// [`allowed_on_bucket`] for a peer's link acting here (the access report):
+/// `s3:ReplicateWrite` must also hold on the bucket itself, since a merge
+/// link pushes settings changes (versioning, CORS) as stamped writes of the
+/// bucket. A link's own local key needs it on the keys only — local writes
+/// do not go through the API.
+pub fn allowed_to_peer(identity: &crate::server::identity::Identity, action: &'static str, bucket: &str) -> bool {
+    allowed_on_bucket(identity, action, bucket)
+        && (action != "s3:ReplicateWrite"
+            || identity.authorize(&[crate::server::policy::Requirement::bucket(action, bucket)]))
 }
 
 /// The actions `link` needs on its local bucket.
@@ -291,7 +303,12 @@ struct Inner {
     db: LinkDb,
     local_auth: LocalAuth,
     timing: Timing,
+    /// A child of the process token: the service's tasks (the supervisor,
+    /// the link workers) stop with the process, or alone through
+    /// [`ReplicationService::shutdown`].
     shutdown: CancellationToken,
+    /// Every task the service spawned, so a shutdown can wait for them.
+    tracker: TaskTracker,
     links: RwLock<HashMap<String, Arc<Mutex<Runtime>>>>,
     /// Serialises link creation, so the per-bucket rules (a mirror is the
     /// bucket's only link) cannot be raced.
@@ -383,7 +400,8 @@ impl ReplicationService {
                 db,
                 local_auth,
                 timing,
-                shutdown,
+                shutdown: shutdown.child_token(),
+                tracker: TaskTracker::new(),
                 links: RwLock::new(HashMap::new()),
                 create_lock: tokio::sync::Mutex::new(()),
                 incoming: Mutex::new(HashMap::new()),
@@ -511,27 +529,48 @@ impl ReplicationService {
 
     fn spawn_supervisor(&self) {
         let service = self.clone();
-        tokio::spawn(async move {
+        self.inner.tracker.spawn(async move {
             let mut tick = tokio::time::interval(service.inner.timing.check_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
-                    _ = service.inner.shutdown.cancelled() => {
-                        service.stop_all();
-                        break;
-                    }
+                    // The workers' tokens are children of this one: they
+                    // stop with it.
+                    _ = service.inner.shutdown.cancelled() => break,
                     _ = tick.tick() => service.supervise(),
                 }
             }
         });
     }
 
-    fn stop_all(&self) {
+    /// Stops every task of the service — the supervisor, the link workers,
+    /// what they spawned — and returns once they have all ended, so none of
+    /// them still runs (or holds a database open) afterwards. A worker that
+    /// has not noticed its cancellation within `grace` (one mid-step on a
+    /// slow peer) is aborted; nothing is lost, the step is redone from its
+    /// checkpoint next time.
+    pub async fn shutdown(&self, grace: Duration) {
+        self.inner.shutdown.cancel();
+        self.inner.tracker.close();
+        if tokio::time::timeout(grace, self.inner.tracker.wait()).await.is_ok() {
+            return;
+        }
+        let mut aborted = 0;
         for rt in self.inner.links.read().unwrap().values() {
-            let mut rt = rt.lock().unwrap();
-            for (cancel, _) in [rt.worker.take(), rt.pusher.take()].into_iter().flatten() {
-                cancel.cancel();
+            if rt.lock().unwrap().stop() {
+                aborted += 1;
             }
+        }
+        if aborted > 0 {
+            log::warn!(
+                "replication: {aborted} link(s) still had a worker running {}s after shutdown; aborted",
+                grace.as_secs()
+            );
+        }
+        // What remains is short-lived (a record of a bound peer); still,
+        // never hold a shutdown past a second grace.
+        if tokio::time::timeout(grace, self.inner.tracker.wait()).await.is_err() {
+            log::warn!("replication: a task still runs {}s after its workers were aborted", grace.as_secs());
         }
     }
 
@@ -578,7 +617,7 @@ impl ReplicationService {
                     lease_renew: self.inner.timing.lease_renew,
                     fatal_pause: self.inner.timing.fatal_pause,
                 };
-                rt.worker = Some((cancel, tokio::spawn(worker.run())));
+                rt.worker = Some((cancel, self.inner.tracker.spawn(worker.run())));
             }
             if rt.link.mode != Mode::Merge {
                 continue;
@@ -606,7 +645,7 @@ impl ReplicationService {
                     local_check: self.local_check(&rt.link),
                     lease_renew: self.inner.timing.lease_renew,
                 };
-                rt.pusher = Some((cancel, tokio::spawn(pusher.run())));
+                rt.pusher = Some((cancel, self.inner.tracker.spawn(pusher.run())));
             }
         }
     }
@@ -633,7 +672,7 @@ impl ReplicationService {
                 rt.link.clone()
             };
             let db = inner.db.clone();
-            tokio::spawn(async move {
+            inner.tracker.spawn(async move {
                 match db.put(&link).await {
                     Ok(()) => log::info!("replication link {} bound to peer site {site}", link.id),
                     Err(err) => log::warn!("replication link {}: could not record peer site {site}: {err}", link.id),

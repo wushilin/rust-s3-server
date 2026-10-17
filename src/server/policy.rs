@@ -94,9 +94,11 @@ const WRITE_OBJECT_ACTIONS: &[&str] = &[
 ];
 
 /// A replication rule: the changelog (bucket level), and object reads and
-/// stamped writes. Multipart helpers let a pushed multipart copy clean up
-/// after a failure.
-const REPLICATION_BUCKET_ACTIONS: &[&str] = &["s3:GetBucketChangelog"];
+/// stamped writes. `s3:ReplicateWrite` is needed on the bucket as well: a
+/// replicated settings change (versioning, CORS) is a stamped write of the
+/// bucket. Multipart helpers let a pushed multipart copy clean up after a
+/// failure.
+const REPLICATION_BUCKET_ACTIONS: &[&str] = &["s3:GetBucketChangelog", "s3:ReplicateWrite"];
 const REPLICATION_OBJECT_ACTIONS: &[&str] = &[
     "s3:GetObject",
     "s3:PutObject",

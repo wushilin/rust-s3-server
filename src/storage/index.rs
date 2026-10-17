@@ -1941,7 +1941,9 @@ impl ObjectIndex {
 
     /// Removes tombstones of deletes made before `cutoff_ms`, at most
     /// `max_entries` per call. Returns the removed tombstones, so the caller
-    /// can trash their marker dirs.
+    /// can trash their marker dirs. A delete made while versioning was
+    /// enabled (`versioned`) is a real delete marker — a version clients
+    /// list and remove by id — and is kept whatever its age.
     pub async fn purge_tombstones(&self, cutoff_ms: i64, max_entries: usize) -> Result<Vec<Tombstone>> {
         let db = self.db.clone();
         let durability = self.durability;
@@ -1952,7 +1954,7 @@ impl ObjectIndex {
             for item in db.iterator_cf(&tombstones, IteratorMode::Start) {
                 let (key, value) = item?;
                 let t = decode_tombstone(&key, &value);
-                let expired = t.as_ref().map(|t| t.deleted_at_ms < cutoff_ms).unwrap_or(true);
+                let expired = t.as_ref().map(|t| !t.versioned && t.deleted_at_ms < cutoff_ms).unwrap_or(true);
                 if expired {
                     batch.delete_cf(&tombstones, &key);
                     if let Ok(t) = t {

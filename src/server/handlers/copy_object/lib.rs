@@ -7,7 +7,7 @@ use axum::response::Response;
 use crate::server as srv;
 use crate::server::handlers::ObjectCtx;
 use crate::server::xml::copy_object_xml;
-use crate::storage::store::LocalObjectStore;
+use crate::storage::store::{LocalObjectStore, Precondition};
 
 pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body) -> Response {
     let resource = ctx.resource();
@@ -87,6 +87,7 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             &format!("/{src_bucket}/{src_key}"),
         );
     }
+    let source_etag = src_object.meta.etag.clone();
     drop(src_object);
     // `x-amz-tagging-directive: REPLACE` takes the tags from the request
     // (none when the header is absent); COPY, the default, keeps the
@@ -104,6 +105,17 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
     let options = match srv::write_options(&store, &ctx, &resource).await {
         Ok(options) => options.with_tags(tags),
         Err(response) => return response,
+    };
+    // A copy onto itself with `x-amz-copy-source-if-match` (a replicator
+    // adopting a peer's metadata for bytes it compared): the condition was
+    // checked on a read, so it is also made the write's own guard, decided
+    // under the key lock — bytes a client puts meanwhile are refused (412)
+    // instead of being republished under the copy's stamp.
+    let self_copy = src_bucket == ctx.bucket && src_key == ctx.key && src_version.is_none();
+    let options = if self_copy && options.precondition.is_none() && ctx.headers.contains_key("x-amz-copy-source-if-match") {
+        options.with_precondition(Some(Precondition::IfMatch(source_etag)))
+    } else {
+        options
     };
     match store
         .copy_object_version(

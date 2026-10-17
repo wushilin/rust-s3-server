@@ -1309,7 +1309,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
         });
     }
 
-    let app = router_with_notify(store, auth_state, metrics, tasks, Some(notify));
+    let app = router_with_notify(store, auth_state, metrics, tasks, Some(notify.clone()));
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     let drain = shutdown.clone();
     // Our own accept loop rather than `axum::serve`: it reads an optional PROXY
@@ -1329,15 +1329,30 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     // it: a container runtime gives us ten seconds before SIGKILL, so we take
     // rather less than that and then go. Nothing is lost by leaving early —
     // writes are committed before they are acknowledged.
-    tokio::select! {
-        result = server => result?,
-        _ = drain_deadline(drain) => {
-            log::warn!(
-                "connections still open {}s after the shutdown signal — exiting anyway",
-                SHUTDOWN_DRAIN_GRACE.as_secs()
-            );
+    let serve = async {
+        tokio::select! {
+            result = server => result,
+            _ = drain_deadline(drain) => {
+                log::warn!(
+                    "connections still open {}s after the shutdown signal — exiting anyway",
+                    SHUTDOWN_DRAIN_GRACE.as_secs()
+                );
+                Ok(())
+            }
         }
-    }
+    };
+    // The background services stop with the signal too: alongside the
+    // drain, wait (the same grace) for their workers to end rather than
+    // leave them mid-step when the process goes.
+    let services = {
+        let signalled = shutdown.clone();
+        async move {
+            signalled.cancelled().await;
+            tokio::join!(replication.shutdown(SHUTDOWN_DRAIN_GRACE), notify.shutdown(SHUTDOWN_DRAIN_GRACE));
+        }
+    };
+    let (served, ()) = tokio::join!(serve, services);
+    served?;
     // The flusher stopped with the shutdown signal; write out whatever was
     // stamped while connections drained.
     if let Err(err) = key_usage.flush().await {
@@ -1756,7 +1771,7 @@ async fn access_s3(store: LocalObjectStore, ctx: handlers::BucketCtx) -> Respons
     let allowed = |action: &'static str| match &ctx.identity {
         // Auth disabled: everything is allowed.
         None => true,
-        Some(identity) => replication::allowed_on_bucket(identity, action, &ctx.bucket),
+        Some(identity) => replication::allowed_to_peer(identity, action, &ctx.bucket),
     };
     let actions = READ_ACTIONS
         .iter()
@@ -2493,8 +2508,23 @@ pub(crate) fn replicated_author(query: &HashMap<String, String>, origin: &crate:
 fn settings_stamp(query: &HashMap<String, String>) -> Result<Option<crate::storage::stamp::Stamp>, String> {
     match query.get("x-rs3-stamp") {
         None => Ok(None),
-        Some(value) => crate::storage::stamp::Stamp::parse_header(value).map(Some),
+        Some(value) => {
+            let stamp = crate::storage::stamp::Stamp::parse_header(value)?;
+            stamp_not_far_ahead(&stamp)?;
+            Ok(Some(stamp))
+        }
     }
+}
+
+/// A replicated write's stamp is observed by this site's clock, so a bad
+/// peer clock cannot be allowed to drag it into the future: a stamp more
+/// than [`MAX_FUTURE_MS`](crate::storage::stamp::MAX_FUTURE_MS) ahead is
+/// refused, whichever way it arrived (header or query).
+fn stamp_not_far_ahead(stamp: &crate::storage::stamp::Stamp) -> Result<(), String> {
+    if stamp.ms > crate::storage::time::now_ms() + crate::storage::stamp::MAX_FUTURE_MS {
+        return Err("x-rs3-stamp is too far in the future (check the source site's clock)".to_string());
+    }
+    Ok(())
 }
 
 fn storage_error_response(err: StorageError, resource: &str) -> Response {
@@ -2703,15 +2733,8 @@ pub(crate) fn replicated_stamp(
         .to_str()
         .map_err(|_| "x-rs3-stamp is not valid text".to_string())
         .and_then(crate::storage::stamp::Stamp::parse_header)
+        .and_then(|stamp| stamp_not_far_ahead(&stamp).map(|()| stamp))
         .map_err(|message| s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, resource))?;
-    if stamp.ms > crate::storage::time::now_ms() + crate::storage::stamp::MAX_FUTURE_MS {
-        return Err(s3_error(
-            StatusCode::BAD_REQUEST,
-            "InvalidArgument",
-            "x-rs3-stamp is too far in the future (check the source site's clock)",
-            resource,
-        ));
-    }
     require_replicate_write(identity, bucket, key, resource, "x-rs3-stamp")?;
     Ok(Some(stamp))
 }

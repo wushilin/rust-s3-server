@@ -188,6 +188,8 @@ pub struct ObjectVersionEntry {
     pub delete_marker: bool,
     /// The version's stamp (the `x-rs3-stamp` form).
     pub stamp: Stamp,
+    /// The version's storage class (empty for a delete marker).
+    pub storage_class: String,
 }
 
 /// One page of `ListObjectVersions`, key-ordered — one live version per key,
@@ -586,12 +588,21 @@ impl LocalObjectStore {
         self.crash_points.lock().unwrap().insert(name.to_string());
     }
 
-    /// How many handles to this store's shared state exist, clones of
-    /// `self` included. Tests use it to wait for a stopped site's tasks to
-    /// let go before the same data directory is opened again.
+    /// How many clones of this store exist, `self` included. Tests use it,
+    /// with [`Self::open_index_handles`], to wait for a stopped site's tasks
+    /// to let go before the same data directory is opened again.
     #[cfg(test)]
     pub(crate) fn handle_count(&self) -> usize {
         Arc::strong_count(&self.index_cache)
+    }
+
+    /// How many handles to the buckets' index databases exist beyond the one
+    /// the cache keeps per bucket: a clone handed to a request, or to a
+    /// blocking operation still running after its task was dropped. Each
+    /// keeps that bucket's RocksDB open.
+    #[cfg(test)]
+    pub(crate) fn open_index_handles(&self) -> usize {
+        self.index_cache.lock().unwrap().values().map(|index| index.handle_count() - 1).sum()
     }
 
     #[cfg(test)]
@@ -1872,6 +1883,16 @@ impl LocalObjectStore {
         Ok(rank.zip(newest))
     }
 
+    /// A deleted key's tombstone — its last state, which a replicator reads
+    /// off a 404. `None` while the key has a live state, or was never here.
+    pub async fn key_tombstone(&self, bucket: &str, key: &str) -> Result<Option<Tombstone>> {
+        let index = self.index(bucket).await?;
+        if index.get(key).await?.is_some() {
+            return Ok(None);
+        }
+        index.get_tombstone(key).await
+    }
+
     /// The rank of `key`'s current state, for replicators deciding whether a
     /// change is newer than what is here.
     pub async fn key_rank(&self, bucket: &str, key: &str) -> Result<Option<Rank>> {
@@ -2340,20 +2361,42 @@ impl LocalObjectStore {
                 versioning != BucketVersioning::Off,
             )
             .await?;
-        let entries = page
-            .entries
-            .iter()
-            .map(|(v, is_latest)| ObjectVersionEntry {
-                key: v.object_key.clone(),
-                version_id: v.version_id(),
-                is_latest: *is_latest,
-                last_modified_ms: v.last_modified_ms,
-                etag: v.etag.clone(),
-                size: v.size,
-                delete_marker: v.delete_marker,
-                stamp: v.stamp.clone(),
-            })
-            .collect::<Vec<_>>();
+        // The storage class is not in the index: it is read from each
+        // version's `meta.json` (a few at a time; a marker has none).
+        let bucket_dir = self.layout.bucket_dir(bucket)?;
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for chunk in page.entries.chunks(16) {
+            let mut reads = Vec::with_capacity(chunk.len());
+            for (v, _) in chunk {
+                let path = bucket_dir.join(&v.blob_dir).join("meta.json");
+                reads.push(async move {
+                    if v.delete_marker {
+                        return String::new();
+                    }
+                    read_json::<super::metadata::ObjectMeta>(&path)
+                        .await
+                        .map(|meta| meta.storage_class)
+                        .unwrap_or_else(|err| {
+                            log::warn!("list versions: cannot read {}: {err}", path.display());
+                            super::metadata::DEFAULT_STORAGE_CLASS.to_string()
+                        })
+                });
+            }
+            let classes = futures::future::join_all(reads).await;
+            for ((v, is_latest), storage_class) in chunk.iter().zip(classes) {
+                entries.push(ObjectVersionEntry {
+                    key: v.object_key.clone(),
+                    version_id: v.version_id(),
+                    is_latest: *is_latest,
+                    last_modified_ms: v.last_modified_ms,
+                    etag: v.etag.clone(),
+                    size: v.size,
+                    delete_marker: v.delete_marker,
+                    stamp: v.stamp.clone(),
+                    storage_class,
+                });
+            }
+        }
         // The marker is the last version's id as listed (`null` for a null
         // version); after a rolled-up group there is no version: `null`.
         let next_version_id_marker = page.is_truncated.then(|| {

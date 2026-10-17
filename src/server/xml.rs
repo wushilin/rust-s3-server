@@ -237,13 +237,14 @@ pub fn list_object_versions_xml(
             ));
         } else {
             body.push_str(&format!(
-                "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass><Owner><ID>rust-s3-server</ID></Owner></Version>",
+                "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>{}</StorageClass><Owner><ID>rust-s3-server</ID></Owner></Version>",
                 escape_xml(&encode_list_value(&version.key, encode_keys)),
                 escape_xml(&version.version_id),
                 version.is_latest,
                 iso_utc_ms(version.last_modified_ms),
                 escape_xml(&quote_etag(&version.etag)),
                 version.size,
+                escape_xml(&version.storage_class),
             ));
         }
     }
@@ -711,6 +712,7 @@ mod tests {
                 size: 5,
                 delete_marker: false,
                 stamp: stamp.clone(),
+                storage_class: "STANDARD".to_string(),
             },
             ObjectVersionEntry {
                 key: "my-prefix/datafile".to_string(),
@@ -721,6 +723,7 @@ mod tests {
                 size: 0,
                 delete_marker: true,
                 stamp,
+                storage_class: String::new(),
             },
         ];
         let xml = list_object_versions_xml("bucket", "my-prefix", None, None, &versions, &[], 1000, "", "", true, Some("my-prefix/datafile"), Some("null"));

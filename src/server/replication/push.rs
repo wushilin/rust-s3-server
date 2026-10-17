@@ -149,10 +149,14 @@ impl Pusher {
     }
 
     /// The peer's settings seen on a probe: adopt what is newer; what is
-    /// newer here is pushed (`PeerClient::put_settings`). A versioning that
-    /// still differs afterwards (the peer cannot take ours: an old layout
-    /// there) fails the batch, retried later.
-    async fn reconcile_settings(&self, peer: &crate::storage::metadata::BucketSettings) -> Result<(), StepError> {
+    /// newer here is pushed (`PeerClient::put_settings`). Returns the
+    /// versioning both buckets then run. A peer that did not take ours (it
+    /// cannot: an old layout there) fails the batch, retried later — the
+    /// batch is never pushed under a versioning the peer does not have.
+    async fn reconcile_settings(
+        &self,
+        peer: &crate::storage::metadata::BucketSettings,
+    ) -> Result<crate::storage::metadata::BucketVersioning, StepError> {
         let bucket = &self.link.local_bucket;
         let local = match self.store.adopt_bucket_settings(bucket, peer).await {
             Ok(local) => local,
@@ -161,12 +165,22 @@ impl Pusher {
             }
             Err(err) => return Err(err.into()),
         };
-        if local != peer.versioning || peer.cors != self.store.bucket_settings(bucket).await?.cors {
-            let ours = self.store.bucket_settings(bucket).await?;
-            self.alive(self.peer.put_settings(&ours)).await?;
-            self.peer_site_check()?;
+        let ours = self.store.bucket_settings(bucket).await?;
+        if local == peer.versioning && peer.cors == ours.cors {
+            return Ok(local);
         }
-        Ok(())
+        self.alive(self.peer.put_settings(&ours)).await?;
+        self.peer_site_check()?;
+        if local != peer.versioning {
+            let adopted = self.alive(self.peer.versioning()).await?;
+            if adopted != local.as_str() {
+                return Err(StepError::Retry(format!(
+                    "the peer bucket kept versioning {adopted} after being sent {}",
+                    local.as_str()
+                )));
+            }
+        }
+        Ok(local)
     }
 
     async fn save(&self, checkpoint: Option<&PushCheckpoint>) -> Result<(), StepError> {
@@ -297,7 +311,7 @@ impl Pusher {
                 };
                 let page = tokio::select! {
                     _ = self.cancel.cancelled() => return Ok(()),
-                    page = read::read(&self.store, &bucket, &params) => page?,
+                    page = self.alive(read::read(&self.store, &bucket, &params)) => page?,
                 };
                 // Stopped while this waited for changes: keep them for later.
                 if self.held() {
@@ -335,8 +349,8 @@ impl Pusher {
         // versioning-enabled peer keeps every state it is sent, so nothing
         // is collapsed on the way there.
         let probe = self.alive(self.peer.snapshot(None, 1, "", false, false)).await?;
-        self.reconcile_settings(&probe.settings).await?;
-        let peer_versioned = self.store.bucket_versioning(&self.link.local_bucket).await? == crate::storage::metadata::BucketVersioning::Enabled;
+        let peer_versioned =
+            self.reconcile_settings(&probe.settings).await? == crate::storage::metadata::BucketVersioning::Enabled;
         let (batch, collapsed) = if peer_versioned { (events.to_vec(), 0) } else { latest_per_key(events) };
         if collapsed > 0 {
             self.update(|s| s.collapsed += collapsed as u64);
@@ -476,8 +490,8 @@ impl Pusher {
             versioned: change.versioned,
             tags: object.meta.tags.clone(),
         };
-        if remote.is_some_and(|r| r.etag == object.meta.etag && r.size == object.meta.size) {
-            self.alive(self.peer.copy_metadata(key, &meta, stamp)).await.map_err(PushError::Peer)?;
+        if let Some(remote) = remote.filter(|r| r.etag == object.meta.etag && r.size == object.meta.size) {
+            self.alive(self.peer.copy_metadata(key, &meta, stamp, &remote.etag)).await.map_err(PushError::Peer)?;
             self.update(|s| s.metadata_only += 1);
             return Ok(());
         }

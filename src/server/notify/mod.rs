@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use self::db::NotifyDb;
 use self::engine::{Limits, Next};
@@ -226,7 +227,12 @@ struct Inner {
     changelog: ChangelogConfig,
     client: reqwest::Client,
     permits: Arc<Semaphore>,
+    /// A child of the process token: the service's tasks (the webhook
+    /// workers, the checker, the trim loop) stop with the process, or alone
+    /// through [`NotifyService::shutdown`].
     shutdown: CancellationToken,
+    /// Every task the service spawned, so a shutdown can wait for them.
+    tracker: TaskTracker,
     subs: RwLock<HashMap<String, Arc<Runtime>>>,
 }
 
@@ -268,7 +274,8 @@ impl NotifyService {
                 db,
                 cfg,
                 changelog,
-                shutdown,
+                shutdown: shutdown.child_token(),
+                tracker: TaskTracker::new(),
                 subs: RwLock::new(HashMap::new()),
             }),
         };
@@ -330,7 +337,7 @@ impl NotifyService {
         if kind == SubscriptionKind::Webhook {
             let service = self.clone();
             let worker = rt.clone();
-            tokio::spawn(async move { service.run_webhook(worker).await });
+            self.inner.tracker.spawn(async move { service.run_webhook(worker).await });
         }
         rt
     }
@@ -508,12 +515,24 @@ impl NotifyService {
         self.apply_from_worker(rt, generation, |st| st.paused = Some(pause)).await;
     }
 
+    /// Stops every task of the service — the webhook workers, the checker,
+    /// the trim loop — and returns once they have all ended. A delivery that
+    /// has not noticed its cancellation within `grace` is left to finish on
+    /// its own (its HTTP timeouts bound it), with a warning.
+    pub async fn shutdown(&self, grace: Duration) {
+        self.inner.shutdown.cancel();
+        self.inner.tracker.close();
+        if tokio::time::timeout(grace, self.inner.tracker.wait()).await.is_err() {
+            log::warn!("changelog subscriptions: a worker still runs {}s after shutdown", grace.as_secs());
+        }
+    }
+
     // ── checker tick and trimming ───────────────────────────────────────────
 
     fn spawn_checker(&self) {
         let service = self.clone();
         let every = Duration::from_secs(self.inner.cfg.check_interval_secs.max(1));
-        tokio::spawn(async move {
+        self.inner.tracker.spawn(async move {
             let mut tick = tokio::time::interval(every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -553,7 +572,7 @@ impl NotifyService {
     fn spawn_trimmer(&self) {
         let service = self.clone();
         let every = Duration::from_secs(self.inner.changelog.trim_interval_secs.max(1));
-        tokio::spawn(async move {
+        self.inner.tracker.spawn(async move {
             let mut tick = tokio::time::interval(every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {

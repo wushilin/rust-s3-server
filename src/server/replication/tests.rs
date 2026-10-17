@@ -28,6 +28,8 @@ struct Site {
     replication: ReplicationService,
     shutdown: CancellationToken,
     endpoint: String,
+    /// The HTTP server task: it ends once every connection is done.
+    server: tokio::task::JoinHandle<()>,
 }
 
 fn fast_timing() -> Timing {
@@ -115,7 +117,7 @@ impl Site {
         };
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let stop = shutdown.clone();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app)
                 .with_graceful_shutdown(async move { stop.cancelled().await })
                 .await;
@@ -129,6 +131,7 @@ impl Site {
             replication,
             shutdown,
             endpoint,
+            server,
         }
     }
 
@@ -138,20 +141,44 @@ impl Site {
     }
 
     /// Stops this site (its data and address are kept for [`Stopped::start`]).
+    ///
+    /// Every task of the site has ended when this returns: RocksDB holds a
+    /// lock file per database, and a handle still open in a worker winding
+    /// down (seconds, on a loaded Windows runner) makes the reopen fail.
     async fn stop(self) -> Stopped {
-        self.shutdown.cancel();
+        let Site { tmp, name, store, iam, notify, replication, shutdown, endpoint, server } = self;
+        let grace = Duration::from_secs(30);
+        shutdown.cancel();
         // As the real server does: the store's token is the process one, and
         // it ends long polls so the shutdown is not held up.
-        self.store.shutdown_token().cancel();
-        let Site { tmp, name, store, iam, notify, replication, endpoint, .. } = self;
+        store.shutdown_token().cancel();
+        // The services wait for their tasks; the server ends with its last
+        // connection, and with it the router's handles to the store and iam.
+        replication.shutdown(grace).await;
+        notify.shutdown(grace).await;
+        tokio::time::timeout(grace, server)
+            .await
+            .unwrap_or_else(|_| panic!("site {name}: the server task did not end {}s after shutdown", grace.as_secs()))
+            .unwrap();
         drop((notify, replication));
-        // Every task of the site lets go of the store and the admin database
-        // before the directory can be opened again: RocksDB holds a lock
-        // file per database, and a handle still open in a worker winding
-        // down (seconds, on a loaded Windows runner) makes the reopen fail.
+        // What the join cannot cover: a blocking operation a dropped task
+        // left running keeps its bucket's index database open until it is
+        // done. Wait for the last handle, and say which one was held if it
+        // never comes.
         let admin = iam.admin_db();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while (store.handle_count() > 1 || Arc::strong_count(&admin) > 2) && Instant::now() < deadline {
+        let deadline = Instant::now() + grace;
+        loop {
+            let (clones, index_handles, admin_handles) =
+                (store.handle_count(), store.open_index_handles(), Arc::strong_count(&admin));
+            if clones <= 1 && index_handles == 0 && admin_handles <= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "site {name}: {}s after stop something still holds the store (clones {clones}, \
+                 bucket index handles {index_handles}) or the admin database (handles {admin_handles})",
+                grace.as_secs()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop((admin, iam, store));

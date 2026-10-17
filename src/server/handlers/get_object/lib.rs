@@ -46,32 +46,33 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
                 response.headers_mut().insert("x-rs3-site", value);
             }
             // A deleted key still has a state for replication: its
-            // tombstone's stamp.
+            // tombstone — the delete's stamp, what it ranks by (the version
+            // it removed), and on a versioned bucket the delete marker.
             if not_found {
-                if let Ok(Some((stamp, true))) = store.key_stamp(&bucket, &key).await {
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&stamp.to_header()) {
+                if let Ok(Some(tombstone)) = store.key_tombstone(&bucket, &key).await {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&tombstone.stamp.to_header()) {
                         response.headers_mut().insert("x-rs3-stamp", value);
                         response
                             .headers_mut()
                             .insert("x-rs3-deleted", axum::http::HeaderValue::from_static("true"));
                     }
-                    // S3: a key whose current state is a delete marker.
+                    // S3: a key whose current state is a delete marker — one
+                    // that exists as a version (a tombstone from before
+                    // markers were kept has none to name).
                     if versioning != crate::storage::metadata::BucketVersioning::Off {
-                        response
-                            .headers_mut()
-                            .insert("x-amz-delete-marker", axum::http::HeaderValue::from_static("true"));
-                        if let Ok(Some(marker)) = store.list_versions(&bucket, &key).await.map(|v| v.into_iter().next()) {
+                        if let Some(marker) = crate::storage::index::VersionRecord::from_tombstone(&tombstone) {
                             if let Ok(value) = axum::http::HeaderValue::from_str(&marker.version_id()) {
+                                response
+                                    .headers_mut()
+                                    .insert("x-amz-delete-marker", axum::http::HeaderValue::from_static("true"));
                                 response.headers_mut().insert("x-amz-version-id", value);
                             }
                         }
                     }
-                    // What the tombstone ranks by: the version it removed.
-                    if let Ok(Some(rank)) = store.key_rank(&bucket, &key).await {
-                        if rank.deleted {
-                            if let Ok(value) = axum::http::HeaderValue::from_str(&rank.stamp.to_header()) {
-                                response.headers_mut().insert("x-rs3-removed-stamp", value);
-                            }
+                    let rank = tombstone.rank();
+                    if rank.deleted {
+                        if let Ok(value) = axum::http::HeaderValue::from_str(&rank.stamp.to_header()) {
+                            response.headers_mut().insert("x-rs3-removed-stamp", value);
                         }
                     }
                 }

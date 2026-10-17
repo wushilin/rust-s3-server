@@ -450,7 +450,7 @@ batch/grace settings.
 | `replication.check_interval_secs` | `5` | Supervisor tick: an enabled replication link without a live worker gets one within this. |
 | `replication.worker_stale_secs` | `600` | A link worker silent for this long is replaced. A worker renews its lease while it makes progress (every chunk of a transfer counts, renewed at most every 5s), so a slow transfer of a large object is never mistaken for a hang. |
 | `replication.parallelism` | `8` | Changes a link applies concurrently within one batch. |
-| `changelog.tombstone_days` | `14` | How long a delete's tombstone (its stamp) is kept, so an older replicated write cannot bring the object back. |
+| `changelog.tombstone_days` | `14` | How long a delete's tombstone (its stamp) is kept, so an older replicated write cannot bring the object back. A delete marker made while versioning was enabled is a version: kept until it is removed by version id. |
 | `webhooks.check_interval_secs` | `5` | Checker tick: muted webhooks whose mute has passed resume on the next tick. |
 | `webhooks.mute_secs` | `30` | Mute after any unsuccessful delivery (per-webhook override). A longer `Retry-After` wins. |
 | `webhooks.max_mute_secs` | `900` | Cap on a receiver's `Retry-After`. |
@@ -924,10 +924,13 @@ site, start it from an empty data directory and let a link fill it.
 | On this site | **local access key**: an access key of this site, named only (no secret: the server acts *as* it) | `s3:PutObject`, `s3:DeleteObject`, `s3:ReplicateWrite` | the same, plus `s3:GetObject`, `s3:GetBucketChangelog` |
 | On the peer | **peer access key and secret** (SigV4) | `s3:GetObject`, `s3:GetBucketChangelog` | the same, plus `s3:PutObject`, `s3:DeleteObject`, `s3:ReplicateWrite` |
 
-Each action is needed on the whole bucket (every key). `s3:ReplicateWrite` is
-the permission to write with a change's original stamp: replicated writes keep
-the stamp of the site that made them, which is what decides conflicts, so
-setting it is a privilege of its own. Admin keys (`s3:*`) have everything.
+Each action is needed on the whole bucket (every key); on the peer,
+`s3:ReplicateWrite` on the bucket itself as well, since a merge link pushes
+settings changes (versioning, CORS) as stamped writes of the bucket.
+`s3:ReplicateWrite` is the permission to write with a change's original
+stamp: replicated writes keep the stamp of the site that made them, which is
+what decides conflicts, so setting it is a privilege of its own. Admin keys
+(`s3:*`) have everything.
 In the console's policy editor, the rule builder's **Replication** access
 level grants exactly these on a whole bucket (bucket `*` for every bucket),
 and the JSON presets **Replicate all buckets** (`ReplicateAllBuckets`) and

@@ -24,7 +24,7 @@ use super::peer::{PeerClient, PeerError};
 use crate::server::notify::model::WireEvent;
 use crate::storage::errors::StorageError;
 use crate::storage::metadata::BucketVersioning;
-use crate::storage::store::{CompletePartRequest, LocalObjectStore, WriteOptions, WriteOrigin};
+use crate::storage::store::{CompletePartRequest, LocalObjectStore, Precondition, WriteOptions, WriteOrigin};
 use crate::storage::write::outranks;
 use crate::storage::time::now_ms;
 
@@ -664,8 +664,9 @@ impl Worker {
         };
         match result {
             Ok(()) => Ok(()),
-            Err(StorageError::StaleStamp { .. }) => {
-                // A newer state landed meanwhile.
+            Err(StorageError::StaleStamp { .. } | StorageError::PreconditionFailed { .. }) => {
+                // A newer state landed meanwhile (the guard of a
+                // metadata-only adoption saw other bytes).
                 self.update(|s| s.superseded += 1);
                 Ok(())
             }
@@ -689,7 +690,8 @@ impl Worker {
 
     /// Applies a put: the peer's state `change`, with its stamp. Same bytes
     /// here already (same ETag and size): adopt the peer's metadata and
-    /// stamp without moving data.
+    /// stamp without moving data — guarded on that ETag, so bytes a client
+    /// writes here meanwhile are never republished under the peer's stamp.
     async fn apply_put(&self, change: &Change) -> Result<(), PutError> {
         let bucket = &self.link.local_bucket;
         let key = &change.key;
@@ -708,7 +710,9 @@ impl Worker {
                     Some(&headers.user_meta),
                     headers.content_type.as_deref(),
                     headers.content_language.as_deref(),
-                    options.with_tags(Some(headers.tags.clone())),
+                    options
+                        .with_tags(Some(headers.tags.clone()))
+                        .with_precondition(Some(Precondition::IfMatch(change.etag.clone()))),
                 )
                 .await
                 .map_err(PutError::Local)?;

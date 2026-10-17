@@ -627,10 +627,16 @@ impl PeerClient {
 
     /// Replaces `key`'s metadata and stamp without moving data (a self-copy
     /// with `REPLACE`; the peer keeps the bytes it has).
-    pub async fn copy_metadata(&self, key: &str, meta: &ObjectHeaders, stamp: &Stamp) -> Result<(), PeerError> {
+    /// Re-stamps `key` on the peer with `meta` over the bytes it has
+    /// (`expect_etag`, as compared): a self-copy guarded by
+    /// `x-amz-copy-source-if-match`, which the peer holds through the write,
+    /// so bytes a client puts there meanwhile are never re-stamped
+    /// (`PeerError::Stale`).
+    pub async fn copy_metadata(&self, key: &str, meta: &ObjectHeaders, stamp: &Stamp, expect_etag: &str) -> Result<(), PeerError> {
         let path = object_path(&self.config.bucket, key);
         let mut headers = Self::write_headers(meta, stamp);
         headers.push(("x-amz-copy-source".to_string(), path.clone()));
+        headers.push(("x-amz-copy-source-if-match".to_string(), format!("\"{}\"", expect_etag.trim_matches('"'))));
         headers.push(("x-amz-metadata-directive".to_string(), "REPLACE".to_string()));
         let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let builder = Self::with_content_headers(self.signed(Method::PUT, &path, "", &extra), meta).header("content-length", 0);
