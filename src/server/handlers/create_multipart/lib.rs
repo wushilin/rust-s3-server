@@ -30,8 +30,19 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message, &resource)
         }
     };
+    // `x-rs3-replicate: true` starts a replicated upload (the stamp the
+    // object keeps comes with the completion), which a read-only bucket
+    // accepts; a client's create is refused there before any part is sent.
+    let replicated = match srv::replicated_upload(ctx.identity.as_ref(), &ctx.headers, &ctx.bucket, &ctx.key, &resource) {
+        Ok(replicated) => replicated,
+        Err(response) => return response,
+    };
+    let tags = match srv::extract_tags(&ctx.headers) {
+        Ok(tags) => tags.unwrap_or_default(),
+        Err(message) => return srv::s3_error(StatusCode::BAD_REQUEST, "InvalidTag", message, &resource),
+    };
     match store
-        .initiate_multipart_with_metadata(
+        .initiate_multipart_as(
             &ctx.bucket,
             &ctx.key,
             content_type,
@@ -39,6 +50,8 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, _body: Body)
             storage_class,
             content_language,
             &user_meta,
+            &tags,
+            replicated,
         )
         .await
     {

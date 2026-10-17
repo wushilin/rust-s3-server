@@ -392,7 +392,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Standard SigV4 signing-key derivation chain: `HMAC(HMAC(HMAC(HMAC("AWS4"
 /// + secret, date), region), service), "aws4_request")`.
-fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+pub(crate) fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
@@ -407,7 +407,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn hex_hmac(key: &[u8], data: &[u8]) -> String {
+pub(crate) fn hex_hmac(key: &[u8], data: &[u8]) -> String {
     hex_encode(&hmac_sha256(key, data))
 }
 

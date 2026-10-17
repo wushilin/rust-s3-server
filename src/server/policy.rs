@@ -65,6 +65,9 @@ pub enum RuleAccess {
     Read,
     Write,
     ReadWrite,
+    /// What a replication link's key needs on a whole bucket: read it and
+    /// its changelog, and write it with the changes' original stamps.
+    Replication,
 }
 
 /// The deliberately small, safe rule model exposed by the management UI.
@@ -90,6 +93,20 @@ const WRITE_OBJECT_ACTIONS: &[&str] = &[
     "s3:ListMultipartUploadParts",
 ];
 
+/// A replication rule: the changelog (bucket level), and object reads and
+/// stamped writes. `s3:ReplicateWrite` is needed on the bucket as well: a
+/// replicated settings change (versioning, CORS) is a stamped write of the
+/// bucket. Multipart helpers let a pushed multipart copy clean up after a
+/// failure.
+const REPLICATION_BUCKET_ACTIONS: &[&str] = &["s3:GetBucketChangelog", "s3:ReplicateWrite"];
+const REPLICATION_OBJECT_ACTIONS: &[&str] = &[
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:ReplicateWrite",
+    "s3:AbortMultipartUpload",
+];
+
 pub fn compile_rules(rules: &[PolicyRule]) -> Result<PolicyDocument, String> {
     let mut statement = Vec::with_capacity(rules.len() * 2);
     for (index, rule) in rules.iter().enumerate() {
@@ -100,6 +117,12 @@ pub fn compile_rules(rules: &[PolicyRule]) -> Result<PolicyDocument, String> {
         }
         if bucket.contains('/') {
             return Err(format!("Rule {}: bucket must not contain '/'", index + 1));
+        }
+        if rule.access == RuleAccess::Replication && !prefix.is_empty() {
+            return Err(format!(
+                "Rule {}: replication covers the whole bucket; leave the prefix empty",
+                index + 1
+            ));
         }
         if bucket == "*" && !prefix.is_empty() {
             return Err(format!(
@@ -122,6 +145,15 @@ pub fn compile_rules(rules: &[PolicyRule]) -> Result<PolicyDocument, String> {
             )]),
             ..Condition::default()
         });
+        if rule.access == RuleAccess::Replication {
+            statement.push(Statement {
+                sid: Some(format!("RustS3Rule{}ReplicationBucket", index + 1)),
+                effect: rule.effect,
+                action: strings(REPLICATION_BUCKET_ACTIONS.to_vec()),
+                resource: OneOrMany::One(bucket_resource.clone()),
+                condition: None,
+            });
+        }
         if matches!(rule.access, RuleAccess::Read | RuleAccess::ReadWrite) {
             statement.push(Statement {
                 sid: Some(format!("RustS3Rule{}ReadBucket", index + 1)),
@@ -166,8 +198,12 @@ pub fn decompile_rules(policy: &PolicyDocument) -> Result<Vec<PolicyRule>, Strin
         let first = &policy.statement[cursor];
         let read_sid = format!("RustS3Rule{rule_number}ReadBucket");
         let write_sid = format!("RustS3Rule{rule_number}WriteBucket");
+        let replication_sid = format!("RustS3Rule{rule_number}ReplicationBucket");
         let (access, bucket_statement, write_statement) =
-            if first.sid.as_deref() == Some(read_sid.as_str()) {
+            if first.sid.as_deref() == Some(replication_sid.as_str()) {
+                cursor += 1;
+                (RuleAccess::Replication, first, None)
+            } else if first.sid.as_deref() == Some(read_sid.as_str()) {
                 cursor += 1;
                 if policy
                     .statement
@@ -241,6 +277,7 @@ fn rule_actions(access: RuleAccess) -> (Vec<&'static str>, Vec<&'static str>) {
     match access {
         RuleAccess::Read => (READ_BUCKET_ACTIONS.to_vec(), READ_OBJECT_ACTIONS.to_vec()),
         RuleAccess::Write => (WRITE_BUCKET_ACTIONS.to_vec(), WRITE_OBJECT_ACTIONS.to_vec()),
+        RuleAccess::Replication => (REPLICATION_BUCKET_ACTIONS.to_vec(), REPLICATION_OBJECT_ACTIONS.to_vec()),
         RuleAccess::ReadWrite => (
             READ_BUCKET_ACTIONS
                 .iter()
@@ -716,6 +753,22 @@ pub fn requirements_for_request(
         return Some(vec![Requirement::bucket("s3:RebuildIndex", bucket)]);
     }
 
+    if key.is_none()
+        && (has(super::notify::read::QUERY_CHANGELOG) || has(super::notify::read::QUERY_SNAPSHOT))
+    {
+        // rusts3 extension: reading a bucket's changelog (and its snapshot
+        // listing) reveals every key, size and ETag — a custom action, like
+        // s3:RebuildIndex, so it is granted deliberately (the admin group's
+        // s3:* includes it). The router refuses any verb but GET.
+        return Some(vec![Requirement::bucket("s3:GetBucketChangelog", bucket)]);
+    }
+    if key.is_none() && has(super::replication::peer::QUERY_ACCESS) {
+        // rusts3 extension: "what may I do on this bucket?" — any
+        // authenticated caller may ask about its own permissions (a
+        // replication link checks its key before it is created).
+        return Some(Vec::new());
+    }
+
     let decoded_key = key.map(|k| {
         urlencoding::decode(k)
             .map(|v| v.into_owned())
@@ -726,9 +779,16 @@ pub fn requirements_for_request(
     let reqs = match (method, &decoded_key) {
         // ── bucket level ──
         ("GET", None) if has("cors") => vec![Requirement::bucket("s3:GetBucketCORS", bucket)],
+        // A replicated settings write (a peer's change, stamped in the
+        // query) is replication's permission, not the operator's.
+        ("PUT", None) if (has("cors") || has("versioning")) && has("x-rs3-stamp") => {
+            vec![Requirement::bucket("s3:ReplicateWrite", bucket)]
+        }
         ("PUT" | "DELETE", None) if has("cors") => {
             vec![Requirement::bucket("s3:PutBucketCORS", bucket)]
         }
+        ("GET", None) if has("versioning") => vec![Requirement::bucket("s3:GetBucketVersioning", bucket)],
+        ("PUT", None) if has("versioning") => vec![Requirement::bucket("s3:PutBucketVersioning", bucket)],
         ("PUT", None) => vec![Requirement::bucket("s3:CreateBucket", bucket)],
         ("DELETE", None) => vec![Requirement::bucket("s3:DeleteBucket", bucket)],
         ("HEAD", None) => vec![Requirement::bucket("s3:ListBucket", bucket)],
@@ -950,6 +1010,38 @@ mod tests {
     }
 
     #[test]
+    fn a_replication_rule_grants_exactly_what_a_link_key_needs_and_round_trips() {
+        let rules = vec![PolicyRule { effect: Effect::Allow, access: RuleAccess::Replication, bucket: "photos".into(), prefix: String::new() }];
+        let policy = compile_rules(&rules).unwrap();
+        // Everything a merge link needs on the bucket (a mirror's local key
+        // needs a subset)...
+        for action in ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ReplicateWrite"] {
+            assert!(is_authorized(&policy, &[Requirement::object(action, "photos", "*")]), "{action}");
+            assert!(is_authorized(&policy, &[Requirement::object(action, "photos", "a/b.jpg")]), "{action}");
+        }
+        assert!(is_authorized(&policy, &[Requirement::bucket("s3:GetBucketChangelog", "photos")]));
+        // ...and nothing else: no listing, no other bucket.
+        assert!(!is_authorized(&policy, &[Requirement::bucket("s3:ListBucket", "photos")]));
+        assert!(!is_authorized(&policy, &[Requirement::object("s3:GetObject", "other", "k")]));
+        assert_eq!(decompile_rules(&policy).unwrap(), rules);
+        // Mixed with other rules, still round-trips.
+        let mixed = vec![
+            PolicyRule { effect: Effect::Allow, access: RuleAccess::Read, bucket: "logs".into(), prefix: "app/".into() },
+            rules[0].clone(),
+        ];
+        assert_eq!(decompile_rules(&compile_rules(&mixed).unwrap()).unwrap(), mixed);
+        // Every bucket.
+        let all = vec![PolicyRule { bucket: "*".into(), ..rules[0].clone() }];
+        let policy = compile_rules(&all).unwrap();
+        assert!(is_authorized(&policy, &[Requirement::bucket("s3:GetBucketChangelog", "any")]));
+        assert!(is_authorized(&policy, &[Requirement::object("s3:ReplicateWrite", "any", "*")]));
+        assert_eq!(decompile_rules(&policy).unwrap(), all);
+        // Replication is whole-bucket.
+        let prefixed = PolicyRule { prefix: "x/".into(), ..rules[0].clone() };
+        assert!(compile_rules(&[prefixed]).unwrap_err().contains("whole bucket"));
+    }
+
+    #[test]
     fn visual_rules_compile_to_prefix_safe_s3_policy_and_round_trip() {
         let rules = vec![PolicyRule {
             effect: Effect::Allow,
@@ -1120,6 +1212,22 @@ mod tests {
             !is_authorized(&read_only, &reqs),
             "a read-only policy cannot rebuild"
         );
+    }
+
+    #[test]
+    fn changelog_reads_map_to_their_own_action() {
+        for query in ["x-rs3-changelog", "x-rs3-changelog-snapshot", "after=5&x-rs3-changelog=&prefix=a/"] {
+            let reqs = requirements_for_request("GET", "/docs", query, None).unwrap();
+            assert_eq!(reqs, vec![Requirement::bucket("s3:GetBucketChangelog", "docs")], "{query}");
+        }
+        // Read rights alone do not include it; s3:* does.
+        let reqs = requirements_for_request("GET", "/docs", "x-rs3-changelog", None).unwrap();
+        assert!(!is_authorized(&policy(READ_ONLY_DOCS), &reqs));
+        let admin = policy(r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::*"}]}"#);
+        assert!(is_authorized(&admin, &reqs));
+        // On an object path the parameter means nothing: an ordinary GET.
+        let reqs = requirements_for_request("GET", "/docs/k", "x-rs3-changelog", None).unwrap();
+        assert_eq!(reqs, vec![Requirement::object("s3:GetObject", "docs", "k")]);
     }
 
     #[test]

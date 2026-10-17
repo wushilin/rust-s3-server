@@ -75,6 +75,14 @@ pub fn object_dir_random_suffix() -> String {
         .collect()
 }
 
+/// The full lowercase hex SHA-1 of an object key (40 chars): the key's
+/// directory name on layout 3.
+pub fn key_hash(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hex_lower(&hasher.finalize())
+}
+
 // ── Shared ────────────────────────────────────────────────────────────────────
 
 pub fn fanout_id(bucket: &str, key: &str) -> String {

@@ -7,6 +7,7 @@ const SUB_MASK='********';
 const subStatusBadge=s=>s.status==='active'?'<span class="badge green">Active</span>':s.status==='snapshot'?'<span class="badge green">Snapshot</span>':s.status==='muted'?`<span class="badge amber" title="Until ${esc(fmtTime(s.muted_until_ms))}">Muted ${fmtDur(s.muted_until_ms-Date.now())}</span>`:`<span class="badge" style="color:var(--danger,#c33)" title="${esc(s.paused?.message||'')}">Paused · ${esc((s.paused?.reason||'').replace('_',' '))}</span>`;
 function subFilterText(f){const parts=[];if(f.prefix)parts.push(`prefix <code>${esc(f.prefix)}</code>`);if(f.suffix)parts.push(`suffix <code>${esc(f.suffix)}</code>`);if(f.ops&&f.ops.length===1)parts.push(f.ops[0]+'s only');return parts.join(' · ')||'<span class="muted">all changes</span>';}
 function subPosition(s){
+  if(s.kind==='pull')return s.last_success_ms?`served through seq ${s.offset.toLocaleString()}<div class="muted" style="font-size:11px">readers keep their own position</div>`:'<span class="muted">not read yet</span>';
   if(s.phase==='snapshot')return `Snapshot${s.snapshot_cursor?` at <code>${esc(s.snapshot_cursor)}</code>`:''}`;
   const lag=s.lag??0;let text=`seq ${s.offset.toLocaleString()} / ${(s.head??0).toLocaleString()}`;
   if(lag)text+=`<div class="muted" style="font-size:11px">${lag.toLocaleString()} behind</div>`;
@@ -19,6 +20,7 @@ function subLast(s){
   return `${fmtTime(s.last_attempt_ms||s.last_success_ms)}<div class="muted" style="font-size:11px">${ok?'ok':esc(s.last_error||('HTTP '+s.last_status))}${s.consecutive_failures?` · ${s.consecutive_failures} failed`:''}</div>`;
 }
 async function loadSubs(){
+  loadLinks();
   try{
     const data=await api('GET','/api/subscriptions');subs=data.subscriptions||[];
     $('subCount').textContent=`${subs.length} subscription${subs.length===1?'':'s'}`;
@@ -65,7 +67,7 @@ async function saveSub(event){
 }
 function showSubSecret(result){
   const s=result.subscription;
-  if(result.token){$('ss_title').textContent=`Replication token for ${s.name}`;$('ss_hint').textContent='Replicators send it as “Authorization: Bearer <token>” to GET /_rs3/changelog and POST /_rs3/changelog/ack on the S3 port.';$('ss_text').textContent=result.token;}
+  if(result.token){$('ss_title').textContent=`Replication token for ${s.name}`;$('ss_hint').textContent='Replicators send it as “Authorization: Bearer <token>” to GET /_rs3/changelog?after=<seq> and GET /_rs3/changelog/snapshot on the S3 port, and keep their own position.';$('ss_text').textContent=result.token;}
   else{$('ss_title').textContent=`Signing secret for ${s.name}`;$('ss_hint').textContent='Every delivery carries X-RS3-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>. Verify it, and reject stale timestamps.';$('ss_text').textContent=result.secret;}
   $('subSecretDlg').showModal();
 }
@@ -79,6 +81,8 @@ function renderSubActions(){
   const pause=$('sa_pause');pause.classList.toggle('hidden',!s.paused);pause.textContent=s.paused?.message||'';
   $('sa_detail').textContent=[`phase: ${s.phase}`,`offset: ${s.offset}`,`head: ${s.head??'?'}`,`oldest retained: after seq ${s.trimmed_through??'?'}`,`delivered: ${s.delivered_events} events in ${s.delivered_batches} batches`,s.last_error?`last error: ${s.last_error}`:null,s.muted_until_ms>Date.now()?`muted until: ${fmtTime(s.muted_until_ms)}`:null].filter(Boolean).join('\n');
   $('sa_rotate').textContent=s.kind==='webhook'?'Rotate secret':'Rotate token';
+  document.querySelectorAll('#subActionDlg .sa-webhook').forEach(el=>el.classList.toggle('hidden',s.kind!=='webhook'));
+  if(s.kind==='pull')$('sa_detail').textContent=[`last read: ${s.last_success_ms?fmtTime(s.last_success_ms):'never'}`,`served through: seq ${s.offset}`,`head: ${s.head??'?'}`,'Readers keep their own position (after=). Pause disables the token.'].join('\n');
 }
 async function subAction(action){
   setInlineError('saError');const body={action};
@@ -91,3 +95,71 @@ function subRotate(){
   showConfirm(`Rotate ${what}?`,s.name,`The current ${what} stops working immediately.`,async()=>{const result=await api('POST','/api/subscriptions/'+encodeURIComponent(s.id)+'/action',{action:s.kind==='webhook'?'rotate_secret':'rotate_token'});$('subActionDlg').close();showSubSecret(result);},{confirmLabel:'Rotate',busyLabel:'Rotating…'});
 }
 function confirmDeleteSub(i){const s=subs[i];showConfirm('Delete subscription?',s.name,`Deliveries stop and its position is discarded. ${s.kind==='pull'?'The replication token stops working.':''}`,async()=>{await api('DELETE','/api/subscriptions/'+encodeURIComponent(s.id));toast('Subscription deleted',s.name);await loadSubs();});}
+
+// ── replication links ─────────────────────────────────────────────────────
+let links=[],localKeys=[];
+const LINK_PERMS={
+  mirror:{here:['s3:PutObject','s3:DeleteObject','s3:ReplicateWrite'],peer:['s3:GetObject','s3:GetBucketChangelog'],
+    hereWhy:'writes the copies, with their original stamps',peerWhy:'reads the bucket and its changelog'},
+  merge:{here:['s3:GetObject','s3:GetBucketChangelog','s3:PutObject','s3:DeleteObject','s3:ReplicateWrite'],peer:['s3:GetObject','s3:GetBucketChangelog','s3:PutObject','s3:DeleteObject','s3:ReplicateWrite'],
+    hereWhy:'reads this bucket and its changelog, writes the peer\'s changes',peerWhy:'reads the peer bucket and its changelog, writes this bucket\'s changes'}};
+const linkBadge=s=>({live:'<span class="badge green">Live</span>',snapshot:'<span class="badge green">Snapshot</span>',idle:'<span class="badge">Starting</span>',paused:'<span class="badge">Paused</span>',error:'<span class="badge amber">Retrying</span>',stopped:'<span class="badge" style="color:var(--danger,#c33)">Stopped</span>'}[s]||`<span class="badge">${esc(s||'—')}</span>`);
+const flowEnd=(label,bucket,here)=>`<div class="rend${here?' here':''}"><small>${esc(label)}</small><code>${esc(bucket)}</code></div>`;
+// [this site] arrow [peer]: mirror ⟵ (into here), merge ⟷; `outbound` is a
+// mirror the peer runs, copying this bucket out (⟶).
+const flow=(mode,here,peerLabel,peer,outbound)=>{
+  const arrow=mode==='merge'?['⟷','merge']:outbound?['⟶','mirror']:['⟵','mirror'];
+  return `<div class="rflow">${flowEnd('this site',here,true)}<div class="rarrow" title="${mode==='merge'?'both ways, newer wins':outbound?'the peer copies this bucket':'copied from the peer, remote wins'}">${arrow[0]}<small>${arrow[1]}</small></div>${flowEnd(peerLabel,peer,false)}</div>`;
+};
+const errCell=(label,err,ms)=>err?`<div style="font-size:11.5px">${label}${esc(err)}</div><div class="muted" style="font-size:11px">${fmtTime(ms)}</div>`:'';
+const progressOf=(s,head)=>s.state==='snapshot'?`snapshot${s.snapshot_cursor?` at <code>${esc(s.snapshot_cursor)}</code>`:''}`:s.position!=null?`seq ${s.position.toLocaleString()} / ${(head??s.position).toLocaleString()}`:'—';
+const counts=s=>`${(s.copied||0).toLocaleString()} copied · ${(s.metadata_only||0).toLocaleString()} metadata-only · ${(s.deleted||0).toLocaleString()} deleted · ${(s.skipped||0).toLocaleString()} skipped`;
+async function loadLinks(){
+  try{
+    const data=await api('GET','/api/replication');links=data.links||[];localKeys=data.local_keys||[];$('siteId').textContent=data.site_name&&data.site_name!==data.site_id?`${data.site_name} (id ${data.site_id})`:(data.site_id||'');
+    $('linkRows').innerHTML=links.map((l,i)=>{const s=l.status||{};const p=l.mode==='merge'?s.push:null;
+      const peerLabel=s.peer_site_name||s.peer_site?`peer · ${s.peer_site_name||s.peer_site}`:'peer';
+      const progress=p
+        ?`<div>⟵ in ${linkBadge(s.state)} ${progressOf(s,s.peer_head)}</div><div class="muted" style="font-size:11px">${counts(s)}</div><div style="margin-top:4px">⟶ out ${linkBadge(p.state)} ${progressOf(p,p.local_head)}</div><div class="muted" style="font-size:11px">${counts(p)}</div>`
+        :`<div>${progressOf(s,s.peer_head)}</div><div class="muted" style="font-size:11px">${counts(s)}</div>`;
+      return `<tr><td><div class="identity"><span class="identity-icon">${icons.layers}</span><div><strong>${esc(l.name)}</strong><small>${l.mode==='mirror'?'Mirror — remote wins':'Merge — newer wins'}</small></div></div></td><td>${flow(l.mode,l.local_bucket,peerLabel,l.peer_bucket,false)}<div class="muted" style="font-size:11px;margin-top:4px">${esc(l.peer_endpoint)}<br>acts as <code>${esc(l.local_access_key||'(none)')}</code> here, <code>${esc(l.access_key)}</code> on the peer<br>made between site ids <code>${esc(l.local_site_id||'?')}</code> (here) and <code>${esc(l.peer_site_id||'(first contact)')}</code></div></td><td>${l.enabled?linkBadge(s.state==='stopped'||(p&&p.state==='error')?(s.state==='stopped'?'stopped':'error'):s.state):'<span class="badge">Paused</span>'}</td><td>${progress}</td><td>${s.site_changed?`<div style="font-size:11.5px"><b>Site id changed:</b> ${esc(s.site_changed)}</div><button class="btn small" style="margin-top:6px" onclick="linkAction(${i},'accept_site_ids')">Accept site ids</button>`:errCell(p?'in: ':'',s.last_error,s.last_error_ms)}${p?errCell('out: ',p.last_error,p.last_error_ms):''}${!s.last_error&&!(p&&p.last_error)?'<span class="muted">—</span>':''}</td><td class="actions" style="white-space:nowrap"><button class="btn small" title="${l.enabled?'Stop replicating for now (keeps the link and its position)':'Continue from where it stopped'}" onclick="linkAction(${i},'${l.enabled?'pause':'resume'}')">${l.enabled?'Pause':'Resume'}</button><button class="row-action" title="Re-snapshot" onclick="linkAction(${i},'resnapshot')">${icons.refresh}</button><button class="row-action danger" title="Delete link" onclick="confirmDeleteLink(${i})">${icons.trash}</button></td></tr>`;}).join('');
+    const incoming=data.incoming||[];$('incomingWrap').classList.toggle('hidden',!incoming.length);
+    $('incomingRows').innerHTML=incoming.map(x=>`<tr><td><strong>${esc(x.link_name)}</strong><div class="muted" style="font-size:11px">${esc(x.link_id)} · runs on ${esc(x.site_name||x.site)}${x.site_name&&x.site_name!==x.site?` (id ${esc(x.site)})`:''}</div></td><td>${flow(x.mode,x.bucket,`peer · ${x.site_name||x.site}`,x.peer_bucket,x.mode==='mirror')}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('');
+    const empty=!links.length;$('linkRows').closest('table').classList.toggle('hidden',empty);$('linkEmpty').classList.toggle('hidden',!empty);
+    if(empty)$('linkEmpty').innerHTML=`<div class="empty-icon">${icons.layers}</div><h3>No replication links</h3><p>Mirror or merge a bucket with another rusts3 site.</p>`;
+  }catch(e){toast('Could not load replication links',e.message,false);}
+}
+function linkMode(){const c=document.querySelector('input[name="ln_mode"]:checked');return c?c.value:'mirror';}
+function linkModeChanged(){
+  const m=LINK_PERMS[linkMode()],codes=a=>a.map(x=>`<code>${x}</code>`).join(', ');
+  const here=$('ln_bucket').value||'the bucket',peer=$('ln_peer_bucket').value||here;
+  $('ln_perms').innerHTML=`<div><b>This site's key</b> needs ${codes(m.here)} on <code>${esc(here)}</code>: the link ${m.hereWhy}.</div><div><b>Peer key</b> needs ${codes(m.peer)} on <code>${esc(peer)}</code>: the link ${m.peerWhy}.</div><div class="muted">Both are checked when you create the link${linkMode()==='mirror'?'. The bucket here becomes read-only.':'.'}</div>`;
+}
+async function openLinkDialog(){
+  setInlineError('linkError');
+  try{const data=await api('GET','/api/buckets');$('ln_bucket').innerHTML=(data.buckets||[]).map(b=>`<option>${esc(b.name)}</option>`).join('');}catch{}
+  if(!localKeys.length)try{localKeys=(await api('GET','/api/replication')).local_keys||[];}catch{}
+  $('ln_local_key').innerHTML=localKeys.map(k=>`<option value="${esc(k.access_key)}">${esc(k.access_key)} — ${esc(k.owner)}${k.admin?' (admin)':''}</option>`).join('');
+  ['ln_name','ln_endpoint','ln_peer_bucket','ln_ak','ln_sk'].forEach(id=>$(id).value='');
+  document.querySelector('input[name="ln_mode"][value="mirror"]').checked=true;
+  $('ln_bucket').onchange=()=>{linkModeChanged();};$('ln_peer_bucket').oninput=linkModeChanged;linkModeChanged();
+  $('linkDlg').showModal();setTimeout(()=>$('ln_name').focus(),50);
+}
+async function saveLink(event){
+  event.preventDefault();setInlineError('linkError');
+  const btn=$('ln_submit'),label=btn.textContent;btn.disabled=true;btn.textContent='Checking…';
+  try{
+    const mode=linkMode();
+    await api('POST','/api/replication',{name:$('ln_name').value,local_bucket:$('ln_bucket').value,local_access_key:$('ln_local_key').value,peer_endpoint:$('ln_endpoint').value,peer_bucket:$('ln_peer_bucket').value||$('ln_bucket').value,access_key:$('ln_ak').value,secret_key:$('ln_sk').value,mode,make_read_only:mode==='mirror'});
+    $('linkDlg').close();toast('Replication link created',$('ln_name').value+(mode==='mirror'?' · the bucket is now a read-only replica':''));await loadLinks();if(typeof loadBuckets==='function')loadBuckets(true);
+  }catch(e){setInlineError('linkError',e.message);}
+  finally{btn.disabled=false;btn.textContent=label;}
+}
+async function linkAction(i,action){
+  const l=links[i];
+  const run=async()=>{await api('POST','/api/replication/'+encodeURIComponent(l.id)+'/action',{action});toast('Done',`${action.replace(/_/g,' ')} · ${l.name}`);await loadLinks();};
+  if(action==='accept_site_ids')showConfirm('Accept the new site ids?',l.name,`The link was made between sites ${l.local_site_id} (here) and ${l.peer_site_id}. ${l.status&&l.status.site_changed||''} Accepting re-checks the peer, binds the link to the ids both sides report now, and starts again from a fresh snapshot. Only accept if the rename was intended.`,run,{confirmLabel:'Accept',danger:false,busyLabel:'Checking…'});
+  else if(action==='resnapshot')showConfirm('Re-snapshot link?',l.name,`The link discards its positions and walks the bucket${l.mode==='merge'?'s':''} again. Unchanged objects are skipped without copying.`,run,{confirmLabel:'Re-snapshot',danger:false,busyLabel:'Restarting…'});
+  else try{await run();}catch(e){toast('Action failed',e.message,false);}
+}
+function confirmDeleteLink(i){const l=links[i];showConfirm('Delete replication link?',l.name,'Replication stops and the link\'s position is discarded. Local objects are kept.',async()=>{await api('DELETE','/api/replication/'+encodeURIComponent(l.id));toast('Link deleted',l.name);await loadLinks();});}

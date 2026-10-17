@@ -98,13 +98,14 @@ pub async fn check_continuity(
 }
 
 /// The next batch for `state`.
-pub async fn next(index: &ObjectIndex, sub: &Subscription, state: &SubState, limits: Limits) -> Result<Next> {
+/// `site` is this server's site id (the fallback stamp of unstamped objects).
+pub async fn next(index: &ObjectIndex, sub: &Subscription, state: &SubState, limits: Limits, site: &str) -> Result<Next> {
     let position = state.position();
     if let Some(pause) = check_continuity(index, sub, &position).await? {
         return Ok(Next::Pause(pause));
     }
     match &position.snapshot {
-        Some(snapshot) => next_snapshot(index, sub, &position, snapshot, limits).await,
+        Some(snapshot) => next_snapshot(index, sub, &position, snapshot, limits, site).await,
         None => next_live(index, sub, position, limits).await,
     }
 }
@@ -153,6 +154,7 @@ async fn next_snapshot(
     position: &Position,
     snapshot: &SnapshotState,
     limits: Limits,
+    site: &str,
 ) -> Result<Next> {
     // Walk the live index (no RocksDB snapshot is held across batches:
     // replaying the log from `through` repairs anything that changed during
@@ -182,17 +184,7 @@ async fn next_snapshot(
                     continue;
                 }
                 bytes += record.object_key.len() + 128;
-                entries.push(WireEvent {
-                    seq: None,
-                    op: "exists".to_string(),
-                    key: record.object_key.clone(),
-                    etag: record.etag.clone(),
-                    size: record.size,
-                    last_modified_ms: record.last_modified_ms,
-                    version: crate::storage::changelog::version_of(&record.blob_dir),
-                    origin: None,
-                    ts_ms: None,
-                });
+                entries.push(WireEvent::exists(&record, site));
                 if bytes >= limits.max_bytes {
                     break;
                 }
@@ -235,26 +227,4 @@ async fn next_snapshot(
         }
     };
     Ok(Next::Deliver { batch, after })
-}
-
-/// Validates a pull consumer's ack against its current position: it must be
-/// in the same log and move forward without passing the head.
-pub fn ack_is_valid(current: &Position, ack: &Position, head: u64) -> bool {
-    if ack.log_id != current.log_id {
-        return false;
-    }
-    match (&current.snapshot, &ack.snapshot) {
-        (None, None) => ack.offset >= current.offset && ack.offset <= head,
-        (Some(cur), Some(next)) => {
-            next.through == cur.through
-                && next.begun
-                && match (&cur.cursor, &next.cursor) {
-                    (Some(a), Some(b)) => b > a,
-                    (None, _) => true,
-                    (Some(_), None) => false,
-                }
-        }
-        (Some(cur), None) => ack.offset == cur.through,
-        (None, Some(_)) => false,
-    }
 }

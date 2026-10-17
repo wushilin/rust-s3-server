@@ -26,6 +26,7 @@ use super::iam::{Group, IamStore};
 use super::policy::{
     compile_rules, decompile_rules, PolicyDocument, PolicyRule, Requirement,
 };
+use crate::storage::metadata::{BucketLayout, CURRENT_LAYOUT};
 use crate::storage::errors::StorageError;
 use crate::storage::rawdb;
 use crate::storage::metadata::CorsRule;
@@ -54,6 +55,8 @@ pub struct UiState {
     /// Changelog subscriptions (webhooks / replication tokens). `None` in
     /// tests that do not exercise them.
     pub(crate) notify: Option<super::notify::NotifyService>,
+    /// Replication links. `None` in tests that do not exercise them.
+    pub(crate) replication: Option<super::replication::ReplicationService>,
 }
 
 /// A resolved UI session. Managed admin membership is resolved on every
@@ -75,6 +78,7 @@ pub fn router(state: UiState) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/ping", get(server_ping))
+        .route("/api/site", axum::routing::put(rename_site))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{name}", delete(delete_user))
         .route("/api/users/{name}/password", put(reset_password))
@@ -94,6 +98,11 @@ pub fn router(state: UiState) -> Router {
         .route("/api/buckets/{name}/stats", get(bucket_stats))
         .route("/api/buckets/{name}/rebuild", post(rebuild_bucket))
         .route("/api/buckets/{name}/cors", get(get_bucket_cors).put(set_bucket_cors))
+        .route("/api/buckets/{name}/read-only", put(set_bucket_read_only))
+        .route("/api/buckets/{name}/upgrade-layout", post(upgrade_bucket_layout))
+        .route("/api/buckets/{name}/versioning", put(set_bucket_versioning))
+        .route("/api/buckets/{name}/cors-local", put(set_bucket_cors_local))
+        .route("/api/object/versions", get(list_object_versions))
         // Changelog subscriptions: webhooks and replication tokens (admin only).
         .route("/api/subscriptions", get(list_subscriptions).post(create_subscription))
         .route(
@@ -103,6 +112,10 @@ pub fn router(state: UiState) -> Router {
                 .delete(delete_subscription),
         )
         .route("/api/subscriptions/{id}/action", post(subscription_action))
+        // Replication links (admin only).
+        .route("/api/replication", get(list_links).post(create_link))
+        .route("/api/replication/{id}", get(get_link).put(update_link).delete(delete_link))
+        .route("/api/replication/{id}/action", post(link_action))
         .route("/api/admin/export", get(export_iam))
         // Import buffers and fully validates the dump before an atomic apply, so
         // the body is held in memory. The global IAM database is small by nature
@@ -676,11 +689,14 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 
 fn storage_error(err: StorageError) -> Response {
     let status = match err {
-        StorageError::ObjectNotFound { .. } | StorageError::BucketNotFound(_) => {
+        StorageError::ObjectNotFound { .. } | StorageError::BucketNotFound(_) | StorageError::NoSuchVersion { .. } => {
             StatusCode::NOT_FOUND
         }
+        StorageError::VersionIsDeleteMarker { .. } => StatusCode::METHOD_NOT_ALLOWED,
         StorageError::BucketRebuilding(_) => StatusCode::SERVICE_UNAVAILABLE,
         StorageError::InvalidMultipartUpload(_) | StorageError::BucketInUse(_) => StatusCode::CONFLICT,
+        StorageError::StaleStamp { .. } => StatusCode::PRECONDITION_FAILED,
+        StorageError::BucketReadOnly(_) => StatusCode::FORBIDDEN,
         StorageError::InvalidBucketName(_) | StorageError::InvalidObjectKey(_) => {
             StatusCode::BAD_REQUEST
         }
@@ -913,6 +929,9 @@ async fn server_ping(State(state): State<UiState>, headers: HeaderMap) -> Respon
     let mut response = Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "site_id": state.store.site_id(),
+        "site_name": state.store.site_name(),
+        "site_name_locked": state.store.site_name_locked(),
         "now_ms": crate::storage::time::now_ms(),
     }))
     .into_response();
@@ -1544,10 +1563,22 @@ async fn list_buckets(
                 // bucket, so it rides along with the listing rather than
                 // costing the console one request per bucket.
                 let multipart_uploads = state.store.count_multipart_uploads(&name).await;
+                // The bucket's storage layout, so the console can prompt for
+                // an upgrade and show one in progress.
+                let layout = match meta.layout {
+                    Some(layout) => layout,
+                    None => state.store.bucket_layout(&name).await.unwrap_or(BucketLayout::current()),
+                };
                 visible.push(json!({
                     "name": name,
+                    "read_only": meta.read_only,
                     "created_at_ms": meta.created_at_ms,
                     "multipart_uploads": multipart_uploads,
+                    "layout": layout,
+                    "layout_current": CURRENT_LAYOUT,
+                    "layout_upgrade": LocalObjectStore::layout_upgrade_available(layout),
+                    "versioning": meta.versioning,
+                    "cors_local": meta.cors_local,
                 }));
             }
             Json(json!({ "buckets": visible })).into_response()
@@ -1674,7 +1705,7 @@ async fn get_bucket_cors(
             let console_origin = state.config.ui.public_hostname.as_deref().map(|host| {
                 format!("{}://{host}", state.config.ui.public_scheme.as_str())
             });
-            Json(json!({ "rules": meta.cors, "console_origin": console_origin })).into_response()
+            Json(json!({ "rules": meta.cors, "console_origin": console_origin, "read_only": meta.read_only })).into_response()
         }
         Err(err) => storage_error(err),
     }
@@ -2053,6 +2084,55 @@ async fn list_objects(
 struct ObjectQuery {
     bucket: String,
     key: String,
+    /// A version of the object (`null`, or a version id from the versions
+    /// listing); the current one when absent.
+    #[serde(default)]
+    version_id: Option<String>,
+}
+
+/// `GET /api/object/versions?bucket=&key=`: every version of the key, newest
+/// first, with which one is current (a delete marker when the key is
+/// deleted).
+async fn list_object_versions(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Query(q): Query<ObjectQuery>,
+) -> Response {
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let _guard = match begin_verb(
+        &state,
+        &session,
+        &rid.0,
+        "LIST",
+        format!("/{}/{} versions", q.bucket, q.key),
+        &[Requirement::object("s3:GetObject", &q.bucket, &q.key)],
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let versioning = state.store.bucket_versioning(&q.bucket).await.unwrap_or_default();
+    match state.store.list_versions(&q.bucket, &q.key).await {
+        Ok(versions) => Json(json!({
+            "versioning": versioning,
+            "versions": versions.iter().map(|v| json!({
+                "version_id": v.version_id(),
+                "is_current": v.is_current,
+                "delete_marker": v.record.delete_marker,
+                "versioned": v.record.versioned,
+                "size": v.record.size,
+                "etag": v.record.etag,
+                "last_modified_ms": v.record.last_modified_ms,
+                "stamp": v.record.stamp.to_header(),
+                "removed_stamp": v.record.removed.as_ref().map(|s| s.to_header()),
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(err) => storage_error(err),
+    }
 }
 
 async fn download_object(
@@ -2076,11 +2156,24 @@ async fn download_object(
         Ok(g) => g,
         Err(resp) => return resp,
     };
-    let read = match state.store.read_object(&q.bucket, &q.key).await {
+    let read = match &q.version_id {
+        Some(version_id) => state.store.read_object_version(&q.bucket, &q.key, version_id).await,
+        None => state.store.read_object(&q.bucket, &q.key).await,
+    };
+    let read = match read {
         Ok(read) => read,
         Err(err) => return storage_error(err),
     };
-    audit(&state, &rid.0, &session.username, "download", format!("/{}/{}", q.bucket, q.key));
+    audit(
+        &state,
+        &rid.0,
+        &session.username,
+        "download",
+        match &q.version_id {
+            Some(version_id) => format!("/{}/{} (version {version_id})", q.bucket, q.key),
+            None => format!("/{}/{}", q.bucket, q.key),
+        },
+    );
     // Open every part before responding: open FDs survive a concurrent
     // overwrite retiring the dir mid-download.
     let mut files = Vec::with_capacity(read.meta.parts.len());
@@ -2213,6 +2306,20 @@ async fn delete_object(
         Ok(g) => g,
         Err(resp) => return resp,
     };
+    if let Some(version_id) = &q.version_id {
+        // A permanent delete of one version (no marker is left).
+        return match state
+            .store
+            .delete_object_version(&q.bucket, &q.key, version_id, crate::storage::write::WriteOrigin::Client)
+            .await
+        {
+            Ok(_) => {
+                audit(&state, &rid.0, &session.username, "delete_object_version", format!("/{}/{} (version {version_id})", q.bucket, q.key));
+                Json(json!({"ok": true})).into_response()
+            }
+            Err(err) => storage_error(err),
+        };
+    }
     match state.store.delete_object(&q.bucket, &q.key).await {
         Ok(()) => {
             audit(&state, &rid.0, &session.username, "delete_object", format!("/{}/{}", q.bucket, q.key));
@@ -3124,6 +3231,8 @@ fn parse_repair_action(value: &str) -> Option<crate::storage::scan::RepairAction
         "quarantine" => Some(RepairAction::Quarantine),
         "resync_row" => Some(RepairAction::ResyncRow),
         "reclaim_empty_dirs" => Some(RepairAction::ReclaimEmptyDirs),
+        "restore_from_peer" => Some(RepairAction::RestoreFromPeer),
+        "restore_older_from_peer" => Some(RepairAction::RestoreOlderFromPeer),
         _ => None,
     }
 }
@@ -3614,5 +3723,328 @@ async fn subscription_action(
             Json(result).into_response()
         }
         Err(err) => super::notify::pull::error_response(err),
+    }
+}
+
+// ── replication links (admin only) ───────────────────────────────────────────
+
+fn replication_service(state: &UiState) -> Result<&super::replication::ReplicationService, Response> {
+    state
+        .replication
+        .as_ref()
+        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "replication is not available"))
+}
+
+fn link_error(err: super::replication::LinkError) -> Response {
+    use super::replication::LinkError;
+    let status = match &err {
+        LinkError::NotFound(_) => StatusCode::NOT_FOUND,
+        LinkError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        LinkError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, err.to_string())
+}
+
+async fn list_links(State(state): State<UiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    // The keys a link can act as here (its local access key).
+    let mut local_keys: Vec<serde_json::Value> = state
+        .config
+        .auth
+        .credentials
+        .iter()
+        .map(|c| json!({ "access_key": c.access_key, "owner": "root (config)", "admin": true }))
+        .collect();
+    for user in &state.config.auth.users {
+        for key in &user.api_keys {
+            local_keys.push(json!({ "access_key": key.ak, "owner": user.user, "admin": true }));
+        }
+    }
+    if let Ok(users) = state.iam.list_users().await {
+        for user in users {
+            for key in state.iam.list_access_keys(&user.username).await.unwrap_or_default() {
+                local_keys.push(json!({
+                    "access_key": key.access_key,
+                    "owner": user.username,
+                    "admin": state.iam.is_admin(&user.username),
+                }));
+            }
+        }
+    }
+    match replication_service(&state) {
+        Ok(service) => Json(json!({
+            "links": service.list(),
+            "incoming": service.incoming(),
+            "site_id": state.store.site_id(),
+            "site_name": state.store.site_name(),
+            "local_keys": local_keys,
+        })).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+async fn create_link(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(request): Json<super::replication::LinkRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    let bucket = request.local_bucket.clone();
+    match service.create(request, &session.username).await {
+        Ok(view) => {
+            audit(&state, &rid.0, &session.username, "create_replication_link", format!("/{bucket} {}", view.id));
+            Json(view).into_response()
+        }
+        Err(err) => link_error(err),
+    }
+}
+
+async fn get_link(State(state): State<UiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(resp) = require_root(&state, &headers) {
+        return resp;
+    }
+    match replication_service(&state) {
+        Ok(service) => match service.view(&id) {
+            Ok(view) => Json(view).into_response(),
+            Err(err) => link_error(err),
+        },
+        Err(resp) => resp,
+    }
+}
+
+async fn update_link(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+    Json(update): Json<super::replication::LinkUpdate>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.update(&id, update).await {
+        Ok(view) => {
+            audit(&state, &rid.0, &session.username, "update_replication_link", id);
+            Json(view).into_response()
+        }
+        Err(err) => link_error(err),
+    }
+}
+
+async fn delete_link(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    match service.delete(&id).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "delete_replication_link", id);
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(err) => link_error(err),
+    }
+}
+
+async fn link_action(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(id): Path<String>,
+    Json(action): Json<super::replication::LinkAction>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let service = match replication_service(&state) {
+        Ok(service) => service,
+        Err(resp) => return resp,
+    };
+    let label = format!("{action:?}");
+    match service.act(&id, action).await {
+        Ok(view) => {
+            audit(&state, &rid.0, &session.username, "replication_link_action", format!("{id} {label}"));
+            Json(view).into_response()
+        }
+        Err(err) => link_error(err),
+    }
+}
+
+// ── site name (admin only) ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SiteRename {
+    site_name: String,
+}
+
+/// Renames this site: a label only (the site id never changes). Takes
+/// effect at once; peers see it on their next changelog read.
+async fn rename_site(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Json(request): Json<SiteRename>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let before = state.store.site_name();
+    match state.store.set_site_name(&request.site_name) {
+        Ok(name) => {
+            audit(&state, &rid.0, &session.username, "rename_site", format!("{before:?} -> {name:?}"));
+            Json(json!({ "site_id": state.store.site_id(), "site_name": name })).into_response()
+        }
+        Err(crate::storage::errors::StorageError::Io(message)) => error_response(StatusCode::BAD_REQUEST, message),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+// ── bucket storage layout upgrade (admin only) ───────────────────────────────
+
+/// Starts the upgrade of a bucket on an older storage layout. The bucket
+/// answers 503 until the upgrade completes (progress in the tasks panel);
+/// an upgrade interrupted by a restart resumes at the next start.
+async fn upgrade_bucket_layout(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.start_layout_upgrade(&name).await {
+        Ok(layout) => {
+            audit(&state, &rid.0, &session.username, "upgrade_bucket_layout", format!("/{name}"));
+            super::jobs::migrate_layout::spawn(
+                state.store.clone(),
+                name,
+                layout,
+                state.tasks.clone(),
+                state.store.shutdown_token().child_token(),
+                std::time::Duration::from_secs(state.config.sweeper.interval_secs.max(1)),
+            );
+            (StatusCode::ACCEPTED, Json(json!({ "ok": true, "layout": layout }))).into_response()
+        }
+        Err(StorageError::BucketInUse(message)) => error_response(StatusCode::CONFLICT, message),
+        Err(err) => storage_error(err),
+    }
+}
+
+// ── bucket versioning (admin only) ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct VersioningRequest {
+    state: crate::storage::metadata::BucketVersioning,
+}
+
+/// Enables or suspends object versioning. Enabling needs the bucket on the
+/// current storage layout (409 with the reason otherwise); a bucket that
+/// was ever enabled can only be suspended.
+async fn set_bucket_versioning(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+    Json(request): Json<VersioningRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.set_bucket_versioning(&name, request.state).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "set_bucket_versioning", format!("/{name} ({})", request.state.as_str()));
+            Json(json!({ "ok": true, "versioning": request.state })).into_response()
+        }
+        Err(StorageError::BucketInUse(message)) => error_response(StatusCode::CONFLICT, message),
+        Err(err) => storage_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct CorsLocalRequest {
+    cors_local: bool,
+}
+
+/// Whether the bucket keeps its CORS rules local (a replication peer's
+/// rules are not adopted).
+async fn set_bucket_cors_local(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+    Json(request): Json<CorsLocalRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.set_bucket_cors_local(&name, request.cors_local).await {
+        Ok(()) => {
+            audit(&state, &rid.0, &session.username, "set_bucket_cors_local", format!("/{name} ({})", request.cors_local));
+            Json(json!({ "ok": true, "cors_local": request.cors_local })).into_response()
+        }
+        Err(err) => storage_error(err),
+    }
+}
+
+// ── bucket read-only flag (admin only) ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ReadOnlyRequest {
+    read_only: bool,
+}
+
+/// Marks a bucket read-only (only replicated writes accepted) or read-write.
+async fn set_bucket_read_only(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Extension(rid): Extension<super::RequestId>,
+    Path(name): Path<String>,
+    Json(request): Json<ReadOnlyRequest>,
+) -> Response {
+    let session = match require_root(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    match state.store.set_bucket_read_only(&name, request.read_only).await {
+        Ok(()) => {
+            audit(
+                &state,
+                &rid.0,
+                &session.username,
+                if request.read_only { "set_bucket_read_only" } else { "set_bucket_read_write" },
+                format!("/{name}"),
+            );
+            Json(json!({ "ok": true, "read_only": request.read_only })).into_response()
+        }
+        Err(err) => storage_error(err),
     }
 }

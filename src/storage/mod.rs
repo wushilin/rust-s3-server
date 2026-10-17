@@ -6,11 +6,19 @@ pub mod encoding;
 pub mod errors;
 pub mod index;
 pub mod layout;
+pub mod layouts;
 pub mod locks;
 pub mod metadata;
 pub mod rawdb;
 pub mod scan;
+pub mod stamp;
 pub mod staging;
 pub mod store;
 pub mod sweeper;
 pub mod time;
+pub mod write;
+
+#[cfg(test)]
+mod layout_upgrade_tests;
+#[cfg(test)]
+mod versioning_tests;

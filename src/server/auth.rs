@@ -71,6 +71,19 @@ impl AuthState {
         None
     }
 
+    /// The identity an access key acts as, without a request: a config
+    /// credential is root, an IAM key its user (hidden web keys are not
+    /// eligible). For server-side actors that act *as* a key — a
+    /// replication link's local writes.
+    pub fn identity_of_key(&self, access_key: &str) -> Option<super::identity::Identity> {
+        if self.config.find_secret(access_key).is_some() {
+            return Some(super::identity::Identity::root(None, Some(access_key.to_string())));
+        }
+        let iam = self.iam.as_ref()?;
+        let (_, username) = iam.find_key(access_key)?;
+        Some(iam.identity_for(&username))
+    }
+
     /// Stamps `access_key` as used just now. Call only once its signature has
     /// verified, so a request merely *naming* a key never counts as a use.
     /// Hidden `RSWEB_…` console signing keys are never listed, so not tracked.
@@ -661,10 +674,12 @@ impl Verified {
 }
 
 /// The first header that is present but not covered by `signed`: `host` must
-/// always be signed, as must every `x-amz-*` header (bar `exempt`) and, when
-/// `require_content_md5`, a `Content-MD5`. SigV4 only protects what is signed;
-/// an unsigned `x-amz-copy-source`, `x-amz-meta-*`, `x-amz-decoded-content-length`
-/// … could otherwise be added to, or altered on, a captured request.
+/// always be signed, as must every `x-amz-*` and `x-rs3-*` header (bar
+/// `exempt`) and, when `require_content_md5`, a `Content-MD5`. SigV4 only
+/// protects what is signed; an unsigned `x-amz-copy-source`, `x-amz-meta-*`,
+/// `x-amz-decoded-content-length` … could otherwise be added to, or altered
+/// on, a captured request — and `x-rs3-stamp` decides which version of an
+/// object wins.
 fn first_unsigned_header(
     headers: &HeaderMap,
     signed: &[String],
@@ -679,7 +694,7 @@ fn first_unsigned_header(
         .keys()
         .map(|name| name.as_str())
         .find(|name| {
-            (name.starts_with("x-amz-") || (require_content_md5 && *name == "content-md5"))
+            (name.starts_with("x-amz-") || name.starts_with("x-rs3-") || (require_content_md5 && *name == "content-md5"))
                 && !exempt.contains(name)
                 && !is_signed(name)
         })
@@ -1696,8 +1711,8 @@ pub(crate) fn compute_auth_header_with_headers(
 }
 
 /// Returns `(authorization, seed_signature)` for a request whose
-/// `x-amz-content-sha256` is `payload_hash`.
-#[cfg(test)]
+/// `x-amz-content-sha256` is `payload_hash`. Also the outbound signer of the
+/// replication client (a peer verifies it with the same canonical forms).
 pub(crate) fn compute_auth_header_payload(
     method: &str,
     path: &str,

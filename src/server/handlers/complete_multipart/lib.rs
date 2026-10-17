@@ -32,8 +32,13 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
             return srv::s3_error(StatusCode::BAD_REQUEST, "MalformedXML", message, &resource)
         }
     };
+    // A replicated upload takes its stamp at completion.
+    let options = match srv::write_options(&store, &ctx, &resource).await {
+        Ok(options) => options,
+        Err(response) => return response,
+    };
     match store
-        .complete_multipart(&ctx.bucket, &ctx.key, &upload_id, &parts)
+        .complete_multipart_with(&ctx.bucket, &ctx.key, &upload_id, &parts, options)
         .await
     {
         Ok(result) => {
@@ -44,9 +49,12 @@ pub(crate) async fn handle(store: LocalObjectStore, ctx: ObjectCtx, body: Body) 
                 .unwrap_or("127.0.0.1");
             let location = format!("http://{host}/{}/{}", ctx.bucket, ctx.key);
             srv::with_measure(
-                srv::xml_response(
-                    StatusCode::OK,
-                    complete_multipart_xml(&location, &ctx.bucket, &ctx.key, &result.etag),
+                srv::with_version_id(
+                    srv::xml_response(
+                        StatusCode::OK,
+                        complete_multipart_xml(&location, &ctx.bucket, &ctx.key, &result.etag),
+                    ),
+                    result.version_id.as_deref(),
                 ),
                 srv::OperationMeasure::Bytes(result.size),
             )

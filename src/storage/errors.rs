@@ -18,7 +18,8 @@ pub enum StorageError {
     EntityTooSmall(String),
     PayloadHashMismatch { expected: String, actual: String },
     CorruptObject(String),
-    /// The bucket's index is being rebuilt; all requests get 503 until done.
+    /// The bucket's index is being rebuilt, or its storage layout upgraded;
+    /// all data requests get 503 until done.
     BucketRebuilding(String),
     /// The on-disk index schema is not current; a rebuild is required.
     IndexOutdated(String),
@@ -28,6 +29,23 @@ pub enum StorageError {
     /// The bucket cannot be deleted while something still depends on it
     /// (changelog subscriptions). Maps to HTTP 409.
     BucketInUse(String),
+    /// A replicated write or delete (carrying a version stamp) that is not
+    /// newer than the key's current state — the object or its tombstone.
+    /// Nothing was changed. Maps to HTTP 412.
+    StaleStamp { bucket: String, key: String, current: String },
+    /// A client write to a read-only bucket (only replicated writes are
+    /// accepted). Maps to HTTP 403.
+    BucketReadOnly(String),
+    /// The bucket's recorded layout is one this build does not know (a
+    /// newer build wrote it) or a migration step this build cannot run.
+    /// The server refuses to start.
+    UnsupportedLayout { bucket: String, message: String },
+    /// No version of the key has the given version id. Maps to HTTP 404
+    /// `NoSuchVersion`.
+    NoSuchVersion { bucket: String, key: String, version_id: String },
+    /// The version named is a delete marker: it has no content to read.
+    /// Maps to HTTP 405 `MethodNotAllowed` with `x-amz-delete-marker`.
+    VersionIsDeleteMarker { bucket: String, key: String, version_id: String },
 }
 
 impl fmt::Display for StorageError {
@@ -59,13 +77,30 @@ impl fmt::Display for StorageError {
             }
             StorageError::CorruptObject(v) => write!(f, "corrupt object: {v}"),
             StorageError::BucketRebuilding(v) => {
-                write!(f, "bucket index rebuild in progress: {v}")
+                write!(f, "bucket {v} is unavailable while its index is rebuilt or its storage layout upgraded")
             }
             StorageError::IndexOutdated(v) => write!(f, "index schema outdated: {v}"),
             StorageError::PreconditionFailed { bucket, key } => {
                 write!(f, "precondition failed for {bucket}/{key}")
             }
             StorageError::BucketInUse(v) => write!(f, "{v}"),
+            StorageError::BucketReadOnly(bucket) => write!(
+                f,
+                "bucket {bucket} is read-only: it accepts only replicated writes"
+            ),
+            StorageError::StaleStamp { bucket, key, current } => write!(
+                f,
+                "{bucket}/{key} already has a state at least as new (stamp {current}); nothing changed"
+            ),
+            StorageError::NoSuchVersion { bucket, key, version_id } => {
+                write!(f, "no version {version_id} of {bucket}/{key}")
+            }
+            StorageError::VersionIsDeleteMarker { bucket, key, version_id } => {
+                write!(f, "version {version_id} of {bucket}/{key} is a delete marker")
+            }
+            StorageError::UnsupportedLayout { bucket, message } => {
+                write!(f, "bucket {bucket}: unsupported storage layout: {message}")
+            }
         }
     }
 }

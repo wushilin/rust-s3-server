@@ -44,6 +44,7 @@ fail; `--help` shows only what actually works.
 | `diff` | two-URL positional-only comparison; local and S3 sides |
 | `find` | `--name`, `--path`, `--regex`, `--older-than`/`--newer-than`, `--larger`/`--smaller`, `--maxdepth`, `--ignore`, `--exec`, `--print`; S3 aliases only |
 | `share download\|upload\|list` | presigned `GetObject` URLs, browser-POST upload commands (`--content-type`/`-T`), `--expire`/`-E` (Go duration grammar, clamped to `[1s, 7d]`) |
+| `watch ALIAS/BUCKET[/PREFIX]` | follows the bucket's changelog (a rusts3 extension; needs `s3:GetBucketChangelog`): one line per change as it commits, `--json` for the raw event; `--from-start` replays the retained log, `--after N` resumes after a position, `--snapshot [--versions]` lists the current objects (or every version) first, `--ops put,delete,...` filters, `--once` stops at the head. A replaced or trimmed log is reported and followed from its head. |
 
 A few flag combinations are legitimate on their own but unsupported together,
 and hard-error at runtime rather than silently no-opping: `--attr` on an

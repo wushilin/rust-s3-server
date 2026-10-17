@@ -22,6 +22,16 @@ pub struct ServerConfig {
     /// PROXY protocol handling on both listeners (S3 API and console).
     #[serde(default)]
     pub proxy_protocol: ProxyProtocolMode,
+    /// No longer configurable (refused when set): the site id is generated
+    /// on first start, kept in `<base_dir>/site.json`, and never changes.
+    /// Use `site_name` for a readable name.
+    #[serde(default, skip_serializing)]
+    pub site_id: Option<String>,
+    /// A readable name for this site, shown in the console and to
+    /// replication peers. A label only — change it any time. Unset: the
+    /// site id is shown instead.
+    #[serde(default)]
+    pub site_name: Option<String>,
 }
 
 /// Whether the listeners read a PROXY protocol header (v1 or v2) ahead of HTTP.
@@ -315,6 +325,11 @@ pub struct ChangelogConfig {
     /// How often the trim pass runs.
     #[serde(default = "default_changelog_trim_interval_secs")]
     pub trim_interval_secs: u64,
+    /// How long a delete's tombstone (its version stamp) is kept. Replicated
+    /// changes older than this can no longer be told apart from new ones, so
+    /// a site offline for longer must re-snapshot instead of resuming.
+    #[serde(default = "default_tombstone_days")]
+    pub tombstone_days: u64,
 }
 
 impl Default for ChangelogConfig {
@@ -322,6 +337,7 @@ impl Default for ChangelogConfig {
         Self {
             retention_days: default_changelog_retention_days(),
             trim_interval_secs: default_changelog_trim_interval_secs(),
+            tombstone_days: default_tombstone_days(),
         }
     }
 }
@@ -331,6 +347,46 @@ fn default_changelog_retention_days() -> u64 {
 }
 fn default_changelog_trim_interval_secs() -> u64 {
     600
+}
+fn default_tombstone_days() -> u64 {
+    14
+}
+
+/// Server-side replication links (see `server::replication`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationConfig {
+    /// Supervisor tick: a link without a live worker gets one within this.
+    #[serde(default = "default_replication_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// A worker silent (no heartbeat) for this long is replaced.
+    #[serde(default = "default_replication_stale_secs")]
+    pub worker_stale_secs: u64,
+    /// Changes a link applies concurrently (per batch, latest per key).
+    #[serde(default = "default_replication_parallelism")]
+    pub parallelism: usize,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: default_replication_check_interval_secs(),
+            worker_stale_secs: default_replication_stale_secs(),
+            parallelism: default_replication_parallelism(),
+        }
+    }
+}
+
+fn default_replication_check_interval_secs() -> u64 {
+    5
+}
+fn default_replication_stale_secs() -> u64 {
+    // A worker renews its lease on every chunk it moves (throttled to 5s),
+    // so only a real hang goes this long without one; generous so a slow
+    // peer never looks hung.
+    600
+}
+fn default_replication_parallelism() -> usize {
+    8
 }
 
 /// Webhook delivery. Each webhook can override the batch limits and
@@ -423,6 +479,8 @@ pub struct AppConfig {
     pub changelog: ChangelogConfig,
     #[serde(default)]
     pub webhooks: WebhookConfig,
+    #[serde(default)]
+    pub replication: ReplicationConfig,
 }
 
 /// Deserializes a list of strings, dropping entries that were never filled in.
@@ -584,6 +642,18 @@ impl AppConfig {
                 );
             }
         }
+        // An empty value means "not configured" (container templating).
+        if self.server.site_id.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            return Err("server.site_id is no longer configurable: the site id is generated on first start and \
+                        never changes (it is in every version stamp). Remove it, and use server.site_name for a \
+                        readable name."
+                .to_string());
+        }
+        if let Some(name) = self.server.site_name.as_deref() {
+            if name.chars().count() > 64 || name.chars().any(char::is_control) {
+                return Err("server.site_name must be at most 64 characters, without control characters".to_string());
+            }
+        }
         if self.sweeper.trash_expiry_secs < MIN_TRASH_RETENTION_SECS {
             return Err(format!(
                 "sweeper.trash_expiry_secs must be at least {MIN_TRASH_RETENTION_SECS} seconds (3 hours)"
@@ -666,6 +736,7 @@ impl Default for AppConfig {
             stats: StatsConfig::default(),
             changelog: ChangelogConfig::default(),
             webhooks: WebhookConfig::default(),
+            replication: ReplicationConfig::default(),
         }
     }
 }
@@ -677,6 +748,8 @@ impl Default for ServerConfig {
             bind_port: default_bind_port(),
             base_dir: default_base_dir(),
             proxy_protocol: ProxyProtocolMode::default(),
+            site_id: None,
+            site_name: None,
         }
     }
 }
@@ -744,6 +817,24 @@ fn default_trash_expiry_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_site_id_is_not_configurable_but_the_site_name_is() {
+        let mut config = AppConfig::default();
+        config.server.site_name = Some("Singapore DC-1".into());
+        config.validate().unwrap();
+        config.server.site_id = Some("site-a".into());
+        assert!(config.validate().unwrap_err().contains("site_name"));
+        // Empty (a templated value that was not supplied) is not set.
+        config.server.site_id = Some(String::new());
+        config.validate().unwrap();
+        config.server.site_name = Some("x".repeat(65));
+        assert!(config.validate().is_err());
+        config.server.site_name = Some("bad\nname".into());
+        assert!(config.validate().is_err());
+        // A generated config does not mention site_id.
+        assert!(!AppConfig::default().to_yaml().unwrap().contains("site_id"));
+    }
 
     /// What a container gets when RUSTS3_PUBLIC_HOSTNAME is not supplied:
     /// the placeholder expands to "", which must read as "not configured".

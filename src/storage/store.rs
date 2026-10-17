@@ -35,17 +35,18 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use super::aws_chunked::{decode_aws_chunked, AwsChunkedDecoder, CHUNK_SIGNATURE_MISMATCH};
 use super::cache::BoundedLruCache;
 use super::config::{DurabilityMode, StorageConfig};
-use super::encoding::{
-    fanout_segment, object_dir_prefix, object_dir_random_suffix, validate_bucket_name,
-    validate_object_key,
-};
+use super::encoding::{validate_bucket_name, validate_object_key};
+use super::layouts::{self, v3};
 use super::errors::{Result, StorageError};
+use super::stamp::{Rank, SiteClock, Stamp};
+use super::write::outranks;
 use super::index::{
-    self, Durability, IntentRecord, ListPage, ObjectRecord, ObjectIndex, INTENT_RETIRE,
+    self, Displaced, Durability, IntentRecord, ListPage, ObjectRecord, ObjectIndex, Tombstone, VersionRecord,
+    VersionTarget, INTENT_RETIRE,
 };
 use super::layout::StorageLayout;
 use super::locks::ObjectLockTable;
-use super::metadata::{
+use super::metadata::{BucketLayout, BucketSettings, BucketVersioning, CURRENT_LAYOUT, META_FORMAT, 
     content_encoding_or_none, content_language_or_none, content_type_or_default,
     storage_class_or_default, unquote_etag, BucketMeta, CorsRule, ObjectMeta, ObjectStorageKind, PartMeta,
     PutMeta, UploadMeta,
@@ -73,6 +74,44 @@ pub struct ChangeListener(pub Arc<dyn Fn(&str, u64) + Send + Sync>);
 impl std::fmt::Debug for ChangeListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ChangeListener")
+    }
+}
+
+/// What a "restore from peer" repair asks for.
+#[derive(Debug, Clone)]
+pub struct RestoreRequest {
+    pub bucket: String,
+    pub key: String,
+    /// The lost version's stamp and ETag.
+    pub lost_stamp: Stamp,
+    pub lost_etag: String,
+    /// Accept a peer that only has an older version.
+    pub allow_older: bool,
+}
+
+/// Fetches a lost object back from a replication peer (installed by the
+/// replication service): `Ok(message)` once restored, `Err(why not)`.
+#[derive(Clone)]
+pub struct PeerRestorer(
+    pub Arc<dyn Fn(RestoreRequest) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> + Send + Sync>,
+);
+
+impl std::fmt::Debug for PeerRestorer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerRestorer")
+    }
+}
+
+/// Told about each replication link reading a bucket's changelog:
+/// `(bucket, the reader's x-rs3-replicator header, record it?)`. Returns the
+/// `x-rs3-merge-back` answer (a merge link here already pairs the bucket
+/// with that reader's site), if any. Installed by the replication service.
+#[derive(Clone)]
+pub struct ReplicaReader(pub Arc<dyn Fn(&str, &str, bool) -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for ReplicaReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplicaReader")
     }
 }
 
@@ -118,16 +157,39 @@ pub struct LocalObjectStore {
     change_listener: Arc<std::sync::RwLock<Option<ChangeListener>>>,
     /// Vetoes bucket deletion (returns the reason) — the changelog
     /// subscriptions refuse while any subscription targets the bucket.
-    delete_guard: Arc<std::sync::RwLock<Option<DeleteGuard>>>,
+    delete_guard: Arc<std::sync::RwLock<Vec<DeleteGuard>>>,
+    /// Vetoes making a bucket read-write (a mirror replica must stay
+    /// read-only).
+    read_write_guard: Arc<std::sync::RwLock<Vec<DeleteGuard>>>,
+    /// Restores lost objects from replication peers (health-scan repair).
+    peer_restorer: Arc<std::sync::RwLock<Option<PeerRestorer>>>,
+    /// Records replication links reading this server's changelogs.
+    replica_reader: Arc<std::sync::RwLock<Option<ReplicaReader>>>,
+    /// Per-bucket "the changelog moved" signal, for long-polling readers.
+    change_signals: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// This site's identity and version-stamp clock. Opened by
+    /// [`Self::init_site`] at startup; tests get an ephemeral one lazily.
+    clock: Arc<std::sync::OnceLock<Arc<SiteClock>>>,
+    /// The name is set by `server.site_name` (set by [`Self::init_site`]).
+    site_name_locked: Arc<std::sync::OnceLock<bool>>,
     #[cfg(test)]
     crash_points: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectVersionEntry {
-    pub meta: ObjectMeta,
+    pub key: String,
+    /// The version id S3 clients see: the stamp dir, or `null`.
     pub version_id: String,
     pub is_latest: bool,
+    pub last_modified_ms: i64,
+    pub etag: String,
+    pub size: u64,
+    pub delete_marker: bool,
+    /// The version's stamp (the `x-rs3-stamp` form).
+    pub stamp: Stamp,
+    /// The version's storage class (empty for a delete marker).
+    pub storage_class: String,
 }
 
 /// One page of `ListObjectVersions`, key-ordered — one live version per key,
@@ -135,9 +197,26 @@ pub struct ObjectVersionEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectVersionPage {
     pub entries: Vec<ObjectVersionEntry>,
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<String>,
 }
+
+/// One version of a key as the console and version-scoped reads see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion {
+    pub record: VersionRecord,
+    pub is_current: bool,
+}
+
+impl ObjectVersion {
+    pub fn version_id(&self) -> String {
+        self.record.version_id()
+    }
+}
+
+pub use super::write::{WriteOptions, WriteOrigin};
 
 /// Returned by a successful PUT or multipart complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +224,23 @@ pub struct PutResult {
     pub etag: String,
     pub size: u64,
     pub last_modified_ms: i64,
+    pub stamp: Option<Stamp>,
+    /// The S3 version id of the written state (`x-amz-version-id`): the
+    /// stamp dir when the bucket's versioning is enabled, `null` when
+    /// suspended, absent when never enabled.
+    pub version_id: Option<String>,
+}
+
+/// Returned by a delete: the removed object's indexed size (`None` when
+/// no object was at the key), and — on a bucket with versioning enabled or
+/// suspended — the delete marker's S3 version id (`x-amz-version-id`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeleteResult {
+    pub size: Option<u64>,
+    pub version_id: Option<String>,
+    /// Whether the delete left a delete marker in S3 terms (the bucket has
+    /// versioning enabled or suspended).
+    pub delete_marker: bool,
 }
 
 /// A conditional-write precondition, evaluated against the object currently at
@@ -290,7 +386,13 @@ impl LocalObjectStore {
             rebuild_progress: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
             change_listener: Arc::new(std::sync::RwLock::new(None)),
-            delete_guard: Arc::new(std::sync::RwLock::new(None)),
+            delete_guard: Arc::new(std::sync::RwLock::new(Vec::new())),
+            read_write_guard: Arc::new(std::sync::RwLock::new(Vec::new())),
+            change_signals: Arc::new(Mutex::new(HashMap::new())),
+            peer_restorer: Arc::new(std::sync::RwLock::new(None)),
+            replica_reader: Arc::new(std::sync::RwLock::new(None)),
+            clock: Arc::new(std::sync::OnceLock::new()),
+            site_name_locked: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             crash_points: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -303,19 +405,142 @@ impl LocalObjectStore {
         *self.change_listener.write().unwrap() = Some(listener);
     }
 
-    /// Installs the bucket-deletion veto (replacing any previous one).
-    pub fn set_delete_guard(&self, guard: DeleteGuard) {
-        *self.delete_guard.write().unwrap() = Some(guard);
+    /// Installs the peer restorer (the replication service).
+    pub fn set_peer_restorer(&self, restorer: PeerRestorer) {
+        *self.peer_restorer.write().unwrap() = Some(restorer);
+    }
+
+    /// Installs the replica-reader hook (the replication service).
+    pub fn set_replica_reader(&self, reader: ReplicaReader) {
+        *self.replica_reader.write().unwrap() = Some(reader);
+    }
+
+    /// A replication link (header `x-rs3-replicator`) read `bucket`'s
+    /// changelog (`record`), or a link being created asks; returns the
+    /// `x-rs3-merge-back` answer, if any.
+    pub(crate) fn replica_read(&self, bucket: &str, replicator: &str, record: bool) -> Option<String> {
+        let reader = self.replica_reader.read().unwrap().clone();
+        reader.and_then(|reader| reader.0(bucket, replicator, record))
+    }
+
+    /// Fetches a lost object back from a replication peer.
+    pub(crate) async fn restore_from_peer(&self, request: RestoreRequest) -> std::result::Result<String, String> {
+        let restorer = self.peer_restorer.read().unwrap().clone();
+        match restorer {
+            Some(restorer) => restorer.0(request).await,
+            None => Err("replication is not available on this server".to_string()),
+        }
+    }
+
+    /// Adds a veto on making a bucket read-write. Any one refusing blocks it.
+    pub fn add_read_write_guard(&self, guard: DeleteGuard) {
+        self.read_write_guard.write().unwrap().push(guard);
+    }
+
+    /// Adds a bucket-deletion veto. Any one refusing blocks the delete.
+    pub fn add_delete_guard(&self, guard: DeleteGuard) {
+        self.delete_guard.write().unwrap().push(guard);
+    }
+
+    /// Opens this site's identity and clock (`<root>/site.json`), with an
+    /// optional configured site id. Call once at startup, before any write.
+    /// `configured_name` (`server.site_name`), when set, is applied at every
+    /// start and locks the name; otherwise the stored (first: generated)
+    /// name stands and can be changed with [`Self::set_site_name`].
+    pub fn init_site(&self, configured_name: Option<&str>) -> Result<()> {
+        let clock = SiteClock::open(self.layout.root())?;
+        let configured = configured_name.map(str::trim).filter(|n| !n.is_empty());
+        if let Some(name) = configured {
+            if clock.site_name() != name {
+                clock.set_site_name(name)?;
+            }
+        }
+        let _ = self.site_name_locked.set(configured.is_some());
+        log::info!(
+            "site id {} name {:?}{}",
+            clock.site_id(),
+            clock.site_name(),
+            if configured.is_some() { " (server.site_name)" } else { "" }
+        );
+        self.clock
+            .set(Arc::new(clock))
+            .map_err(|_| StorageError::Io("site clock already initialised".to_string()))
+    }
+
+    fn clock(&self) -> &Arc<SiteClock> {
+        self.clock.get_or_init(|| {
+            // Tests and tools that never call init_site: persisted when the
+            // data root is writable, so stamps still survive a reopen.
+            Arc::new(
+                SiteClock::open(self.layout.root())
+                    .unwrap_or_else(|_| SiteClock::ephemeral("local")),
+            )
+        })
+    }
+
+    /// This site's id (see `storage::stamp`): generated, never changes.
+    pub fn site_id(&self) -> String {
+        self.clock().site_id().to_string()
+    }
+
+    /// This site's readable name: a label only, free to change.
+    pub fn site_name(&self) -> String {
+        self.clock().site_name()
+    }
+
+    /// Whether the name is set by `server.site_name` (then it can only be
+    /// changed there).
+    pub fn site_name_locked(&self) -> bool {
+        self.site_name_locked.get().copied().unwrap_or(false)
+    }
+
+    /// Renames this site (persisted; takes effect at once). Refused when
+    /// `server.site_name` sets it.
+    pub fn set_site_name(&self, name: &str) -> Result<String> {
+        if self.site_name_locked() {
+            return Err(StorageError::Io(
+                "the site name is set by server.site_name in the config; change it there".to_string(),
+            ));
+        }
+        self.clock().set_site_name(name)?;
+        Ok(self.site_name())
+    }
+
+    /// The next local version stamp.
+    pub fn next_stamp(&self) -> Stamp {
+        self.clock().next()
+    }
+
+    /// The effective stamp of a stored state: its own, or for objects
+    /// written before stamps existed, `(last_modified_ms, 0, this site)`.
+    pub fn effective_stamp(&self, stamp: Option<&Stamp>, last_modified_ms: i64) -> Stamp {
+        stamp
+            .cloned()
+            .unwrap_or_else(|| Stamp::fallback(last_modified_ms, self.clock().site_id()))
+    }
+
+    /// The bucket's changelog signal: woken (`notify_waiters`) after every
+    /// logged commit. Long-polling readers `enable()` a `notified()` future
+    /// before reading, then wait on it, so no commit can slip between.
+    pub fn change_signal(&self, bucket: &str) -> Arc<tokio::sync::Notify> {
+        self.change_signals
+            .lock()
+            .unwrap()
+            .entry(bucket.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
     }
 
     /// Wraps a freshly opened index with the bucket's commit notification.
     fn attach_change_hook(&self, bucket: &str, index: ObjectIndex) -> ObjectIndex {
         let slot = self.change_listener.clone();
+        let signal = self.change_signal(bucket);
         let bucket = bucket.to_string();
         index.with_commit_hook(Arc::new(move |watermark| {
             if let Some(listener) = slot.read().unwrap().as_ref() {
                 listener.0(&bucket, watermark);
             }
+            signal.notify_waiters();
         }))
     }
 
@@ -363,6 +588,23 @@ impl LocalObjectStore {
         self.crash_points.lock().unwrap().insert(name.to_string());
     }
 
+    /// How many clones of this store exist, `self` included. Tests use it,
+    /// with [`Self::open_index_handles`], to wait for a stopped site's tasks
+    /// to let go before the same data directory is opened again.
+    #[cfg(test)]
+    pub(crate) fn handle_count(&self) -> usize {
+        Arc::strong_count(&self.index_cache)
+    }
+
+    /// How many handles to the buckets' index databases exist beyond the one
+    /// the cache keeps per bucket: a clone handed to a request, or to a
+    /// blocking operation still running after its task was dropped. Each
+    /// keeps that bucket's RocksDB open.
+    #[cfg(test)]
+    pub(crate) fn open_index_handles(&self) -> usize {
+        self.index_cache.lock().unwrap().values().map(|index| index.handle_count() - 1).sum()
+    }
+
     #[cfg(test)]
     pub fn disarm_crash_point(&self, name: &str) {
         self.crash_points.lock().unwrap().remove(name);
@@ -389,8 +631,14 @@ impl LocalObjectStore {
         if !bucket_meta_path.exists() {
             let meta = BucketMeta {
                 created_at_ms: now_ms(),
-                storage_version: "v2".to_string(),
+                storage_version: String::new(),
+                layout: Some(BucketLayout::current()),
                 cors: Vec::new(),
+                read_only: false,
+                versioning: BucketVersioning::Off,
+                versioning_stamp: None,
+                cors_stamp: None,
+                cors_local: false,
             };
             write_json_atomic(&bucket_meta_path, &meta).await?;
             self.bucket_meta_cache.insert(bucket.to_string(), meta);
@@ -429,21 +677,52 @@ impl LocalObjectStore {
         Ok(meta)
     }
 
+    /// Replaces the bucket's CORS rules: a client's change, stamped now.
     pub async fn set_bucket_cors(&self, bucket: &str, cors: Vec<CorsRule>) -> Result<()> {
+        self.apply_bucket_cors(bucket, cors, None, &WriteOrigin::Client).await.map(|_| ())
+    }
+
+    /// Marks a bucket read-only (only replicated writes accepted) or
+    /// read-write.
+    pub async fn set_bucket_read_only(&self, bucket: &str, read_only: bool) -> Result<()> {
         validate_bucket_name(bucket)?;
+        if !read_only {
+            let veto = self.read_write_guard.read().unwrap().iter().find_map(|g| g.0(bucket));
+            if let Some(reason) = veto {
+                return Err(StorageError::BucketInUse(reason));
+            }
+        }
         let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
         let path = self.layout.bucket_meta_path(bucket)?;
         if !path.exists() {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
         let mut meta: BucketMeta = read_json(&path).await?;
-        meta.cors = cors;
+        meta.read_only = read_only;
         write_json_atomic(&path, &meta).await?;
         if self.durability == Durability::Full {
             fsync_file(&path).await?;
             fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
         }
         self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        log::info!("bucket {bucket} is now {}", if read_only { "read-only" } else { "read-write" });
+        Ok(())
+    }
+
+    /// Refuses a client (unstamped) write to a read-only bucket.
+    /// Refuses a write a read-only bucket does not take: a client's. Every
+    /// other origin (replication, a mirror's sweep, a repair) writes it.
+    pub async fn check_write_allowed(&self, bucket: &str, origin: &WriteOrigin) -> Result<()> {
+        if origin.allowed_on_read_only() {
+            return Ok(());
+        }
+        self.ensure_writable(bucket).await
+    }
+
+    pub async fn ensure_writable(&self, bucket: &str) -> Result<()> {
+        if self.bucket_meta(bucket).await.map(|m| m.read_only).unwrap_or(false) {
+            return Err(StorageError::BucketReadOnly(bucket.to_string()));
+        }
         Ok(())
     }
 
@@ -479,7 +758,7 @@ impl LocalObjectStore {
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        let veto = self.delete_guard.read().unwrap().as_ref().and_then(|g| g.0(bucket));
+        let veto = self.delete_guard.read().unwrap().iter().find_map(|g| g.0(bucket));
         if let Some(reason) = veto {
             return Err(StorageError::BucketInUse(reason));
         }
@@ -531,11 +810,22 @@ impl LocalObjectStore {
     /// background rebuild and fail with `BucketRebuilding` until it
     /// completes.
     pub async fn index(&self, bucket: &str) -> Result<ObjectIndex> {
+        self.index_impl(bucket, true).await
+    }
+
+    /// [`Self::index`] for maintenance that runs *behind* the 503 gate (a
+    /// layout migration holds the gate up while it rewrites the bucket):
+    /// opens the index whether or not the gate is up. Never for a request.
+    pub(crate) async fn index_unchecked(&self, bucket: &str) -> Result<ObjectIndex> {
+        self.index_impl(bucket, false).await
+    }
+
+    async fn index_impl(&self, bucket: &str, gated: bool) -> Result<ObjectIndex> {
         let bucket_dir = self.layout.bucket_dir(bucket)?;
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        if self.rebuilding.lock().unwrap().contains(bucket) {
+        if gated && self.rebuilding.lock().unwrap().contains(bucket) {
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
         }
         if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
@@ -552,7 +842,7 @@ impl LocalObjectStore {
         if !self.bucket_exists(bucket).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        if self.rebuilding.lock().unwrap().contains(bucket) {
+        if gated && self.rebuilding.lock().unwrap().contains(bucket) {
             return Err(StorageError::BucketRebuilding(bucket.to_string()));
         }
         if let Some(index) = self.index_cache.lock().unwrap().get(bucket).cloned() {
@@ -676,7 +966,7 @@ impl LocalObjectStore {
             aws_chunked,
             expected_sha256,
             None,
-            None,
+            WriteOptions::default(),
         )
         .await
     }
@@ -694,7 +984,7 @@ impl LocalObjectStore {
         aws_chunked: bool,
         expected_sha256: Option<&str>,
         expected_decoded_len: Option<u64>,
-        precondition: Option<Precondition>,
+        options: WriteOptions,
     ) -> Result<PutResult>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -727,7 +1017,7 @@ impl LocalObjectStore {
             )
             .await?
         };
-        self.commit_staged_put(bucket, key, &staging_id, precondition)
+        self.commit_staged_put_with(bucket, key, &staging_id, options)
             .await
     }
 
@@ -782,6 +1072,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: BTreeMap::new(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         cleanup.disarm();
@@ -865,6 +1156,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: BTreeMap::new(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         cleanup.disarm();
@@ -952,6 +1244,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: BTreeMap::new(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         cleanup.disarm();
@@ -964,6 +1257,19 @@ impl LocalObjectStore {
         key: &str,
         staging_id: &str,
         precondition: Option<Precondition>,
+    ) -> Result<PutResult> {
+        self.commit_staged_put_with(bucket, key, staging_id, WriteOptions::precondition(precondition))
+            .await
+    }
+
+    /// [`Self::commit_staged_put`] with full [`WriteOptions`] (a replicated
+    /// stamp).
+    pub async fn commit_staged_put_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        staging_id: &str,
+        options: WriteOptions,
     ) -> Result<PutResult> {
         validate_staging_id(staging_id)?;
         let staging_dir = self.layout.put_staging_dir(bucket, staging_id)?;
@@ -986,7 +1292,11 @@ impl LocalObjectStore {
         ensure_file_exists(&staged_part).await?;
 
         let object_meta = ObjectMeta {
-            format_version: 1,
+            format_version: META_FORMAT,
+            stamp: None,
+            versioned: false,
+            delete_marker: false,
+            removed: None,
             bucket: bucket.to_string(),
             object_key: key.to_string(),
             storage: ObjectStorageKind::Single,
@@ -1005,6 +1315,7 @@ impl LocalObjectStore {
                 etag: put_meta.etag.clone(),
                 last_modified_ms: now_ms(),
             }],
+            tags: put_meta.tags.clone(),
         };
         let publish_dir =
             prepare_single_publish_dir(&staging_dir, &staged_part, &object_meta).await?;
@@ -1012,7 +1323,7 @@ impl LocalObjectStore {
         // Remove staging on every path — a rejected precondition must not leak
         // the staged blob.
         let result = self
-            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, precondition)
+            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, options)
             .await;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         cleanup.disarm();
@@ -1020,40 +1331,43 @@ impl LocalObjectStore {
     }
 
     /// The shared commit section for PUT / CopyObject / CompleteMultipart:
-    /// intent → fresh-name rename into the live tree → atomic row flip →
-    /// retire the displaced dir. `publish_dir` must already contain the
-    /// complete blob (parts + meta.json).
+    /// decide under the key lock → intent → rename into the live tree at the
+    /// version's own path → atomic row flip → retire what was displaced (or
+    /// keep it as a noncurrent version). `publish_dir` must already contain
+    /// the complete blob (parts + meta.json).
     async fn publish_prepared_dir(
         &self,
         bucket: &str,
         key: &str,
         publish_dir: &Path,
         mut object_meta: ObjectMeta,
-        precondition: Option<Precondition>,
+        options: WriteOptions,
     ) -> Result<PutResult> {
+        let WriteOptions { origin, precondition, versioned: versioned_hint, tags } = options;
+        if let Err(err) = self.check_write_allowed(bucket, &origin).await {
+            let _ = tokio::fs::remove_dir_all(publish_dir).await;
+            return Err(err);
+        }
+        if let Some(tags) = tags {
+            object_meta.tags = tags;
+        }
         let bucket_dir = self.layout.bucket_dir(bucket)?;
+        let versioning = self.bucket_meta(bucket).await?.versioning;
         if self.durability == Durability::Full {
             fsync_publish_dir(publish_dir, &object_meta).await?;
         }
 
         let index = self.index(bucket).await?;
-        let mut blob_rel = new_blob_rel(bucket, key);
-        let intent_id = index
-            .insert_publish_intent(key, &blob_rel, now_ms())
-            .await?;
-        self.crash_point("publish_after_intent");
-
         let _guard = self.locks.lock(bucket, key).await;
 
         let old = index.get(key).await?;
 
         // Conditional write: evaluate the precondition against the object
         // currently at the key, atomically under the lock we already hold, so
-        // the check and the publish cannot race. On failure, abandon the intent
-        // and the staged blob and report 412.
+        // the check and the publish cannot race. On failure, abandon the
+        // staged blob and report 412.
         if let Some(precondition) = &precondition {
             if !precondition.is_met(old.as_ref().map(|o| o.etag.as_str())) {
-                let _ = index.delete_intent(intent_id).await;
                 let _ = tokio::fs::remove_dir_all(publish_dir).await;
                 return Err(StorageError::PreconditionFailed {
                     bucket: bucket.to_string(),
@@ -1062,15 +1376,51 @@ impl LocalObjectStore {
             }
         }
 
-        // Monotonic per-key clamp: newer-wins adjudication (rebuild, DR)
-        // requires timestamps to order versions even across clock steps.
-        let last_modified_ms = old
-            .as_ref()
-            .map(|o| o.last_modified_ms.saturating_add(1))
-            .unwrap_or(i64::MIN)
-            .max(now_ms());
-        if last_modified_ms != object_meta.last_modified_ms {
+        // The key's current state: the object, or its tombstone.
+        let old_tombstone = index.get_tombstone(key).await?;
+        let current = self.current_rank(&index, key, old.as_ref()).await?;
+        let versioned = self.versioned_bit(&index, key, versioning, versioned_hint).await?;
+        // On a versioning-enabled bucket a replicated state that does not
+        // outrank the current one is not stale: it is history, kept as a
+        // noncurrent version (every site holds the same set of versions).
+        if versioning == BucketVersioning::Enabled {
+            if let Some(given) = origin.given_stamp().filter(|_| origin.adjudicated()) {
+                let below = current.as_ref().is_some_and(|(rank, _)| !outranks(&Rank::live(given.clone()), Some(rank)));
+                if below {
+                    return self
+                        .insert_history_version(bucket, key, &index, publish_dir, object_meta, given.clone(), versioned, &origin)
+                        .await;
+                }
+            }
+        }
+        let stamp = match self.decide(bucket, key, &origin, origin.put_rank(), current.as_ref()) {
+            Ok(stamp) => stamp,
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(publish_dir).await;
+                return Err(err);
+            }
+        };
+        let last_modified_ms = match origin.given_stamp() {
+            // A replicated state shows its origin's time.
+            Some(_) => stamp.ms,
+            // Monotonic per-key clamp: newer-wins adjudication (rebuild, DR)
+            // requires timestamps to order versions even across clock steps.
+            None => old
+                .as_ref()
+                .map(|o| o.last_modified_ms.saturating_add(1))
+                .unwrap_or(i64::MIN)
+                .max(stamp.ms),
+        };
+        if last_modified_ms != object_meta.last_modified_ms
+            || object_meta.stamp.as_ref() != Some(&stamp)
+            || object_meta.versioned != versioned
+            || object_meta.format_version != META_FORMAT
+            || !object_meta.tags.is_empty()
+        {
+            object_meta.format_version = META_FORMAT;
             object_meta.last_modified_ms = last_modified_ms;
+            object_meta.stamp = Some(stamp.clone());
+            object_meta.versioned = versioned;
             write_json_atomic(&publish_dir.join("meta.json"), &object_meta).await?;
             if self.durability == Durability::Full {
                 fsync_file(&publish_dir.join("meta.json")).await?;
@@ -1082,10 +1432,15 @@ impl LocalObjectStore {
             }
         }
 
+        // The version's path is its stamp: decided, so the intent can name it.
+        let blob_rel = v3::blob_rel(bucket, key, &stamp);
+        let intent_id = index.insert_publish_intent(key, &blob_rel, now_ms()).await?;
+        self.crash_point("publish_after_intent");
+
         // Rename into the live tree, retrying on ENOENT (an empty-leaf
-        // cleaner may race dir creation — the retry recreates it) and
-        // choosing a fresh name on collision (never publish into an
-        // existing dir).
+        // cleaner may race dir creation — the retry recreates it). A dir
+        // already at the version's path can only be a leftover (the same
+        // stamp is never decided twice for a key): it is trashed first.
         let objects_dir = bucket_dir.join("objects");
         let objects_existed = tokio::fs::metadata(&objects_dir).await.is_ok();
         let mut leaf_created = false;
@@ -1142,8 +1497,8 @@ impl LocalObjectStore {
                     if err.kind() == ErrorKind::AlreadyExists
                         || err.kind() == ErrorKind::DirectoryNotEmpty =>
                 {
-                    blob_rel = new_blob_rel(bucket, key);
-                    index.update_intent_blob_dir(intent_id, &blob_rel).await?;
+                    log::warn!("publish bucket={bucket} key={key}: leftover dir at {blob_rel}; trashing it");
+                    move_object_dir_to_trash(&self.layout, bucket, &dest).await?;
                     continue;
                 }
                 Err(err) => {
@@ -1172,54 +1527,276 @@ impl LocalObjectStore {
             size: object_meta.size,
             etag: object_meta.etag.clone(),
             last_modified_ms,
+            parts: Some(crate::storage::changelog::PartLayout::of(&object_meta)),
+            stamp: Some(stamp.clone()),
+            versioned,
         };
-        let retire_id = index
-            .commit_publish(
-                &record,
-                intent_id,
-                old.as_ref().map(|o| o.blob_dir.as_str()),
-                now_ms(),
-            )
+        // What the write displaces: the previous row and marker are kept as
+        // noncurrent versions while versioning is enabled (and real versions
+        // always are); `null` states are retired.
+        let mut displaced = Displaced::default();
+        if let Some(old) = old.as_ref().filter(|old| !index::same_blob_dir(&old.blob_dir, &blob_rel)) {
+            // (A restore republishing the very version the row names lands
+            // at the same path: nothing is displaced — the leftover, if
+            // any, went to trash before the rename.)
+            if old.versioned || versioned {
+                let old_stamp = self.effective_stamp(old.stamp.as_ref(), old.last_modified_ms);
+                displaced.keep.push(VersionRecord::from_row(old, old_stamp));
+            } else {
+                displaced.retire.push(old.blob_dir.clone());
+            }
+        }
+        if let Some(t) = &old_tombstone {
+            if let Some(marker) = VersionRecord::from_tombstone(t) {
+                if t.versioned || versioned {
+                    displaced.keep.push(marker);
+                } else {
+                    displaced.retire.push(marker.blob_dir);
+                }
+            }
+        }
+        if !versioned {
+            Self::displace_null_versions(&index, key, &mut displaced).await?;
+        }
+        let retire_dirs = displaced.retire.clone();
+        let retire_ids = index
+            .commit_publish_from(&record, intent_id, displaced, now_ms(), origin.change_origin())
             .await?;
         self.crash_point("publish_after_commit");
 
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
-
-        if let (Some(old), Some(retire_id)) = (&old, retire_id) {
-            // Relaxed mode: the commit may still sit in an unsynced WAL. Sync
-            // it before retiring the displaced blob, or a power loss can roll
-            // the row back to a blob dir that is already in trash. (If the
-            // sync fails, leave the retire to the resolver.)
-            if self.durability == Durability::Relaxed {
-                if let Err(err) = index.sync_wal().await {
-                    log::warn!("wal sync before retire failed bucket={bucket} key={key} error={err}");
-                    return Ok(PutResult {
-                        etag: object_meta.etag,
-                        size: object_meta.size,
-                        last_modified_ms,
-                    });
-                }
-            }
-            let old_abs = bucket_dir.join(&old.blob_dir);
-            match move_object_dir_to_trash(&self.layout, bucket, &old_abs).await {
-                Ok(_) => {
-                    let _ = index.delete_intent(retire_id).await;
-                }
-                Err(err) => {
-                    // The retire intent stays; the resolver finishes the job.
-                    log::warn!(
-                        "retire failed bucket={bucket} key={key} dir={} error={err}",
-                        old.blob_dir
-                    );
-                }
-            }
-        }
+        self.retire_displaced(bucket, key, &index, &retire_ids, &retire_dirs).await;
 
         Ok(PutResult {
             etag: object_meta.etag,
             size: object_meta.size,
             last_modified_ms,
+            version_id: Self::version_id_for(versioning, &stamp),
+            stamp: Some(stamp),
         })
+    }
+
+    /// A key has at most one `null` state: a new `null` state (a write or a
+    /// delete while versioning is off or suspended) replaces a `null`
+    /// version kept among the noncurrent ones too, as S3 does.
+    async fn displace_null_versions(index: &ObjectIndex, key: &str, displaced: &mut Displaced) -> Result<()> {
+        for v in index.versions_of(key).await? {
+            if !v.versioned {
+                displaced.retire.push(v.blob_dir.clone());
+                displaced.drop_versions.push(v.version_dir());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a state written now is a real version. Only on a
+    /// versioning-enabled bucket; there, a replicated state that was the
+    /// `null` version on its site (`hint` `Some(false)`) stays `null` here
+    /// if the key has no `null` state yet, and is a real version otherwise
+    /// (a key holds one `null` state, so the history of an unversioned
+    /// source is still kept). Called under the key lock.
+    async fn versioned_bit(&self, index: &ObjectIndex, key: &str, versioning: BucketVersioning, hint: Option<bool>) -> Result<bool> {
+        Ok(match (versioning, hint) {
+            (BucketVersioning::Enabled, Some(false)) => self.has_null_state(index, key).await?,
+            (BucketVersioning::Enabled, _) => true,
+            _ => false,
+        })
+    }
+
+    /// Whether this site already holds (or permanently removed) version
+    /// `stamp` of `key`: as the current object, the current marker, a
+    /// noncurrent version, or a version tombstone.
+    pub async fn version_known(&self, bucket: &str, key: &str, stamp: &Stamp) -> Result<bool> {
+        let index = self.index(bucket).await?;
+        self.version_known_in(&index, key, stamp).await
+    }
+
+    async fn version_known_in(&self, index: &ObjectIndex, key: &str, stamp: &Stamp) -> Result<bool> {
+        if let Some(row) = index.get(key).await? {
+            if self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms) == *stamp {
+                return Ok(true);
+            }
+        }
+        if index.get_tombstone(key).await?.is_some_and(|t| t.stamp == *stamp) {
+            return Ok(true);
+        }
+        let dir = v3::stamp_dir(stamp);
+        Ok(index.get_version(key, &dir).await?.is_some() || index.has_version_tombstone(key, &dir).await?)
+    }
+
+    /// Whether the key has a `null` state anywhere (current or kept).
+    async fn has_null_state(&self, index: &ObjectIndex, key: &str) -> Result<bool> {
+        if index.get(key).await?.is_some_and(|row| !row.versioned) {
+            return Ok(true);
+        }
+        if index.get_tombstone(key).await?.is_some_and(|t| !t.versioned && t.blob_dir.is_some()) {
+            return Ok(true);
+        }
+        Ok(index.versions_of(key).await?.iter().any(|v| !v.versioned))
+    }
+
+    /// Commits `publish_dir` as a noncurrent version `stamp` of `key` (a
+    /// replicated state older than the current one, on a versioning-enabled
+    /// bucket). Idempotent: a version this site already knows is dropped.
+    /// A `null` state never joins a key that has one. The caller holds the
+    /// key lock.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_history_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        index: &ObjectIndex,
+        publish_dir: &Path,
+        mut meta: ObjectMeta,
+        stamp: Stamp,
+        versioned: bool,
+        origin: &WriteOrigin,
+    ) -> Result<PutResult> {
+        let result = PutResult {
+            etag: meta.etag.clone(),
+            size: meta.size,
+            last_modified_ms: stamp.ms,
+            version_id: Some(if versioned { v3::stamp_dir(&stamp) } else { "null".to_string() }),
+            stamp: Some(stamp.clone()),
+        };
+        if self.version_known_in(index, key, &stamp).await? || (!versioned && self.has_null_state(index, key).await?) {
+            let _ = tokio::fs::remove_dir_all(publish_dir).await;
+            return Ok(result);
+        }
+        meta.format_version = META_FORMAT;
+        meta.stamp = Some(stamp.clone());
+        meta.versioned = versioned;
+        meta.last_modified_ms = stamp.ms;
+        write_json_atomic(&publish_dir.join("meta.json"), &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&publish_dir.join("meta.json")).await?;
+            fsync_dir(publish_dir).await?;
+        }
+        let blob_rel = v3::blob_rel(bucket, key, &stamp);
+        let intent_id = index.insert_publish_intent(key, &blob_rel, now_ms()).await?;
+        self.rename_into_tree(bucket, publish_dir, &blob_rel).await?;
+        let record = VersionRecord {
+            object_key: key.to_string(),
+            stamp: stamp.clone(),
+            blob_dir: blob_rel,
+            size: meta.size,
+            etag: meta.etag.clone(),
+            last_modified_ms: stamp.ms,
+            parts: Some(crate::storage::changelog::PartLayout::of(&meta)),
+            versioned,
+            delete_marker: false,
+            removed: None,
+        };
+        index
+            .commit_version_insert(&record, Some(intent_id), Displaced::default(), now_ms(), origin.change_origin())
+            .await?;
+        Ok(result)
+    }
+
+    /// Commits a delete marker `stamp` (removing `removed`) as a noncurrent
+    /// version of `key`: a replicated delete older than the key's current
+    /// state, on a versioning-enabled bucket. Idempotent. The caller holds
+    /// the key lock.
+    async fn insert_history_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+        index: &ObjectIndex,
+        stamp: Stamp,
+        removed: Stamp,
+        versioned: bool,
+        origin: &WriteOrigin,
+    ) -> Result<DeleteResult> {
+        let result = DeleteResult {
+            size: None,
+            version_id: Some(if versioned { v3::stamp_dir(&stamp) } else { "null".to_string() }),
+            delete_marker: true,
+        };
+        if self.version_known_in(index, key, &stamp).await? || (!versioned && self.has_null_state(index, key).await?) {
+            return Ok(result);
+        }
+        let marker_rel = self.write_delete_marker(bucket, key, &stamp, &removed, versioned).await?;
+        let record = VersionRecord {
+            object_key: key.to_string(),
+            stamp: stamp.clone(),
+            blob_dir: marker_rel,
+            size: 0,
+            etag: String::new(),
+            last_modified_ms: stamp.ms,
+            parts: None,
+            versioned,
+            delete_marker: true,
+            removed: Some(removed),
+        };
+        index
+            .commit_version_insert(&record, None, Displaced::default(), now_ms(), origin.change_origin())
+            .await?;
+        Ok(result)
+    }
+
+    /// Moves a prepared blob dir to `blob_rel` in the live tree (a leftover
+    /// at that path is trashed first), making the new entries durable.
+    async fn rename_into_tree(&self, bucket: &str, publish_dir: &Path, blob_rel: &str) -> Result<PathBuf> {
+        let bucket_dir = self.layout.bucket_dir(bucket)?;
+        let dest = bucket_dir.join(blob_rel);
+        let leaf = bucket_dir.join(blob_rel_parent(blob_rel));
+        for attempt in 0..100 {
+            tokio::fs::create_dir_all(&leaf).await?;
+            match tokio::fs::rename(publish_dir, &dest).await {
+                Ok(()) => break,
+                Err(err) if err.kind() == ErrorKind::AlreadyExists || err.kind() == ErrorKind::DirectoryNotEmpty => {
+                    move_object_dir_to_trash(&self.layout, bucket, &dest).await?;
+                }
+                Err(err) if is_leaf_reclaimed_race(&err) && attempt < 99 => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if self.durability == Durability::Full {
+            fsync_dir(&leaf).await?;
+            fsync_dir(&bucket_dir.join("objects")).await?;
+        }
+        Ok(dest)
+    }
+
+    /// The `x-amz-version-id` of a state written with `stamp` under
+    /// `versioning`.
+    fn version_id_for(versioning: BucketVersioning, stamp: &Stamp) -> Option<String> {
+        match versioning {
+            BucketVersioning::Off => None,
+            BucketVersioning::Enabled => Some(v3::stamp_dir(stamp)),
+            BucketVersioning::Suspended => Some("null".to_string()),
+        }
+    }
+
+    /// Trashes the blob dirs a commit displaced, dropping each retire
+    /// intent as its dir goes; a dir that cannot be moved keeps its intent
+    /// for the resolver. In relaxed durability the commit may still sit in
+    /// an unsynced WAL: it is synced first, or a power loss could roll the
+    /// row back to a blob dir that is already in trash.
+    async fn retire_displaced(&self, bucket: &str, key: &str, index: &ObjectIndex, ids: &[i64], dirs: &[String]) {
+        if dirs.is_empty() {
+            return;
+        }
+        if self.durability == Durability::Relaxed {
+            if let Err(err) = index.sync_wal().await {
+                log::warn!("wal sync before retire failed bucket={bucket} key={key} error={err}");
+                return;
+            }
+        }
+        let Ok(bucket_dir) = self.layout.bucket_dir(bucket) else {
+            return;
+        };
+        for (id, dir) in ids.iter().zip(dirs) {
+            match move_object_dir_to_trash(&self.layout, bucket, &bucket_dir.join(dir)).await {
+                Ok(_) => {
+                    let _ = index.delete_intent(*id).await;
+                }
+                Err(err) => {
+                    // The retire intent stays; the resolver finishes the job.
+                    log::warn!("retire failed bucket={bucket} key={key} dir={dir} error={err}");
+                }
+            }
+        }
     }
 
     // ── reads (strictly read-only) ────────────────────────────────────────────
@@ -1286,45 +1863,303 @@ impl LocalObjectStore {
         )))
     }
 
+    /// The rank of `key`'s current state (see [`Rank`]): the live object's,
+    /// or its tombstone's, whichever ranks higher; `None` when the key was
+    /// never seen (or its tombstone expired). Also returns the newest stamp
+    /// involved, for the clock to observe.
+    async fn current_rank(&self, index: &ObjectIndex, key: &str, row: Option<&ObjectRecord>) -> Result<Option<(Rank, Stamp)>> {
+        let tombstone = index.get_tombstone(key).await?;
+        let live = row.map(|row| self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms));
+        let newest = match (&live, &tombstone) {
+            (Some(live), Some(t)) => Some(live.clone().max(t.stamp.clone())),
+            (Some(live), None) => Some(live.clone()),
+            (None, Some(t)) => Some(t.stamp.clone()),
+            (None, None) => None,
+        };
+        let rank = match (live.map(Rank::live), tombstone.map(|t| t.rank())) {
+            (Some(live), Some(tomb)) => Some(live.max(tomb)),
+            (live, tomb) => live.or(tomb),
+        };
+        Ok(rank.zip(newest))
+    }
+
+    /// A deleted key's tombstone — its last state, which a replicator reads
+    /// off a 404. `None` while the key has a live state, or was never here.
+    pub async fn key_tombstone(&self, bucket: &str, key: &str) -> Result<Option<Tombstone>> {
+        let index = self.index(bucket).await?;
+        if index.get(key).await?.is_some() {
+            return Ok(None);
+        }
+        index.get_tombstone(key).await
+    }
+
+    /// The rank of `key`'s current state, for replicators deciding whether a
+    /// change is newer than what is here.
+    pub async fn key_rank(&self, bucket: &str, key: &str) -> Result<Option<Rank>> {
+        let index = self.index(bucket).await?;
+        let row = index.get(key).await?;
+        Ok(self.current_rank(&index, key, row.as_ref()).await?.map(|(rank, _)| rank))
+    }
+
+    fn stale(bucket: &str, key: &str, current: &Rank) -> StorageError {
+        StorageError::StaleStamp {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            current: if current.deleted {
+                format!("{} (deleted)", current.stamp.to_header())
+            } else {
+                current.stamp.to_header()
+            },
+        }
+    }
+
+    /// The current state's stamp of `key` (see [`Self::current_stamp`]),
+    /// and whether it is a tombstone. For HEAD of a deleted key and for
+    /// replicators comparing states.
+    pub async fn key_stamp(&self, bucket: &str, key: &str) -> Result<Option<(Stamp, bool)>> {
+        let index = self.index(bucket).await?;
+        if let Some(row) = index.get(key).await? {
+            return Ok(Some((self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms), false)));
+        }
+        Ok(index.get_tombstone(key).await?.map(|t| (t.stamp, true)))
+    }
+
+    /// Deletes `key` as `options.origin`. Like every write it is decided
+    /// under the key lock by rank: a delete ranks by the version it
+    /// `removed` (just above it), so it never removes a version newer than
+    /// the one its author saw. `removed` is that version's stamp: a
+    /// replicated delete brings its origin's (`x-rs3-removed-stamp`; the
+    /// delete's own stamp when the peer sends none), a mirror's sweep the
+    /// version it listed, and a client's delete (`None`) removes whatever
+    /// is current. A delete that does not outrank the current state fails
+    /// with [`StorageError::StaleStamp`] and changes nothing. A key already
+    /// absent still records the tombstone when the delete names a version,
+    /// so that version (or an older one) arriving later cannot come back;
+    /// a client's delete of an absent key is a no-op (S3: idempotent).
+    ///
+    /// The delete writes a marker dir beside the key's versions (so a
+    /// rebuild finds it) and, while versioning is enabled, keeps the removed
+    /// state as a noncurrent version. Returns the deleted size and the
+    /// marker's S3 version id (see [`DeleteResult`]).
+    pub async fn delete_object_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        options: WriteOptions,
+        removed: Option<Stamp>,
+    ) -> Result<DeleteResult> {
+        let WriteOptions { origin, precondition, versioned: versioned_hint, tags: _ } = options;
+        self.ensure_bucket_and_key(bucket, key).await?;
+        self.check_write_allowed(bucket, &origin).await?;
+        let versioning = self.bucket_meta(bucket).await?.versioning;
+        let index = self.index(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+        let row = index.get(key).await?;
+        if let Some(precondition) = &precondition {
+            if !precondition.is_met(row.as_ref().map(|r| r.etag.as_str())) {
+                return Err(StorageError::PreconditionFailed {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        }
+        let removed = match (removed, &row, origin.given_stamp()) {
+            (Some(removed), _, _) => removed,
+            // A peer that sends no removed stamp: the delete ranks by its own.
+            (None, _, Some(given)) => given.clone(),
+            // A local delete removes exactly the version it sees.
+            (None, Some(row), None) => self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms),
+            // A deleted key: on a versioning-enabled bucket another marker
+            // goes on top (S3); elsewhere there is nothing to do.
+            (None, None, None) => match index.get_tombstone(key).await? {
+                Some(t) if versioning == BucketVersioning::Enabled && t.blob_dir.is_some() => t.stamp.clone(),
+                _ => return Ok(DeleteResult::default()),
+            },
+        };
+        let current = self.current_rank(&index, key, row.as_ref()).await?;
+        let versioned = self.versioned_bit(&index, key, versioning, versioned_hint).await?;
+        // History on a versioning-enabled bucket: a replicated delete that
+        // does not outrank the current state is kept as a noncurrent marker.
+        if versioning == BucketVersioning::Enabled {
+            if let Some(given) = origin.given_stamp().filter(|_| origin.adjudicated()) {
+                let below = current.as_ref().is_some_and(|(rank, _)| !outranks(&Rank::deleted(removed.clone()), Some(rank)));
+                if below {
+                    return self.insert_history_marker(bucket, key, &index, given.clone(), removed, versioned, &origin).await;
+                }
+            }
+        }
+        let stamp = self.decide(bucket, key, &origin, Some(Rank::deleted(removed.clone())), current.as_ref())?;
+        let old_tombstone = index.get_tombstone(key).await?;
+        // The marker goes to disk first: a rebuild after a crash past the
+        // commit must find the delete.
+        let marker_rel = self.write_delete_marker(bucket, key, &stamp, &removed, versioned).await?;
+        let mut displaced = Displaced::default();
+        if let Some(t) = &old_tombstone {
+            if let Some(marker) = VersionRecord::from_tombstone(t) {
+                if t.versioned || versioned {
+                    displaced.keep.push(marker);
+                } else {
+                    displaced.retire.push(marker.blob_dir);
+                }
+            }
+        }
+        if !versioned {
+            Self::displace_null_versions(&index, key, &mut displaced).await?;
+        }
+        let version_id = Self::version_id_for(versioning, &stamp);
+        let size = match row {
+            Some(row) => {
+                if row.versioned || versioned {
+                    let old_stamp = self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms);
+                    displaced.keep.push(VersionRecord::from_row(&row, old_stamp));
+                } else {
+                    displaced.retire.push(row.blob_dir.clone());
+                }
+                let retire_dirs = displaced.retire.clone();
+                let ids = index
+                    .commit_delete_from(
+                        key,
+                        displaced,
+                        now_ms(),
+                        origin.change_origin(),
+                        Some(stamp),
+                        Some(removed),
+                        Some(marker_rel),
+                        versioned,
+                    )
+                    .await?;
+                self.crash_point("delete_after_commit");
+                self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+                self.retire_displaced(bucket, key, &index, &ids, &retire_dirs).await;
+                Some(row.size)
+            }
+            None => {
+                let tombstone = Tombstone {
+                    object_key: key.to_string(),
+                    stamp,
+                    removed: Some(removed),
+                    deleted_at_ms: now_ms(),
+                    version: String::new(),
+                    etag: String::new(),
+                    size: 0,
+                    versioned,
+                    blob_dir: Some(marker_rel.clone()),
+                };
+                let retire_dirs = displaced.retire.clone();
+                match index.record_tombstone(tombstone, displaced, origin.change_origin()).await? {
+                    Some(ids) => self.retire_displaced(bucket, key, &index, &ids, &retire_dirs).await,
+                    None => {
+                        // Not recorded (an equal or newer tombstone exists):
+                        // the marker we wrote is an orphan.
+                        let _ = tokio::fs::remove_dir_all(self.layout.bucket_dir(bucket)?.join(&marker_rel)).await;
+                        return Ok(DeleteResult::default());
+                    }
+                }
+                None
+            }
+        };
+        Ok(DeleteResult { size, version_id, delete_marker: versioning != BucketVersioning::Off })
+    }
+
+    /// Writes the delete marker dir of `key` at `stamp` (a version dir whose
+    /// `meta.json` says `delete_marker`, no parts) and returns its
+    /// bucket-relative path. Idempotent: an existing dir at the path is
+    /// rewritten.
+    async fn write_delete_marker(&self, bucket: &str, key: &str, stamp: &Stamp, removed: &Stamp, versioned: bool) -> Result<String> {
+        let rel = v3::blob_rel(bucket, key, stamp);
+        let dir = self.layout.bucket_dir(bucket)?.join(&rel);
+        let meta = ObjectMeta {
+            format_version: META_FORMAT,
+            bucket: bucket.to_string(),
+            object_key: key.to_string(),
+            storage: ObjectStorageKind::Single,
+            size: 0,
+            etag: String::new(),
+            last_modified_ms: stamp.ms,
+            content_type: String::new(),
+            content_encoding: None,
+            content_language: None,
+            storage_class: super::metadata::DEFAULT_STORAGE_CLASS.to_string(),
+            user_meta: BTreeMap::new(),
+            parts: Vec::new(),
+            stamp: Some(stamp.clone()),
+            versioned,
+            delete_marker: true,
+            removed: Some(removed.clone()),
+            tags: BTreeMap::new(),
+        };
+        tokio::fs::create_dir_all(&dir).await?;
+        write_json_atomic(&dir.join("meta.json"), &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&dir.join("meta.json")).await?;
+            fsync_dir(&dir).await?;
+            if let Some(parent) = dir.parent() {
+                fsync_dir(parent).await?;
+            }
+        }
+        Ok(rel)
+    }
+
+    /// [`Self::delete_object_with`] from a request's optional `x-rs3-stamp`
+    /// and `x-rs3-removed-stamp`.
+    #[cfg(test)]
+    pub async fn delete_object_stamped(
+        &self,
+        bucket: &str,
+        key: &str,
+        stamp: Option<Stamp>,
+        removed: Option<Stamp>,
+    ) -> Result<Option<u64>> {
+        Ok(self.delete_object_with(bucket, key, WriteOptions::stamped(stamp), removed).await?.size)
+    }
+
+    /// A client's delete of `key`.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.delete_object_with_size(bucket, key).await.map(|_| ())
     }
 
-    /// Deletes an object and returns its indexed size when it existed. This
-    /// avoids an extra metadata read for operation audit logging.
+    /// A client's delete, returning the indexed size when the object
+    /// existed (for operation audit logging, without a metadata read).
     pub async fn delete_object_with_size(&self, bucket: &str, key: &str) -> Result<Option<u64>> {
-        self.ensure_bucket_and_key(bucket, key).await?;
-        let index = self.index(bucket).await?;
-        let _guard = self.locks.lock(bucket, key).await;
-        let Some(row) = index.get(key).await? else {
-            return Ok(None); // Idempotent: deleting an absent key succeeds.
-        };
-        let deleted_size = row.size;
-        let retire_id = index.commit_delete(key, &row.blob_dir, now_ms()).await?;
-        self.crash_point("delete_after_commit");
-        self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
-        if self.durability == Durability::Relaxed {
-            // Same as publish: never trash a blob a not-yet-durable commit
-            // displaced. On failure the retire intent stays for the resolver.
-            if let Err(err) = index.sync_wal().await {
-                log::warn!("wal sync before retire failed bucket={bucket} key={key} error={err}");
-                return Ok(Some(deleted_size));
-            }
-        }
-        let abs = self.layout.bucket_dir(bucket)?.join(&row.blob_dir);
-        match move_object_dir_to_trash(&self.layout, bucket, &abs).await {
-            Ok(_) => {
-                let _ = index.delete_intent(retire_id).await;
-            }
-            Err(err) => {
-                log::warn!(
-                    "retire failed bucket={bucket} key={key} dir={} error={err}",
-                    row.blob_dir
-                );
-            }
-        }
-        Ok(Some(deleted_size))
+        Ok(self.delete_object_with(bucket, key, WriteOptions::client(), None).await?.size)
     }
+
+    /// Decides a write under the key lock — the one place every origin goes
+    /// through. `incoming` is the write's rank when it has one to compare
+    /// (a put with a given stamp; every delete, by the version it removes);
+    /// it must outrank the key's `current` state, or the write is stale
+    /// ([`StorageError::StaleStamp`]) — except for an origin that is not
+    /// adjudicated (a restore). Returns the new state's stamp: the one the
+    /// write brings, or a fresh local one, minted after observing the
+    /// current state so it outranks what it replaces even if that came
+    /// from a site whose clock runs ahead.
+    fn decide(
+        &self,
+        bucket: &str,
+        key: &str,
+        origin: &WriteOrigin,
+        incoming: Option<Rank>,
+        current: Option<&(Rank, Stamp)>,
+    ) -> Result<Stamp> {
+        if origin.adjudicated() {
+            if let (Some(incoming), Some((current, _))) = (&incoming, current) {
+                if !outranks(incoming, Some(current)) {
+                    return Err(Self::stale(bucket, key, current));
+                }
+            }
+        }
+        if let Some((_, newest)) = current {
+            self.clock().observe(newest);
+        }
+        Ok(match origin.given_stamp() {
+            Some(stamp) => {
+                self.clock().observe(stamp);
+                stamp.clone()
+            }
+            None => self.clock().next(),
+        })
+    }
+
 
     // ── intent resolution (the only deletion authority) ───────────────────────
 
@@ -1482,23 +2317,19 @@ impl LocalObjectStore {
         self.index(bucket).await?.object_count().await
     }
 
-    /// One page of `ListObjectVersions`, resuming strictly after `key_marker`.
-    ///
-    /// This server is unversioned, so a key has exactly one version — the live
-    /// one — and that is all the listing reports, matching what S3 returns for
-    /// an unversioned bucket. Retired blobs sitting in trash are deliberately
-    /// omitted: no API can address them (there is no `?versionId` route), they
-    /// would all report `VersionId=null` like the live object, and a
-    /// version-aware client acting on such a row would hit the live object
-    /// instead. Trash is a recovery buffer for operators, not an API surface.
-    ///
-    /// Only the page's own key range is touched: one bounded index scan of
-    /// `max_keys + 1` rows, and blob metadata for those rows alone.
+    /// `ListObjectVersions`: every version of every key under `prefix`, in
+    /// key order and newest first per key, from `key_marker` /
+    /// `version_id_marker` on. A key's versions may be split across pages;
+    /// the next markers name the last version listed. On a bucket that
+    /// never had versioning each key has one `null` version (its live
+    /// object).
     pub async fn list_object_versions(
         &self,
         bucket: &str,
         prefix: &str,
+        delimiter: Option<&str>,
         key_marker: &str,
+        version_id_marker: &str,
         max_keys: usize,
     ) -> Result<ObjectVersionPage> {
         validate_bucket_name(bucket)?;
@@ -1509,56 +2340,469 @@ impl LocalObjectStore {
             // advertise a next page.
             return Ok(ObjectVersionPage::default());
         }
+        let versioning = self.bucket_meta(bucket).await?.versioning;
         let index = self.index(bucket).await?;
+        let key_marker = (!key_marker.is_empty()).then_some(key_marker);
+        // A `null` marker resumes after the key's null version; a stamp dir
+        // after that version; anything else (a stray id) after the key.
+        let version_marker = match version_id_marker {
+            "" => None,
+            "null" => Some(String::from("null")),
+            other => v3::parse_stamp_dir(other).map(|_| other.to_string()),
+        };
+        let page = index
+            .list_versions_page(
+                prefix,
+                delimiter,
+                key_marker,
+                version_marker.as_deref().filter(|m| *m != "null"),
+                max_keys,
+                &self.site_id(),
+                versioning != BucketVersioning::Off,
+            )
+            .await?;
+        // The storage class is not in the index: it is read from each
+        // version's `meta.json` (a few at a time; a marker has none).
         let bucket_dir = self.layout.bucket_dir(bucket)?;
-        let after = (!key_marker.is_empty()).then_some(key_marker);
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for chunk in page.entries.chunks(16) {
+            let mut reads = Vec::with_capacity(chunk.len());
+            for (v, _) in chunk {
+                let path = bucket_dir.join(&v.blob_dir).join("meta.json");
+                reads.push(async move {
+                    if v.delete_marker {
+                        return String::new();
+                    }
+                    read_json::<super::metadata::ObjectMeta>(&path)
+                        .await
+                        .map(|meta| meta.storage_class)
+                        .unwrap_or_else(|err| {
+                            log::warn!("list versions: cannot read {}: {err}", path.display());
+                            super::metadata::DEFAULT_STORAGE_CLASS.to_string()
+                        })
+                });
+            }
+            let classes = futures::future::join_all(reads).await;
+            for ((v, is_latest), storage_class) in chunk.iter().zip(classes) {
+                entries.push(ObjectVersionEntry {
+                    key: v.object_key.clone(),
+                    version_id: v.version_id(),
+                    is_latest: *is_latest,
+                    last_modified_ms: v.last_modified_ms,
+                    etag: v.etag.clone(),
+                    size: v.size,
+                    delete_marker: v.delete_marker,
+                    stamp: v.stamp.clone(),
+                    storage_class,
+                });
+            }
+        }
+        // The marker is the last version's id as listed (`null` for a null
+        // version); after a rolled-up group there is no version: `null`.
+        let next_version_id_marker = page.is_truncated.then(|| {
+            match (&page.next_version_marker, entries.last()) {
+                (Some(_), Some(last)) => last.version_id.clone(),
+                _ => "null".to_string(),
+            }
+        });
+        Ok(ObjectVersionPage {
+            is_truncated: page.is_truncated,
+            next_key_marker: page.is_truncated.then(|| page.next_key_marker.clone().unwrap_or_default()),
+            next_version_id_marker,
+            entries,
+            common_prefixes: page.common_prefixes,
+        })
+    }
 
-        // One extra row tells us whether a further key exists without a second
-        // query.
-        let live = index.list(prefix, None, after, max_keys + 1).await?;
-        let has_more = live.entries.len() > max_keys;
+    // ── object versions ─────────────────────────────────────────────────────
 
-        let mut versions: Vec<ObjectVersionEntry> = Vec::new();
-        for row in live.entries.iter().take(max_keys) {
-            let dir = bucket_dir.join(&row.blob_dir);
-            let Ok(meta) = read_json::<ObjectMeta>(&dir.join("meta.json")).await else {
-                log::warn!(
-                    "list_object_versions unreadable blob bucket={bucket} key={} dir={}",
-                    row.object_key,
-                    row.blob_dir
-                );
-                continue;
-            };
-            let version_id = dir
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or("null")
-                .to_string();
-            versions.push(ObjectVersionEntry {
-                meta,
-                version_id,
-                is_latest: true,
+    /// Every version of `key`, newest first: its current state (the object
+    /// or its delete marker) and the noncurrent versions. Empty for a key
+    /// never seen.
+    pub async fn list_versions(&self, bucket: &str, key: &str) -> Result<Vec<ObjectVersion>> {
+        self.ensure_bucket_and_key(bucket, key).await?;
+        let index = self.index(bucket).await?;
+        let mut out = Vec::new();
+        if let Some(row) = index.get(key).await? {
+            let stamp = self.effective_stamp(row.stamp.as_ref(), row.last_modified_ms);
+            out.push(ObjectVersion { record: VersionRecord::from_row(&row, stamp), is_current: true });
+        } else if let Some(t) = index.get_tombstone(key).await? {
+            if let Some(marker) = VersionRecord::from_tombstone(&t) {
+                out.push(ObjectVersion { record: marker, is_current: true });
+            }
+        }
+        for v in index.versions_of(key).await? {
+            out.push(ObjectVersion { record: v, is_current: false });
+        }
+        Ok(out)
+    }
+
+    /// Resolves an S3 version id (`null`, or a stamp dir) to the version of
+    /// `key` it names, with whether that version is current.
+    /// [`StorageError::NoSuchVersion`] when there is none.
+    pub async fn find_version(&self, bucket: &str, key: &str, version_id: &str) -> Result<ObjectVersion> {
+        let no_such = || StorageError::NoSuchVersion {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: version_id.to_string(),
+        };
+        if version_id != "null" && v3::parse_stamp_dir(version_id).is_none() {
+            return Err(no_such());
+        }
+        let versions = self.list_versions(bucket, key).await?;
+        versions
+            .into_iter()
+            .find(|v| if version_id == "null" { !v.record.versioned } else { v.record.version_dir() == version_id })
+            .ok_or_else(no_such)
+    }
+
+    /// Reads one version of `key` by its S3 version id. A delete marker is
+    /// [`StorageError::VersionIsDeleteMarker`] (S3: 405).
+    pub async fn read_object_version(&self, bucket: &str, key: &str, version_id: &str) -> Result<ReadObject> {
+        let version = self.find_version(bucket, key, version_id).await?;
+        if version.record.delete_marker {
+            return Err(StorageError::VersionIsDeleteMarker {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version.version_id(),
             });
         }
-
-        // The index scan is already key-ordered, so the page needs no sorting.
-        let mut next_key_marker = versions.last().map(|v| v.meta.object_key.clone());
-        if has_more && next_key_marker.is_none() {
-            // Every blob in this window was unreadable. Hand back the last key
-            // we scanned so the client skips the hole instead of replaying it.
-            next_key_marker = live
-                .entries
-                .get(max_keys - 1)
-                .map(|row| row.object_key.clone());
+        if version.is_current {
+            return self.read_object(bucket, key).await;
         }
+        let object_dir = self.layout.bucket_dir(bucket)?.join(&version.record.blob_dir);
+        let meta: ObjectMeta = read_json(&object_dir.join("meta.json")).await.map_err(|err| {
+            StorageError::CorruptObject(format!(
+                "version {} of {bucket}/{key} references unreadable blob: {err}",
+                version.version_id()
+            ))
+        })?;
+        validate_object_parts(&object_dir, &meta).await?;
+        Ok(ReadObject { part_offsets: part_offsets(&meta), meta, object_dir })
+    }
 
-        Ok(ObjectVersionPage {
-            // Without a marker to hand back there is no way to make progress,
-            // so the response must not claim there is more.
-            is_truncated: has_more && next_key_marker.is_some(),
-            next_key_marker,
-            entries: versions,
-        })
+    /// Permanently removes one version of `key` (`DeleteObject?versionId`),
+    /// live or delete marker, current or not. When the current state goes,
+    /// the newest remaining version becomes current (a marker as the key's
+    /// tombstone). Returns the removed version's size, or `None` when the
+    /// version did not exist (S3: idempotent).
+    pub async fn delete_object_version(&self, bucket: &str, key: &str, version_id: &str, origin: WriteOrigin) -> Result<Option<u64>> {
+        self.delete_object_version_by(bucket, key, version_id, origin, None).await
+    }
+
+    /// The site where a change was made: the given `author` of a
+    /// replicated change, else this site.
+    fn author_of(&self, author: Option<&str>) -> String {
+        author.map(str::to_string).unwrap_or_else(|| self.site_id())
+    }
+
+    /// [`Self::delete_object_version`] with the change's `author` site (a
+    /// replicated removal keeps the site where a client made it).
+    pub async fn delete_object_version_by(&self, bucket: &str, key: &str, version_id: &str, origin: WriteOrigin, author: Option<&str>) -> Result<Option<u64>> {
+        let author = self.author_of(author);
+        self.ensure_bucket_and_key(bucket, key).await?;
+        self.check_write_allowed(bucket, &origin).await?;
+        let index = self.index(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+        let Ok(version) = self.find_version(bucket, key, version_id).await else {
+            // A replicated removal of a version this site never got (or
+            // already removed): remember it, so a copy arriving later is
+            // refused, and pass it on.
+            if let (Some(given), Some(stamp)) = (origin.given_stamp(), v3::parse_stamp_dir(version_id)) {
+                let dir = v3::stamp_dir(&stamp);
+                if !index.has_version_tombstone(key, &dir).await? {
+                    self.clock().observe(given);
+                    index
+                        .record_version_tombstone(key, &stamp, true, now_ms(), origin.change_origin(), &author)
+                        .await?;
+                }
+            }
+            return Ok(None);
+        };
+        let target = match (version.is_current, version.record.delete_marker) {
+            (true, false) => VersionTarget::Current,
+            (true, true) => VersionTarget::Marker,
+            (false, _) => VersionTarget::Noncurrent(version.record.version_dir()),
+        };
+        let promote = if version.is_current {
+            index.versions_of(key).await?.into_iter().next()
+        } else {
+            None
+        };
+        let current = self.current_rank(&index, key, index.get(key).await?.as_ref()).await?;
+        let stamp = self.decide(bucket, key, &WriteOrigin::Repair, None, current.as_ref())?;
+        let removed = index
+            .commit_remove_version(key, target, promote, now_ms(), origin.change_origin(), stamp, &author)
+            .await?;
+        self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+        if let Some((id, dir)) = removed {
+            self.retire_displaced(bucket, key, &index, &[id], &[dir]).await;
+        }
+        Ok(Some(version.record.size))
+    }
+
+    /// The tags of `key` (of the version `version_id` names, else the
+    /// current one) and that version's S3 id. A delete marker is
+    /// [`StorageError::VersionIsDeleteMarker`].
+    pub async fn object_tags(&self, bucket: &str, key: &str, version_id: Option<&str>) -> Result<(BTreeMap<String, String>, String)> {
+        let read = match version_id {
+            Some(version_id) => self.read_object_version(bucket, key, version_id).await?,
+            None => self.read_object(bucket, key).await?,
+        };
+        let version_id = match read.meta.versioned {
+            true => read.meta.stamp.as_ref().map(v3::stamp_dir).unwrap_or_else(|| "null".to_string()),
+            false => "null".to_string(),
+        };
+        Ok((read.meta.tags, version_id))
+    }
+
+    /// Replaces the tags of one version of `key` (the version `version_id`
+    /// names, else the current one) in place: neither the ETag nor the
+    /// version changes. Logged as a `tags` change, unless nothing changed.
+    /// Returns the version's S3 id.
+    pub async fn set_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: BTreeMap<String, String>,
+        origin: WriteOrigin,
+    ) -> Result<String> {
+        self.set_object_tags_by(bucket, key, version_id, tags, origin, None).await
+    }
+
+    /// [`Self::set_object_tags`] with the change's `author` site.
+    pub async fn set_object_tags_by(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: BTreeMap<String, String>,
+        origin: WriteOrigin,
+        author: Option<&str>,
+    ) -> Result<String> {
+        let author = self.author_of(author);
+        super::metadata::validate_tags(&tags).map_err(StorageError::InvalidObjectKey)?;
+        self.ensure_bucket_and_key(bucket, key).await?;
+        self.check_write_allowed(bucket, &origin).await?;
+        let index = self.index(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+        let version = match version_id {
+            Some(version_id) => self.find_version(bucket, key, version_id).await?,
+            None => self
+                .list_versions(bucket, key)
+                .await?
+                .into_iter()
+                .find(|v| v.is_current)
+                .ok_or_else(|| StorageError::ObjectNotFound { bucket: bucket.to_string(), key: key.to_string() })?,
+        };
+        if version.record.delete_marker {
+            return Err(StorageError::VersionIsDeleteMarker {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version.version_id(),
+            });
+        }
+        let dir = self.layout.bucket_dir(bucket)?.join(&version.record.blob_dir);
+        let mut meta: ObjectMeta = read_json(&dir.join("meta.json")).await?;
+        if meta.tags == tags {
+            return Ok(version.version_id());
+        }
+        meta.tags = tags.clone();
+        write_json_atomic(&dir.join("meta.json"), &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&dir.join("meta.json")).await?;
+            fsync_dir(&dir).await?;
+        }
+        self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+        index.log_tags(&version.record, &tags, now_ms(), origin.change_origin(), &author).await?;
+        Ok(version.version_id())
+    }
+
+    /// The bucket's versioning state.
+    pub async fn bucket_versioning(&self, bucket: &str) -> Result<BucketVersioning> {
+        Ok(self.bucket_meta(bucket).await?.versioning)
+    }
+
+    /// Sets the bucket's versioning state (`PutBucketVersioning`): a
+    /// client's change, stamped now.
+    pub async fn set_bucket_versioning(&self, bucket: &str, versioning: BucketVersioning) -> Result<()> {
+        self.apply_bucket_versioning(bucket, versioning, None, &WriteOrigin::Client).await.map(|_| ())
+    }
+
+    /// The bucket's replicated settings with their change stamps.
+    pub async fn bucket_settings(&self, bucket: &str) -> Result<BucketSettings> {
+        Ok(BucketSettings::of(&self.bucket_meta(bucket).await?))
+    }
+
+    /// Applies a versioning state, a client's (no `stamp`: a fresh one) or
+    /// a peer's (its change's `stamp`). Enabling requires the bucket to be
+    /// stable on the current layout (every object has a materialised stamp,
+    /// so every version has an id); a bucket that was ever enabled can only
+    /// be suspended, not turned off. Two sites agree on the result: enabled
+    /// or suspended always beats off, and between those the newer stamp
+    /// wins. Logged as a `bucket` change when applied. Returns whether the
+    /// state changed.
+    pub async fn apply_bucket_versioning(
+        &self,
+        bucket: &str,
+        versioning: BucketVersioning,
+        stamp: Option<Stamp>,
+        origin: &WriteOrigin,
+    ) -> Result<bool> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        if versioning == BucketVersioning::Off {
+            if meta.versioning == BucketVersioning::Off {
+                return Ok(false);
+            }
+            if stamp.is_some() {
+                return Ok(false); // a peer still off: it will adopt ours
+            }
+            return Err(StorageError::BucketInUse(format!(
+                "bucket {bucket}: versioning cannot be turned off once enabled, only suspended"
+            )));
+        }
+        let stamp = match stamp {
+            Some(stamp) => {
+                self.clock().observe(&stamp);
+                stamp
+            }
+            None => self.clock().next(),
+        };
+        if meta.versioning == versioning {
+            if meta.versioning_stamp.as_ref().is_some_and(|have| *have >= stamp) {
+                return Ok(false);
+            }
+            // Same state, newer stamp: remember it, nothing to log.
+            meta.versioning_stamp = Some(stamp);
+            write_json_atomic(&path, &meta).await?;
+            self.bucket_meta_cache.insert(bucket.to_string(), meta);
+            return Ok(false);
+        }
+        // Enabled vs suspended: the newer change wins (off never does).
+        if meta.versioning != BucketVersioning::Off && meta.versioning_stamp.as_ref().is_some_and(|have| *have >= stamp) {
+            return Ok(false);
+        }
+        let layout = meta.layout.unwrap_or(BucketLayout::Stable { version: 1 });
+        if !layout.is_stable_current() {
+            return Err(StorageError::BucketInUse(format!(
+                "bucket {bucket} is on storage layout {}; upgrade it to layout {CURRENT_LAYOUT} before enabling versioning",
+                layout.target()
+            )));
+        }
+        meta.versioning = versioning;
+        meta.versioning_stamp = Some(stamp.clone());
+        write_json_atomic(&path, &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&path).await?;
+            fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
+        }
+        let settings = BucketSettings::of(&meta);
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        log::info!("bucket {bucket} versioning is now {} (by {:?})", versioning.as_str(), origin.change_origin());
+        self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin(), &stamp.site).await?;
+        Ok(true)
+    }
+
+    /// Applies CORS rules, a client's (no `stamp`) or a peer's (its
+    /// change's `stamp`, adopted only when newer and the bucket does not
+    /// keep its CORS local). Logged as a `bucket` change when applied.
+    pub async fn apply_bucket_cors(&self, bucket: &str, cors: Vec<CorsRule>, stamp: Option<Stamp>, origin: &WriteOrigin) -> Result<bool> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        let stamp = match stamp {
+            Some(stamp) => {
+                if meta.cors_local || meta.cors_stamp.as_ref().is_some_and(|have| *have >= stamp) {
+                    return Ok(false);
+                }
+                self.clock().observe(&stamp);
+                stamp
+            }
+            None => self.clock().next(),
+        };
+        let changed = meta.cors != cors;
+        meta.cors = cors;
+        meta.cors_stamp = Some(stamp.clone());
+        write_json_atomic(&path, &meta).await?;
+        if self.durability == Durability::Full {
+            fsync_file(&path).await?;
+            fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
+        }
+        let settings = BucketSettings::of(&meta);
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        if changed {
+            self.index(bucket).await?.log_bucket(&settings, &stamp, now_ms(), origin.change_origin(), &stamp.site).await?;
+        }
+        Ok(changed)
+    }
+
+    /// Whether this bucket keeps its CORS rules local (never adopts a
+    /// peer's).
+    pub async fn set_bucket_cors_local(&self, bucket: &str, local: bool) -> Result<()> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        meta.cors_local = local;
+        write_json_atomic(&path, &meta).await?;
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        Ok(())
+    }
+
+    /// Adopts a peer's settings where they are newer (versioning: enabled
+    /// or suspended over off, else the newer stamp; CORS: the newer stamp,
+    /// unless kept local). Returns the local versioning afterwards.
+    pub async fn adopt_bucket_settings(&self, bucket: &str, peer: &BucketSettings) -> Result<BucketVersioning> {
+        let local = self.bucket_settings(bucket).await?;
+        if peer.versioning != local.versioning && peer.versioning != BucketVersioning::Off {
+            let adopt = local.versioning == BucketVersioning::Off
+                || match (&peer.versioning_stamp, &local.versioning_stamp) {
+                    (Some(theirs), Some(ours)) => theirs > ours,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+            if adopt {
+                self.apply_bucket_versioning(bucket, peer.versioning, peer.versioning_stamp.clone(), &WriteOrigin::Mirror).await?;
+            }
+        }
+        if let Some(stamp) = &peer.cors_stamp {
+            if peer.cors != local.cors {
+                self.apply_bucket_cors(bucket, peer.cors.clone(), Some(stamp.clone()), &WriteOrigin::Mirror).await?;
+            }
+        }
+        self.bucket_versioning(bucket).await
+    }
+
+    /// Removes tombstones of deletes made before `cutoff_ms` (at most
+    /// `max_entries`), trashing their marker dirs. Returns how many.
+    pub async fn purge_tombstones(&self, bucket: &str, cutoff_ms: i64, max_entries: usize) -> Result<usize> {
+        let index = self.index(bucket).await?;
+        let bucket_dir = self.layout.bucket_dir(bucket)?;
+        let purged = index.purge_tombstones(cutoff_ms, max_entries).await?;
+        index.purge_version_tombstones(cutoff_ms, max_entries).await?;
+        for t in &purged {
+            if let Some(dir) = &t.blob_dir {
+                let _guard = self.locks.lock(bucket, &t.object_key).await;
+                if let Err(err) = move_object_dir_to_trash(&self.layout, bucket, &bucket_dir.join(dir)).await {
+                    log::warn!("purge of marker dir failed bucket={bucket} key={} dir={dir} error={err}", t.object_key);
+                }
+            }
+        }
+        Ok(purged.len())
     }
 
     // ── multipart ─────────────────────────────────────────────────────────────
@@ -1592,6 +2836,48 @@ impl LocalObjectStore {
         content_language: Option<&str>,
         user_meta: &BTreeMap<String, String>,
     ) -> Result<String> {
+        self.initiate_multipart_as(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta, &BTreeMap::new(), false)
+            .await
+    }
+
+    /// Starts a multipart upload: a client's (`replicated: false`) is
+    /// refused up front on a read-only bucket, before any part is sent;
+    /// replication's is accepted there (its completion carries the stamp,
+    /// which is where the write's origin is decided).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn initiate_multipart_as(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
+        tags: &BTreeMap<String, String>,
+        replicated: bool,
+    ) -> Result<String> {
+        if !replicated {
+            self.ensure_writable(bucket).await?;
+        }
+        self.initiate_multipart_replicated(bucket, key, content_type, content_encoding, storage_class, content_language, user_meta, tags)
+            .await
+    }
+
+    /// [`Self::initiate_multipart_with_metadata`] for a replicated upload,
+    /// which a read-only bucket accepts (its completion carries the stamp).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn initiate_multipart_replicated(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
+        storage_class: Option<&str>,
+        content_language: Option<&str>,
+        user_meta: &BTreeMap<String, String>,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<String> {
         self.ensure_bucket_and_key(bucket, key).await?;
         let upload_id = new_staging_id(now_ms());
         let staging_dir = self.layout.multipart_staging_dir(bucket, &upload_id)?;
@@ -1613,6 +2899,7 @@ impl LocalObjectStore {
             content_language: content_language_or_none(content_language),
             storage_class: storage_class_or_default(storage_class),
             user_meta: user_meta.clone(),
+            tags: tags.clone(),
         };
         let upload_json = staging_dir.join("upload.json");
         write_json_atomic(&upload_json, &upload).await?;
@@ -1751,6 +3038,8 @@ impl LocalObjectStore {
             etag,
             size,
             last_modified_ms: now_ms(),
+            stamp: None,
+            version_id: None,
         })
     }
 
@@ -1831,6 +3120,8 @@ impl LocalObjectStore {
             etag: written.md5,
             size: written.size,
             last_modified_ms: now_ms(),
+            stamp: None,
+            version_id: None,
         })
     }
 
@@ -1883,6 +3174,8 @@ impl LocalObjectStore {
             etag: written.md5,
             size: written.size,
             last_modified_ms: now_ms(),
+            stamp: None,
+            version_id: None,
         })
     }
 
@@ -1893,6 +3186,33 @@ impl LocalObjectStore {
         upload_id: &str,
         requested_parts: &[CompletePartRequest],
     ) -> Result<PutResult> {
+        self.complete_multipart_with(bucket, key, upload_id, requested_parts, WriteOptions::default())
+            .await
+    }
+
+    /// [`Self::complete_multipart`] with [`WriteOptions`] — a replicated
+    /// upload takes its stamp here, at completion, not at create.
+    pub async fn complete_multipart_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        requested_parts: &[CompletePartRequest],
+        options: WriteOptions,
+    ) -> Result<PutResult> {
+        // A replicated upload older than what is here is refused before
+        // anything is assembled, leaving the upload intact (to abort). The
+        // publish re-checks under the key lock.
+        if let Some(incoming) = options.origin.put_rank().filter(|_| options.origin.adjudicated()) {
+            // (A versioning-enabled bucket keeps an older state as history.)
+            if self.bucket_versioning(bucket).await? != BucketVersioning::Enabled {
+                if let Some(current) = self.key_rank(bucket, key).await? {
+                    if !outranks(&incoming, Some(&current)) {
+                        return Err(Self::stale(bucket, key, &current));
+                    }
+                }
+            }
+        }
         self.validate_upload(bucket, key, upload_id).await?;
         if requested_parts.is_empty() {
             return Err(StorageError::InvalidMultipartUpload(
@@ -1984,7 +3304,11 @@ impl LocalObjectStore {
             })
             .collect();
         let object_meta = ObjectMeta {
-            format_version: 1,
+            format_version: META_FORMAT,
+            stamp: None,
+            versioned: false,
+            delete_marker: false,
+            removed: None,
             bucket: bucket.to_string(),
             object_key: key.to_string(),
             storage: ObjectStorageKind::Multipart,
@@ -1997,6 +3321,7 @@ impl LocalObjectStore {
             storage_class: upload.storage_class.clone(),
             user_meta: upload.user_meta.clone(),
             parts: object_parts,
+            tags: upload.tags.clone(),
         };
         let publish_dir = prepare_multipart_publish_dir(&staging_dir, &parts, &object_meta).await?;
         self.crash_point("complete_after_prepare");
@@ -2004,7 +3329,7 @@ impl LocalObjectStore {
         // Multipart completion is unconditional (object_store never sends a
         // precondition with it).
         let result = self
-            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, None)
+            .publish_prepared_dir(bucket, key, &publish_dir, object_meta, options)
             .await?;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(result)
@@ -2018,11 +3343,103 @@ impl LocalObjectStore {
         dst_key: &str,
     ) -> Result<PutResult> {
         self.copy_object_with_metadata(
-            src_bucket, src_key, dst_bucket, dst_key, None, None, None, None,
+            src_bucket,
+            src_key,
+            dst_bucket,
+            dst_key,
+            None,
+            None,
+            None,
+            None,
+            WriteOptions::default(),
         )
         .await
     }
 
+    /// A metadata-only update of `key` (CopyObject onto itself): a new blob
+    /// dir whose part files are **hardlinks** to the current ones, with a new
+    /// `meta.json`, published through the normal commit (new version, new
+    /// stamp, a changelog `put`). No byte is copied, and the part layout and
+    /// ETag are kept — a multipart object keeps its `-N` ETag. The old dir is
+    /// retired as usual; its files live on through the links.
+    ///
+    /// `Ok(None)` when the files cannot be hardlinked (e.g. a filesystem
+    /// without hardlinks): the caller falls back to copying the bytes.
+    /// Refuses (412) if the object changed after it was read, rather than
+    /// republishing the older bytes over a concurrent write.
+    #[allow(clippy::too_many_arguments)]
+    async fn republish_metadata_only(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_class: Option<&str>,
+        replacement_user_meta: Option<&BTreeMap<String, String>>,
+        replacement_content_type: Option<&str>,
+        replacement_content_language: Option<&str>,
+        options: WriteOptions,
+    ) -> Result<Option<PutResult>> {
+        // A concurrent overwrite between reading and publishing makes the
+        // guard below refuse; re-read and try again (the caller asked for no
+        // precondition, so a race must not surface as a 412).
+        let guarded = options.precondition.is_none();
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let staging_id = new_staging_id(now_ms());
+            let staging_dir = self.layout.put_staging_dir(bucket, &staging_id)?;
+            let publish_dir = staging_dir.join("object");
+            let meta = {
+                // Link under the key lock: the source files cannot be retired
+                // mid-link, and once linked they outlive any later retire.
+                let _guard = self.locks.lock(bucket, key).await;
+                let src = self.read_object(bucket, key).await?;
+                tokio::fs::create_dir_all(&publish_dir).await?;
+                for part in &src.meta.parts {
+                    if let Err(err) =
+                        tokio::fs::hard_link(src.object_dir.join(&part.file), publish_dir.join(&part.file)).await
+                    {
+                        log::info!(
+                            "metadata-only copy falls back to a byte copy bucket={bucket} key={key}: cannot hardlink ({err})"
+                        );
+                        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                        return Ok(None);
+                    }
+                }
+                let mut meta = src.meta.clone();
+                if let Some(content_type) = replacement_content_type {
+                    meta.content_type = content_type.to_string();
+                }
+                if let Some(language) = replacement_content_language {
+                    meta.content_language = Some(language.to_string());
+                }
+                if let Some(class) = storage_class {
+                    meta.storage_class = class.to_string();
+                }
+                if let Some(user_meta) = replacement_user_meta {
+                    meta.user_meta = user_meta.clone();
+                }
+                meta
+            };
+            let cleanup = StagingDirGuard::new(&staging_dir);
+            write_json_atomic(&publish_dir.join("meta.json"), &meta).await?;
+            let mut attempt_options = options.clone();
+            if guarded {
+                // Only republish over the state that was read.
+                attempt_options.precondition = Some(Precondition::IfMatch(meta.etag.clone()));
+            }
+            let result = self
+                .publish_prepared_dir(bucket, key, &publish_dir, meta, attempt_options)
+                .await;
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            cleanup.disarm();
+            match result {
+                Err(StorageError::PreconditionFailed { .. }) if guarded && attempt < 5 => continue,
+                other => return other.map(Some),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_object_with_metadata(
         &self,
         src_bucket: &str,
@@ -2033,10 +3450,63 @@ impl LocalObjectStore {
         replacement_user_meta: Option<&BTreeMap<String, String>>,
         replacement_content_type: Option<&str>,
         replacement_content_language: Option<&str>,
+        options: WriteOptions,
+    ) -> Result<PutResult> {
+        self.copy_object_version(
+            src_bucket,
+            src_key,
+            None,
+            dst_bucket,
+            dst_key,
+            storage_class,
+            replacement_user_meta,
+            replacement_content_type,
+            replacement_content_language,
+            options,
+        )
+        .await
+    }
+
+    /// [`Self::copy_object_with_metadata`] of one version of the source
+    /// (`src_version_id`: an S3 version id; the current state when `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_object_version(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        src_version_id: Option<&str>,
+        dst_bucket: &str,
+        dst_key: &str,
+        storage_class: Option<&str>,
+        replacement_user_meta: Option<&BTreeMap<String, String>>,
+        replacement_content_type: Option<&str>,
+        replacement_content_language: Option<&str>,
+        options: WriteOptions,
     ) -> Result<PutResult> {
         self.ensure_bucket_and_key(dst_bucket, dst_key).await?;
+        if src_bucket == dst_bucket && src_key == dst_key && src_version_id.is_none() {
+            // Copy onto itself = a metadata update: keep the bytes, the part
+            // layout and the ETag (hardlinks, constant cost).
+            if let Some(result) = self
+                .republish_metadata_only(
+                    dst_bucket,
+                    dst_key,
+                    storage_class,
+                    replacement_user_meta,
+                    replacement_content_type,
+                    replacement_content_language,
+                    options.clone(),
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
         let _source_guard = self.locks.lock(src_bucket, src_key).await;
-        let src = self.read_object(src_bucket, src_key).await?;
+        let src = match src_version_id {
+            Some(version_id) => self.read_object_version(src_bucket, src_key, version_id).await?,
+            None => self.read_object(src_bucket, src_key).await?,
+        };
         let content_type = replacement_content_type
             .map(str::to_string)
             .unwrap_or_else(|| src.meta.content_type.clone());
@@ -2067,12 +3537,14 @@ impl LocalObjectStore {
             content_language,
             storage_class: copied_storage_class,
             user_meta,
+            // A copy keeps the source's tags unless the write replaces them.
+            tags: src.meta.tags.clone(),
         };
         write_json_atomic(&staging_dir.join("put.json"), &meta).await?;
         drop(_source_guard);
         // commit_staged_put owns the staging dir from here (and removes it).
         cleanup.disarm();
-        self.commit_staged_put(dst_bucket, dst_key, &staging_id, None)
+        self.commit_staged_put_with(dst_bucket, dst_key, &staging_id, options)
             .await
     }
 
@@ -2230,55 +3702,70 @@ impl LocalObjectStore {
         Ok(removed)
     }
 
-    /// Relocates one object's blob dir from the legacy 4-level fanout layout to
-    /// the current single-level layout via **hardlink → atomic index flip →
-    /// unlink** — metadata-only, no object bytes are copied.
+    /// Relocates one object's blob dir to the current layout (its key's dir,
+    /// named by its stamp, `meta.json` at the current format with the stamp
+    /// materialised) via **hardlink → atomic index flip → unlink** — no
+    /// object bytes are copied. An object from before stamps gets the
+    /// fallback stamp (its Last-Modified, this site).
     ///
     /// Idempotent: `Ok(false)` if the object is gone or already current.
-    /// Safe under concurrent reads (both paths hold the same inodes across the
-    /// atomic flip, and `read_object` retries on a vanished path) and crashes
-    /// (the tree is self-describing, so a rebuild dedups any orphan left behind).
-    /// Serialised with publish/delete of the same key by the per-key lock.
-    pub async fn migrate_object_layout(&self, bucket: &str, key: &str) -> Result<bool> {
+    /// Safe under concurrent reads (both paths hold the same inodes across
+    /// the atomic flip, and `read_object` retries on a vanished path) and
+    /// crashes (the tree is self-describing, so a rebuild dedups any orphan
+    /// left behind). Serialised with publish/delete of the same key by the
+    /// per-key lock.
+    pub async fn relocate_object(&self, bucket: &str, key: &str) -> Result<bool> {
         validate_bucket_name(bucket)?;
         let bucket_dir = self.layout.bucket_dir(bucket)?;
-        let index = self.index(bucket).await?;
+        let index = self.index_unchecked(bucket).await?;
         let _guard = self.locks.lock(bucket, key).await;
 
         let Some(row) = index.get(key).await? else {
             return Ok(false); // gone
         };
-        if !is_legacy_layout(&row.blob_dir) {
+        if layouts::is_current(&row.blob_dir) && row.stamp.is_some() {
             return Ok(false); // already on the current layout
         }
         let old_dir = bucket_dir.join(&row.blob_dir);
+        let mut meta: ObjectMeta = read_json(&old_dir.join("meta.json")).await?;
+        let stamp = self.effective_stamp(row.stamp.as_ref().or(meta.stamp.as_ref()), row.last_modified_ms);
+        let new_rel = v3::blob_rel(bucket, key, &stamp);
+        let new_dir = bucket_dir.join(&new_rel);
+        if new_rel == row.blob_dir {
+            // Already at its place; only the stamp was missing from the row.
+            return index.relocate_row(key, &row.blob_dir, &new_rel, &stamp).await;
+        }
 
-        // 1. Fresh single-level dir; hardlink every file from the old dir into
-        //    it. Retry the random leaf name on the (astronomically rare) clash.
-        let (new_rel, new_dir) = loop {
-            let new_rel = new_blob_rel(bucket, key);
-            let new_dir = bucket_dir.join(&new_rel);
-            tokio::fs::create_dir_all(bucket_dir.join(blob_rel_parent(&new_rel))).await?;
-            match tokio::fs::create_dir(&new_dir).await {
-                Ok(()) => break (new_rel, new_dir),
-                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err.into()),
-            }
-        };
+        // 1. A fresh dir at the version's path (a leftover of an interrupted
+        //    attempt is replaced); hardlink every part into it and write the
+        //    current-format meta.json.
+        let _ = tokio::fs::remove_dir_all(&new_dir).await;
+        tokio::fs::create_dir_all(&new_dir).await?;
         let linked_and_flipped: Result<bool> = async {
             let mut entries = tokio::fs::read_dir(&old_dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 // Object leaves hold files only (meta.json + part.N), no subdirs.
+                if entry.file_name() == "meta.json" {
+                    continue;
+                }
                 tokio::fs::hard_link(old_dir.join(entry.file_name()), new_dir.join(entry.file_name()))
                     .await?;
             }
+            meta.format_version = META_FORMAT;
+            meta.stamp = Some(stamp.clone());
+            write_json_atomic(&new_dir.join("meta.json"), &meta).await?;
             if self.durability == Durability::Full {
+                fsync_file(&new_dir.join("meta.json")).await?;
                 fsync_dir(&new_dir).await?;
+                if let Some(parent) = new_dir.parent() {
+                    fsync_dir(parent).await?;
+                }
             }
 
+            self.crash_point("migrate_after_link");
             // 2. Atomic pivot: repoint the index row, guarded by the old path so a
             //    concurrent overwrite (should the lock ever not hold) can't be lost.
-            index.update_blob_dir(key, &row.blob_dir, &new_rel).await
+            index.relocate_row(key, &row.blob_dir, &new_rel, &stamp).await
         }
         .await;
         match linked_and_flipped {
@@ -2291,55 +3778,396 @@ impl LocalObjectStore {
             }
         }
         self.meta_cache.remove(&ObjectCacheKey::new(bucket, key));
+        self.crash_point("migrate_after_flip");
 
         // 3. Clean up the old leaf. Its files are hardlinks, so unlinking just
-        //    drops the extra link — the inodes live on under new_dir.
-        let _ = tokio::fs::remove_dir_all(&old_dir).await;
-        // Reclaim the now-empty legacy 4-level fanout chain bottom-up. This is
-        // race-free: new writes only ever create single-level dirs, so nothing
-        // recreates these old paths; a sibling object still under the chain just
-        // makes `remove_dir` fail (`DirectoryNotEmpty`) and we stop. The reclaim
-        // job doesn't descend, so migration owns cleaning what it vacates.
-        let objects_root = bucket_dir.join("objects");
-        let mut parent = old_dir.parent().map(|p| p.to_path_buf());
-        while let Some(dir) = parent {
-            if dir == objects_root || tokio::fs::remove_dir(&dir).await.is_err() {
-                break;
-            }
-            parent = dir.parent().map(|p| p.to_path_buf());
-        }
+        //    drops the extra link — the inodes live on under new_dir. A crash
+        //    before this point leaves the old leaf behind with its row already
+        //    flipped; `reap_relocated_leaves` finishes the job on resume.
+        remove_old_leaf(&bucket_dir.join("objects"), &old_dir).await;
         Ok(true)
     }
 
-    /// Up to `limit` keys in `bucket` still on the legacy 4-level layout,
-    /// strictly after `after`.
-    pub async fn legacy_layout_keys(
+    /// Old-layout leaves whose object already lives on the current layout:
+    /// the leftover of a crash between an index flip and the old leaf's
+    /// unlink. The index-driven pass never revisits them (their rows are
+    /// current), so the resumed upgrade walks the tree for them. A leaf is
+    /// reaped only when its row names a current-layout dir holding the same
+    /// content (same ETag); a leaf the index still names is the index-driven
+    /// pass's job, and one it does not name at all is an orphan left for a
+    /// rebuild to trash. Returns how many were reaped.
+    async fn reap_relocated_leaves(&self, bucket: &str, cancel: &CancellationToken) -> Result<u64> {
+        let bucket_dir = self.layout.bucket_dir(bucket)?;
+        let objects_root = bucket_dir.join("objects");
+        let index = self.index_unchecked(bucket).await?;
+        let mut reaped = 0u64;
+        let mut stack = vec![objects_root.clone()];
+        while let Some(dir) = stack.pop() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            let mut is_leaf = false;
+            let mut subdirs = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_name() == "meta.json" {
+                    is_leaf = true;
+                } else if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    subdirs.push(entry.path());
+                }
+            }
+            drop(entries);
+            if !is_leaf {
+                stack.extend(subdirs);
+                continue;
+            }
+            let Ok(rel) = dir.strip_prefix(&bucket_dir) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if layouts::is_current(&rel) {
+                continue;
+            }
+            let Ok(meta) = read_json::<ObjectMeta>(&dir.join("meta.json")).await else {
+                continue;
+            };
+            let key = meta.object_key;
+            let _guard = self.locks.lock(bucket, &key).await;
+            let Some(row) = index.get(&key).await? else {
+                continue;
+            };
+            if row.blob_dir == rel || !layouts::is_current(&row.blob_dir) || row.etag != meta.etag {
+                continue;
+            }
+            log::info!("bucket {bucket}: reaping old-layout leaf {rel} of {key}, already moved to {}", row.blob_dir);
+            remove_old_leaf(&objects_root, &dir).await;
+            reaped += 1;
+        }
+        Ok(reaped)
+    }
+
+    /// Writes the marker dir of a tombstone that has none (from before
+    /// markers were written) and records it. `Ok(false)` if the tombstone
+    /// is gone or already has one.
+    pub async fn materialize_marker(&self, bucket: &str, key: &str) -> Result<bool> {
+        validate_bucket_name(bucket)?;
+        let index = self.index_unchecked(bucket).await?;
+        let _guard = self.locks.lock(bucket, key).await;
+        let Some(t) = index.get_tombstone(key).await? else {
+            return Ok(false);
+        };
+        if t.blob_dir.is_some() {
+            return Ok(false);
+        }
+        let removed = t.removed.clone().unwrap_or_else(|| t.stamp.clone());
+        let rel = self.write_delete_marker(bucket, key, &t.stamp, &removed, t.versioned).await?;
+        index.set_tombstone_marker(key, &t.stamp, &rel).await
+    }
+
+    /// Up to `limit` keys in `bucket` not yet on the current layout (or
+    /// without a stamp), strictly after `after`.
+    pub async fn keys_off_layout(
         &self,
         bucket: &str,
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<String>> {
-        self.index(bucket).await?.legacy_layout_keys(after, limit).await
+        self.index_unchecked(bucket).await?.rows_off_layout(after, limit).await
     }
 
-    /// Cheap check for whether `bucket` still has any legacy layout structure:
-    /// legacy fanout dirs at `objects/` root have 2-char names, the current
-    /// layout uses 4-char names. One `read_dir` of the root (early-returns on
-    /// the first 2-char entry) — far cheaper than a `LIKE` scan of the index,
-    /// and lets migration skip clean buckets without touching SQLite.
-    pub async fn has_legacy_layout_dirs(&self, bucket: &str) -> Result<bool> {
+    // ── bucket layout versions ─────────────────────────────────────────────
+
+    /// The bucket's layout as recorded in its `bucket.json`, or, for a
+    /// bucket from before layouts were recorded, as detected from its tree
+    /// ([`Self::detect_layout`]).
+    pub async fn bucket_layout(&self, bucket: &str) -> Result<BucketLayout> {
+        if let Some(layout) = self.bucket_meta(bucket).await?.layout {
+            return Ok(layout);
+        }
+        Ok(BucketLayout::Stable { version: self.detect_layout(bucket).await? })
+    }
+
+    /// The oldest layout the bucket's tree holds, by shape: a 2-char dir at
+    /// the `objects/` root is layout 1; a 4-char fanout dir holding a leaf
+    /// that is not a key dir is layout 2; else the current layout. A bucket
+    /// from before layouts were recorded can hold a mix (new writes always
+    /// went to the newest layout), and the oldest is what an upgrade must
+    /// still handle.
+    pub async fn detect_layout(&self, bucket: &str) -> Result<u32> {
         let objects_dir = self.layout.bucket_dir(bucket)?.join("objects");
-        let mut entries = match tokio::fs::read_dir(&objects_dir).await {
+        let mut fanouts = match tokio::fs::read_dir(&objects_dir).await {
             Ok(entries) => entries,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(CURRENT_LAYOUT),
         };
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_name().as_encoded_bytes().len() == 2 {
-                return Ok(true);
+        let mut oldest = CURRENT_LAYOUT;
+        while let Some(entry) = fanouts.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.len() == 2 {
+                return Ok(1);
+            }
+            if name.len() != 4 || oldest == 2 {
+                continue;
+            }
+            let mut leaves = match tokio::fs::read_dir(entry.path()).await {
+                Ok(leaves) => leaves,
+                Err(_) => continue,
+            };
+            while let Some(leaf) = leaves.next_entry().await? {
+                let leaf = leaf.file_name();
+                if !layouts::is_hex(&leaf.to_string_lossy(), 40) {
+                    oldest = 2;
+                    break;
+                }
             }
         }
-        Ok(false)
+        Ok(oldest)
     }
+
+    /// Records the bucket's layout (durably).
+    pub async fn set_bucket_layout(&self, bucket: &str, layout: BucketLayout) -> Result<()> {
+        validate_bucket_name(bucket)?;
+        let _guard = self.locks.lock(bucket, "\0bucket-meta").await;
+        let path = self.layout.bucket_meta_path(bucket)?;
+        if !path.exists() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        let mut meta: BucketMeta = read_json(&path).await?;
+        meta.layout = Some(layout);
+        write_json_atomic(&path, &meta).await?;
+        fsync_file(&path).await?;
+        fsync_dir(path.parent().unwrap_or(self.layout.root())).await?;
+        self.bucket_meta_cache.insert(bucket.to_string(), meta);
+        Ok(())
+    }
+
+    /// Drops the cached `bucket.json` (tests edit the file directly).
+    #[cfg(test)]
+    pub(crate) fn forget_bucket_meta(&self, bucket: &str) {
+        self.bucket_meta_cache.remove(&bucket.to_string());
+    }
+
+    /// Drops the cached index handle (tests delete the index directory to
+    /// simulate its loss).
+    #[cfg(test)]
+    pub(crate) fn forget_index(&self, bucket: &str) {
+        self.index_cache.lock().unwrap().remove(bucket);
+    }
+
+    /// Whether `layout` is an older layout this build still serves, so an
+    /// upgrade can be started ([`Self::start_layout_upgrade`]).
+    pub fn layout_upgrade_available(layout: BucketLayout) -> bool {
+        matches!(layout, BucketLayout::Stable { version } if version < CURRENT_LAYOUT)
+    }
+
+    /// The startup layout check, run before the server serves. For every
+    /// bucket: records a layout that was never recorded; refuses a layout,
+    /// or a migration target, newer than this build knows (the server must
+    /// not start); leaves a bucket stable on an older layout serving (this
+    /// build reads it; an operator upgrades it explicitly). A bucket found
+    /// `migrating` — an upgrade was started and did not finish — is
+    /// returned **with its 503 gate raised**: it serves nothing until
+    /// [`Self::migrate_bucket_layout`] finishes and the caller lowers the
+    /// gate ([`Self::end_rebuild`]).
+    pub async fn check_layouts(&self) -> Result<Vec<(String, BucketLayout)>> {
+        let mut resume = Vec::new();
+        for (bucket, _) in self.list_buckets().await? {
+            let recorded = self.bucket_meta(&bucket).await?.layout;
+            let layout = match recorded {
+                Some(layout) => layout,
+                None => self.bucket_layout(&bucket).await?,
+            };
+            let unsupported = |message: String| StorageError::UnsupportedLayout { bucket: bucket.clone(), message };
+            match layout {
+                BucketLayout::Stable { version } if version > CURRENT_LAYOUT => {
+                    return Err(unsupported(format!(
+                        "layout {version} was written by a newer build; this build knows up to layout {CURRENT_LAYOUT}"
+                    )))
+                }
+                BucketLayout::Migrating { to, .. } if to > CURRENT_LAYOUT => {
+                    return Err(unsupported(format!(
+                        "a migration to layout {to} was started by a newer build; this build knows up to layout {CURRENT_LAYOUT}"
+                    )))
+                }
+                BucketLayout::Stable { .. } => {
+                    if recorded.is_none() {
+                        self.set_bucket_layout(&bucket, layout).await?;
+                    }
+                }
+                BucketLayout::Migrating { from, to } => {
+                    // Continue the interrupted step; an older target becomes
+                    // the current layout.
+                    let next = BucketLayout::Migrating { from, to: to.max(CURRENT_LAYOUT) };
+                    if recorded != Some(next) {
+                        self.set_bucket_layout(&bucket, next).await?;
+                    }
+                    self.try_begin_rebuild(&bucket);
+                    resume.push((bucket, next));
+                }
+            }
+        }
+        Ok(resume)
+    }
+
+    /// Starts the upgrade of a bucket on an older layout: marks it
+    /// `migrating` and raises its 503 gate, which the caller lowers once
+    /// [`Self::migrate_bucket_layout`] has made it stable. Refused when the
+    /// bucket is already current (`BucketInUse` with the reason) or an
+    /// upgrade is in progress.
+    pub async fn start_layout_upgrade(&self, bucket: &str) -> Result<BucketLayout> {
+        let layout = self.bucket_layout(bucket).await?;
+        let next = match layout {
+            BucketLayout::Stable { version } if version < CURRENT_LAYOUT => {
+                BucketLayout::Migrating { from: version, to: CURRENT_LAYOUT }
+            }
+            BucketLayout::Stable { .. } => {
+                return Err(StorageError::BucketInUse(format!(
+                    "bucket {bucket} is already on layout {CURRENT_LAYOUT}"
+                )))
+            }
+            BucketLayout::Migrating { from, to } => {
+                return Err(StorageError::BucketInUse(format!(
+                    "bucket {bucket} is already being upgraded from layout {from} to {to}"
+                )))
+            }
+        };
+        if !self.try_begin_rebuild(bucket) {
+            return Err(StorageError::BucketRebuilding(bucket.to_string()));
+        }
+        if let Err(err) = self.set_bucket_layout(bucket, next).await {
+            self.end_rebuild(bucket);
+            return Err(err);
+        }
+        Ok(next)
+    }
+
+    /// Runs the bucket's recorded migration step to completion, behind the
+    /// gate the caller holds, and marks the bucket stable on the target
+    /// layout. Resumable: every object is either on the old or the new
+    /// layout, and a key already moved is skipped. Fails (leaving the
+    /// bucket `migrating`, to be retried) if any object could not be
+    /// moved. Returns the number of objects moved.
+    ///
+    /// The step to layout 3 is the same from layouts 1 and 2: relocate every
+    /// object to its key's dir under its (materialised) stamp, rewrite its
+    /// `meta.json` to the current format, and write a marker dir for every
+    /// tombstone that has none.
+    pub async fn migrate_bucket_layout(&self, bucket: &str, cancel: &CancellationToken) -> Result<u64> {
+        let layout = self.bucket_layout(bucket).await?;
+        let BucketLayout::Migrating { from, to } = layout else {
+            return Ok(0);
+        };
+        let unsupported = |message: String| StorageError::UnsupportedLayout { bucket: bucket.to_string(), message };
+        if to != CURRENT_LAYOUT {
+            return Err(unsupported(format!("cannot migrate to layout {to}; this build writes layout {CURRENT_LAYOUT}")));
+        }
+        let moved = match from {
+            1 | 2 => self.relocate_to_current_layout(bucket, cancel).await?,
+            other => return Err(unsupported(format!("no migration step from layout {other} to {to}"))),
+        };
+        if cancel.is_cancelled() {
+            return Err(StorageError::Io(format!("layout migration of bucket {bucket} cancelled")));
+        }
+        let reaped = self.reap_relocated_leaves(bucket, cancel).await?;
+        if reaped > 0 {
+            log::info!("bucket {bucket}: {reaped} old-layout leaves of already-moved objects reaped");
+        }
+        if cancel.is_cancelled() {
+            return Err(StorageError::Io(format!("layout migration of bucket {bucket} cancelled")));
+        }
+        // Done only when nothing is left on the old layout, in the index
+        // and in the tree.
+        let left = self.keys_off_layout(bucket, None, 1).await?;
+        if !left.is_empty() {
+            return Err(StorageError::Io(format!(
+                "layout migration of bucket {bucket} incomplete: {} (and possibly more) could not be moved",
+                left[0]
+            )));
+        }
+        let left = self.index_unchecked(bucket).await?.tombstones_without_marker(None, 1).await?;
+        if let Some(t) = left.first() {
+            return Err(StorageError::Io(format!(
+                "layout migration of bucket {bucket} incomplete: the delete marker of {} could not be written",
+                t.object_key
+            )));
+        }
+        // Empty dirs of the old shape (chains a delete emptied long ago) go;
+        // a dir that still holds something is an orphan the index does not
+        // name, left for a rebuild to trash.
+        prune_empty_dirs(&self.layout.bucket_dir(bucket)?.join("objects"), 0).await;
+        if self.detect_layout(bucket).await? != CURRENT_LAYOUT {
+            log::warn!("bucket {bucket}: old-layout dirs remain after migration (orphans; a rebuild trashes them)");
+        }
+        self.set_bucket_layout(bucket, BucketLayout::Stable { version: to }).await?;
+        Ok(moved)
+    }
+
+    /// Relocates every object not on the current layout (hardlink → index
+    /// flip → unlink per object) and writes every missing delete marker.
+    /// Keys that fail are skipped for this pass and reported by the
+    /// caller's final check.
+    async fn relocate_to_current_layout(&self, bucket: &str, cancel: &CancellationToken) -> Result<u64> {
+        const BATCH: usize = 500;
+        /// Objects relocated at once: each move is a few fsyncs, which
+        /// overlap across keys (different keys, different locks).
+        const CONCURRENCY: usize = 8;
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let mut after: Option<String> = None;
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(moved.into_inner());
+            }
+            let keys = self.keys_off_layout(bucket, after.as_deref(), BATCH).await?;
+            let Some(last) = keys.last().cloned() else {
+                break;
+            };
+            after = Some(last);
+            futures::stream::iter(keys)
+                .for_each_concurrent(CONCURRENCY, |key| {
+                    let moved = &moved;
+                    async move {
+                        if cancel.is_cancelled() {
+                            return;
+                        }
+                        match self.relocate_object(bucket, &key).await {
+                            Ok(true) => {
+                                moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Ok(false) => {}
+                            Err(err) => log::warn!("layout migration bucket={bucket} key={key} error={err}"),
+                        }
+                        self.crash_point("migrate_after_object");
+                    }
+                })
+                .await;
+            if cancel.is_cancelled() {
+                return Ok(moved.into_inner());
+            }
+        }
+        let mut moved = moved.into_inner();
+        let mut after: Option<String> = None;
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(moved);
+            }
+            let tombstones = self.index_unchecked(bucket).await?.tombstones_without_marker(after.as_deref(), BATCH).await?;
+            let Some(last) = tombstones.last().map(|t| t.object_key.clone()) else {
+                return Ok(moved);
+            };
+            after = Some(last);
+            for t in tombstones {
+                match self.materialize_marker(bucket, &t.object_key).await {
+                    Ok(true) => moved += 1,
+                    Ok(false) => {}
+                    Err(err) => log::warn!("layout migration bucket={bucket} key={} marker error={err}", t.object_key),
+                }
+            }
+        }
+    }
+
+
 
     /// Buckets whose index is missing, legacy-schema, or otherwise not current
     /// and therefore need a rebuild before they can serve. Used by the server
@@ -2419,9 +4247,12 @@ impl LocalObjectStore {
 
     /// Rebuilds the catalog from the self-describing blob tree: a bounded
     /// walker feeds N meta.json readers feeding one batch writer into a
-    /// temporary database that is atomically swapped in. Per key the
-    /// highest `last_modified_ms` wins; displaced duplicates and invalid
-    /// dirs are trashed on the spot. `trash/` and `staging/` are never
+    /// temporary database that is atomically swapped in. Every version dir
+    /// found is a version; per key the newest is current, real versions
+    /// are kept, and of the `null` states only the newest survives (see
+    /// `ObjectIndex::insert_rebuild_batch`). Delete markers rebuild the
+    /// key's tombstone. Displaced duplicates and invalid dirs are trashed
+    /// on the spot. `trash/` and `staging/` are never
     /// scanned (that would resurrect deleted objects).
     pub async fn rebuild_index(&self, bucket: &str) -> Result<usize> {
         self.rebuild_progress.lock().unwrap().insert(
@@ -2490,20 +4321,13 @@ impl LocalObjectStore {
         let tmp = ObjectIndex::open_at(&tmp_path, Durability::Relaxed).await?;
         tmp.create_schema().await?;
 
-        if let Some(old) = old {
-            // Carry the changelog across so webhook / replication offsets stay
-            // valid. If it cannot be read, the new index keeps its own fresh
-            // log id and consumers detect the switch and pause.
-            match old.copy_changelog_into(&tmp).await {
-                Ok(n) => log::info!("rebuild carried changelog bucket={bucket} entries={n}"),
-                Err(err) => log::warn!(
-                    "rebuild could not carry changelog bucket={bucket} error={err}; consumers will pause"
-                ),
+        if let Some(old) = &old {
+            // Tombstones first: the walk adjudicates what it finds on disk
+            // against them (a carried delete still wins over an older blob).
+            match old.copy_tombstones_into(&tmp).await {
+                Ok(n) => log::info!("rebuild carried tombstones bucket={bucket} entries={n}"),
+                Err(err) => log::warn!("rebuild could not carry tombstones bucket={bucket} error={err}"),
             }
-            old.close().await;
-            // Drop the last handle so RocksDB releases its directory lock
-            // before the live directory is replaced.
-            drop(old);
         }
 
         // One pool of workers traverses and parses concurrently over a
@@ -2575,15 +4399,30 @@ impl LocalObjectStore {
         let mut indexed = 0usize;
         let mut trashed = dirs_trashed_up_front;
         let written: Result<()> = async {
-            let mut batch: Vec<ObjectRecord> = Vec::with_capacity(self.rebuild_batch_size);
+            let mut batch: Vec<VersionRecord> = Vec::with_capacity(self.rebuild_batch_size);
             let mut dirs_by_rel: HashMap<String, PathBuf> = HashMap::new();
+            let site = self.site_id();
             loop {
                 let message = entry_rx.recv().await;
                 let done = message.is_none();
                 let flush = match message {
-                    Some(RebuildMessage::Object(record, dir)) => {
-                        dirs_by_rel.insert(record.blob_dir.clone(), dir);
-                        batch.push(record);
+                    Some(RebuildMessage::Object(meta, rel, dir)) => {
+                        // A blob from before stamps gets the fallback stamp
+                        // (its Last-Modified, this site), as every read does.
+                        let stamp = meta.stamp.clone().unwrap_or_else(|| Stamp::fallback(meta.last_modified_ms, &site));
+                        dirs_by_rel.insert(rel.clone(), dir);
+                        batch.push(VersionRecord {
+                            object_key: meta.object_key.clone(),
+                            stamp,
+                            blob_dir: rel,
+                            size: meta.size,
+                            etag: meta.etag.clone(),
+                            last_modified_ms: meta.last_modified_ms,
+                            parts: (!meta.delete_marker).then(|| crate::storage::changelog::PartLayout::of(&meta)),
+                            versioned: meta.versioned,
+                            delete_marker: meta.delete_marker,
+                            removed: meta.removed.clone(),
+                        });
                         batch.len() >= self.rebuild_batch_size
                     }
                     Some(RebuildMessage::Invalid(dir)) => {
@@ -2649,6 +4488,33 @@ impl LocalObjectStore {
             return Err(StorageError::Io("rebuild cancelled".to_string()));
         }
 
+        if let Some(old) = old {
+            // The changelog describes the prior index. It is carried across
+            // (so webhook / replication offsets stay valid) only when the
+            // rebuilt catalog is the same catalog: if the tree disagreed with
+            // the prior index — the index was stale or corrupt — the log no
+            // longer describes the state, and the new index keeps its own
+            // fresh log id; consumers detect the switch and resnapshot.
+            match self.rebuild_matches_prior(&old, &tmp).await {
+                Ok(None) => match old.copy_changelog_into(&tmp).await {
+                    Ok(n) => log::info!("rebuild carried changelog bucket={bucket} entries={n}"),
+                    Err(err) => log::warn!(
+                        "rebuild could not carry changelog bucket={bucket} error={err}; consumers will resnapshot"
+                    ),
+                },
+                Ok(Some(why)) => log::warn!(
+                    "rebuild changed the catalog bucket={bucket} ({why}); the changelog starts over and consumers resnapshot"
+                ),
+                Err(err) => log::warn!(
+                    "rebuild could not compare with the prior index bucket={bucket} error={err}; the changelog starts over"
+                ),
+            }
+            old.close().await;
+            // Drop the last handle so RocksDB releases its directory lock
+            // before the live directory is replaced.
+            drop(old);
+        }
+
         tmp.checkpoint_truncate().await?;
         tmp.close().await;
         // `close` flushes; the files are open until the last handle drops.
@@ -2671,6 +4537,31 @@ impl LocalObjectStore {
             "rebuild finished bucket={bucket} objects_indexed={indexed} dirs_trashed={trashed}"
         );
         Ok(indexed)
+    }
+
+    /// Whether the rebuilt catalog `tmp` has exactly the rows of the prior
+    /// index `old` (same key → same blob dir, same count). `Some(reason)`
+    /// names the first difference.
+    async fn rebuild_matches_prior(&self, old: &ObjectIndex, tmp: &ObjectIndex) -> Result<Option<String>> {
+        let (old_count, new_count) = (old.object_count().await?, tmp.object_count().await?);
+        if old_count != new_count {
+            return Ok(Some(format!("{old_count} objects before, {new_count} after")));
+        }
+        let mut after: Option<String> = None;
+        loop {
+            let batch = old.all_entries_after(after.as_deref(), 1000).await?;
+            let Some(last) = batch.last().map(|r| r.object_key.clone()) else {
+                return Ok(None);
+            };
+            for row in &batch {
+                match tmp.get(&row.object_key).await? {
+                    Some(now) if index::same_blob_dir(&now.blob_dir, &row.blob_dir) => {}
+                    Some(now) => return Ok(Some(format!("{} moved from {} to {}", row.object_key, row.blob_dir, now.blob_dir))),
+                    None => return Ok(Some(format!("{} is gone", row.object_key))),
+                }
+            }
+            after = Some(last);
+        }
     }
 
     /// Before a rebuild walks the tree: trashes every blob dir a pending
@@ -2746,7 +4637,7 @@ impl LocalObjectStore {
 }
 
 enum RebuildMessage {
-    Object(ObjectRecord, PathBuf),
+    Object(Box<ObjectMeta>, String, PathBuf),
     Invalid(PathBuf),
     /// An I/O failure while walking: the rebuild must abort, not guess.
     Error(StorageError),
@@ -2821,13 +4712,8 @@ async fn rebuild_classify_dir(dir: &Path, bucket_dir: &Path) -> Result<RebuildDi
             StorageError::Io(format!("rebuild walked outside the bucket: {}", dir.display()))
         })?;
         return Ok(RebuildDir::Message(RebuildMessage::Object(
-            ObjectRecord {
-                object_key: meta.object_key.clone(),
-                blob_dir: rel_path_string(rel),
-                size: meta.size,
-                etag: meta.etag.clone(),
-                last_modified_ms: meta.last_modified_ms,
-            },
+            Box::new(meta),
+            rel_path_string(rel),
             dir.to_path_buf(),
         )));
     }
@@ -2984,31 +4870,11 @@ fn is_plain_file_name(name: &str) -> bool {
         && !name.contains(['/', '\\'])
 }
 
-/// Fresh, unique, opaque blob dir path relative to the bucket dir:
-/// `objects/<4hex>/V1XXXXXX_YYYY` — a single 4-char fanout level. Every publish
-/// gets its own name (deterministic folder + prefix, random suffix), so old and
-/// new versions coexist until the row flip retires the old one. Legacy objects
-/// on the old 4-level layout are read via their stored path and migrated by the
-/// `migrate_layout` job.
-fn new_blob_rel(bucket: &str, key: &str) -> String {
-    format!(
-        "objects/{}/{}_{}",
-        fanout_segment(bucket, key),
-        object_dir_prefix(key),
-        object_dir_random_suffix()
-    )
-}
 
 fn blob_rel_parent(rel: &str) -> &str {
     rel.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
 }
 
-/// A blob dir is on the legacy 4-level layout iff it has more path components
-/// than the current single-level `objects/<seg>/<leaf>` (3 components). Used by
-/// the layout migration to decide whether a row needs relocating.
-fn is_legacy_layout(blob_rel: &str) -> bool {
-    blob_rel.split('/').filter(|s| !s.is_empty()).count() > 3
-}
 
 async fn fsync_file(path: &Path) -> Result<()> {
     // Windows' FlushFileBuffers needs a handle with write access; a read-only
@@ -3156,6 +5022,49 @@ async fn prepare_multipart_publish_dir(
     }
     write_json_atomic(&publish_dir.join("meta.json"), meta).await?;
     Ok(publish_dir)
+}
+
+/// Removes every empty directory under `dir` (bottom-up, `remove_dir` only,
+/// so a dir holding anything is never touched) and returns whether `dir`
+/// itself ended up removed. `depth` 0 is the `objects/` root, which stays.
+/// Unlinks an old-layout leaf dir and reclaims its now-empty fanout chain
+/// bottom-up, stopping at `objects_root`. Race-free: new writes only ever
+/// create current-layout dirs, so nothing recreates these old paths; a
+/// sibling object still under the chain just makes `remove_dir` fail
+/// (`DirectoryNotEmpty`) and the climb stops.
+async fn remove_old_leaf(objects_root: &Path, old_dir: &Path) {
+    let _ = tokio::fs::remove_dir_all(old_dir).await;
+    let mut parent = old_dir.parent().map(|p| p.to_path_buf());
+    while let Some(dir) = parent {
+        if dir == objects_root || tokio::fs::remove_dir(&dir).await.is_err() {
+            break;
+        }
+        parent = dir.parent().map(|p| p.to_path_buf());
+    }
+}
+
+async fn prune_empty_dirs(dir: &Path, depth: usize) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return false;
+    };
+    let mut remaining = 0usize;
+    let mut subdirs = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        match entry.file_type().await {
+            Ok(ft) if ft.is_dir() => subdirs.push(entry.path()),
+            _ => remaining += 1,
+        }
+    }
+    drop(entries);
+    for sub in subdirs {
+        if !Box::pin(prune_empty_dirs(&sub, depth + 1)).await {
+            remaining += 1;
+        }
+    }
+    if depth == 0 || remaining > 0 {
+        return false;
+    }
+    tokio::fs::remove_dir(dir).await.is_ok()
 }
 
 pub(crate) async fn move_object_dir_to_trash(
@@ -3505,7 +5414,7 @@ mod tests {
         let dirs = Arc::new(AtomicUsize::new(0));
         let objs = Arc::new(AtomicUsize::new(0));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<ObjectRecord>(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<VersionRecord>(4096);
         let frontier = Arc::new(RebuildFrontier::new());
         frontier.push(objects_dir.clone());
 
@@ -3550,12 +5459,17 @@ mod tests {
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             let _ = tx
-                                .send(ObjectRecord {
+                                .send(VersionRecord {
+                                    stamp: meta.stamp.clone().unwrap_or_else(|| Stamp::fallback(meta.last_modified_ms, "0000000000000000")),
                                     object_key: meta.object_key.clone(),
                                     blob_dir: rel,
                                     size: meta.size,
                                     etag: meta.etag.clone(),
                                     last_modified_ms: meta.last_modified_ms,
+                                    parts: None,
+                                    versioned: false,
+                                    delete_marker: false,
+                                    removed: None,
                                 })
                                 .await;
                         }
@@ -3572,7 +5486,7 @@ mod tests {
 
         // ── phase: SQLite batched insert (serial writer) ──
         let mut sqlite_nanos = 0u64;
-        let mut batch: Vec<ObjectRecord> = Vec::with_capacity(batch_size);
+        let mut batch: Vec<VersionRecord> = Vec::with_capacity(batch_size);
         let mut inserted = 0usize;
         while let Some(rec) = rx.recv().await {
             batch.push(rec);
@@ -3703,6 +5617,9 @@ mod tests {
         let legacy_dir = bucket_dir.join(&legacy_rel);
         tokio::fs::create_dir_all(legacy_dir.parent().unwrap()).await.unwrap();
         tokio::fs::rename(bucket_dir.join(&row.blob_dir), &legacy_dir).await.unwrap();
+        // The now-empty key dir of the current layout goes too: a legacy
+        // tree never had one.
+        let _ = tokio::fs::remove_dir(bucket_dir.join(&row.blob_dir).parent().unwrap()).await;
         index.update_blob_dir(key, &row.blob_dir, &legacy_rel).await.unwrap();
         legacy_rel
     }
@@ -3712,21 +5629,23 @@ mod tests {
         let (_tmp, store) = store_and_bucket().await;
         let legacy_rel = make_legacy_object(&store, "docs/a", b"hello").await;
         let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
-        assert!(is_legacy_layout(&legacy_rel));
+        assert_eq!(layouts::layout_of(&legacy_rel), Some(1));
         assert_eq!(read_body(&store, "bucket", "docs/a").await, b"hello");
         assert!(tokio::fs::try_exists(bucket_dir.join(&legacy_rel)).await.unwrap());
 
-        assert!(store.migrate_object_layout("bucket", "docs/a").await.unwrap());
+        assert!(store.relocate_object("bucket", "docs/a").await.unwrap());
 
         let row = store.index("bucket").await.unwrap().get("docs/a").await.unwrap().unwrap();
-        assert!(!is_legacy_layout(&row.blob_dir), "now single-level: {}", row.blob_dir);
+        assert!(layouts::is_current(&row.blob_dir), "now on the current layout: {}", row.blob_dir);
+        let meta: ObjectMeta = read_json(&bucket_dir.join(&row.blob_dir).join("meta.json")).await.unwrap();
+        assert_eq!((meta.format_version, meta.stamp.as_ref()), (META_FORMAT, row.stamp.as_ref()), "meta rewritten at the current format with the stamp");
         assert_eq!(read_body(&store, "bucket", "docs/a").await, b"hello", "content intact");
         assert!(
             !tokio::fs::try_exists(bucket_dir.join(&legacy_rel)).await.unwrap(),
             "old leaf removed"
         );
         // Idempotent: a second call is a no-op.
-        assert!(!store.migrate_object_layout("bucket", "docs/a").await.unwrap());
+        assert!(!store.relocate_object("bucket", "docs/a").await.unwrap());
         assert_invariants(&store, "bucket").await;
     }
 
@@ -3773,7 +5692,7 @@ mod tests {
             })
         };
         for i in 0..40 {
-            store.migrate_object_layout("bucket", &format!("k{i}")).await.unwrap();
+            store.relocate_object("bucket", &format!("k{i}")).await.unwrap();
         }
         stop.cancel();
         reader.await.unwrap();
@@ -3781,7 +5700,7 @@ mod tests {
         // Every object migrated and fully readable afterwards — no loss.
         for i in 0..40 {
             let row = store.index("bucket").await.unwrap().get(&format!("k{i}")).await.unwrap().unwrap();
-            assert!(!is_legacy_layout(&row.blob_dir), "all migrated: {}", row.blob_dir);
+            assert!(layouts::is_current(&row.blob_dir), "all migrated: {}", row.blob_dir);
             assert_eq!(read_body(&store, "bucket", &format!("k{i}")).await, format!("v{i}").into_bytes());
         }
         assert_invariants(&store, "bucket").await;
@@ -4039,20 +5958,21 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let page = store.list_object_versions("bucket", "", "", 3).await.unwrap();
+        let page = store.list_object_versions("bucket", "", None, "", "", 3).await.unwrap();
         assert_eq!(page.entries.len(), 3, "only one page of versions is read");
         assert!(page.is_truncated);
         assert_eq!(page.next_key_marker.as_deref(), Some("obj-02"));
+        assert_eq!(page.next_version_id_marker.as_deref(), Some("null"));
 
         let resumed = store
-            .list_object_versions("bucket", "", "obj-02", 3)
+            .list_object_versions("bucket", "", None, "obj-02", "null", 3)
             .await
             .unwrap();
         assert_eq!(
             resumed
                 .entries
                 .iter()
-                .map(|v| v.meta.object_key.as_str())
+                .map(|v| v.key.as_str())
                 .collect::<Vec<_>>(),
             vec!["obj-03", "obj-04", "obj-05"],
         );
@@ -4079,14 +5999,14 @@ mod tests {
         let mut pages = 0usize;
         loop {
             let page = store
-                .list_object_versions("bucket", "", &marker, 2)
+                .list_object_versions("bucket", "", None, &marker, if marker.is_empty() { "" } else { "null" }, 2)
                 .await
                 .unwrap();
             pages += 1;
             let keys: Vec<String> = page
                 .entries
                 .iter()
-                .map(|v| v.meta.object_key.clone())
+                .map(|v| v.key.clone())
                 .collect();
             assert!(keys.len() <= 2, "a page holds at most max_keys rows");
             for key in &keys {
@@ -4103,7 +6023,7 @@ mod tests {
         assert_eq!(seen, vec!["a", "b", "c"], "one live version per key");
         // Every row is the live version, and the trash blobs are still on disk —
         // they are simply not listable.
-        let page = store.list_object_versions("bucket", "", "", 10).await.unwrap();
+        let page = store.list_object_versions("bucket", "", None, "", "", 10).await.unwrap();
         assert!(page.entries.iter().all(|v| v.is_latest));
         let trash = store.layout().trash_dir("bucket").unwrap();
         let mut trash_dirs = tokio::fs::read_dir(&trash).await.unwrap();
@@ -4147,13 +6067,15 @@ mod tests {
         let row = store.index("bucket").await.unwrap().get("k").await.unwrap().unwrap();
         // Fabricate an older duplicate dir for the same key (an
         // interrupted-overwrite leftover from the old regime).
-        let dup_rel = new_blob_rel("bucket", "k");
+        let older = Stamp { ms: row.stamp.as_ref().unwrap().ms - 10_000, c: 0, site: store.site_id() };
+        let dup_rel = v3::blob_rel("bucket", "k", &older);
         let dup_abs = bucket_dir.join(&dup_rel);
         tokio::fs::create_dir_all(&dup_abs).await.unwrap();
         tokio::fs::write(dup_abs.join("part.1"), b"old").await.unwrap();
         let mut old_meta: ObjectMeta =
             read_json(&bucket_dir.join(&row.blob_dir).join("meta.json")).await.unwrap();
         old_meta.last_modified_ms -= 10_000;
+        old_meta.stamp = Some(older.clone());
         old_meta.size = 3;
         old_meta.etag = md5_hex(b"old");
         old_meta.parts[0].size = 3;
@@ -4183,7 +6105,7 @@ mod tests {
         let err = store.read_object("bucket", "k").await;
         assert!(matches!(err, Err(StorageError::BucketRebuilding(_))));
         // Wait for the background rebuild to finish.
-        for _ in 0..200 {
+        for _ in 0..2000 {
             if !store.rebuilding.lock().unwrap().contains("bucket") {
                 break;
             }

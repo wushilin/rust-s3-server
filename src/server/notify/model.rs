@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::changelog::{ChangeEvent, ChangeOp};
+use crate::storage::changelog::{ChangeEvent, ChangeOp, ChangeOrigin};
 
 /// Highest record version this build reads.
 pub(super) const RECORD_VERSION: u32 = 1;
@@ -189,42 +189,226 @@ pub enum Phase {
     Live,
 }
 
+/// An event's operation on the wire (`op`). Live changes are `put` and
+/// `delete`; snapshot entries are `exists` (an object stored now) and
+/// `deleted` (a tombstone: a deleted key still remembered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireOp {
+    Put,
+    Delete,
+    Exists,
+    Deleted,
+    /// One version of the key (its `stamp`) was permanently removed.
+    #[serde(rename = "remove_version")]
+    RemoveVersion,
+    /// The tags of one version (its `stamp`) were replaced: `tags`.
+    Tags,
+    /// A bucket setting changed: `settings`.
+    Bucket,
+    /// An operation this build does not know (a newer peer's). A reader
+    /// must not guess what it means.
+    #[serde(other)]
+    Unknown,
+}
+
+impl WireOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WireOp::Put => "put",
+            WireOp::Delete => "delete",
+            WireOp::Exists => "exists",
+            WireOp::Deleted => "deleted",
+            WireOp::RemoveVersion => "remove_version",
+            WireOp::Tags => "tags",
+            WireOp::Bucket => "bucket",
+            WireOp::Unknown => "unknown",
+        }
+    }
+
+    /// A state removed: a live `delete` or a snapshot tombstone.
+    pub fn is_delete(self) -> bool {
+        matches!(self, WireOp::Delete | WireOp::Deleted)
+    }
+
+    /// A state present: a live `put` or a snapshot object.
+    pub fn is_put(self) -> bool {
+        matches!(self, WireOp::Put | WireOp::Exists)
+    }
+}
+
+impl PartialEq<str> for WireOp {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for WireOp {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/// Who caused an event (`origin`): see [`ChangeOrigin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireOrigin {
+    Client,
+    Replication,
+    Repair,
+    #[serde(other)]
+    Unknown,
+}
+
+impl WireOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WireOrigin::Client => "client",
+            WireOrigin::Replication => "replication",
+            WireOrigin::Repair => "repair",
+            WireOrigin::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<ChangeOrigin> for WireOrigin {
+    fn from(origin: ChangeOrigin) -> Self {
+        match origin {
+            ChangeOrigin::Client => WireOrigin::Client,
+            ChangeOrigin::Replication => WireOrigin::Replication,
+            ChangeOrigin::Repair => WireOrigin::Repair,
+        }
+    }
+}
+
+impl PartialEq<str> for WireOrigin {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
 /// One event on the wire. Live events carry their `seq`; snapshot entries
-/// (`op: "exists"`) have none.
+/// (`op: "exists"` / `"deleted"`) have none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub seq: Option<u64>,
-    pub op: String,
+    pub op: WireOp,
     pub key: String,
     pub etag: String,
     pub size: u64,
     pub last_modified_ms: i64,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub origin: Option<String>,
+    pub origin: Option<WireOrigin>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ts_ms: Option<i64>,
+    /// Upload layout to reproduce for an identical ETag; absent for objects
+    /// indexed before layouts were recorded (ask GetObjectAttributes).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parts: Option<crate::storage::changelog::PartLayout>,
+    /// Version stamp: the state's (put / exists) or the delete's own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stamp: Option<crate::storage::stamp::Stamp>,
+    /// Deletes: the stamp of the version removed. A delete ranks by it, so
+    /// it never defeats a newer version than the one its author saw.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub removed_stamp: Option<crate::storage::stamp::Stamp>,
+    /// The state is a real version of a versioning-enabled bucket (its
+    /// stamp is its version id); `false` is the key's `null` version.
+    /// Absent from events written before versioning existed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub versioned: Option<bool>,
+    /// `tags` events: the version's new tag set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
+    /// `bucket` events: the bucket's settings after the change.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub settings: Option<crate::storage::metadata::BucketSettings>,
+    /// The site where a client made the change (`remove_version`, `tags`,
+    /// `bucket`: their `stamp` names a version, not the change's author).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub author: Option<String>,
+}
+
+impl WireEvent {
+    /// A snapshot entry for one version of a key: `exists` for a live
+    /// version, `deleted` for a delete marker.
+    pub fn version(v: &crate::storage::index::VersionRecord) -> Self {
+        Self {
+            seq: None,
+            op: if v.delete_marker { WireOp::Deleted } else { WireOp::Exists },
+            key: v.object_key.clone(),
+            etag: v.etag.clone(),
+            size: v.size,
+            last_modified_ms: v.last_modified_ms,
+            version: v.version_dir(),
+            origin: None,
+            ts_ms: None,
+            parts: v.parts.clone(),
+            stamp: Some(v.stamp.clone()),
+            removed_stamp: v.removed.clone(),
+            versioned: Some(v.versioned),
+            tags: None,
+            settings: None,
+            author: None,
+        }
+    }
+
+    /// A snapshot entry for a stored object. Objects written before stamps
+    /// existed get the fallback stamp `(last_modified_ms, 0, site)`.
+    pub fn exists(record: &crate::storage::index::ObjectRecord, site: &str) -> Self {
+        Self {
+            seq: None,
+            op: WireOp::Exists,
+            key: record.object_key.clone(),
+            etag: record.etag.clone(),
+            size: record.size,
+            last_modified_ms: record.last_modified_ms,
+            version: crate::storage::changelog::version_of(&record.blob_dir),
+            origin: None,
+            ts_ms: None,
+            parts: record.parts.clone(),
+            stamp: Some(
+                record
+                    .stamp
+                    .clone()
+                    .unwrap_or_else(|| crate::storage::stamp::Stamp::fallback(record.last_modified_ms, site)),
+            ),
+            removed_stamp: None,
+            versioned: Some(record.versioned),
+            tags: None,
+            settings: None,
+            author: None,
+        }
+    }
 }
 
 impl From<&ChangeEvent> for WireEvent {
     fn from(event: &ChangeEvent) -> Self {
         Self {
             seq: Some(event.seq),
-            op: event.op.as_str().to_string(),
+            op: match event.op {
+                ChangeOp::Put => WireOp::Put,
+                ChangeOp::Delete => WireOp::Delete,
+                ChangeOp::RemoveVersion => WireOp::RemoveVersion,
+                ChangeOp::Tags => WireOp::Tags,
+                ChangeOp::Bucket => WireOp::Bucket,
+            },
             key: event.key.clone(),
             etag: event.etag.clone(),
             size: event.size,
             last_modified_ms: event.last_modified_ms,
             version: event.version.clone(),
-            origin: Some(
-                match event.origin {
-                    crate::storage::changelog::ChangeOrigin::Client => "client",
-                    crate::storage::changelog::ChangeOrigin::Repair => "repair",
-                }
-                .to_string(),
-            ),
+            origin: Some(event.origin.into()),
             ts_ms: Some(event.ts_ms),
+            parts: event.parts.clone(),
+            stamp: event.stamp.clone(),
+            removed_stamp: event.removed_stamp.clone(),
+            versioned: Some(event.versioned),
+            tags: event.tags.clone(),
+            settings: event.settings.clone(),
+            author: event.author.clone(),
         }
     }
 }

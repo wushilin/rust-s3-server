@@ -136,6 +136,7 @@ impl Harness {
             ),
             stats: None,
             notify: None,
+            replication: None,
         });
         Self {
             _tmp: tmp,
@@ -1053,4 +1054,173 @@ async fn list_buckets_shows_each_caller_the_buckets_they_may_have_access_to() {
     // An administrator sees everything, whatever else they are a member of.
     h.join("bob", &["admin", "no-vault", "no-listing"]).await;
     assert_eq!(listed(bob).await, (OK, all.map(String::from).to_vec()));
+}
+
+#[tokio::test]
+async fn changelog_reads_need_their_own_action() {
+    // The changelog reveals every key, size and ETag, including deleted ones,
+    // so ordinary read rights do not grant it: s3:GetBucketChangelog does.
+    let h = Harness::new().await;
+    h.seed("logs", &["a.txt"]).await;
+    let reader = h.user("reader").await;
+    h.iam
+        .set_policy("reader", Some(&allow(&["s3:GetObject", "s3:ListBucket"], "logs")))
+        .await
+        .unwrap();
+    let (status, _) = h.s3_full(&reader, "GET", "/logs", "x-rs3-changelog=", &[], b"").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "list/read rights do not include the changelog");
+    let (status, _) = h.s3_full(&reader, "GET", "/logs", "x-rs3-changelog-snapshot=", &[], b"").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let replicator = h.user("replicator").await;
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:GetBucketChangelog"], "logs")))
+        .await
+        .unwrap();
+    let (status, body) = h.s3_full(&replicator, "GET", "/logs", "after=0&x-rs3-changelog=", &[], b"").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page["events"][0]["key"], "a.txt");
+    assert_eq!(page["next"], 1);
+    let (status, body) = h.s3_full(&replicator, "GET", "/logs", "x-rs3-changelog-snapshot=", &[], b"").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The action is read-only: no verb other than GET does anything.
+    let (status, _) = h.s3_full(&replicator, "DELETE", "/logs", "x-rs3-changelog=", &[], b"").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(h.store.bucket_exists("logs").await, "a DELETE with the subresource never deletes the bucket");
+    // And it grants nothing else.
+    assert_eq!(h.get(&replicator, "/logs/a.txt").await, StatusCode::FORBIDDEN);
+    // The admin group's s3:* covers it.
+    assert_eq!(h.s3_full(&root_cred(), "GET", "/logs", "x-rs3-changelog=", &[], b"").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn x_rs3_headers_must_be_signed() {
+    // A stamp decides which version of an object wins, so like every
+    // x-amz-* header it is only honoured when the signature covers it.
+    let h = Harness::new().await;
+    h.seed("data", &[]).await;
+    let replicator = h.user("replicator").await;
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:PutObject", "s3:ReplicateWrite"], "data")))
+        .await
+        .unwrap();
+    let stamp_value = format!("{}.0.site-a", crate::storage::time::now_ms() + 60_000);
+    let stamp = [("x-rs3-stamp", stamp_value.as_str())];
+    let (status, _) = h.s3_full(&replicator, "PUT", "/data/k", "", &stamp, b"x").await;
+    assert_eq!(status, StatusCode::OK, "signed: accepted");
+
+    // The same request with the stamp added after signing.
+    let datetime = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let auth = super::auth::compute_auth_header_with_headers(
+        "PUT", "/data/k2", "", HOST, &replicator.ak, &replicator.sk, REGION, &datetime, &[],
+    );
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/data/k2")
+        .header("host", HOST)
+        .header("x-amz-date", &datetime)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .header("authorization", auth)
+        .header("x-rs3-stamp", stamp_value.as_str())
+        .body(Body::from(&b"x"[..]))
+        .unwrap();
+    let response = h.s3.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = String::from_utf8_lossy(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).into_owned();
+    assert!(body.contains("not signed"), "{body}");
+    assert_eq!(h.get(&root_cred(), "/data/k2").await, StatusCode::NOT_FOUND, "nothing written");
+}
+
+#[tokio::test]
+async fn setting_a_version_stamp_needs_replicate_write() {
+    // A stamp decides last-writer-wins conflicts, so carrying one is a
+    // privilege of replication credentials, on top of the write itself.
+    let h = Harness::new().await;
+    h.seed("data", &[]).await;
+    let writer = h.user("writer").await;
+    h.iam.set_policy("writer", Some(&allow(&["s3:PutObject"], "data"))).await.unwrap();
+    // Ahead of the ordinary write below, so last-writer-wins accepts it.
+    let future = crate::storage::time::now_ms() + 60_000;
+    let stamp_value = format!("{future}.0.site-a");
+    let stamp = [("x-rs3-stamp", stamp_value.as_str())];
+    let (status, _) = h.s3_full(&writer, "PUT", "/data/k", "", &stamp, b"x").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "PutObject alone cannot set a stamp");
+    let (status, _) = h.s3_full(&writer, "PUT", "/data/k", "", &[], b"x").await;
+    assert_eq!(status, StatusCode::OK, "an ordinary write is unaffected");
+
+    let replicator = h.user("replicator").await;
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:PutObject", "s3:ReplicateWrite"], "data")))
+        .await
+        .unwrap();
+    let (status, body) = h.s3_full(&replicator, "PUT", "/data/k", "", &stamp, b"x").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = h.store.index("data").await.unwrap().get("k").await.unwrap().unwrap();
+    assert_eq!(row.stamp.unwrap().to_header(), stamp_value);
+
+    // Stamped deletes need it too.
+    h.iam.set_policy("writer", Some(&allow(&["s3:PutObject", "s3:DeleteObject"], "data"))).await.unwrap();
+    let newer_value = format!("{}.0.site-a", future + 1);
+    let newer = [("x-rs3-stamp", newer_value.as_str())];
+    let (status, _) = h.s3_full(&writer, "DELETE", "/data/k", "", &newer, b"").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    h.iam
+        .set_policy("replicator", Some(&allow(&["s3:DeleteObject", "s3:ReplicateWrite"], "data")))
+        .await
+        .unwrap();
+    let (status, _) = h.s3_full(&replicator, "DELETE", "/data/k", "", &newer, b"").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+// ═══ the site name: a label an admin can change ═══════════════════════════════
+
+#[tokio::test]
+async fn an_admin_renames_the_site_and_nothing_else_changes() {
+    let h = Harness::new().await;
+    let admin = h.session(ROOT_USER, true);
+    let (status, ping) = h.console(Some(&admin), "GET", "/api/ping", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (id, generated) = (ping["site_id"].as_str().unwrap().to_string(), ping["site_name"].as_str().unwrap().to_string());
+    assert_eq!(generated.split('-').count(), 2, "a two-word default: {generated}");
+    assert_eq!(ping["site_name_locked"], false);
+
+    let (status, body) = h.console(Some(&admin), "PUT", "/api/site", Some(json!({"site_name": "Singapore DC-1"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, ping) = h.console(Some(&admin), "GET", "/api/ping", None).await;
+    assert_eq!((ping["site_id"].as_str(), ping["site_name"].as_str()), (Some(id.as_str()), Some("Singapore DC-1")));
+    // Shown to changelog readers at once.
+    h.seed("docs", &["a.txt"]).await;
+    let (_, page) = h.s3_full(&root_cred(), "GET", "/docs", "x-rs3-changelog=&wait=0", &[], b"").await;
+    let page: Value = serde_json::from_str(&page).unwrap();
+    assert_eq!((page["site_id"].as_str(), page["site_name"].as_str()), (Some(id.as_str()), Some("Singapore DC-1")));
+
+    // Invalid names are refused with the reason.
+    let (status, body) = h.console(Some(&admin), "PUT", "/api/site", Some(json!({"site_name": "  "}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("1-64"), "{body}");
+    // Only admins.
+    h.user("alice").await;
+    let alice = h.session("alice", false);
+    let (status, _) = h.console(Some(&alice), "PUT", "/api/site", Some(json!({"site_name": "mine"}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(h.store.site_name(), "Singapore DC-1");
+}
+
+#[tokio::test]
+async fn a_configured_site_name_wins_and_locks_the_console() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = crate::storage::store::LocalObjectStore::new(tmp.path());
+    store.init_site(Some("From config")).unwrap();
+    assert_eq!(store.site_name(), "From config");
+    assert!(store.site_name_locked());
+    let err = store.set_site_name("other").unwrap_err().to_string();
+    assert!(err.contains("server.site_name"), "{err}");
+    let id = store.site_id();
+    drop(store);
+    // Without the setting, the last name stays and can be changed again.
+    let store = crate::storage::store::LocalObjectStore::new(tmp.path());
+    store.init_site(None).unwrap();
+    assert_eq!((store.site_id(), store.site_name()), (id, "From config".to_string()));
+    assert_eq!(store.set_site_name("renamed").unwrap(), "renamed");
 }
