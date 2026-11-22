@@ -77,6 +77,9 @@ vice versa. Each surface can be firewalled or proxied independently.
 
 ## Highlights
 
+- **Memory-safe all the way down**: the server compiles no C or C++ — redb
+  for metadata, graviola for TLS, rustix for system calls. See
+  [Security](#security).
 - **Fully streaming** single-part and multipart uploads/downloads — object
   bodies are never buffered in memory, on the API or in the console.
 - **SigV4 and SigV2** authentication, presigned URLs, `aws-chunked` streaming,
@@ -99,7 +102,7 @@ vice versa. Each surface can be firewalled or proxied independently.
   with last-writer-wins by version stamp, every version and marker on
   versioning-enabled buckets, tags, and bucket settings (versioning, CORS)
   adopted by the newer change; webhooks on the same changelog.
-- **Crash-safe storage**: RocksDB-primary indexes over immutable blob
+- **Crash-safe storage**: redb (pure Rust) indexes over immutable blob
   directories, write-ahead intents, atomic publication, automatic index
   rebuilds, versioned on-disk layouts with explicit gated upgrades, a
   health scan with repair actions, and configurable durability.
@@ -135,9 +138,36 @@ vice versa. Each surface can be firewalled or proxied independently.
 
 </details>
 
+## Security
+
+rusts3 parses untrusted input (HTTP, SigV4, XML, multipart bodies) and its
+own on-disk metadata, so memory-safety bugs are the defect class that
+matters most: they are behind most remote-code-execution vulnerabilities in
+network services, and C and C++ cannot rule them out. Since 0.9 the server
+contains **no C or C++ code**:
+
+| Need | Choice | Why this one |
+|---|---|---|
+| Metadata databases (indexes, changelogs, IAM, …) | [redb](https://github.com/cberner/redb) | Pure Rust, crash-safe, ACID with MVCC readers, stable file format. Of the pure-Rust engines it favours reads — lookups and range scans, which are what an S3 server mostly does — over bulk writes; write throughput for durable commits comes back through group commit in `storage::kv`. (fjall is closer to RocksDB's write profile but younger; sled is unmaintained.) |
+| TLS for webhooks and replication | [graviola](https://github.com/ctz/graviola) via rustls | No C compiler involved; its big-number and curve arithmetic is formally verified assembly from s2n-bignum. The RustCrypto provider was ruled out: its own README says not to use it in production. Needs a CPU from roughly 2013 on (x86_64: AES-NI, PCLMULQDQ, AVX2, BMI1, ADX; aarch64: AES, PMULL, SHA2); without one, `https://` endpoints are refused cleanly. |
+| System calls | [rustix](https://github.com/bytecodealliance/rustix) | Safe wrappers instead of `unsafe` libc calls. |
+
+What remains is the system C library (every Rust program uses it) and
+`unsafe` code inside Rust dependencies — much smaller and easier to audit
+than a C codebase, but "no C" is not "no memory-safety bugs possible". The
+`rs3` client keeps its C dependencies (`aws-lc` through the AWS SDK): it is
+a command-line tool, not a network service.
+
+Related safeguards: the server refuses to start on databases it cannot read
+(older RocksDB data, or a newer format) rather than misreading them or
+starting empty; changelog consumers (webhooks, pull subscribers, replication
+peers) only ever see durable entries, so a crash cannot take back an event a
+peer already acted on; the [bucket directory](#bucket-directory) token
+carries no other rights.
+
 ## Status
 
-As of 2026-10-15, on the `feat/replication-foundation` branch.
+As of 2026-11-22, release 0.9.0.
 
 **Implemented**
 
@@ -150,7 +180,8 @@ As of 2026-10-15, on the `feat/replication-foundation` branch.
 | IAM | Users, groups, API keys, AWS-style policies with conditions, a policy builder; actions for every operation above, including `s3:ReplicateWrite` for replicated writes. |
 | Changelog and webhooks | Per-bucket ordered changelog (`put`, `delete`, `remove_version`, `tags`, `bucket`), long-poll reads, snapshots, signed webhook deliveries with retries and mute, replication tokens. |
 | Replication | Mirror (one-way, read-only replica) and merge (two-way) links between sites; last-writer-wins by stamp; every version, marker, removal and tag change on versioning-enabled buckets; bucket settings (versioning, CORS) adopted by the newer change; chains of sites; restore of lost objects from a peer. |
-| Storage | Layouts 1, 2 and 3 read, 3 written; explicit, gated, resumable upgrades started from the console; index rebuild from the tree alone (versions, markers and tags included); health scan with repair; `full` and `relaxed` durability. |
+| Storage | redb metadata databases with group commit; layouts 1, 2 and 3 read, 3 written; explicit, gated, resumable upgrades started from the console; index rebuild from the tree alone (versions, markers and tags included); health scan with repair; `full` and `relaxed` durability; `rusts3-migrate` for data from 0.3.0 – 0.8.x. |
+| Bucket directory | Token-only `GET /_rs3/buckets[/{name}]` for DNS servers and certificate issuers. |
 | Console | Object browser, uploads, versions panel, bucket settings (versioning, CORS, keep-CORS-local, read-only, layout upgrade), IAM, webhooks, replication links with live status, tasks, stats, health scan. |
 | `rs3` client | mc-compatible command line: aliases, ls, cp, mirror, find, share, and `rs3 watch` to follow a bucket's changelog. |
 
@@ -175,14 +206,15 @@ integration suites)
 
 | Suite | What it checks | Last result |
 |---|---|---|
-| Unit and integration tests (in-process) | Storage commit paths and crash points, layout upgrades from every supported layout (interrupted and resumed), versioning and tagging semantics, the version-removal matrix, IAM, webhooks, replication between two and three sites | 604 pass, 1 ignored |
+| Unit and integration tests (in-process) | Storage commit paths and crash points, layout upgrades from every supported layout (interrupted and resumed), versioning and tagging semantics, the version-removal matrix, IAM, webhooks, replication between two and three sites, group commit and the changelog durability watermark | 625 pass, 2 ignored |
+| Migration tool (`migrate/`) | Round trip, idempotence, interrupted commit, conflicting copies, lock held by a server, version bounds | 8 pass; plus real-data round trips with the 0.7.0 and 0.8.0 binaries |
 | Protocol conformance (`src/server/spec_tests.rs`) | Every header, parameter and event field of [the replication spec](docs/spec-replication.md) and [the webhook spec](docs/spec-webhooks.md), over SigV4 | all pass |
 | AWS golden replay (`tests/aws_compat.rs`) | 39 operations compared with a recording of what Amazon S3 returned | pass, with the listed accepted divergences |
 | AWS SDK for Rust (`tests/sdk_compat.rs`) | Versioning, tagging, copies and bulk deletes by version id, and two linked sites converging, as the official SDK sees them | 2 pass |
 | MinIO Mint `versioning` suite (built natively, see `test_report.md`) | 13 versioning and tagging tests | 13 pass; the object lock tests cannot run |
 
-One in-process test, the webhook offset replay, is sensitive to machine
-load and can fail under the full suite while passing alone.
+A 0.8 and a 0.9 site replicating both ways (merge links owned by each) were
+checked to converge to identical contents and version histories.
 
 ## Compatibility
 
@@ -291,7 +323,7 @@ ui:
 
 Built-in users live in configuration, cannot be edited at runtime, and bypass
 policy checks. Runtime users, groups, access keys, and policies live in
-`<base_dir>/admin.rocksdb` and are **default-deny** unless an attached
+`<base_dir>/admin.redb` and are **default-deny** unless an attached
 user/group policy allows the request; a matching explicit deny always wins.
 A user's effective policy is their own plus that of every group they belong to,
 and any change to it applies to the next request of an already-issued key.
@@ -311,7 +343,7 @@ and any change to it applies to the next request of an already-issued key.
   Behind a reverse proxy on a private address the client address is taken from
   `X-Forwarded-For`/`X-Real-IP`, and behind a TCP load balancer from the PROXY
   protocol header (v1 or v2, auto-detected on both ports). The stamps live in
-  `<base_dir>/key_usage.rocksdb`, apart from the IAM database and its export.
+  `<base_dir>/key_usage.redb`, apart from the IAM database and its export.
 
 Bcrypt is recommended for console passwords (cleartext is still accepted). S3
 secrets must stay recoverable, because request authentication needs the original
@@ -340,7 +372,7 @@ HMAC key.
 | Field | Default | Description |
 |---|---:|---|
 | `storage.meta_cache_capacity` | `200000` | Maximum cached object metadata entries. |
-| `storage.durability` | `full` | `full` fsyncs blobs and syncs the RocksDB index WAL on every write; `relaxed` skips per-PUT blob fsync and leaves the WAL to the OS. |
+| `storage.durability` | `full` | `full` fsyncs blobs and commits every index write durably; `relaxed` skips per-PUT blob fsync and makes index writes durable in the background, at most about a second later (a crash can lose that last second). |
 | `storage.rebuild_reader_threads` | `0` | Parallel index-rebuild workers; `0` selects one per CPU core. |
 | `storage.rebuild_queue_bound` | `1000` | Bounded rebuild pipeline queue. |
 | `storage.rebuild_batch_size` | `1000` | Index rows written per rebuild batch. |
@@ -404,6 +436,27 @@ miss a change.
 | `auth.users` | `[]` | Built-in, unrestricted bootstrap administrators. |
 | `auth.public_hostname` | absent | Public hostname and optional port used to verify proxy-safe signatures, generate share links, and enable virtual-hosted-style addressing (`<bucket>.<public_hostname>`). No scheme. |
 | `auth.public_scheme` | `http` | `http` or `https`, used for generated share links. |
+| `auth.bucket_list_tokens` | `[]` | Tokens for the bucket directory (`GET /_rs3/buckets`), at least 16 characters each. See [Bucket directory](#bucket-directory). Empty: not served. |
+
+#### Bucket directory
+
+Infrastructure that only needs to know *which buckets exist* — a DNS server
+answering `<bucket>.<public_hostname>`, a certificate issuer or admission hook
+checking a name before it signs for it — can ask without an S3 identity:
+
+```sh
+curl -H 'x-list-bucket-token: <token>' http://s3.example.com:8002/_rs3/buckets
+# {"buckets":[{"name":"photos","created_at_ms":1763800000000}, …]}
+
+curl -I -H 'x-list-bucket-token: <token>' http://s3.example.com:8002/_rs3/buckets/photos
+# 200 if the bucket exists, 404 if not
+```
+
+The token is matched against `auth.bucket_list_tokens` and carries no rights
+at all: it cannot sign S3 requests, read objects, or see anything beyond
+bucket names and creation times. A missing or wrong token gets `401` and a
+`bucket directory DENY … from=<client>` line in the auth log. Generate one with
+`openssl rand -hex 24`; in the container image set `RUSTS3_BUCKET_LIST_TOKEN`.
 
 ### Logging
 
@@ -573,10 +626,54 @@ publishes them (`.github/workflows/release.yml`):
 
 The tag must match the `version` in the crate's `Cargo.toml`. FreeBSD aarch64
 is not built: it is a Tier 3 Rust target with no standard library shipped by
-rustup. The FreeBSD server binary links the system RocksDB (`pkg install
-rocksdb`); librocksdb-sys does not build RocksDB from source there. Linux
+rustup. Linux
 binaries are static (`musl.sh`; `MUSL_ARCH=aarch64` for arm) and run on any
 distribution.
+
+## Upgrading from 0.8: RocksDB → redb
+
+Full release notes: [docs/releases/0.9.0.md](docs/releases/0.9.0.md).
+
+Up to 0.8 the metadata databases were RocksDB, a C++ library. From 0.9 they
+are [redb](https://github.com/cberner/redb), written in Rust, and the server
+contains no C or C++ code (TLS for outgoing connections uses
+[graviola](https://github.com/ctz/graviola), Rust plus formally verified
+assembly). The server cannot read the old databases and **refuses to start**
+while any remain, naming them. Convert them once, with the server stopped,
+using `rusts3-migrate` (in `migrate/`; the only program here that still
+links RocksDB):
+
+```bash
+rusts3-migrate status   /var/lib/rusts3   # your server.base_dir
+rusts3-migrate migrate  /var/lib/rusts3
+# container: podman run --rm -v rusts3-data:/data wushilin/rusts3:0.9.0 rusts3-migrate migrate /data
+```
+
+`rusts3-migrate` ships in every server release archive and in the Docker
+image; to build it yourself, `cd migrate && cargo build --release` (it needs a
+C++ compiler and libclang, the server does not).
+
+Every database (IAM, key usage, scans, stats, and each bucket's index with
+its changelog) is copied row for row, verified against the original, and
+only then renamed into place; the original is kept as `*.rocksdb.migrated`
+for you to delete later. An interrupted run is resumed by running it again.
+To return to 0.8, stop the server and run `rusts3-migrate rollback`: it
+converts the *current* data back, including everything written since the
+migration. The tool takes the server's `.rusts3.lock`, so it cannot run
+against a live server.
+
+Version bounds, checked for every database before anything is converted:
+
+- `migrate` reads data from **any RocksDB release, 0.3.0 – 0.8.x** (all
+  share bucket-index schema 2; rows are copied verbatim, so 0.9 sees what
+  an in-place upgrade from that release would). Data from an unknown build
+  is refused.
+- `rollback` produces data for **0.8.x** only, and only while the data is
+  still at format 1. Every redb database carries a format marker (table
+  `rusts3_format`: format number, the build that created it, the build that
+  last opened it); a server refuses a database whose format is newer than
+  it understands, and a release that changes what a database stores bumps
+  the format — after which rollback is refused.
 
 ## Management console
 
@@ -1259,7 +1356,7 @@ podman.
 <details>
 <summary><strong>Storage and recovery model</strong></summary>
 
-Each bucket has an authoritative RocksDB index. Object data lives in an
+Each bucket has an authoritative index (a redb database). Object data lives in an
 immutable, self-describing blob directory, and the index records that
 directory's path. A mutation follows this protocol:
 
@@ -1270,7 +1367,7 @@ directory's path. A mutation follows this protocol:
 5. Move the old blob to trash and clear the retirement intent.
 
 After a crash, startup drains the small intent table instead of scanning every
-object. Reads and listings use the RocksDB index as the source of truth.
+object. Reads and listings use the index as the source of truth.
 Per-key locking, monotonic modification timestamps, and immutable snapshots keep
 concurrent overwrites/deletes consistent with in-flight downloads.
 
@@ -1279,10 +1376,11 @@ The current layout uses a single 16-bit fanout directory:
 ```text
 <base_dir>/
   .rusts3.lock
-  admin.rocksdb/
+  admin.redb                 IAM, changelog subscriptions, replication links
+  key_usage.redb  scans.redb  stats.redb
   buckets/<bucket>/
     bucket.json
-    index.rocksdb/
+    index.redb
     objects/<4-hex>/V1<6-hex>_<unique>/
       meta.json
       part.1, part.2, ...

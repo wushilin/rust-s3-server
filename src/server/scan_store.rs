@@ -1,6 +1,6 @@
-//! Persistence for storage health scans — `<data_root>/scans.rocksdb`.
+//! Persistence for storage health scans — `<data_root>/scans.redb`.
 //!
-//! Deliberately its own database, not a family inside `admin.rocksdb`: IAM is
+//! Deliberately its own database, not a family inside `admin.redb`: IAM is
 //! exported and imported as one unit, and scan history has no business
 //! travelling with it.
 //!
@@ -32,17 +32,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode, MultiThreaded, Options,
-    WriteBatch, WriteOptions,
-};
+use crate::storage::kv::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::errors::{Result, StorageError};
 use crate::storage::scan::{BucketReport, Finding, FindingState, FINDING_VERSION};
 use crate::storage::time::now_ms;
 
-type Db = DBWithThreadMode<MultiThreaded>;
+type Db = crate::storage::kv::Db;
 
 const CF_REPORTS: &str = "reports";
 const CF_FINDINGS: &str = "findings";
@@ -168,7 +165,7 @@ impl std::fmt::Debug for ScanStore {
     }
 }
 
-fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'a>>> {
+fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnFamily<'a>>> {
     db.cf_handle(name)
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }
@@ -239,7 +236,7 @@ pub fn new_report_id() -> String {
 impl ScanStore {
     pub async fn open(data_root: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(data_root).await?;
-        let db_path = data_root.join("scans.rocksdb");
+        let db_path = data_root.join("scans.redb");
         let db = blocking(move || {
             let mut opts = Options::default();
             opts.create_if_missing(true);

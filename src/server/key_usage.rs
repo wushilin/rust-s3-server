@@ -1,8 +1,8 @@
-//! "Last used" tracking for API access keys — `<data_root>/key_usage.rocksdb`.
+//! "Last used" tracking for API access keys — `<data_root>/key_usage.redb`.
 //!
 //! Its own database, like [`stats_store`](super::stats_store): usage stamps are
 //! derived, high-churn, and have no business travelling with the IAM export.
-//! Keeping them out of `admin.rocksdb` also means a request never touches
+//! Keeping them out of `admin.redb` also means a request never touches
 //! primary data, and that built-in (config-file) keys — which have no IAM row
 //! at all — are tracked exactly like runtime-issued ones.
 //!
@@ -23,15 +23,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded, Options, WriteBatch,
-    WriteOptions,
-};
+use crate::storage::kv::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::errors::{Result, StorageError};
 
-type Db = DBWithThreadMode<MultiThreaded>;
+type Db = crate::storage::kv::Db;
 
 const CF_USAGE: &str = "usage";
 
@@ -67,7 +64,7 @@ impl std::fmt::Debug for KeyUsageStore {
     }
 }
 
-fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'a>>> {
+fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnFamily<'a>>> {
     db.cf_handle(name)
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }
@@ -91,11 +88,11 @@ where
 }
 
 impl KeyUsageStore {
-    /// Opens (creating if absent) `<data_root>/key_usage.rocksdb` and loads
+    /// Opens (creating if absent) `<data_root>/key_usage.redb` and loads
     /// every stamp into memory. The family holds one small row per access key.
     pub async fn open(data_root: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(data_root).await?;
-        let db_path = data_root.join("key_usage.rocksdb");
+        let db_path = data_root.join("key_usage.redb");
         let (db, entries) = blocking(move || {
             let mut opts = Options::default();
             opts.create_if_missing(true);

@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const MIN_TRASH_RETENTION_SECS: u64 = 3 * 60 * 60;
+/// Shortest accepted `auth.bucket_list_tokens` entry.
+pub const MIN_BUCKET_LIST_TOKEN_CHARS: usize = 16;
 
 pub use crate::storage::config::StorageConfig;
 
@@ -94,7 +96,7 @@ pub struct ApiKeyPair {
 /// held in memory, are **not alterable at runtime**, and are unrestricted
 /// (no policy applies): they are the bootstrap identities that always work,
 /// even against a bare data directory. Runtime-managed IAM users live in
-/// `admin.rocksdb` instead.
+/// `admin.redb` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuiltinUser {
     pub user: String,
@@ -162,6 +164,12 @@ pub struct AuthConfig {
     /// itself is scheme-independent. Defaults to `http`.
     #[serde(default)]
     pub public_scheme: PublicScheme,
+    /// Tokens for the bucket directory (`GET /_rs3/buckets`, sent as the
+    /// `x-list-bucket-token` header). A token carries no IAM rights: it can
+    /// only list bucket names and check that one exists. Empty (the default):
+    /// the directory is not served.
+    #[serde(default, deserialize_with = "list_of_filled_strings")]
+    pub bucket_list_tokens: Vec<String>,
 }
 
 /// Background maintenance settings.
@@ -684,6 +692,16 @@ impl AppConfig {
                 }
             }
         }
+        for token in &self.auth.bucket_list_tokens {
+            if token.chars().count() < MIN_BUCKET_LIST_TOKEN_CHARS
+                || token.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(format!(
+                    "auth.bucket_list_tokens: each token must be at least {MIN_BUCKET_LIST_TOKEN_CHARS} characters, \
+                     without whitespace (generate one with e.g. `openssl rand -hex 24`)"
+                ));
+            }
+        }
         for credential in &self.auth.credentials {
             if credential.access_key.is_empty() || credential.secret_key.is_empty() {
                 return Err("auth.credentials contains an empty access key or secret".to_string());
@@ -957,6 +975,21 @@ mod tests {
         assert_eq!(config.auth.public_hostname, None);
         assert_eq!(config.ui.bind_address, None);
         assert_eq!(config.server.bind_port, 8002);
+    }
+
+    #[test]
+    fn bucket_list_tokens_must_be_long_and_unfilled_slots_are_dropped() {
+        let parse = |yaml: &str| -> std::result::Result<AppConfig, String> {
+            let mut config: AppConfig = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+            config.normalize();
+            config.validate().map(|()| config)
+        };
+        let config = parse("auth:\n  bucket_list_tokens:\n    - \"\"\n    - \n").unwrap();
+        assert!(config.auth.bucket_list_tokens.is_empty());
+        let config = parse("auth:\n  bucket_list_tokens:\n    - \"0123456789abcdef\"\n").unwrap();
+        assert_eq!(config.auth.bucket_list_tokens, ["0123456789abcdef"]);
+        assert!(parse("auth:\n  bucket_list_tokens: [\"short\"]\n").is_err());
+        assert!(parse("auth:\n  bucket_list_tokens: [\"0123456789 abcdef\"]\n").is_err());
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod config;
 pub mod encoding;
 pub mod errors;
 pub mod index;
+pub mod kv;
 pub mod layout;
 pub mod layouts;
 pub mod locks;

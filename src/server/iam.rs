@@ -1,4 +1,4 @@
-//! IAM users, access keys, and policies, backed by `admin.rocksdb` at the data
+//! IAM users, access keys, and policies, backed by `admin.redb` at the data
 //! root (outside any bucket — bucket index rebuilds never touch it).
 //!
 //! This database is *primary* data, not a derived cache: it cannot be rebuilt
@@ -27,15 +27,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode, MultiThreaded, Options,
-    WriteBatch, WriteOptions,
-};
+use crate::storage::kv::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 /// Multi-threaded RocksDB handle (see the same alias in `storage::index`).
-type Db = DBWithThreadMode<MultiThreaded>;
+type Db = crate::storage::kv::Db;
 
 /// The admin database handle, shared with other admin-owned stores (the
 /// changelog subscriptions in [`super::notify`]) — RocksDB allows one open
@@ -328,7 +325,7 @@ pub struct IamStore {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
-fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'a>>> {
+fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnFamily<'a>>> {
     db.cf_handle(name)
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }
@@ -368,11 +365,11 @@ where
 }
 
 impl IamStore {
-    /// Opens (creating if absent) `<data_root>/admin.rocksdb` and loads the
+    /// Opens (creating if absent) `<data_root>/admin.redb` and loads the
     /// in-memory snapshot.
     pub async fn open(data_root: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(data_root).await?;
-        let db_path = data_root.join("admin.rocksdb");
+        let db_path = data_root.join("admin.redb");
         let db = blocking(move || {
             let mut opts = Options::default();
             opts.create_if_missing(true);

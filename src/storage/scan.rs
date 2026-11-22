@@ -971,13 +971,11 @@ impl LocalObjectStore {
             dir_usage(&bucket_dir.join("staging"), cancel, &self.shutdown_token()).await?;
         report.staging_bytes = staging_bytes;
         report.staging_dirs = staging_dirs;
-        let (index_bytes, _) = dir_usage(
-            &super::index::index_db_path(&bucket_dir),
-            cancel,
-            &self.shutdown_token(),
-        )
-        .await?;
-        report.index_bytes = index_bytes;
+        // The index is one redb file.
+        report.index_bytes = tokio::fs::metadata(super::index::index_db_path(&bucket_dir))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         report.stale_intents = index
             .stale_intents(now_ms(), SCAN_GRACE_MS, STALE_INTENT_SAMPLE)
             .await

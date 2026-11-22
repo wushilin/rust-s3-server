@@ -7,10 +7,11 @@ pub struct StorageConfig {
     /// Each entry is roughly 400–700 bytes; 200 000 ≈ 80–140 MB.
     #[serde(default = "default_meta_cache_capacity")]
     pub meta_cache_capacity: usize,
-    /// `full`: blobs are fsynced before commit and the RocksDB index syncs its
-    /// WAL on every write — acked writes survive power loss.
-    /// `relaxed`: no per-put blob fsync and the index WAL is left to the OS —
-    /// power loss may drop the last acked writes (never corrupts).
+    /// `full`: blobs are fsynced before commit and every index commit is
+    /// durable — acked writes survive power loss.
+    /// `relaxed`: no per-put blob fsync, and index commits become durable in
+    /// the background within ~1 s (`storage::kv`) — a crash may drop the last
+    /// second of acked writes (never corrupts).
     #[serde(default = "default_durability")]
     pub durability: DurabilityMode,
     /// Worker tasks used by the index rebuild pipeline (each traverses

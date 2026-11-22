@@ -1807,7 +1807,7 @@ async fn rebuild_bucket(
     }
 }
 
-/// Admin-only. Streams the whole global IAM database (`admin.rocksdb`) as a
+/// Admin-only. Streams the whole global IAM database (`admin.redb`) as a
 /// downloadable dump — a length-delimited protobuf stream of raw
 /// `(column-family, key, value)` rows. Per-bucket object indexes are not
 /// exported: they are derived from the blob tree and rebuilt on demand.
@@ -1822,7 +1822,7 @@ async fn export_iam(
     };
     match state.iam.export_raw().await {
         Ok(bytes) => {
-            audit(&state, &rid.0, &actor.username, "export_iam", "admin.rocksdb");
+            audit(&state, &rid.0, &actor.username, "export_iam", "admin.redb");
             let mut response = (StatusCode::OK, bytes).into_response();
             let out = response.headers_mut();
             out.insert(

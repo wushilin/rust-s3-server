@@ -4,6 +4,7 @@
 //! Axum [`Router`] for use in integration tests.
 
 pub mod auth;
+pub mod bucket_list;
 pub mod config;
 pub mod event_hub;
 pub(crate) mod handlers;
@@ -15,6 +16,7 @@ pub mod replication;
 pub mod key_usage;
 pub mod logging;
 pub(crate) mod pipeline;
+pub(crate) mod tls;
 pub mod policy;
 mod proxy_protocol;
 pub mod range;
@@ -262,6 +264,7 @@ pub(crate) fn router_with_notify(
         config: auth_state.config.clone(),
         store: store.clone(),
     };
+    let store_for_directory = store.clone();
     let inner = Router::new()
         .route("/minio/health/live", get(health_live))
         .route("/minio/health/ready", get(health_live))
@@ -303,10 +306,17 @@ pub(crate) fn router_with_notify(
     // path is an object key, which the rewrite turns into
     // `/bucket/_rs3/changelog` so it reaches S3. Path-style `/_rs3/…` can
     // never be a bucket (bucket names start with a letter or digit).
-    let routed = match notify {
-        Some(service) => notify::pull::router(service).fallback_service(inner),
-        None => Router::new().fallback_service(inner),
+    // The bucket directory (`/_rs3/buckets`, token-only) sits here for the
+    // same reason, and only when a token is configured.
+    let directory = bucket_list::router(store_for_directory, &host_style_config.auth.bucket_list_tokens);
+    let mut routed = match notify {
+        Some(service) => notify::pull::router(service),
+        None => Router::new(),
     };
+    if let Some(directory) = directory {
+        routed = routed.merge(directory);
+    }
+    let routed = routed.fallback_service(inner);
     Router::new().fallback_service(tower::Layer::layer(
         &middleware::from_fn_with_state(host_style_config, host_style_middleware),
         routed,
@@ -973,8 +983,7 @@ async fn traffic_metrics_middleware(
 /// ownership of a mounted volume is what goes wrong.
 #[cfg(unix)]
 fn running_as() -> String {
-    // SAFETY: geteuid never fails and takes no arguments.
-    format!(" as uid {}", unsafe { libc::geteuid() })
+    format!(" as uid {}", rustix::process::geteuid().as_raw())
 }
 #[cfg(not(unix))]
 fn running_as() -> String {
@@ -983,8 +992,7 @@ fn running_as() -> String {
 
 #[cfg(unix)]
 fn ownership_hint() -> String {
-    // SAFETY: as above.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let (uid, gid) = (rustix::process::geteuid().as_raw(), rustix::process::getegid().as_raw());
     format!(
         " If this is a mounted volume, give that uid ownership of it \
          (chown -R {uid}:{gid} <host path>) or run the container with a matching --user."
@@ -1051,6 +1059,11 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     // Exactly one process may own a data directory: the per-key in-memory
     // locks are only meaningful under that assumption.
     let _process_lock = acquire_process_lock(FsPath::new(&config.root))?;
+    // Databases from <= 0.8 are RocksDB, which this build cannot read. Refuse
+    // to start rather than come up with an empty IAM or rebuild indexes over
+    // them (losing their changelogs): rusts3-migrate converts them.
+    crate::storage::kv::ensure_migrated(FsPath::new(&config.root))
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
 
     let store = LocalObjectStore::from_storage_config(&config.root, &config.app_config.storage);
     // Site identity and version-stamp clock, before anything can write.
@@ -1247,7 +1260,7 @@ pub async fn serve(config: S3HttpConfig) -> Result<(), Box<dyn std::error::Error
     // completely separate from the access-key-authenticated S3 API.
     if config.app_config.ui.enabled {
         // Storage-scan history lives in its own database, deliberately not a
-        // family of admin.rocksdb: IAM is exported/imported as one unit and
+        // family of admin.redb: IAM is exported/imported as one unit and
         // scan reports have no business travelling with it.
         let scans = jobs::perf_scan::ScanService::new(
             scan_store::ScanStore::open(FsPath::new(&config.root)).await?,

@@ -1,6 +1,6 @@
 [package]
 name = "rs3"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
@@ -26,8 +26,9 @@ percent-encoding = "2"
 pin-project-lite = "0.2"
 regex = "1"
 # `rs3 watch` reads a bucket's changelog (a rusts3 extension the SDK has no
-# operation for): a signed GET over rustls, bundled roots.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# operation for): a signed GET over rustls (aws-lc, as the AWS SDK already
+# uses), verified against the operating system's certificate store.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

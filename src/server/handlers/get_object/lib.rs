@@ -538,24 +538,11 @@ impl StableObjectDir {
     }
 
     fn open_part(&self, name: &str) -> std::io::Result<tokio::fs::File> {
-        use std::os::fd::{AsRawFd, FromRawFd};
+        use rustix::fs::{openat, Mode, OFlags};
 
-        let name = std::ffi::CString::new(name)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in part name"))?;
-        // SAFETY: `self.0` owns a live directory fd, `name` is NUL-terminated,
-        // and a successful fd is transferred exactly once into `File`.
-        let fd = unsafe {
-            libc::openat(
-                self.0.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        Ok(tokio::fs::File::from_std(file))
+        // rustix rejects a name containing NUL (InvalidInput), like CString did.
+        let fd = openat(&self.0, name, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+        Ok(tokio::fs::File::from_std(std::fs::File::from(fd)))
     }
 }
 

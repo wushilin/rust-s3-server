@@ -10,11 +10,16 @@
 # credentials are configured as repository secrets — a multi-arch image is
 # published as <version> and latest.
 #
+# Server tags also build rusts3-migrate (migrate/, the RocksDB -> redb
+# converter for upgrades from <= 0.8) and ship it in every server tarball and
+# in the Docker image. It is the only binary here that still links RocksDB
+# (C++), which is why the C/C++ toolchain and libclang steps below remain.
+#
 # Platforms:
 #   linux    x86_64, aarch64   static musl (musl.sh, zig toolchain), built on
 #                              native runners so the binary is executed
 #   macos    aarch64, x86_64   native runners
-#   freebsd  x86_64            built natively inside a FreeBSD VM; the server
+#   freebsd  x86_64            built natively inside a FreeBSD VM; rusts3-migrate
 #                              links the system RocksDB (`pkg install rocksdb`).
 #                              aarch64 FreeBSD is a Tier 3 Rust target (no
 #                              standard library from rustup), so it is not built.
@@ -91,6 +96,7 @@ jobs:
           workspaces: |
             . -> target
             client -> client/target
+            migrate -> migrate/target
 
       # ── Linux: static musl via the repo's own musl.sh, zig as the C/C++ toolchain ──
       - name: Install zig and libclang
@@ -107,9 +113,12 @@ jobs:
           # The server image also ships the client: build it too on server tags.
           if [ "$COMPONENT" = server ]; then
             BIN=rs3 ./musl.sh --locked --manifest-path client/Cargo.toml
-            mkdir -p docker-bins && cp target/${{ matrix.target }}/release/rusts3 client/target/${{ matrix.target }}/release/rs3 docker-bins/
+            BIN=rusts3-migrate ./musl.sh --locked --manifest-path migrate/Cargo.toml
+            mkdir -p docker-bins && cp target/${{ matrix.target }}/release/rusts3 client/target/${{ matrix.target }}/release/rs3 \
+              migrate/target/${{ matrix.target }}/release/rusts3-migrate docker-bins/
           fi
           mkdir -p out && cp "$(dirname "$MANIFEST")/target/${{ matrix.target }}/release/$BIN" out/
+          if [ "$COMPONENT" = server ]; then cp migrate/target/${{ matrix.target }}/release/rusts3-migrate out/; fi
 
       # ── macOS: native ──
       - name: Build (macOS)
@@ -119,6 +128,10 @@ jobs:
           export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH"
           cargo build --locked --release --manifest-path "$MANIFEST"
           mkdir -p out && cp "$(dirname "$MANIFEST")/target/release/$BIN" out/
+          if [ "$COMPONENT" = server ]; then
+            cargo build --locked --release --manifest-path migrate/Cargo.toml
+            cp migrate/target/release/rusts3-migrate out/
+          fi
 
       # ── Windows: native MSVC (client only) ──
       - uses: ilammy/setup-nasm@v1   # aws-lc-sys assembly on x86_64; harmless on arm64
@@ -131,6 +144,10 @@ jobs:
           export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
           cargo build --locked --release --manifest-path "$MANIFEST"
           mkdir -p out && cp "$(dirname "$MANIFEST")/target/release/$BIN.exe" out/
+          if [ "$COMPONENT" = server ]; then
+            cargo build --locked --release --manifest-path migrate/Cargo.toml
+            cp migrate/target/release/rusts3-migrate.exe out/
+          fi
 
       # ── FreeBSD: native build inside a VM (KVM-accelerated on the Linux runner) ──
       - name: Build (FreeBSD)
@@ -145,7 +162,8 @@ jobs:
           prepare: |
             # librocksdb-sys does not build RocksDB from source on FreeBSD; it
             # links the system library from the rocksdb package (a runtime
-            # dependency of the FreeBSD server binary).
+            # dependency of the FreeBSD rusts3-migrate binary; the server
+            # itself no longer uses RocksDB).
             pkg install -y curl llvm gmake rocksdb
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           run: |
@@ -155,6 +173,11 @@ jobs:
             cargo build --locked --release --manifest-path "${{ needs.meta.outputs.manifest }}"
             mkdir -p out && cp "$(dirname "${{ needs.meta.outputs.manifest }}")/target/release/${{ needs.meta.outputs.bin }}" out/
             out/${{ needs.meta.outputs.bin }} --version
+            if [ "${{ needs.meta.outputs.component }}" = server ]; then
+              cargo build --locked --release --manifest-path migrate/Cargo.toml
+              cp migrate/target/release/rusts3-migrate out/
+              out/rusts3-migrate --help
+            fi
 
       # ── Smoke test and package ──
       - name: Smoke test
@@ -164,6 +187,7 @@ jobs:
           case "${{ matrix.kind }}" in windows) exe=.exe ;; *) exe= ;; esac
           out/$BIN$exe --version | tee version.txt
           grep -q "$BIN $VERSION" version.txt
+          if [ "$COMPONENT" = server ]; then out/rusts3-migrate$exe --help | head -3; fi
       - name: Package
         shell: bash
         run: |
@@ -171,6 +195,9 @@ jobs:
           mkdir -p "dist/$name"
           cp LICENSE "dist/$name/"
           if [ "$COMPONENT" = server ]; then cp config.yaml README.md "dist/$name/"; else cp client/README.md "dist/$name/README.md"; fi
+          if [ "$COMPONENT" = server ]; then
+            case "${{ matrix.kind }}" in windows) cp out/rusts3-migrate.exe "dist/$name/" ;; *) cp out/rusts3-migrate "dist/$name/"; chmod 755 "dist/$name/rusts3-migrate" ;; esac
+          fi
           if [ "${{ matrix.kind }}" = windows ]; then
             cp "out/$BIN.exe" "dist/$name/"
             (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null)
@@ -198,6 +225,9 @@ jobs:
     needs: [meta, build]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/releases
       - uses: actions/download-artifact@v4
         with:
           pattern: dist-*
@@ -210,8 +240,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           latest=--latest; [ "${{ needs.meta.outputs.component }}" = client ] && latest=--latest=false
+          # Hand-written notes when docs/releases/<version>.md exists (server
+          # tags), else GitHub's generated ones.
+          notes=--generate-notes
+          file="docs/releases/${{ needs.meta.outputs.version }}.md"
+          if [ "${{ needs.meta.outputs.component }}" = server ] && [ -f "$file" ]; then notes="--notes-file $file"; fi
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" $latest --verify-tag \
-            --title "${{ needs.meta.outputs.bin }} ${{ needs.meta.outputs.version }}" --generate-notes dist/*
+            --title "${{ needs.meta.outputs.bin }} ${{ needs.meta.outputs.version }}" $notes dist/*
 
   docker:
     name: publish Docker image

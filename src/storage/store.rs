@@ -4316,8 +4316,8 @@ impl LocalObjectStore {
         }
         // A RocksDB "database" is a directory, so the temp index is a directory
         // built alongside the live one and swapped in wholesale at the end.
-        let tmp_path = bucket_dir.join("index.rebuild.rocksdb");
-        let _ = tokio::fs::remove_dir_all(&tmp_path).await;
+        let tmp_path = bucket_dir.join("index.rebuild.redb");
+        let _ = tokio::fs::remove_file(&tmp_path).await;
         let tmp = ObjectIndex::open_at(&tmp_path, Durability::Relaxed).await?;
         tmp.create_schema().await?;
 
@@ -4480,7 +4480,7 @@ impl LocalObjectStore {
         }
         if let Err(err) = written {
             drop(tmp);
-            let _ = tokio::fs::remove_dir_all(&tmp_path).await;
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             log::error!("rebuild aborted bucket={bucket} error={err}; prior index kept");
             return Err(err);
         }
@@ -4525,7 +4525,7 @@ impl LocalObjectStore {
         // Remove the prior live index (a RocksDB directory) plus any legacy
         // SQLite leftovers from before the switch, then atomically swap the
         // freshly built directory into place.
-        let _ = tokio::fs::remove_dir_all(&live_path).await;
+        let _ = tokio::fs::remove_file(&live_path).await;
         for suffix in ["", "-wal", "-shm"] {
             let _ = tokio::fs::remove_file(bucket_dir.join(format!("index.sqlite{suffix}"))).await;
         }
@@ -5404,7 +5404,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let idx =
-            ObjectIndex::open_at(&tmp.path().join("bench.rocksdb"), Durability::Relaxed)
+            ObjectIndex::open_at(&tmp.path().join("bench.redb"), Durability::Relaxed)
                 .await
                 .unwrap();
         idx.create_schema().await.unwrap();
@@ -6047,7 +6047,7 @@ mod tests {
         // Simulate total index loss.
         let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
         store.index_cache.lock().unwrap().clear();
-        let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
+        let _ = tokio::fs::remove_file(bucket_dir.join("index.redb")).await;
         let count = store.rebuild_index("bucket").await.unwrap();
         assert_eq!(count, 3);
         assert_eq!(read_body(&store, "bucket", "a/1").await, b"a/1");
@@ -6083,7 +6083,7 @@ mod tests {
         write_json_atomic(&dup_abs.join("meta.json"), &old_meta).await.unwrap();
 
         store.index_cache.lock().unwrap().clear();
-        let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
+        let _ = tokio::fs::remove_file(bucket_dir.join("index.redb")).await;
         let count = store.rebuild_index("bucket").await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(read_body(&store, "bucket", "k").await, b"new");
@@ -6100,7 +6100,7 @@ mod tests {
             .unwrap();
         let bucket_dir = store.layout().bucket_dir("bucket").unwrap();
         store.index_cache.lock().unwrap().clear();
-        let _ = tokio::fs::remove_dir_all(bucket_dir.join("index.rocksdb")).await;
+        let _ = tokio::fs::remove_file(bucket_dir.join("index.redb")).await;
         // First access trips the gate and starts a background rebuild.
         let err = store.read_object("bucket", "k").await;
         assert!(matches!(err, Err(StorageError::BucketRebuilding(_))));

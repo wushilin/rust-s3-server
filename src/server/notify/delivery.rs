@@ -90,7 +90,11 @@ pub fn ip_is_internal(ip: IpAddr) -> bool {
 pub fn validate_url(url: &str, cfg: &WebhookConfig) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(url).map_err(|err| format!("invalid URL: {err}"))?;
     match parsed.scheme() {
-        "https" => {}
+        "https" => {
+            if let Some(reason) = crate::server::tls::https_unavailable() {
+                return Err(reason.to_string());
+            }
+        }
         "http" if cfg.allow_http => {}
         "http" => {
             return Err("plain http:// webhooks are disabled (webhooks.allow_http)".to_string())
@@ -136,6 +140,7 @@ impl Resolve for GuardedResolver {
 
 pub fn build_client(cfg: &WebhookConfig) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
+        .tls_backend_preconfigured(crate::server::tls::client_config())
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(cfg.request_timeout_secs.max(1)))
         .connect_timeout(Duration::from_secs(cfg.request_timeout_secs.clamp(1, 10)))

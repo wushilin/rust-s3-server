@@ -504,7 +504,7 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let heads = |site: &Site| {
         let store = site.store.clone();
-        async move { store.index("shared").await.unwrap().changelog_head() }
+        async move { store.index("shared").await.unwrap().durable_head().await.unwrap() }
     };
     let (ha, hb) = (heads(&a).await, heads(&b).await);
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1029,7 +1029,7 @@ async fn the_position_lives_with_the_data_and_survives_a_restart() {
     eventually(30, "mirrored", || same(&a, &b, "data")).await;
     // The checkpoint is saved just after a batch applies; wait for it to be
     // live at the peer's head. It is kept in the target bucket's index.
-    let head = a.store.index("data").await.unwrap().changelog_head();
+    let head = a.store.index("data").await.unwrap().durable_head().await.unwrap();
     eventually(30, "checkpoint saved at the head", || {
         let store = b.store.clone();
         let id = id.clone();
@@ -1450,7 +1450,7 @@ async fn two_way_chaos_converges_exactly() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let head = |site: &Site| {
         let store = site.store.clone();
-        async move { store.index("chaos").await.unwrap().changelog_head() }
+        async move { store.index("chaos").await.unwrap().durable_head().await.unwrap() }
     };
     let before = (head(&a).await, head(&b).await);
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1513,7 +1513,7 @@ async fn a_failed_change_holds_the_checkpoint_until_it_succeeds() {
         async move { view.status.state == "live" }
     })
     .await;
-    let start = a.store.index("data").await.unwrap().changelog_head();
+    let start = a.store.index("data").await.unwrap().durable_head().await.unwrap();
     eventually(10, "checkpoint at the head", || {
         let (b, id) = (&b, id.clone());
         async move { checkpoint_of(b, "data", &id).await.map(|c| c.phase) == Some(model::Phase::Live { after: start }) }
@@ -1547,7 +1547,7 @@ async fn a_failed_change_holds_the_checkpoint_until_it_succeeds() {
     // no-ops) and the checkpoint advances past it.
     a.put("data", "broken", b"fixed").await;
     eventually(30, "converged", || same(&a, &b, "data")).await;
-    let head = a.store.index("data").await.unwrap().changelog_head();
+    let head = a.store.index("data").await.unwrap().durable_head().await.unwrap();
     eventually(10, "checkpoint advanced", || {
         let (b, id) = (&b, id.clone());
         async move { checkpoint_of(b, "data", &id).await.map(|c| c.phase) == Some(model::Phase::Live { after: head }) }

@@ -1,4 +1,4 @@
-//! Subscription persistence in `admin.rocksdb`.
+//! Subscription persistence in `admin.redb`.
 //!
 //! | family                  | key             | value                    |
 //! |-------------------------|-----------------|--------------------------|
@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use rocksdb::{IteratorMode, WriteBatch, WriteOptions};
+use crate::storage::kv::{IteratorMode, WriteBatch, WriteOptions};
 
 use super::model::{SubState, Subscription, RECORD_VERSION};
 use crate::server::iam::AdminDb;
@@ -25,7 +25,7 @@ pub struct NotifyDb {
     db: Arc<AdminDb>,
 }
 
-fn cf<'a>(db: &'a AdminDb, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'a>>> {
+fn cf<'a>(db: &'a AdminDb, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnFamily<'a>>> {
     db.cf_handle(name)
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }

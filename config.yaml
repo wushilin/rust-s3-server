@@ -12,8 +12,8 @@ server:
   bind_port: 18000
 
   # Root directory where all data is stored.  Layout:
-  #   <base_dir>/buckets/<bucket>/           bucket data + per-bucket index.sqlite
-  #   <base_dir>/admin.sqlite                IAM users/keys/policies (management UI)
+  #   <base_dir>/buckets/<bucket>/           bucket data + per-bucket index.redb
+  #   <base_dir>/admin.redb                  IAM users/keys/policies (management UI)
   #   <base_dir>/.rusts3.lock                process-exclusivity lock
   # Exactly ONE rusts3 process may own a base_dir (enforced via flock).
   base_dir: "./test-data"
@@ -46,12 +46,12 @@ storage:
   meta_cache_capacity: 200000
 
   # Durability of acknowledged writes.  (default full)
-  #   full    — blob files are fsynced before the index commit and SQLite
-  #             runs synchronous=FULL: an acked PUT survives power loss.
-  #   relaxed — no per-put blob fsync, SQLite synchronous=NORMAL: faster,
-  #             but a power loss may silently drop the last few acked
-  #             writes.  Consistency is never violated either way; a plain
-  #             process crash loses nothing in either mode.
+  #   full    — blob files are fsynced before the index commit, and every
+  #             index commit is durable: an acked PUT survives power loss.
+  #   relaxed — no per-put blob fsync, and index commits become durable in
+  #             the background, at most ~1 second later: faster, but a
+  #             crash (process or power) may drop the last second of acked
+  #             writes.  Consistency is never violated either way.
   durability: full
 
   # Index rebuild pipeline (runs at startup for buckets whose index is
@@ -142,6 +142,16 @@ auth:
   # Accepted values: http, https. (default http)
   public_scheme: http
 
+  # Bucket directory: GET /_rs3/buckets (list) and /_rs3/buckets/<name>
+  # (200 exists / 404 not) on the S3 port, for DNS servers or certificate
+  # issuers that must know which buckets exist. Requests send the header
+  #   x-list-bucket-token: <one of these>
+  # A token has NO other rights — it cannot sign S3 requests or read objects.
+  # At least 16 characters each; generate with `openssl rand -hex 24`.
+  # Empty or absent (default): the directory is not served.
+  # bucket_list_tokens:
+  #   - "change-me-to-a-long-random-token"
+
   # Built-in admin users.  Held in memory, NON-ALTERABLE at runtime (the
   # management UI shows them read-only), and unrestricted — no policy
   # applies.  They are the bootstrap identities that always work, even
@@ -150,7 +160,7 @@ auth:
   #   api_keys  — optional cleartext root access keys for the S3 API.
   # Run `rusts3 genpassword` to generate a bcrypt console password.
   # Runtime-managed IAM users (policy-bound, with their own access keys)
-  # are created in the management UI and stored in <base_dir>/admin.sqlite.
+  # are created in the management UI and stored in <base_dir>/admin.redb.
   # (A legacy flat `credentials:` list of access_key/secret_key pairs is
   # still accepted, but keys defined here also appear in the console.)
   users:

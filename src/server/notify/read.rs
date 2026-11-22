@@ -393,7 +393,7 @@ pub async fn snapshot(
     let settings = store.bucket_settings(bucket).await?;
     let versioning = settings.versioning.as_str().to_string();
     if params.deleted {
-        let head = index.changelog_head();
+        let head = index.durable_head().await?;
         let (tombstones, more) = index
             .list_tombstones(&params.filter.prefix, params.after.as_deref(), params.limit)
             .await?;
@@ -433,7 +433,7 @@ pub async fn snapshot(
         });
     }
     if params.versions {
-        let head = index.changelog_head();
+        let head = index.durable_head().await?;
         let page = index
             .list_versions_page(
                 &params.filter.prefix,
@@ -470,7 +470,7 @@ pub async fn snapshot(
             site_id: store.site_id(),
             site_name: store.site_name(),
             log_id: index.changelog_id().to_string(),
-            head: index.changelog_head(),
+            head: index.durable_head().await?,
             entries: Vec::new(),
             next_after: None,
             next_after_version: None,
@@ -479,7 +479,7 @@ pub async fn snapshot(
         });
     }
     // Head first: everything committed after it is replayed live.
-    let head = index.changelog_head();
+    let head = index.durable_head().await?;
     let log_id = index.changelog_id().to_string();
     let site = store.site_id();
     let page = index

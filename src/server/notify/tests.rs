@@ -1667,13 +1667,13 @@ async fn replicated_changes_apply_only_over_older_states() {
     put_stamped(&h.store, "bkt", "k", b"v5", Some(st(base + 5, "a"))).await.unwrap();
 
     // Older or equal: refused, nothing changes, nothing is logged.
-    let head_before = h.store.index("bkt").await.unwrap().changelog_head();
+    let head_before = h.store.index("bkt").await.unwrap().durable_head().await.unwrap();
     for stale in [st(base + 4, "z"), st(base + 5, "a")] {
         let err = put_stamped(&h.store, "bkt", "k", b"old", Some(stale)).await.unwrap_err();
         assert!(matches!(err, crate::storage::errors::StorageError::StaleStamp { .. }), "{err:?}");
     }
     assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"v5");
-    assert_eq!(h.store.index("bkt").await.unwrap().changelog_head(), head_before, "no event for a refused change");
+    assert_eq!(h.store.index("bkt").await.unwrap().durable_head().await.unwrap(), head_before, "no event for a refused change");
     // The same (ms, c) from a higher site id wins the tie.
     put_stamped(&h.store, "bkt", "k", b"tie", Some(st(base + 5, "b"))).await.unwrap();
     assert_eq!(object_bytes(&h.store, "bkt", "k").await, b"tie");
@@ -2049,7 +2049,7 @@ async fn a_read_only_bucket_accepts_only_replicated_writes() {
     assert!(ro(h.store.initiate_multipart("replica", "big", None, None).await.map(|_| ())));
     assert!(ro(h.store.delete_object("replica", "existing").await));
     assert_eq!(object_bytes(&h.store, "replica", "existing").await, b"x", "nothing changed");
-    let head = h.store.index("replica").await.unwrap().changelog_head();
+    let head = h.store.index("replica").await.unwrap().durable_head().await.unwrap();
 
     // Replicated (stamped) writes go through: put, metadata update,
     // multipart, delete.
@@ -2082,7 +2082,7 @@ async fn a_read_only_bucket_accepts_only_replicated_writes() {
         .await
         .unwrap();
     h.store.delete_object_stamped("replica", "existing", Some(st(base + 3, "peer")), None).await.unwrap();
-    assert!(h.store.index("replica").await.unwrap().changelog_head() > head);
+    assert!(h.store.index("replica").await.unwrap().durable_head().await.unwrap() > head);
 
     // Read-write again: client writes work.
     h.store.set_bucket_read_only("replica", false).await.unwrap();

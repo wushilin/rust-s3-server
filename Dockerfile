@@ -1,16 +1,22 @@
 # rusts3 container image — runtime only, no in-container compile.
 #
-# Two binaries ship: the server (rusts3) and its CLI client (rs3), so a running
-# container can be driven from inside without pulling a second image. Both are
-# built outside the image and copied in from dist/linux-<arch>/, where <arch>
-# is Docker's TARGETARCH (amd64, arm64) — so one Dockerfile serves a multi-arch
-# `buildx` build as well as a single-arch local one. librocksdb-sys compiles
-# RocksDB from source, which is slow, so it happens once against a warm cargo
-# cache rather than on every image build:
+# Three binaries ship: the server (rusts3), its CLI client (rs3), and
+# rusts3-migrate, which converts a data volume from <= 0.8 (RocksDB) to the
+# redb databases of 0.9+ — run it against the stopped server's volume:
+#
+#   podman run --rm -v rusts3-data:/data rusts3:0.9.0 rusts3-migrate migrate /data
+#
+# All are built outside the image and copied in from dist/linux-<arch>/, where
+# <arch> is Docker's TARGETARCH (amd64, arm64) — so one Dockerfile serves a
+# multi-arch `buildx` build as well as a single-arch local one. Only
+# rusts3-migrate still compiles RocksDB (C++), which is slow, so builds happen
+# once against a warm cargo cache rather than on every image build:
 #
 #   cargo build --release --bin rusts3
 #   cargo build --release --manifest-path client/Cargo.toml
-#   mkdir -p dist/linux-amd64 && cp target/release/rusts3 client/target/release/rs3 dist/linux-amd64/
+#   cargo build --release --manifest-path migrate/Cargo.toml
+#   mkdir -p dist/linux-amd64 && cp target/release/rusts3 client/target/release/rs3 \
+#       migrate/target/release/rusts3-migrate dist/linux-amd64/
 #   podman build -t rusts3:latest .
 #   podman run -d -p 8002:8002 -p 8003:8003 -v rusts3-data:/data rusts3:latest
 #
@@ -39,6 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG TARGETARCH
 COPY dist/linux-${TARGETARCH}/rusts3 /usr/local/bin/rusts3
 COPY dist/linux-${TARGETARCH}/rs3 /usr/local/bin/rs3
+COPY dist/linux-${TARGETARCH}/rusts3-migrate /usr/local/bin/rusts3-migrate
 COPY config.docker.yaml /etc/rusts3/config.yaml
 
 # Everything durable lives here: buckets, the IAM database, scan history, logs.

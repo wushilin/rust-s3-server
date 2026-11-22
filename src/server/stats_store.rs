@@ -1,4 +1,4 @@
-//! Persistence for the Runtime Stats time-series — `<data_root>/stats.rocksdb`.
+//! Persistence for the Runtime Stats time-series — `<data_root>/stats.redb`.
 //!
 //! Its own database, like [`scan_store`](super::scan_store): runtime samples
 //! are derived, high-churn, and have no business travelling with the IAM export
@@ -15,15 +15,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode, MultiThreaded, Options,
-    WriteBatch, WriteOptions,
-};
+use crate::storage::kv::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, WriteOptions};
 
 use super::sysstat::Sample;
 use crate::storage::errors::{Result, StorageError};
 
-type Db = DBWithThreadMode<MultiThreaded>;
+type Db = crate::storage::kv::Db;
 
 const CF_SAMPLES: &str = "samples";
 
@@ -48,7 +45,7 @@ impl std::fmt::Debug for StatsStore {
     }
 }
 
-fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'a>>> {
+fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnFamily<'a>>> {
     db.cf_handle(name)
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }
@@ -75,7 +72,7 @@ where
 impl StatsStore {
     pub async fn open(data_root: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(data_root).await?;
-        let db_path = data_root.join("stats.rocksdb");
+        let db_path = data_root.join("stats.redb");
         let db = blocking(move || {
             let mut opts = Options::default();
             opts.create_if_missing(true);
