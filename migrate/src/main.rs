@@ -7,9 +7,15 @@
 //! rusts3-migrate rollback <base_dir>   # redb -> RocksDB   (returning to <= 0.8)
 //! ```
 //!
-//! `<base_dir>` is the server's `server.base_dir`. The server must be stopped:
-//! the tool takes the same `.rusts3.lock` the server holds, so neither can run
-//! while the other does.
+//! `<base_dir>` is the server's `server.base_dir`. `migrate` and `rollback`
+//! need the server stopped: they take the same `.rusts3.lock` the server
+//! holds, so neither can run while the other does. `status` only looks, so it
+//! works while the server runs — plan the downtime with it.
+//!
+//! **Ownership.** Everything the tool creates gets the owner of what it
+//! replaces, so running it as root (say, `sudo`) leaves files the server's own
+//! user can open. Where that is not possible (a user who is neither root nor
+//! the data's owner), the database is refused before anything is committed.
 //!
 //! **What is converted.** `admin`, `key_usage`, `stats` and `scans` at the
 //! root, and every `buckets/<bucket>/index`. Each RocksDB column family
@@ -156,6 +162,14 @@ from_error!(
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// `println!` that does not panic when stdout is closed early (`… | head`).
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 fn fail<T>(message: impl Into<String>) -> Result<T> {
     Err(Error(message.into()))
 }
@@ -249,7 +263,12 @@ fn lock(root: &Path) -> Result<std::fs::File> {
         return fail(format!("{} is not a directory", root.display()));
     }
     let path = root.join(".rusts3.lock");
+    let existed = path.exists();
     let file = OpenOptions::new().create(true).write(true).open(&path)?;
+    if !existed {
+        // The server opens it for writing: it must not end up root's.
+        match_owner(&path, root)?;
+    }
     if let Err(err) = file.try_lock() {
         return fail(format!(
             "{} is locked ({err}): stop the rusts3 server using this data directory first",
@@ -257,6 +276,74 @@ fn lock(root: &Path) -> Result<std::fs::File> {
         ));
     }
     Ok(file)
+}
+
+/// Whether a server holds `<root>`'s lock right now — without taking it for
+/// longer than the check (and without creating the lock file).
+fn in_use(root: &Path) -> Result<bool> {
+    let path = root.join(".rusts3.lock");
+    let file = match OpenOptions::new().read(true).open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(file.try_lock().is_err())
+}
+
+/// Gives `path` — recursively, for a directory — the owner and group of
+/// `like`, so a tool run as root leaves files the server's user can open.
+/// Fails, rather than leave files that user may not be able to write, when
+/// the current user cannot do that (neither root nor already the owner).
+#[cfg(unix)]
+fn match_owner(path: &Path, like: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let want = std::fs::metadata(like)?;
+    let (uid, gid) = (want.uid(), want.gid());
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&p)?;
+        if meta.uid() != uid || meta.gid() != gid {
+            std::os::unix::fs::lchown(&p, Some(uid), Some(gid)).map_err(|err| {
+                Error(format!(
+                    "{} would be owned by uid {} but the data belongs to uid {uid} ({err}) — \
+                     run as that user (e.g. `sudo -u <user> rusts3-migrate …`) or as root",
+                    p.display(),
+                    meta.uid()
+                ))
+            })?;
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&p)? {
+                stack.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn match_owner(_path: &Path, _like: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// After a run, whatever its outcome: every path belonging to a database —
+/// the live copy, set-aside originals, leftovers of an interrupted copy — gets
+/// the data directory's owner back. Opening a RocksDB database writes into its
+/// directory (log, manifest, options), so a run as root would otherwise leave
+/// root-owned files inside the originals, and a server running as the data's
+/// user could no longer open them.
+fn restore_ownership(root: &Path, databases: &[Database]) {
+    for db in databases {
+        let prefix = format!("{}.", db.kind());
+        let Ok(entries) = std::fs::read_dir(db.dir()) else { continue };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                if let Err(err) = match_owner(&entry.path(), root) {
+                    eprintln!("warning: {err}");
+                }
+            }
+        }
+    }
 }
 
 // ─── engines ────────────────────────────────────────────────────────────────
@@ -615,7 +702,8 @@ fn convert(db: &Database, direction: Direction) -> Result<Outcome> {
                 Direction::Migrate => rocks_to_redb(&source, &tmp),
                 Direction::Rollback => redb_to_rocks(&source, &tmp),
             };
-            let rows = match rows {
+            // The copy takes the source's owner before it can go live.
+            let rows = match rows.and_then(|rows| match_owner(&tmp, &source).map(|()| rows)) {
                 Ok(rows) => rows,
                 Err(err) => {
                     let _ = remove_any(&tmp);
@@ -640,19 +728,39 @@ fn run(command: &str, root: &Path) -> Result<()> {
         "rollback" => Some(Direction::Rollback),
         other => return fail(format!("unknown command {other:?}\n\n{USAGE}")),
     };
-    let _lock = lock(root)?;
-    let databases = discover(root)?;
-    if databases.is_empty() {
-        println!("no rusts3 databases under {}", root.display());
-        return Ok(());
-    }
-    let width = databases.iter().map(|d| d.label.len()).max().unwrap_or(0);
     let Some(direction) = direction else {
+        // Read-only: no lock, so it works while the server runs.
+        if !root.is_dir() {
+            return fail(format!("{} is not a directory", root.display()));
+        }
+        let databases = discover(root)?;
+        out!(
+            "{}: {}",
+            root.display(),
+            if in_use(root)? { "in use by a running server (stop it before migrate/rollback)" } else { "not in use" }
+        );
+        if databases.is_empty() {
+            out!("no rusts3 databases");
+        }
+        let width = databases.iter().map(|d| d.label.len()).max().unwrap_or(0);
         for db in &databases {
-            println!("{:width$}  {}", db.label, db.state());
+            out!("  {:width$}  {}", db.label, db.state());
         }
         return Ok(());
     };
+    let _lock = lock(root)?;
+    let databases = discover(root)?;
+    if databases.is_empty() {
+        out!("no rusts3 databases under {}", root.display());
+        return Ok(());
+    }
+    let outcome = convert_all(root, &databases, direction);
+    restore_ownership(root, &databases);
+    outcome
+}
+
+fn convert_all(root: &Path, databases: &[Database], direction: Direction) -> Result<()> {
+    let width = databases.iter().map(|d| d.label.len()).max().unwrap_or(0);
     let (verb, arrow) = match direction {
         Direction::Migrate => ("migrate", "RocksDB → redb"),
         Direction::Rollback => ("rollback", "redb → RocksDB"),
@@ -663,27 +771,27 @@ fn run(command: &str, root: &Path) -> Result<()> {
     if !refused.is_empty() {
         return fail(format!("nothing was converted:\n  {}", refused.join("\n  ")));
     }
-    println!("{verb} {} ({arrow})", root.display());
+    out!("{verb} {} ({arrow})", root.display());
     let mut converted = 0;
-    for db in &databases {
+    for db in databases {
         let started = Instant::now();
         match convert(db, direction)? {
             Outcome::Converted(rows) => {
                 converted += 1;
-                println!("  {:width$}  {rows} rows, verified ({:.1}s)", db.label, started.elapsed().as_secs_f64());
+                out!("  {:width$}  {rows} rows, verified ({:.1}s)", db.label, started.elapsed().as_secs_f64());
             }
             Outcome::Finished(rows) => {
                 converted += 1;
-                println!("  {:width$}  {rows} rows, verified — finished an interrupted run", db.label);
+                out!("  {:width$}  {rows} rows, verified — finished an interrupted run", db.label);
             }
-            Outcome::AlreadyDone => println!("  {:width$}  already done", db.label),
+            Outcome::AlreadyDone => out!("  {:width$}  already done", db.label),
         }
     }
     let kept = match direction {
         Direction::Migrate => "*.rocksdb.migrated",
         Direction::Rollback => "*.redb.rolledback",
     };
-    println!("done: {converted} converted. The originals are kept as {kept}; delete them once you are satisfied.");
+    out!("done: {converted} converted. The originals are kept as {kept}; delete them once you are satisfied.");
     Ok(())
 }
 
@@ -697,14 +805,21 @@ commands:
   rollback  convert redb databases back to RocksDB, for rusts3 0.8.x
             (refused if the data uses anything 0.8 cannot read)
 
-<base_dir> is the server's server.base_dir. Stop the server first.";
+<base_dir> is the server's server.base_dir. `status` works while the server
+runs; stop it before migrate or rollback. Run as the user that owns the data,
+or as root (new files are given the data's owner).
+
+rollback produces data for rusts3 0.8.x only. Coming from an earlier release
+(0.3 - 0.7), returning to that release means restoring a backup of the
+*.rocksdb databases taken before migrating, or the *.rocksdb.migrated copies
+the migration kept (both lose writes made since).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, root) = match args.as_slice() {
         [command, root] => (command.as_str(), PathBuf::from(root)),
         [flag] if flag == "-h" || flag == "--help" => {
-            println!("{USAGE}");
+            out!("{USAGE}");
             return;
         }
         _ => {
@@ -898,6 +1013,36 @@ mod tests {
         run("migrate", root.path()).unwrap();
         run("rollback", root.path()).unwrap();
         assert!(!rocks_families(&root.path().join("admin.rocksdb")).unwrap().contains(&FORMAT_TABLE.to_string()));
+    }
+
+    #[test]
+    fn status_works_while_a_server_runs_and_says_so() {
+        let root = legacy_root();
+        assert!(!in_use(root.path()).unwrap());
+        let held = OpenOptions::new().create(true).write(true).open(root.path().join(".rusts3.lock")).unwrap();
+        held.lock().unwrap();
+        assert!(in_use(root.path()).unwrap());
+        run("status", root.path()).unwrap();
+        assert!(run("migrate", root.path()).is_err(), "converting still needs the server stopped");
+        drop(held);
+        assert!(!in_use(root.path()).unwrap());
+    }
+
+    #[test]
+    fn new_files_keep_the_datas_owner() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let root = legacy_root();
+            run("migrate", root.path()).unwrap();
+            let source = std::fs::metadata(root.path().join("admin.rocksdb.migrated")).unwrap();
+            for f in ["admin.redb", "buckets/photos/index.redb"] {
+                let m = std::fs::metadata(root.path().join(f)).unwrap();
+                assert_eq!((m.uid(), m.gid()), (source.uid(), source.gid()), "{f}");
+            }
+            // Root's case (chown to another user) needs root; the refusal for
+            // a user who cannot chown is the lchown error path above.
+        }
     }
 
     #[test]

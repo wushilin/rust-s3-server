@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "rusts3-migrate"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "redb",
  "rocksdb",

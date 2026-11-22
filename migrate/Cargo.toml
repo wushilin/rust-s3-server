@@ -1,6 +1,6 @@
 [package]
 name = "rusts3-migrate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Converts rusts3 metadata databases between RocksDB (<= 0.8) and redb (0.9+), in both directions"
 

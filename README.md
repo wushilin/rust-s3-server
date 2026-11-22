@@ -635,7 +635,8 @@ distribution.
 
 ## Upgrading from 0.8: RocksDB → redb
 
-Full release notes: [docs/releases/0.9.0.md](docs/releases/0.9.0.md).
+Full release notes: [docs/releases/0.9.0.md](docs/releases/0.9.0.md),
+[0.9.1](docs/releases/0.9.1.md).
 
 Up to 0.8 the metadata databases were RocksDB, a C++ library. From 0.9 they
 are [redb](https://github.com/cberner/redb), written in Rust, and the server
@@ -647,7 +648,9 @@ using `rusts3-migrate` (in `migrate/`; the only program here that still
 links RocksDB):
 
 ```bash
-rusts3-migrate status   /var/lib/rusts3   # your server.base_dir
+rusts3 validate -c config.yaml            # the new binary accepts your config (server may run)
+rusts3-migrate status   /var/lib/rusts3   # your server.base_dir (server may run)
+# stop the server, then:
 rusts3-migrate migrate  /var/lib/rusts3
 # container (server stopped):
 #   docker run --rm --entrypoint rusts3-migrate -v rusts3-data:/data ghcr.io/wushilin/rusts3:0.9.0 migrate /data
@@ -663,8 +666,19 @@ only then renamed into place; the original is kept as `*.rocksdb.migrated`
 for you to delete later. An interrupted run is resumed by running it again.
 To return to 0.8, stop the server and run `rusts3-migrate rollback`: it
 converts the *current* data back, including everything written since the
-migration. The tool takes the server's `.rusts3.lock`, so it cannot run
-against a live server.
+migration. `migrate` and `rollback` take the server's `.rusts3.lock`, so they
+cannot run against a live server; `status` only looks, and says whether a
+server holds the directory.
+
+Run the tool as the user that owns the data, or as root (`sudo`): everything
+it creates or touches is given the data directory's owner, so the server's
+user can open it afterwards.
+
+The conversion itself is quick — on a real install (24 buckets, 3,983
+objects, 1.4 GB of RocksDB metadata on NFS) it took 3.6 s, so the outage is
+little more than a restart. The originals are kept, so a separate backup is
+optional; if you take one, of the `*.rocksdb` directories, it is what dominates
+the downtime.
 
 Version bounds, checked for every database before anything is converted:
 
@@ -673,7 +687,10 @@ Version bounds, checked for every database before anything is converted:
   an in-place upgrade from that release would). Data from an unknown build
   is refused.
 - `rollback` produces data for **0.8.x** only, and only while the data is
-  still at format 1. Every redb database carries a format marker (table
+  still at format 1. **Coming from 0.3 – 0.7**, `rollback` does not take you
+  back to that release (it cannot open the families 0.8 added): go forward
+  to 0.8 instead, or restore the `*.rocksdb.migrated` copies (or your own
+  backup) with your old binary, which loses writes made since the upgrade. Every redb database carries a format marker (table
   `rusts3_format`: format number, the build that created it, the build that
   last opened it); a server refuses a database whose format is newer than
   it understands, and a release that changes what a database stores bumps
