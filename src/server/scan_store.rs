@@ -171,7 +171,7 @@ fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnF
 }
 
 /// Scan history is derived data — it can always be produced again by running
-/// another scan — so writes don't pay for a WAL fsync each.
+/// another scan — so writes don't wait for an fsync each.
 fn write_opts() -> WriteOptions {
     let mut opts = WriteOptions::default();
     opts.set_sync(false);

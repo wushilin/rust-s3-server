@@ -352,11 +352,13 @@ pub struct ListPage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
-    /// fsync blobs before commit and fsync the WAL on every write: acked
-    /// writes survive power loss.
+    /// fsync blobs before commit, and wait for every commit to be durable
+    /// (group commit: concurrent writes share one fsync): acked writes
+    /// survive power loss.
     Full,
-    /// No per-put blob fsync and no per-write WAL sync: power loss may drop the
-    /// last acked writes; consistency is preserved via startup reconciliation.
+    /// No per-put blob fsync, and commits become durable in the background
+    /// (at most ~1 s later): power loss may drop the last acked writes;
+    /// consistency is preserved via startup reconciliation.
     Relaxed,
 }
 
@@ -868,10 +870,11 @@ impl ObjectIndex {
         .await
     }
 
-    /// Flushes memtables and the WAL to SST/disk. RocksDB has no WAL-checkpoint
-    /// concept; the name is retained from the previous backend. The rebuild
-    /// pipeline calls this before dropping the temp DB so its directory is
-    /// complete before the atomic swap.
+    /// Makes every commit so far durable (the kv layer keeps one durability
+    /// point per database, so the per-table and log flushes below are the
+    /// same call; they mirror the RocksDB-shaped API). The rebuild pipeline
+    /// calls this before dropping the temp DB so its file is complete before
+    /// the atomic swap.
     pub async fn close(&self) {
         let db = self.db.clone();
         let _ = run_blocking(move || {
@@ -887,9 +890,10 @@ impl ObjectIndex {
         .await;
     }
 
-    /// Syncs the write-ahead log to stable storage. Relaxed-durability writes
-    /// leave the WAL in the OS page cache; callers that are about to act on a
+    /// Makes every commit so far durable. Relaxed-durability commits become
+    /// durable only in the background; callers that are about to act on a
     /// commit irreversibly (e.g. retire the blob it displaced) sync it first.
+    /// (The name is kept from the RocksDB backend.)
     pub async fn sync_wal(&self) -> Result<()> {
         let db = self.db.clone();
         run_blocking(move || Ok(db.flush_wal(true)?)).await

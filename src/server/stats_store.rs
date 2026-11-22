@@ -50,8 +50,8 @@ fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnF
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }
 
-/// Samples are derived data regenerated every few seconds — a WAL fsync per
-/// write would be pure cost for no durability benefit.
+/// Samples are derived data regenerated every few seconds — waiting for an
+/// fsync per write would be pure cost for no durability benefit.
 fn write_opts() -> WriteOptions {
     let mut opts = WriteOptions::default();
     opts.set_sync(false);

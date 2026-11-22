@@ -1770,8 +1770,8 @@ impl LocalObjectStore {
 
     /// Trashes the blob dirs a commit displaced, dropping each retire
     /// intent as its dir goes; a dir that cannot be moved keeps its intent
-    /// for the resolver. In relaxed durability the commit may still sit in
-    /// an unsynced WAL: it is synced first, or a power loss could roll the
+    /// for the resolver. In relaxed durability the commit may not be durable
+    /// yet: it is made durable first, or a power loss could roll the
     /// row back to a blob dir that is already in trash.
     async fn retire_displaced(&self, bucket: &str, key: &str, index: &ObjectIndex, ids: &[i64], dirs: &[String]) {
         if dirs.is_empty() {

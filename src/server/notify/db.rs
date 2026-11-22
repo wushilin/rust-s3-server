@@ -5,7 +5,7 @@
 //! | `notify_subscriptions`  | subscription id | [`Subscription`] JSON    |
 //! | `notify_state`          | subscription id | [`SubState`] JSON        |
 //!
-//! Configuration is written with a synced WAL; progress is not — losing the
+//! Configuration writes wait until they are durable; progress writes do not — losing the
 //! last offset update to a power cut only means a batch is delivered again,
 //! which consumers already de-duplicate by `seq`.
 

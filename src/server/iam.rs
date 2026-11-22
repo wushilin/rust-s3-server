@@ -331,7 +331,7 @@ fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnF
 }
 
 fn sync_write() -> WriteOptions {
-    // IAM is primary data: always fsync the WAL on write.
+    // IAM is primary data: every write waits until it is durable.
     let mut opts = WriteOptions::default();
     opts.set_sync(true);
     opts

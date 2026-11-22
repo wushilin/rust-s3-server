@@ -69,7 +69,7 @@ fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnF
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }
 
-/// Usage stamps are advisory — a WAL fsync per flush would be pure cost.
+/// Usage stamps are advisory — waiting for an fsync per flush would be pure cost.
 fn write_opts() -> WriteOptions {
     let mut opts = WriteOptions::default();
     opts.set_sync(false);
