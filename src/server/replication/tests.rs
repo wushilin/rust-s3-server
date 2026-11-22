@@ -450,14 +450,23 @@ async fn two_way_merge_converges_to_the_union_and_stops() {
     assert_eq!(merged["gone"].2, b.contents("shared").await["gone"].2);
     // Each side logs what replication applied as such, stamped by the site
     // that made the change (the spec's `origin: "replication"`).
+    // A write is visible as soon as it commits, but its changelog entry only
+    // once the write is durable — up to one (group) fsync later, which on a
+    // slow disk (Windows CI) is long enough to observe. So wait for it.
     let origin_of = |site: &Site, key: &str| {
         let store = site.store.clone();
         let key = key.to_string();
         async move {
-            let index = store.index("shared").await.unwrap();
-            let page = index.read_changelog(0, 10_000, usize::MAX).await.unwrap();
-            let event = page.events.iter().rev().find(|e| e.key == key).unwrap().clone();
-            (event.origin, event.stamp.unwrap().site)
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let index = store.index("shared").await.unwrap();
+                let page = index.read_changelog(0, 10_000, usize::MAX).await.unwrap();
+                if let Some(event) = page.events.iter().rev().find(|e| e.key == key) {
+                    return (event.origin, event.stamp.clone().unwrap().site);
+                }
+                assert!(Instant::now() < deadline, "no changelog entry for {key}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     };
     assert_eq!(origin_of(&a, "only-b").await, (crate::storage::changelog::ChangeOrigin::Replication, "site-b".to_string()));

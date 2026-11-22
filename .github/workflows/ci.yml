@@ -112,6 +112,7 @@ jobs:
           workspaces: |
             . -> target
             client -> client/target
+            migrate -> migrate/target
       - uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
@@ -121,8 +122,10 @@ jobs:
           export MUSL_TOOLCHAIN=zig
           ./musl.sh --locked
           BIN=rs3 ./musl.sh --locked --manifest-path client/Cargo.toml
+          BIN=rusts3-migrate ./musl.sh --locked --manifest-path migrate/Cargo.toml
           mkdir -p dist/linux-amd64
-          cp target/x86_64-unknown-linux-musl/release/rusts3 client/target/x86_64-unknown-linux-musl/release/rs3 dist/linux-amd64/
+          cp target/x86_64-unknown-linux-musl/release/rusts3 client/target/x86_64-unknown-linux-musl/release/rs3 \
+            migrate/target/x86_64-unknown-linux-musl/release/rusts3-migrate dist/linux-amd64/
       - name: Build image
         run: docker build -t rusts3:ci .
       - name: Exercise the image
