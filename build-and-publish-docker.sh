@@ -26,8 +26,8 @@ fi
 
 echo ">> Building rusts3 ${VERSION}"
 
-# The binaries are built on the host (not in the container) so the slow RocksDB
-# compile reuses the warm cargo cache instead of running on every image build.
+# The binaries are built on the host (not in the container) so compiles reuse
+# the warm cargo cache instead of running on every image build.
 cargo build --release --bin rusts3
 strip target/release/rusts3
 
@@ -36,6 +36,12 @@ strip target/release/rusts3
 echo ">> Building rs3 client"
 cargo build --release --manifest-path client/Cargo.toml
 strip client/target/release/rs3
+
+# The RocksDB -> redb converter for upgrades from <= 0.8 (the one binary that
+# still compiles RocksDB, so this is the slow step).
+echo ">> Building rusts3-migrate"
+cargo build --release --manifest-path migrate/Cargo.toml
+strip migrate/target/release/rusts3-migrate
 
 # The Dockerfile copies from dist/linux-<TARGETARCH>/ so the same file serves
 # the multi-arch CI build; lay out this host's architecture under its Docker
@@ -46,7 +52,7 @@ case "$(uname -m)" in
     *) echo "error: unsupported host architecture $(uname -m)" >&2; exit 1 ;;
 esac
 rm -rf dist && mkdir -p "dist/linux-${DOCKER_ARCH}"
-cp target/release/rusts3 client/target/release/rs3 "dist/linux-${DOCKER_ARCH}/"
+cp target/release/rusts3 client/target/release/rs3 migrate/target/release/rusts3-migrate "dist/linux-${DOCKER_ARCH}/"
 
 echo ">> Building image ${IMAGE}:${VERSION} (and :latest)"
 # --format docker so the Dockerfile's HEALTHCHECK is preserved (OCI drops it).
