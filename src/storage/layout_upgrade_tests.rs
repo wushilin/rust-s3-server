@@ -252,7 +252,7 @@ async fn every_supported_layout_still_opens_and_upgrades() {
         // catalog: rows, the deleted key's tombstone, and the version ids.
         let before = store.list_object_versions(BUCKET, "", None, "", "", 100).await.unwrap();
         store.forget_index(BUCKET);
-        tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+        tokio::fs::remove_file(store.layout().bucket_dir(BUCKET).unwrap().join("index.redb")).await.unwrap();
         assert_eq!(store.rebuild_index(BUCKET).await.unwrap(), 4, "3 objects and the delete marker");
         assert_fixture_intact(&store, &fixture).await;
         assert_on_current_layout(&store).await;
@@ -384,13 +384,13 @@ async fn a_rebuild_keeps_the_changelog_only_when_the_catalog_is_unchanged() {
     store.put_object(BUCKET, "a", b"1", None, None, false).await.unwrap();
     store.put_object(BUCKET, "b", b"2", None, None, false).await.unwrap();
     let index = store.index(BUCKET).await.unwrap();
-    let (log_id, head) = (index.changelog_id().to_string(), index.changelog_head());
+    let (log_id, head) = (index.changelog_id().to_string(), index.durable_head().await.unwrap());
     drop(index);
 
     // The tree agrees with the index: the log (and its id) is carried.
     store.rebuild_index(BUCKET).await.unwrap();
     let index = store.index(BUCKET).await.unwrap();
-    assert_eq!((index.changelog_id(), index.changelog_head()), (log_id.as_str(), head));
+    assert_eq!((index.changelog_id(), index.durable_head().await.unwrap()), (log_id.as_str(), head));
     drop(index);
 
     // A blob the index never knew (a restored backup, a copied tree): the
@@ -412,7 +412,7 @@ async fn a_rebuild_keeps_the_changelog_only_when_the_catalog_is_unchanged() {
     // The index lost entirely: nothing to carry, a fresh log.
     let fresh_id = store.index(BUCKET).await.unwrap().changelog_id().to_string();
     store.forget_index(BUCKET);
-    tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+    tokio::fs::remove_file(store.layout().bucket_dir(BUCKET).unwrap().join("index.redb")).await.unwrap();
     assert_eq!(store.rebuild_index(BUCKET).await.unwrap(), 3);
     assert_ne!(store.index(BUCKET).await.unwrap().changelog_id(), fresh_id.as_str());
     let _ = WriteOrigin::Client;

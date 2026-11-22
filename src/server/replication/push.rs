@@ -215,7 +215,7 @@ impl Pusher {
         // the peer's writes: an index rebuild waits for in-flight handles.
         let (log_id, head) = {
             let index = self.store.index(&bucket).await?;
-            (index.changelog_id().to_string(), index.changelog_head())
+            (index.changelog_id().to_string(), index.durable_head().await?)
         };
         let checkpoint = match self.load().await? {
             Some(checkpoint) if now_ms() - checkpoint.saved_at_ms > self.max_checkpoint_age_ms => {

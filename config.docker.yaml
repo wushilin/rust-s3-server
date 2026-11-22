@@ -57,6 +57,9 @@ auth:
   # Set these to serve virtual-hosted-style requests (bucket.host/key).
   public_hostname: "{{RUSTS3_PUBLIC_HOSTNAME:}}"
   public_scheme: "{{RUSTS3_PUBLIC_SCHEME:http}}"
+  # Token for GET /_rs3/buckets (header x-list-bucket-token). Unset: not served.
+  bucket_list_tokens:
+    - "{{RUSTS3_BUCKET_LIST_TOKEN:}}"
 
 sweeper:
   interval_secs: {{RUSTS3_SWEEP_INTERVAL_SECS:300}}

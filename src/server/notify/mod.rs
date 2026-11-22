@@ -52,7 +52,7 @@ use crate::storage::errors::StorageError;
 use crate::storage::store::{ChangeListener, DeleteGuard, LocalObjectStore};
 use crate::storage::time::now_ms;
 
-/// Families this module keeps in `admin.rocksdb`.
+/// Families this module keeps in `admin.redb`.
 pub const ADMIN_DB_FAMILIES: [&str; 2] = [db::CF_SUBSCRIPTIONS, db::CF_STATE];
 
 /// Header values are never echoed back.
@@ -385,8 +385,16 @@ impl NotifyService {
             if rt.cancel.is_cancelled() {
                 return;
             }
-            let generation = rt.generation.load(Ordering::SeqCst);
-            let state = rt.state.lock().await.clone();
+            // Generation and state are read together, under the state lock —
+            // the lock `act` changes both under. Read apart, an action landing
+            // in between (a rewind) paired its new state with the old
+            // generation: the worker delivered from the new offset, its
+            // progress was then discarded as stale, and it delivered the same
+            // range again.
+            let (generation, state) = {
+                let state = rt.state.lock().await;
+                (rt.generation.load(Ordering::SeqCst), state.clone())
+            };
             if state.paused.is_some() || state.muted_until_ms > now_ms() {
                 return;
             }
@@ -700,7 +708,7 @@ impl NotifyService {
                 token = Some(value);
             }
         }
-        let head = index.changelog_head();
+        let head = index.durable_head().await?;
         let state = SubState {
             v: model::RECORD_VERSION,
             log_id: index.changelog_id().to_string(),
@@ -941,7 +949,7 @@ impl NotifyService {
                     next.muted_until_ms = 0;
                 }
                 Action::Resnapshot => {
-                    let head = index.changelog_head();
+                    let head = index.durable_head().await?;
                     next.log_id = index.changelog_id().to_string();
                     next.offset = head;
                     next.snapshot = Some(SnapshotState {
@@ -954,7 +962,7 @@ impl NotifyService {
                 }
                 Action::SkipToHead => {
                     next.log_id = index.changelog_id().to_string();
-                    next.offset = index.changelog_head();
+                    next.offset = index.durable_head().await?;
                     next.snapshot = None;
                     next.paused = None;
                     next.muted_until_ms = 0;

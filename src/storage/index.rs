@@ -54,10 +54,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode, MergeOperands, MultiThreaded,
-    Options, WriteBatch, WriteOptions,
-};
+use crate::storage::kv::{ColumnFamilyDescriptor, Direction, IteratorMode, MergeOperands, Options, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 
 use super::changelog::{
@@ -70,7 +67,7 @@ use super::stamp::Stamp;
 /// Multi-threaded RocksDB handle: `cf_handle` yields an `Arc<BoundColumnFamily>`
 /// that outlives a borrow of the DB, which suits the `Arc<DB>` +
 /// `spawn_blocking` access pattern.
-type Db = DBWithThreadMode<MultiThreaded>;
+type Db = crate::storage::kv::Db;
 
 /// Schema version stamped into the `meta` family. Any other value requires a
 /// rebuild. Tracks the *column-family layout*, independent of the per-value
@@ -605,7 +602,21 @@ impl std::fmt::Debug for ObjectIndex {
 }
 
 pub fn index_db_path(bucket_dir: &Path) -> PathBuf {
-    bucket_dir.join("index.rocksdb")
+    bucket_dir.join("index.redb")
+}
+
+/// A bucket whose index is still the RocksDB directory of <= 0.8: never
+/// opened (this build cannot read it) and never rebuilt over (that would
+/// discard its changelog) — `rusts3-migrate` converts it.
+fn refuse_legacy_index(bucket_dir: &Path) -> Result<()> {
+    let legacy = bucket_dir.join("index.rocksdb");
+    if legacy.is_dir() {
+        return Err(StorageError::IndexOutdated(format!(
+            "{} is a RocksDB index from an older version; run rusts3-migrate",
+            legacy.display()
+        )));
+    }
+    Ok(())
 }
 
 fn db_options() -> Options {
@@ -634,7 +645,7 @@ fn open_db(path: &Path) -> Result<Db> {
     Ok(Db::open_cf_descriptors(&db_options(), path, column_families())?)
 }
 
-fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'a>>> {
+fn cf<'a>(db: &'a Db, name: &str) -> Result<Arc<crate::storage::kv::BoundColumnFamily<'a>>> {
     db.cf_handle(name)
         .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))
 }
@@ -719,6 +730,7 @@ fn ensure_log_id(db: &Db) -> Result<String> {
 /// the database is missing while blobs exist, or the schema version is not
 /// current.
 pub async fn needs_rebuild(bucket_dir: &Path) -> Result<bool> {
+    refuse_legacy_index(bucket_dir)?;
     let db_path = index_db_path(bucket_dir);
     if !db_path.exists() {
         // Fresh DB is only acceptable when there are no blobs to lose.
@@ -761,6 +773,7 @@ impl ObjectIndex {
     /// RocksDB manages its own read concurrency, so there is no reader-pool
     /// size to configure.
     pub async fn open(bucket_dir: &Path, durability: Durability) -> Result<Self> {
+        refuse_legacy_index(bucket_dir)?;
         tokio::fs::create_dir_all(bucket_dir).await?;
         let db_path = index_db_path(bucket_dir);
         let existed = db_path.exists();
@@ -799,11 +812,12 @@ impl ObjectIndex {
             Ok((db, seed, last_change, last_ts, log_id))
         })
         .await?;
+        let clock = db.clock();
         Ok(Self {
             db: Arc::new(db),
             durability,
             intent_seq: Arc::new(AtomicI64::new(seed)),
-            changes: Arc::new(SeqTracker::new(last_change, last_ts)),
+            changes: Arc::new(SeqTracker::new(last_change, last_ts).with_clock(clock)),
             log_id: Arc::new(log_id),
             commit_hook: None,
         })
@@ -812,6 +826,13 @@ impl ObjectIndex {
     /// Installs the post-commit notification (the store wires this to the
     /// webhook dispatcher when it opens a bucket's index).
     pub fn with_commit_hook(mut self, hook: CommitHook) -> Self {
+        // Changelog entries become readable when they become durable (see
+        // `SeqTracker`), which for unsynced writes is after they returned:
+        // announce the watermark again then, so waiters wake up. Holds the
+        // tracker and the hook, never the database.
+        let changes = self.changes.clone();
+        let announce = hook.clone();
+        self.db.on_durable(Arc::new(move || announce(changes.watermark())));
         self.commit_hook = Some(hook);
         self
     }
@@ -2258,14 +2279,31 @@ impl ObjectIndex {
         &self.log_id
     }
 
-    /// The commit-order watermark: the newest seq a reader may see.
+    /// The commit-order watermark: the newest seq a reader may see. Entries
+    /// of unsynced writes are held back until durable; [`durable_head`]
+    /// (what readers use) makes them durable first.
+    ///
+    /// [`durable_head`]: Self::durable_head
     pub fn changelog_head(&self) -> u64 {
         self.changes.watermark()
     }
 
+    /// The watermark after making every written changelog entry durable: one
+    /// shared fsync, and only when an unsynced write (`durability: relaxed`,
+    /// or bookkeeping written unsynced) is holding entries back. So a reader
+    /// sees every committed change at once, and never one a crash could take
+    /// back.
+    pub async fn durable_head(&self) -> Result<u64> {
+        if self.changes.has_pending() {
+            let db = self.db.clone();
+            run_blocking(move || Ok(db.flush()?)).await?;
+        }
+        Ok(self.changes.watermark())
+    }
+
     pub async fn changelog_status(&self) -> Result<ChangelogStatus> {
         let db = self.db.clone();
-        let head = self.changes.watermark();
+        let head = self.durable_head().await?;
         let log_id = self.log_id.to_string();
         run_blocking(move || {
             let log = cf(&db, CF_CHANGELOG)?;
@@ -2291,7 +2329,7 @@ impl ObjectIndex {
     /// (always at least one entry).
     pub async fn read_changelog(&self, after: u64, limit: usize, max_bytes: usize) -> Result<ChangelogPage> {
         let db = self.db.clone();
-        let head = self.changes.watermark();
+        let head = self.durable_head().await?;
         let limit = limit.max(1);
         run_blocking(move || {
             let mut page = ChangelogPage {
@@ -2340,7 +2378,7 @@ impl ObjectIndex {
     /// change's commit time).
     pub async fn position_at_time(&self, since_ms: i64) -> Result<Option<u64>> {
         let db = self.db.clone();
-        let head = self.changes.watermark();
+        let head = self.durable_head().await?;
         run_blocking(move || {
             let log = cf(&db, CF_CHANGELOG)?;
             let trimmed = trimmed_through(&db)?;
@@ -2395,7 +2433,7 @@ impl ObjectIndex {
     pub async fn trim_changelog(&self, cutoff_ms: i64, max_entries: usize) -> Result<usize> {
         let db = self.db.clone();
         let durability = self.durability;
-        let head = self.changes.watermark();
+        let head = self.durable_head().await?;
         run_blocking(move || {
             let log = cf(&db, CF_CHANGELOG)?;
             let meta = cf(&db, CF_META)?;
@@ -2867,7 +2905,7 @@ mod tests {
         index.commit_delete("a", "objects/aa/V1A_1", 3).await.unwrap();
         // Deleting an absent key logs nothing.
         index.commit_delete("zz", "objects/zz/V1Z_1", 4).await.unwrap();
-        assert_eq!(index.changelog_head(), 3);
+        assert_eq!(index.durable_head().await.unwrap(), 3);
         let page = index.read_changelog(0, 100, usize::MAX).await.unwrap();
         let ops: Vec<_> = page.events.iter().map(|e| (e.seq, e.op, e.key.as_str(), e.version.as_str())).collect();
         assert_eq!(
@@ -2931,13 +2969,13 @@ mod tests {
         put(&index, "a", "objects/x/V1a_1", 1).await;
         put(&index, "b", "objects/x/V1b_1", 2).await;
         index.trim_changelog(2, 10).await.unwrap(); // trims seq 1
-        let dst = ObjectIndex::open_at(&tmp.path().join("other.rocksdb"), Durability::Relaxed)
+        let dst = ObjectIndex::open_at(&tmp.path().join("other.redb"), Durability::Relaxed)
             .await
             .unwrap();
         assert_ne!(dst.changelog_id(), index.changelog_id());
         assert_eq!(index.copy_changelog_into(&dst).await.unwrap(), 1);
         dst.close().await;
-        let path = tmp.path().join("other.rocksdb");
+        let path = tmp.path().join("other.redb");
         drop(dst);
         let reopened = ObjectIndex::open_at(&path, Durability::Relaxed).await.unwrap();
         assert_eq!(reopened.changelog_id(), index.changelog_id());

@@ -23,7 +23,7 @@
 //!   Entries `<=` it are gone; a consumer whose offset is below it has lost
 //!   events. It also seeds the allocator when every entry has been trimmed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -336,9 +336,18 @@ pub fn decode_u64(bytes: &[u8]) -> u64 {
 
 /// Allocates sequence numbers and tracks which are still being written, so
 /// readers can stop at the commit-order watermark.
+///
+/// With a [`DurableClock`](super::kv::DurableClock), the watermark is also a
+/// *durability* watermark: a seq whose write has returned stays in flight
+/// until the database's durable generation covers that write, so no reader —
+/// webhook, pull subscriber, replication peer — ever sees an entry a crash
+/// could take back (and the seq be reused for a different change). In
+/// `durability: full` the write already waited for its fsync, so this costs
+/// nothing; in `relaxed` the entry appears at the next group fsync.
 #[derive(Debug)]
 pub struct SeqTracker {
     state: Mutex<SeqState>,
+    clock: Option<super::kv::DurableClock>,
 }
 
 #[derive(Debug)]
@@ -348,6 +357,22 @@ struct SeqState {
     /// Commit time given to the last allocated seq.
     last_ts: i64,
     in_flight: BTreeSet<u64>,
+    /// Written but not yet durable: commit generation -> seqs.
+    pending: BTreeMap<u64, Vec<u64>>,
+}
+
+impl SeqState {
+    /// Releases the seqs of every write the durable generation now covers.
+    fn release_durable(&mut self, durable: u64) {
+        while let Some(entry) = self.pending.first_entry() {
+            if *entry.key() > durable {
+                break;
+            }
+            for seq in entry.remove() {
+                self.in_flight.remove(&seq);
+            }
+        }
+    }
 }
 
 impl SeqTracker {
@@ -357,8 +382,16 @@ impl SeqTracker {
                 last,
                 last_ts,
                 in_flight: BTreeSet::new(),
+                pending: BTreeMap::new(),
             }),
+            clock: None,
         }
+    }
+
+    /// Holds each seq back until the write carrying it is durable.
+    pub fn with_clock(mut self, clock: super::kv::DurableClock) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Allocates the next seq and marks it in flight until the returned guard
@@ -376,10 +409,23 @@ impl SeqTracker {
         SeqGuard { tracker: self, seq, ts }
     }
 
+    /// Whether some written seq is still waiting for its write to become
+    /// durable (a reader can make it so: see `ObjectIndex::durable_head`).
+    pub fn has_pending(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let Some(clock) = &self.clock {
+            state.release_durable(clock.durable());
+        }
+        !state.pending.is_empty()
+    }
+
     /// Every seq `<=` this has finished committing (or failed and will never
     /// appear). Readers must not read past it.
     pub fn watermark(&self) -> u64 {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        if let Some(clock) = &self.clock {
+            state.release_durable(clock.durable());
+        }
         match state.in_flight.first() {
             Some(first) => first - 1,
             None => state.last,
@@ -396,7 +442,22 @@ pub struct SeqGuard<'a> {
 
 impl Drop for SeqGuard<'_> {
     fn drop(&mut self) {
-        self.tracker.state.lock().unwrap().in_flight.remove(&self.seq);
+        let mut state = self.tracker.state.lock().unwrap();
+        match &self.tracker.clock {
+            // The write carrying this seq has returned (committed or failed),
+            // so the current commit generation covers it.
+            Some(clock) => {
+                let generation = clock.committed();
+                if clock.durable() >= generation {
+                    state.in_flight.remove(&self.seq);
+                } else {
+                    state.pending.entry(generation).or_default().push(self.seq);
+                }
+            }
+            None => {
+                state.in_flight.remove(&self.seq);
+            }
+        }
     }
 }
 
@@ -427,6 +488,37 @@ pub struct ChangelogStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seq_is_readable_only_once_its_write_is_durable() {
+        use crate::storage::kv::{ColumnFamilyDescriptor, Db, Options, WriteOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_cf_descriptors(
+            &Options::default(),
+            dir.path().join("c.redb"),
+            [ColumnFamilyDescriptor::new("log", Options::default())],
+        )
+        .unwrap();
+        let log = db.cf_handle("log").unwrap();
+        let tracker = SeqTracker::new(10, 0).with_clock(db.clock());
+        // An unsynced write (durability: relaxed): committed and visible, but
+        // the changelog must not offer it yet.
+        {
+            let g = tracker.begin(1);
+            db.put_cf(&log, g.seq.to_be_bytes(), b"e11").unwrap();
+        }
+        assert_eq!(tracker.watermark(), 10, "held back until durable");
+        db.flush().unwrap();
+        assert_eq!(tracker.watermark(), 11, "released by the fsync");
+        // A synced write (durability: full) waited for its fsync: at once.
+        {
+            let g = tracker.begin(2);
+            let mut sync = WriteOptions::default();
+            sync.set_sync(true);
+            db.put_cf_opt(&log, g.seq.to_be_bytes(), b"e12", &sync).unwrap();
+        }
+        assert_eq!(tracker.watermark(), 12);
+    }
 
     #[test]
     fn watermark_waits_for_out_of_order_commits() {

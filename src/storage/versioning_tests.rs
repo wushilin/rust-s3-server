@@ -201,7 +201,7 @@ async fn an_unversioned_bucket_retires_what_it_replaces_but_keeps_deletes_on_dis
 
     // A rebuild from the tree alone finds the delete.
     store.forget_index(BUCKET);
-    tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+    tokio::fs::remove_file(store.layout().bucket_dir(BUCKET).unwrap().join("index.redb")).await.unwrap();
     store.rebuild_index(BUCKET).await.unwrap();
     let read = store.read_object(BUCKET, "k").await.map(|r| r.object_dir);
     assert!(matches!(read, Err(StorageError::ObjectNotFound { .. })), "{read:?}");
@@ -229,7 +229,7 @@ async fn a_versioned_bucket_rebuilds_its_versions_and_markers_from_the_tree() {
     let before = store.list_object_versions(BUCKET, "", None, "", "", 100).await.unwrap();
 
     store.forget_index(BUCKET);
-    tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+    tokio::fs::remove_file(store.layout().bucket_dir(BUCKET).unwrap().join("index.redb")).await.unwrap();
     assert_eq!(store.rebuild_index(BUCKET).await.unwrap(), 7, "every version and marker is indexed");
     assert_eq!(versions(&store, "a").await, before_a);
     assert_eq!(versions(&store, "b").await, before_b);
@@ -301,7 +301,7 @@ async fn tags_live_in_the_version_and_survive_a_rebuild() {
     assert!(matches!(store.set_object_tags(BUCKET, "k", None, tags(&[("bad key!", "x")]), WriteOrigin::Client).await, Err(StorageError::InvalidObjectKey(_))));
     // Rebuilt from the tree: the tags are in each version's meta.json.
     store.forget_index(BUCKET);
-    tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+    tokio::fs::remove_file(store.layout().bucket_dir(BUCKET).unwrap().join("index.redb")).await.unwrap();
     store.rebuild_index(BUCKET).await.unwrap();
     assert_eq!(store.object_tags(BUCKET, "k", None).await.unwrap().0, tags(&[("b", "2")]));
     assert_eq!(store.object_tags(BUCKET, "k", Some("null")).await.unwrap().0, tags(&[("a", "1")]));
@@ -401,7 +401,7 @@ async fn removing_versions_promotes_the_right_one_and_keeps_them_gone() {
     assert!(findings(&store).await.is_empty());
     // And a rebuild from the tree agrees: nothing.
     store.forget_index(BUCKET);
-    tokio::fs::remove_dir_all(store.layout().bucket_dir(BUCKET).unwrap().join("index.rocksdb")).await.unwrap();
+    tokio::fs::remove_file(store.layout().bucket_dir(BUCKET).unwrap().join("index.redb")).await.unwrap();
     assert_eq!(store.rebuild_index(BUCKET).await.unwrap(), 0);
     assert!(versions(&store, "k").await.is_empty());
 }

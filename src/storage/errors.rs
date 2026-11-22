@@ -121,8 +121,8 @@ impl From<serde_json::Error> for StorageError {
     }
 }
 
-impl From<rocksdb::Error> for StorageError {
-    fn from(value: rocksdb::Error) -> Self {
+impl From<super::kv::Error> for StorageError {
+    fn from(value: super::kv::Error) -> Self {
         StorageError::Db(value.to_string())
     }
 }

@@ -1,4 +1,4 @@
-//! Replication links in `admin.rocksdb`.
+//! Replication links in `admin.redb`.
 //!
 //! | family                | key     | value              |
 //! |-----------------------|---------|--------------------|
@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use rocksdb::{IteratorMode, WriteOptions};
+use crate::storage::kv::{IteratorMode, WriteOptions};
 
 use super::model::{Link, RECORD_VERSION};
 use crate::server::iam::AdminDb;
@@ -22,7 +22,7 @@ pub struct LinkDb {
     db: Arc<AdminDb>,
 }
 
-fn cf<'a>(db: &'a AdminDb) -> Result<Arc<rocksdb::BoundColumnFamily<'a>>> {
+fn cf<'a>(db: &'a AdminDb) -> Result<Arc<crate::storage::kv::BoundColumnFamily<'a>>> {
     db.cf_handle(CF_LINKS)
         .ok_or_else(|| StorageError::Db(format!("missing column family {CF_LINKS}")))
 }

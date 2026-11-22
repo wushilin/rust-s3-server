@@ -113,7 +113,15 @@ impl Server {
 
     /// A console session (cookie) for the replication API.
     async fn login(&self) -> (reqwest::Client, String) {
-        let http = reqwest::Client::new();
+        // reqwest is built without a default crypto provider (the server keeps
+        // ring/aws-lc out), so a client needs one handed to it. Plain http
+        // here; the TLS config is never used.
+        let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls_graviola::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let http = reqwest::Client::builder().tls_backend_preconfigured(tls).build().unwrap();
         let response = http
             .post(format!("{}/api/login", self.console()))
             .header("content-type", "application/json")

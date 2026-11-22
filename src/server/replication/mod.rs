@@ -111,7 +111,7 @@ fn check_local(auth: &LocalAuth, link: &Link) -> Result<(), String> {
     ))
 }
 
-/// Families this module keeps in `admin.rocksdb`.
+/// Families this module keeps in `admin.redb`.
 pub const ADMIN_DB_FAMILIES: [&str; 1] = [db::CF_LINKS];
 
 /// Supervisor timing.

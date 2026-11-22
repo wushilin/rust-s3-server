@@ -1,4 +1,4 @@
-//! Raw dump / restore for a RocksDB database.
+//! Raw dump / restore for a metadata database (see `storage::kv`).
 //!
 //! The dump is a fixed 6-byte magic header followed by a **length-delimited
 //! protobuf stream** of [`Row`] messages — one per key/value pair, each
@@ -31,11 +31,11 @@
 use std::io::{Read, Write};
 
 use prost::Message;
-use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, ReadOptions, WriteBatch, WriteOptions};
+use crate::storage::kv::{IteratorMode, WriteBatch, WriteOptions};
 
 use super::errors::{Result, StorageError};
 
-type Db = DBWithThreadMode<MultiThreaded>;
+type Db = crate::storage::kv::Db;
 
 /// File-type marker: `RS3PB` + format version byte.
 const MAGIC: &[u8] = b"RS3PB\x01";
@@ -111,9 +111,7 @@ pub fn export<W: Write>(db: &Db, cf_names: &[&str], w: &mut W) -> Result<u64> {
         let cf = db
             .cf_handle(name)
             .ok_or_else(|| StorageError::Db(format!("missing column family {name}")))?;
-        let mut opts = ReadOptions::default();
-        opts.set_snapshot(&snapshot);
-        for item in db.iterator_cf_opt(&cf, opts, IteratorMode::Start) {
+        for item in snapshot.iterator_cf(&cf, IteratorMode::Start) {
             let (key, value) = item?;
             let row = Row {
                 cf: name.to_string(),

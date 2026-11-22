@@ -273,12 +273,18 @@ impl PeerClient {
         if !matches!(url.scheme(), "http" | "https") {
             return Err("peer endpoint must be http:// or https://".to_string());
         }
+        if url.scheme() == "https" {
+            if let Some(reason) = crate::server::tls::https_unavailable() {
+                return Err(reason.to_string());
+            }
+        }
         let host = match (url.host_str(), url.port()) {
             (Some(host), Some(port)) => format!("{host}:{port}"),
             (Some(host), None) => host.to_string(),
             (None, _) => return Err("peer endpoint has no host".to_string()),
         };
         let http = reqwest::Client::builder()
+            .tls_backend_preconfigured(crate::server::tls::client_config())
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())

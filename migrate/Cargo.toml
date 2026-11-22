@@ -1,0 +1,20 @@
+[package]
+name = "rusts3-migrate"
+version = "0.1.0"
+edition = "2021"
+description = "Converts rusts3 metadata databases between RocksDB (<= 0.8) and redb (0.9+), in both directions"
+
+# The one program in this repository that still links RocksDB (C++): it reads
+# the databases of rusts3 <= 0.8 so the server itself never has to.
+[dependencies]
+rocksdb = { version = "0.25", default-features = false, features = ["lz4"] }
+# Must be the redb the server uses (Cargo.toml at the repository root): the
+# tool writes the files the server opens.
+redb    = "3.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rusts3-migrate"
+path = "src/main.rs"
