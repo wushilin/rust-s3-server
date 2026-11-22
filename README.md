@@ -41,14 +41,17 @@ target/release/rusts3 run
 Or with Docker — the image runs with no configuration at all:
 
 ```bash
-docker build -t rusts3:latest .
 docker run -d --name rusts3 \
   -p 8002:8002 -p 8003:8003 \
   -v rusts3-data:/data \
   -e RUSTS3_ADMIN_PASSWORD=change-me \
   -e RUSTS3_ACCESS_KEY=myaccesskey -e RUSTS3_SECRET_KEY=mysecretkey \
-  rusts3:latest
+  ghcr.io/wushilin/rusts3:latest
 ```
+
+(Released images are on the GitHub Container Registry,
+`ghcr.io/wushilin/rusts3:<version>` and `:latest`, for amd64 and arm64; or
+build one locally with `docker build -t rusts3:latest .`)
 
 - **S3 API** → `http://127.0.0.1:8002` (point the AWS CLI/SDKs, `mc`, `s3cmd`, rclone here)
 - **Console** → `http://127.0.0.1:8003` (username/password login)
@@ -621,7 +624,7 @@ publishes them (`.github/workflows/release.yml`):
 
 | Tag | Component | Assets |
 |---|---|---|
-| `v<version>` | server `rusts3` | Linux x86_64/aarch64 (static musl), macOS aarch64/x86_64, FreeBSD x86_64, Windows x86_64/aarch64; `SHA256SUMS`; Docker image `wushilin/rusts3:<version>` and `:latest` (multi-arch, when Docker Hub credentials are configured as the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repository secrets) |
+| `v<version>` | server `rusts3` | Linux x86_64/aarch64 (static musl), macOS aarch64/x86_64, FreeBSD x86_64, Windows x86_64/aarch64; `SHA256SUMS`; container image `ghcr.io/wushilin/rusts3:<version>` and `:latest` (amd64 and arm64, pushed with the workflow's own token; `publish-image.yml` republishes an existing version) |
 | `rs3-v<version>` | client `rs3` | the same platforms |
 
 The tag must match the `version` in the crate's `Cargo.toml`. FreeBSD aarch64
@@ -646,7 +649,8 @@ links RocksDB):
 ```bash
 rusts3-migrate status   /var/lib/rusts3   # your server.base_dir
 rusts3-migrate migrate  /var/lib/rusts3
-# container: podman run --rm -v rusts3-data:/data wushilin/rusts3:0.9.0 rusts3-migrate migrate /data
+# container (server stopped):
+#   docker run --rm --entrypoint rusts3-migrate -v rusts3-data:/data ghcr.io/wushilin/rusts3:0.9.0 migrate /data
 ```
 
 `rusts3-migrate` ships in every server release archive and in the Docker

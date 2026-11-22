@@ -1,0 +1,90 @@
+# Publishes the container image of an already released server version to
+# ghcr.io, from that release's own Linux binaries — no rebuild:
+#
+#   gh workflow run publish-image.yml -f version=0.9.0
+#
+# Releases publish their image themselves (release.yml, job `docker`); this is
+# for (re)publishing one after the fact. The image is the Dockerfile at the
+# release's tag, with rusts3 and rusts3-migrate from the server release and rs3
+# from the newest client release. It is smoke-tested (docker-test.sh, and
+# rusts3-migrate run the documented way) before anything is pushed.
+name: Publish image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released server version, e.g. 0.9.0"
+        required: true
+      latest:
+        description: "Also tag :latest"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: ghcr.io image for v${{ inputs.version }}
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ inputs.version }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/rusts3
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+      - name: Fetch the released Linux binaries
+        run: |
+          set -euo pipefail
+          rs3_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
+            --jq '[.[].tagName | select(startswith("rs3-v"))][0]')
+          echo "server v$VERSION, client $rs3_tag"
+          for pair in x86_64:amd64 aarch64:arm64; do
+            arch=${pair%%:*}; docker_arch=${pair##*:}
+            mkdir -p rel "dist/linux-$docker_arch"
+            gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" -D rel \
+              -p "rusts3-v$VERSION-$arch-unknown-linux-musl.tar.gz"
+            gh release download "$rs3_tag" --repo "$GITHUB_REPOSITORY" -D rel \
+              -p "rs3-v${rs3_tag#rs3-v}-$arch-unknown-linux-musl.tar.gz"
+            for t in rel/*-"$arch"-unknown-linux-musl.tar.gz; do tar -C rel -xzf "$t"; done
+            cp rel/rusts3-v"$VERSION"-"$arch"-unknown-linux-musl/{rusts3,rusts3-migrate} "dist/linux-$docker_arch/"
+            cp rel/rs3-v"${rs3_tag#rs3-v}"-"$arch"-unknown-linux-musl/rs3 "dist/linux-$docker_arch/"
+          done
+          chmod 755 dist/*/*
+          ls -l dist/*
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Smoke test (amd64)
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --load -t rusts3:candidate .
+          docker run --rm --entrypoint rusts3-migrate rusts3:candidate --help | head -3
+          docker run --rm rusts3:candidate --version | grep -q "rusts3 $VERSION"
+          IMAGE=rusts3:candidate RUNTIME=docker ./docker-test.sh
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tags
+        id: tags
+        run: |
+          {
+            echo "list<<EOF"
+            echo "$IMAGE:$VERSION"
+            if [ "${{ inputs.latest }}" = true ]; then echo "$IMAGE:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.version }}
+          tags: ${{ steps.tags.outputs.list }}

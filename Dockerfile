@@ -4,7 +4,8 @@
 # rusts3-migrate, which converts a data volume from <= 0.8 (RocksDB) to the
 # redb databases of 0.9+ — run it against the stopped server's volume:
 #
-#   podman run --rm -v rusts3-data:/data rusts3:0.9.0 rusts3-migrate migrate /data
+#   podman run --rm --entrypoint rusts3-migrate -v rusts3-data:/data \
+#       ghcr.io/wushilin/rusts3:0.9.0 migrate /data
 #
 # All are built outside the image and copied in from dist/linux-<arch>/, where
 # <arch> is Docker's TARGETARCH (amd64, arm64) — so one Dockerfile serves a

@@ -6,9 +6,8 @@
 # The tag must match the crate version in the corresponding Cargo.toml, or the
 # run fails before building anything. Every platform in the matrix is built and
 # smoke-tested (`--version`), the tarballs and SHA256SUMS are attached to a
-# GitHub release created from the tag, and — for server tags, when Docker Hub
-# credentials are configured as repository secrets — a multi-arch image is
-# published as <version> and latest.
+# GitHub release created from the tag, and — for server tags — a multi-arch
+# image is published to ghcr.io/<owner>/rusts3 as <version> and latest.
 #
 # Server tags also build rusts3-migrate (migrate/, the RocksDB -> redb
 # converter for upgrades from <= 0.8) and ship it in every server tarball and
@@ -249,47 +248,43 @@ jobs:
             --title "${{ needs.meta.outputs.bin }} ${{ needs.meta.outputs.version }}" $notes dist/*
 
   docker:
-    name: publish Docker image
+    name: publish container image (ghcr.io)
     needs: [meta, build]
     if: needs.meta.outputs.component == 'server'
     runs-on: ubuntu-24.04
+    # GitHub Container Registry with the workflow's own token: no secrets.
+    permissions:
+      contents: read
+      packages: write
     env:
-      # Secrets are not available in `if:`; gate the steps on this instead.
-      HAS_CREDS: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
-      IMAGE: docker.io/wushilin/rusts3
+      IMAGE: ghcr.io/${{ github.repository_owner }}/rusts3
     steps:
-      - name: No Docker Hub credentials configured — skipping image publish
-        if: env.HAS_CREDS != 'true'
-        run: echo "Set the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets to publish $IMAGE."
       - uses: actions/checkout@v4
-        if: env.HAS_CREDS == 'true'
       - uses: actions/download-artifact@v4
-        if: env.HAS_CREDS == 'true'
         with:
           pattern: docker-bins-*
           path: docker-bins
       - name: Lay out binaries per platform
-        if: env.HAS_CREDS == 'true'
         run: |
           mkdir -p dist/linux-amd64 dist/linux-arm64
           cp docker-bins/docker-bins-x86_64/*  dist/linux-amd64/
           cp docker-bins/docker-bins-aarch64/* dist/linux-arm64/
           chmod 755 dist/*/*
       - uses: docker/setup-qemu-action@v3
-        if: env.HAS_CREDS == 'true'
       - uses: docker/setup-buildx-action@v3
-        if: env.HAS_CREDS == 'true'
       - uses: docker/login-action@v3
-        if: env.HAS_CREDS == 'true'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
-        if: env.HAS_CREDS == 'true'
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
           tags: |
             ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
             ${{ env.IMAGE }}:latest
